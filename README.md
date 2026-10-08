@@ -47,20 +47,21 @@ hot paths that need it.
 | `plan` / `run` API, metadata, workspace, backend registry | ✅ implemented |
 | `reference` backend (torch, CPU + NPU) — correctness oracle | ✅ implemented |
 | Load-balanced scheduler (query tiling, KV split, LPT ordering) | ✅ implemented |
-| Paged decode TileLang kernel (GQA, NHD, tail-page masking) | 🟡 compiles + launches on Ascend950PR; device numerics blocked on the toolchain (see below) |
+| Paged decode TileLang kernel (GQA, NHD, tail-page masking) | 🟡 compiles and runs on Ascend950PR with `target="pto"`; numerics pending the PTO CV-model port |
 | Prefill / append kernel | ⏳ Phase 1 |
 | Split-KV merge kernel | ⏳ Phase 1 (plan + reference implementation done) |
 | Micro-benchmark harness (vs. torch reference / FIA) | ✅ implemented |
 | vLLM-Ascend backend integration | 🚧 Phase 2 (working sketch in `examples/`) |
 | MLA / cascade / sparse / FP8 · MoE · sampling | ⏳ Phase 3+ |
 
-> **Dev-environment note.** The TileLang Ascend toolchain on the reference machine is a
-> `+linux.cann910` wheel running against CANN 9.1.1 / driver 25.7.rc1. With that combination,
-> *upstream's own* `paged_flash_attn_bhsd.py` example also returns wrong numbers, so device
-> numerics are currently blocked by the toolchain rather than by TileInfer. Everything that can be
-> verified without trusting that toolchain is verified: the whole CPU suite passes, and the kernel
-> itself compiles and launches. See
-> [`docs/architecture.md`](docs/architecture.md#known-environment-traps-ascend-950pr--cann-911).
+> **Dev-environment note.** On the reference Ascend 950PR box the toolchain question is settled but
+> has sharp edges: the `+linux.cann910` release wheel of `tilelang-ascend` emits binaries the
+> device rejects (`ACL_ERROR_RT_AICORE_EXCEPTION`), so TileInfer is built against the *source tree*
+> and compiled with `target="pto"` (the classic `ascendc` code generator cannot lower
+> `T.tile.fill`).  With that combination the upstream PTO GEMM example and a trivial elementwise
+> kernel are numerically correct on the device; the paged decode kernel still needs porting to the
+> PTO cube↔vector model.  See
+> [`docs/architecture.md`](docs/architecture.md#toolchain-status-on-the-reference-machine-ascend-950pr-oct-2026).
 
 ## Install
 

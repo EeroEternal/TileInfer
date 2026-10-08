@@ -39,8 +39,14 @@ Two things about this file are load-bearing and non-obvious:
    *inside* the jit function, because the parser resolves annotation names through module globals
    plus the locals of the defining frame.  Putting them in an enclosing scope degrades the same
    way.
+3. ``target=ASCEND_TARGET`` must be ``"pto"`` on the current ``tile-ai/tilelang-ascend``
+   (``ascendc_pto`` branch): ``T.tile.fill`` lowers to ``tl.ascend_fill``, which only the PTO code
+   generator implements — the classic ``ascendc`` code generator has no handler for it and dies
+   with ``TVMError: Unresolved call Op(tl.ascend_fill)``.  Set ``TILEINFER_ASCEND_TARGET`` to
+   change it on a release where ``auto`` works.
 """
 
+import os
 from typing import Any, Dict
 
 from ...utils import have_tilelang
@@ -57,7 +63,19 @@ except Exception as _exc:  # pragma: no cover - only on machines without TileLan
     T = None  # type: ignore[assignment]
     _IMPORT_ERROR = _exc
 
-__all__ = ["paged_decode_gqa", "build_decode_kernel", "DecodeKernelSpec", "is_available", "clear_kernel_cache"]
+__all__ = [
+    "paged_decode_gqa",
+    "build_decode_kernel",
+    "DecodeKernelSpec",
+    "is_available",
+    "clear_kernel_cache",
+    "ASCEND_TARGET",
+]
+
+#: TileLang target model.  ``pto`` is required on the current ``ascendc_pto`` branch (see the
+#: module docstring); older releases accept ``auto`` / ``ascendc``.  Overridable because this
+#: router has changed once already and will change again.
+ASCEND_TARGET = os.environ.get("TILEINFER_ASCEND_TARGET", "pto")
 
 _KERNEL_CACHE: Dict[tuple, Any] = {}
 
@@ -141,7 +159,12 @@ def paged_decode_gqa(
         tilelang.PassConfigKey.TL_ASCEND_MEMORY_PLANNING: True,
     }
 
-    @tilelang.jit(out_idx=[7], workspace_idx=[8, 9, 10], pass_configs=pass_configs)
+    @tilelang.jit(
+        out_idx=[7],
+        workspace_idx=[8, 9, 10],
+        target=ASCEND_TARGET,
+        pass_configs=pass_configs,
+    )
     def _decode(
         batch: int,
         kv_heads: int,
