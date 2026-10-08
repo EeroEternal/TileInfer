@@ -18,10 +18,12 @@ Status legend: ✅ done · 🟡 in progress · ⏳ not started
 
 | Item | Status |
 |---|---|
-| Paged **decode** kernel, GQA/MQA, NHD layout, tail-page masking | ✅ written, compiles in ~2.6 s and launches on the Ascend950PR |
-| Correctness vs reference on the 950 (rtol/atol 5e-2, fp16) | ⛔ blocked: the toolchain returns wrong numbers for *upstream's own examples* too (wheel built for CANN 9.1.0 on a CANN 9.1.1 box) |
-| Fix the toolchain: build `tilelang-ascend` from source against local CANN | 🟡 tree prepared (`third_party/tilelang-ascend`), CMake step needs one full-log run |
-| Decode benchmark across (batch, kv_len) including 128k context | ⏳ needs the row above |
+| Paged **decode** kernel, GQA/MQA, NHD layout, tail-page masking | 🟡 written; compiles and runs on the 950PR with `target="pto"`, aicore-timeouts because it still uses the classic CV model |
+| Correctness vs reference on the 950 (rtol/atol 5e-2, fp16) | ⛔ pending the PTO port (below) |
+| Fix the toolchain: build `tilelang-ascend` from source against local CANN | ✅ done — the release wheel raises `ACL_ERROR_RT_AICORE_EXCEPTION` on this device, the source build is numerically correct (upstream PTO GEMM example passes) |
+| **Port the decode kernel to the PTO execution model** (`T.Scope("C")/T.Scope("V")` + cross flags, as in `examples/sparse_flash_attention/example_sparse_flash_attn_gqa_pto.py`) | ⏳ next |
+| Keep the GQA group ≥ 16 (the pinned `pto-isa` cannot `T.assign` small Accumulator tiles) | ⏳ next (pad the group or pick a kernel variant) |
+| Decode benchmark across (batch, kv_len) including 128k context | ⏳ needs the two rows above |
 | Split-KV merge kernel (`kv_tile_pages > 0`) | ⏳ plan + reference implementation + tests done |
 | **Prefill / append** kernel (causal, `qo_len > 1`, chunked prefill) | ⏳ |
 | Perf pass: `T.Pipelined` over pages, L0 double buffering, block-size sweep | ⏳ |

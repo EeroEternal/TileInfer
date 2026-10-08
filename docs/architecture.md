@@ -182,16 +182,37 @@ These cost real debugging time; they are listed here so nobody pays for them twi
 | Symptom | Cause | Fix |
 |---|---|---|
 | `libtvm.so: version GLIBCXX_3.4.30 not found` | system libstdc++ too old | conda-forge `libstdcxx-ng 12.2.0`, put it first on `LD_LIBRARY_PATH` |
-| kernel runs but output is garbage — **including the upstream examples** | `ACL_OP_INIT_MODE` unset while `torch_npu` is loaded | `export ACL_OP_INIT_MODE=1` |
-| `[Bisheng] Launch kernel failure! ret 507000` | ACL `RT_INTERNAL_ERROR`; observed together with the row above | same |
+| `ACL_ERROR_RT_AICORE_EXCEPTION` (507015) on **every** kernel, including a plain elementwise add | the `tilelang-…+linux.cann910` release wheel is built for CANN 9.1.0 and emits binaries this device rejects | do not use the wheel; build from source against the local CANN |
+| `TVMError: Unresolved call Op(tl.ascend_fill)` | the classic `ascendc` code generator has no handler for `tl.ascend_fill` (which `T.tile.fill` lowers to) — only `codegen_ascend_pto.cc` implements it | compile with `target="pto"` (see `tileinfer.kernels.attention.paged_decode.ASCEND_TARGET`, overridable via `TILEINFER_ASCEND_TARGET`) |
 | `expected Object but got str` from `script.ir_builder.tir.Arg` | kernel module uses `from __future__ import annotations` (PEP 563 turns annotations into strings), or keeps `T` / shape constants in an enclosing closure | keep PEP 563 off in kernel modules and compute every shape constant inside the jit function |
-| a `+linux.cann910` wheel on a CANN 9.1.1 box | the release asset is built for CANN 9.1.0 | build the wheel from source against the local CANN |
+| `3rdparty/pto-isa/.../TAssign.hpp: no member named 'assignData' in pto::Tile<Acc, …>` | the pinned `pto-isa` cannot express `T.assign` on a *small* Accumulator tile (observed with M=2 and M=4; M=16 compiles) | keep the GQA group (the first GEMM's M) at 16 or above, or avoid materialising a tiny L0C tile |
+| `AclrtSynchronizeDeviceWithTimeout … 507014` (aicore timeout) | kernel deadlocks.  In practice this is what happens when a kernel written against the **classic `ascendc` CV model** (cube ↔ vector hand-off through a workspace tensor plus the automatic sync passes) is compiled with `target="pto"` | write the kernel against the PTO execution model, i.e. follow `examples/sparse_flash_attention/example_sparse_flash_attn_gqa_pto.py` (explicit `T.Scope("C")/T.Scope("V")` and cross-core flags) instead of `examples/flash_attention/paged_flash_attn_bhsd.py` |
 
-Status of the last row on the dev machine: the source build was attempted; the tree is at
-`third_party/tilelang-ascend` (submodules vendored, TVM patches applied) and the CMake step needs
-one full-log run to be fixed.  Until then, device numerics cannot be trusted, which is why the
-kernel test in `tests/test_tilelang_decode.py` is reported as "compiles and launches" rather than
-"validated".
+`have_tilelang()` in `tileinfer/utils.py` checks for the Ascend pass-config keys rather than just
+the import, so a CUDA-only TileLang install correctly reports "no Ascend toolchain" instead of
+failing later inside the compiler.
+
+### Toolchain status on the reference machine (Ascend 950PR, Oct 2026)
+
+What is *known to work* there, in order of how much it proves:
+
+| Check | Result |
+|---|---|
+| `examples/gemm/example_gemm_pto_developer.py` (upstream, PTO target) | ✅ `Kernel Output Match!` |
+| trivial TileLang elementwise add, `target="pto"` + auto-sync pass configs | ✅ max abs diff 0.002 (fp16 rounding) |
+| `examples/flash_attention/paged_flash_attn_bhsd.py` (upstream, classic target) | ❌ wrong numbers / aicore timeout |
+| TileInfer paged decode kernel, `target="pto"` | 🟡 compiles for GQA group ≥ 16, runs, then aicore timeout — needs the PTO CV-model port |
+
+Two environmental facts that surprised us and are worth keeping:
+
+* The device reports **`Ascend950PR_9579`** while the toolchain's simulator paths only know
+  `Ascend950PR_9599`/`Ascend910_9599`; platform detection (`"950" in name → A5`) does the right
+  thing regardless.
+* On this box `ACL_OP_INIT_MODE=1` is silently upgraded by CANN to `2` (aclops disabled), which is
+  the annotation CANN wants for custom kernels here — set it anyway, since with it unset the
+  failure mode is *wrong numbers* rather than an error.
+
+So the toolchain question is settled — the remaining work is a kernel port, not an environment fix.
 
 ## 7. Testing strategy
 
