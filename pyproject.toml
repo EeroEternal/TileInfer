@@ -29,8 +29,8 @@ dev = ["pytest>=7", "pytest-timeout", "tabulate", "rich"]
 npu = ["torch_npu"]
 
 [project.urls]
-Homepage = "https://github.com/TileInfer/TileInfer"
-Documentation = "https://github.com/TileInfer/TileInfer/tree/main/docs"
+Homepage = "https://github.com/EeroEternal/TileInfer"
+Documentation = "https://github.com/EeroEternal/TileInfer/tree/main/docs"
 
 [tool.setuptools.dynamic]
 version = { attr = "tileinfer._version.__version__" }
