@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tileinfer"
+description = "Engine-agnostic, serving-oriented attention kernels for LLM inference on Ascend"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [{ name = "TileInfer contributors" }]
+keywords = ["ascend", "npu", "attention", "llm", "serving", "tilelang"]
+classifiers = [
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Intended Audience :: Developers",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dynamic = ["version"]
+
+# The host side (interface, planning, reference backend) needs nothing but torch.
+# Device-side kernels need torch_npu + the TileLang Ascend toolchain, which cannot be resolved
+# from PyPI (the wheel is published as a GitHub release of tile-ai/tilelang-ascend) — see
+# docs/architecture.md, "Environment".
+dependencies = ["torch>=2.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "pytest-timeout", "tabulate", "rich"]
+npu = ["torch_npu"]
+
+[project.urls]
+Homepage = "https://github.com/TileInfer/TileInfer"
+Documentation = "https://github.com/TileInfer/TileInfer/tree/main/docs"
+
+[tool.setuptools.dynamic]
+version = { attr = "tileinfer._version.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["tileinfer*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+  "npu: test requires an Ascend NPU",
+  "tilelang: test requires the TileLang Ascend toolchain",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
