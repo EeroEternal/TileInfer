@@ -18,12 +18,13 @@ Status legend: ✅ done · 🟡 in progress · ⏳ not started
 
 | Item | Status |
 |---|---|
-| Paged **decode** kernel, GQA/MQA, NHD layout, tail-page masking | 🟡 written; compiles and runs on the 950PR with `target="pto"`, aicore-timeouts because it still uses the classic CV model |
-| Correctness vs reference on the 950 (rtol/atol 5e-2, fp16) | ⛔ pending the PTO port (below) |
-| Fix the toolchain: build `tilelang-ascend` from source against local CANN | ✅ done — the release wheel raises `ACL_ERROR_RT_AICORE_EXCEPTION` on this device, the source build is numerically correct (upstream PTO GEMM example passes) |
-| **Port the decode kernel to the PTO execution model** (`T.Scope("C")/T.Scope("V")` + cross flags, as in `examples/sparse_flash_attention/example_sparse_flash_attn_gqa_pto.py`) | ⏳ next |
+| Paged **decode** kernel, GQA/MQA, NHD layout, tail-page masking | 🟡 written; compiles with `target="pto"`; cannot be validated until the toolchain's cube→vector path works |
+| Correctness vs reference on the 950 (rtol/atol 5e-2, fp16) | ⛔ blocked **upstream**: the minimal cube→vector hand-off hangs (`benchmarks/probes/pto_cv_handoff.py`), and so do both upstream PTO attention examples |
+| Fix the toolchain: build `tilelang-ascend` from source against local CANN | ✅ done — upstream PTO GEMM and a vector-only kernel are correct on the device |
+| Getting a working CV path: try the `npuir` branch, or a vector-only decode kernel as a functional fallback | ⏳ next (see [`architecture.md`](architecture.md#toolchain-status-on-the-reference-machine-ascend-950pr-oct-2026)) |
+| Report the hand-off failure upstream with the minimal reproducer | 🟡 draft ready in [`upstream-issue-pto-cv-hang.md`](upstream-issue-pto-cv-hang.md) |
 | Keep the GQA group ≥ 16 (the pinned `pto-isa` cannot `T.assign` small Accumulator tiles) | ⏳ next (pad the group or pick a kernel variant) |
-| Decode benchmark across (batch, kv_len) including 128k context | ⏳ needs the two rows above |
+| Decode benchmark across (batch, kv_len) including 128k context | ⏳ needs a working CV path |
 | Split-KV merge kernel (`kv_tile_pages > 0`) | ⏳ plan + reference implementation + tests done |
 | **Prefill / append** kernel (causal, `qo_len > 1`, chunked prefill) | ⏳ |
 | Perf pass: `T.Pipelined` over pages, L0 double buffering, block-size sweep | ⏳ |

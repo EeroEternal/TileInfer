@@ -198,21 +198,40 @@ What is *known to work* there, in order of how much it proves:
 
 | Check | Result |
 |---|---|
-| `examples/gemm/example_gemm_pto_developer.py` (upstream, PTO target) | ✅ `Kernel Output Match!` |
-| trivial TileLang elementwise add, `target="pto"` + auto-sync pass configs | ✅ max abs diff 0.002 (fp16 rounding) |
-| `examples/flash_attention/paged_flash_attn_bhsd.py` (upstream, classic target) | ❌ wrong numbers / aicore timeout |
-| TileInfer paged decode kernel, `target="pto"` | 🟡 compiles for GQA group ≥ 16, runs, then aicore timeout — needs the PTO CV-model port |
+| `examples/gemm/example_gemm_pto_developer.py` (upstream, PTO target, cube only) | ✅ `Kernel Output Match!` |
+| trivial TileLang elementwise add, `target="pto"` (vector only) | ✅ max abs diff 0.002 (fp16 rounding) |
+| **minimal cube→vector hand-off** (`benchmarks/probes/pto_cv_handoff.py`) | ❌ aicore timeout `507014` |
+| upstream PTO attention examples, both the developer-mode and the explicit-scope one | ❌ aicore timeout `507014` |
+| TileInfer paged decode kernel, `target="pto"` | ❌ same aicore timeout (not its own bug) |
+| `examples/flash_attention/paged_flash_attn_bhsd.py` (upstream, classic target) | ❌ `Unresolved call Op(tl.ascend_fill)` |
+
+The conclusion is uncomfortable but useful: **the cube→vector hand-off under the PTO target does
+not work on this machine**, for upstream's kernels as much as for ours.  Cube-only and vector-only
+kernels are fine.  So there is nothing to fix in TileInfer before upstream does; the minimal
+reproducer lives in `benchmarks/probes/pto_cv_handoff.py` and the issue draft (with the full
+environment matrix and questions) in
+[`upstream-issue-pto-cv-hang.md`](upstream-issue-pto-cv-hang.md).
+
+Options while that is open, in the order we would try them:
+
+1. **`npuir` branch** — the second, MLIR-based backend route of the same repository; the
+   independently published TileLang FA numbers on Ascend come from there, so it is the most likely
+   route to a working CV path.  Cost: another source build (~20 min) plus re-validating PTO/`npuir`
+   target naming for our kernels.
+2. **Vector-only decode kernel** — decode's M is the GQA group, so the whole online-softmax loop
+   can in principle run on the vector core with no cube involvement, sidestepping the hand-off.
+   Correct and runnable today; slower than the cube path, so it is a functional fallback rather
+   than the target design.
+3. **Wait for upstream**, using the reproducer to drive the fix.
 
 Two environmental facts that surprised us and are worth keeping:
 
 * The device reports **`Ascend950PR_9579`** while the toolchain's simulator paths only know
   `Ascend950PR_9599`/`Ascend910_9599`; platform detection (`"950" in name → A5`) does the right
-  thing regardless.
+  thing regardless — and that SKU difference is a prime suspect for the hand-off failure.
 * On this box `ACL_OP_INIT_MODE=1` is silently upgraded by CANN to `2` (aclops disabled), which is
   the annotation CANN wants for custom kernels here — set it anyway, since with it unset the
   failure mode is *wrong numbers* rather than an error.
-
-So the toolchain question is settled — the remaining work is a kernel port, not an environment fix.
 
 ## 7. Testing strategy
 
