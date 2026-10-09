@@ -236,13 +236,29 @@ Options while that is open, in the order we would try them:
 
 ### If you are tempted to change the CANN version
 
-The only *proven* version mismatch on this machine is the release wheel (`+linux.cann910`, i.e.
-CANN 9.1.0) against the installed 9.1.1 — and that mismatch is already removed by building from
-source.  Against downgrading: the programming guide requires **CANN ≥ 9.0.0** (9.1.1 is inside
-the supported range), one A5 feature is documented as needing **CANN ≥ 9.3.0**, and the CV hang
-reproduces with upstream's own examples, which points at the PTO/A5 path rather than at version
-pairing.  So if a version change is tried at all, **9.3.0 is the more promising direction than
-9.1.0 or older**.
+We tested it, so you do not have to.  The same 25-line canary
+(`benchmarks/probes/pto_cv_handoff.py`) fails identically on three CANN versions, one of them
+newer than ours and one of them the exact version the release wheel was built for:
+
+| CANN | how it is installed on the reference box | `ACL_OP_INIT_MODE` | canary result |
+|---|---|---|---|
+| 9.1.1 | system (`/usr/local/Ascend/cann-9.1.1`) | 1 (CANN upgrades it to 2) | ❌ aicore timeout `507014` |
+| 9.1.0 | side-by-side user prefix (by another user on the same box) | 2 | ❌ aicore timeout `507014` |
+| 9.2.0-beta.2 | side-by-side user prefix | unset **and** 2 | ❌ aicore timeout `507014` |
+
+So the cube→vector hand-off failure is **not** a CANN version issue, and upgrading (to 9.3.0 or
+otherwise) is not a fix we would spend a maintenance window on.  Two useful side effects of that
+sweep: switching CANN in a shell is genuinely risk-free (the user-local prefix pattern works, the
+system install and the driver are untouched), and the *release wheel* can be tested against its
+own target version if ever needed.
+
+The next hypothesis worth a build is a **missing build option**: the PTO route's cross-core
+synchronisation is likely implemented with the shared-memory (``shmem``) feature that
+``install_ascend.sh --enable-shmem`` turns on, and the current build was made without it.  If that
+does not fix the canary either, the remaining explanation is the SKU itself (``Ascend950PR_9579``
+vs the ``_9599`` the toolchain knows about) and it belongs upstream.
+
+If a CANN change is ever needed for another reason, keep the constraints below in mind.
 
 Hard constraints for any such experiment: never modify the system install
 (`/usr/local/Ascend/cann-9.1.1`) — another user's vLLM service runs against it on this box; CANN is
