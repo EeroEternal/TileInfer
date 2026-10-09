@@ -32,7 +32,14 @@ import torch
 import tilelang
 import tilelang.ascend.language as T
 
-__all__ = ["paged_decode_ascend950", "build_decode_kernel", "padded_rows", "forward"]
+__all__ = [
+    "paged_decode_ascend950",
+    "paged_decode_split",
+    "build_decode_kernel",
+    "build_split_kernel",
+    "padded_rows",
+    "forward",
+]
 
 
 def paged_decode_ascend950(
@@ -181,6 +188,175 @@ def paged_decode_ascend950(
 
 
 _KERNEL_CACHE: dict = {}
+
+def paged_decode_split(
+    batch: int,
+    kv_heads: int,
+    group: int,
+    dim: int,
+    page_size: int,
+    num_pages_cap: int,
+    num_tiles: int,
+    dtype: str = "bfloat16",
+    threads: int = 128,
+):
+    """Split-KV decode: one block per ``(tile, kv_head)``, writing *partial* results.
+
+    Same arithmetic as :func:`paged_decode_ascend950`, but the page range comes from the
+    scheduler's tile arrays instead of "all pages of the request", and the epilogue writes the
+    tile's **normalised output plus its log-sum-exp** rather than the final answer.  The merge
+    contract is the one the torch reference implements (``inference.testing.reference``):
+
+        out[b] = sum_t exp(lse_t - lse_all) * partial_t[b] / ...   with weights that sum to 1
+
+    which is why a partial is the *normalised* output and the merge is a weighted average.
+
+    Parallelism: the grid is ``num_tiles * kv_heads`` instead of ``batch * kv_heads``, so a single
+    long request can occupy every core instead of eight of them (the 51 GB/s case in
+    ``docs/performance.md``).
+    """
+    BR = padded_rows(group)
+    BC = page_size
+    D = dim
+    ROWS = BR // 2
+    accum = "float32"
+    scale = 1.0 / math.sqrt(dim)
+
+    assert BR % 2 == 0 and group % 2 == 0
+    assert dim == 128
+    assert page_size % 2 == 0
+
+    @T.prim_func
+    def main(
+        Q: T.Tensor((batch, kv_heads * BR, dim), dtype),
+        KCache: T.Tensor((num_pages_cap, page_size, kv_heads, dim), dtype),
+        VCache: T.Tensor((num_pages_cap, page_size, kv_heads, dim), dtype),
+        kv_indptr: T.Tensor((batch + 1,), "int32"),
+        kv_indices: T.Tensor((num_pages_cap,), "int32"),
+        kv_last_page_len: T.Tensor((batch,), "int32"),
+        seq_ids: T.Tensor((num_tiles,), "int32"),
+        page_starts: T.Tensor((num_tiles,), "int32"),
+        page_lens: T.Tensor((num_tiles,), "int32"),
+        PartOut: T.Tensor((num_tiles * kv_heads, BR, dim), dtype),
+        # 1-D on purpose: `dual_copy` requires both sides to have the same rank, and the
+        # per-AIV lse vector is 1-D (see the upstream FA's `store_lse`).
+        PartLse: T.Tensor((num_tiles * kv_heads * BR,), accum),
+    ):
+        with T.Kernel(num_tiles * kv_heads) as bx:
+            tile = bx // kv_heads
+            bh = bx % kv_heads
+            b = seq_ids[tile]
+            start = page_starts[tile]
+            plen = page_lens[tile]
+            req_pages = kv_indptr[b + 1] - kv_indptr[b]
+
+            q_l1 = T.alloc_l1((BR, D), dtype)
+            k_l1 = T.alloc_l1((BC, D), dtype)
+            v_l1 = T.alloc_l1((D, BC), dtype)
+            p_l1 = T.alloc_l1((BR, BC), dtype)
+
+            qk_a = T.alloc_l0a((BR, D), dtype)
+            qk_b = T.alloc_l0b((BC, D), dtype)
+            pv_a = T.alloc_l0a((BR, BC), dtype)
+            pv_b = T.alloc_l0b((D, BC), dtype)
+            qk_acc = T.alloc_l0c((BR, BC), accum)
+            pv_acc = T.alloc_l0c((BR, D), accum)
+
+            s_ub = T.alloc_shared((ROWS, BC), accum)
+            p_ub = T.alloc_shared((ROWS, BC), dtype)
+            o_ub = T.alloc_shared((ROWS, D), accum)
+            o_tmp_ub = T.alloc_shared((ROWS, D), accum)
+            out_ub = T.alloc_shared((ROWS, D), dtype)
+            lse_ub = T.alloc_shared((ROWS,), accum)
+            m_ub = T.alloc_shared((ROWS,), accum)
+            l_ub = T.alloc_shared((ROWS,), accum)
+
+            T.copy(Q[b, bh * BR : (bh + 1) * BR, 0:D], q_l1)
+            T.fill(m_ub, T.float32(-1e30))
+            T.fill(l_ub, T.float32(0))
+            T.fill(o_ub, T.float32(0))
+
+            for p in T.serial(plen):
+                pid = kv_indices[kv_indptr[b] + start + p]
+
+                T.copy(KCache[pid, 0:BC, bh, 0:D], k_l1)
+                T.copy(q_l1[0:BR, 0:D], qk_a)
+                T.copy(k_l1[0:BC, 0:D], qk_b)
+                T.gemm(qk_a, qk_b, qk_acc, transpose_B=True, clear_accum=True)
+                T.dual_copy(qk_acc, s_ub)
+
+                # only the request's *last* page can be partially filled, wherever it lands
+                limit = T.if_then_else(
+                    start + p + 1 < req_pages, BC, kv_last_page_len[b]
+                )
+                with T.SimtVF(threads=threads):
+                    s_frag = T.alloc_fragment((ROWS, BC), accum)
+                    for r, c in T.Parallel(ROWS, BC):
+                        s_frag[r, c] = T.if_then_else(
+                            c < limit, s_ub[r, c] * T.float32(scale), T.float32(-1e30)
+                        )
+                    row_max = T.alloc_reducer((ROWS,), accum, op="max")
+                    T.reducer_init(row_max)
+                    for r, c in T.Parallel(ROWS, BC):
+                        T.reducer_update(row_max[r], s_frag[r, c])
+                    new_m = T.alloc_fragment((ROWS,), accum)
+                    T.finalize_reducer(row_max, new_m)
+
+                    alpha = T.alloc_fragment((ROWS,), accum)
+                    for r in T.Parallel(ROWS):
+                        alpha[r] = T.exp(m_ub[r] - T.max(m_ub[r], new_m[r]))
+                        m_ub[r] = T.max(m_ub[r], new_m[r])
+
+                    row_sum = T.alloc_reducer((ROWS,), accum, op="sum")
+                    T.reducer_init(row_sum)
+                    for r, c in T.Parallel(ROWS, BC):
+                        s_frag[r, c] = T.exp(s_frag[r, c] - m_ub[r])
+                        T.reducer_update(row_sum[r], s_frag[r, c])
+                    partial = T.alloc_fragment((ROWS,), accum)
+                    T.finalize_reducer(row_sum, partial)
+
+                    for r in T.Parallel(ROWS):
+                        l_ub[r] = l_ub[r] * alpha[r] + partial[r]
+                    for r, d in T.Parallel(ROWS, D):
+                        o_ub[r, d] = o_ub[r, d] * alpha[r]
+                    for r, c in T.Parallel(ROWS, BC):
+                        p_ub[r, c] = T.Cast(dtype, s_frag[r, c])
+
+                T.dual_copy(p_ub[0:ROWS, 0:BC], p_l1[0:BR, 0:BC])
+                T.copy(VCache[pid, 0:BC, bh, 0:D], v_l1[0:D, 0:BC], transpose=True)
+                T.copy(p_l1[0:BR, 0:BC], pv_a)
+                T.copy(v_l1[0:D, 0:BC], pv_b)
+                T.gemm(pv_a, pv_b, pv_acc, transpose_B=True, clear_accum=True)
+                T.dual_copy(pv_acc, o_tmp_ub)
+                with T.SimtVF(threads=threads):
+                    for r, d in T.Parallel(ROWS, D):
+                        o_ub[r, d] = o_ub[r, d] + o_tmp_ub[r, d]
+
+            with T.SimtVF(threads=threads):
+                for r, d in T.Parallel(ROWS, D):
+                    out_ub[r, d] = T.Cast(dtype, o_ub[r, d] / l_ub[r])
+                for r in T.Parallel(ROWS):
+                    lse_ub[r] = m_ub[r] + T.log(l_ub[r])
+
+            T.dual_copy(out_ub[0:ROWS, 0:D], PartOut[bx, 0:BR, 0:D])
+            T.dual_copy(lse_ub[0:ROWS], PartLse[bx * BR : (bx + 1) * BR])
+
+    return main
+
+
+def build_split_kernel(**spec):
+    """Compile (and cache) a split-KV decode kernel."""
+    key = ("split",) + tuple(sorted(spec.items()))
+    kernel = _KERNEL_CACHE.get(key)
+    if kernel is None:
+        kernel = tilelang.compile(
+            paged_decode_split(**spec),
+            out_idx=[],
+            pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
+        )
+        _KERNEL_CACHE[key] = kernel
+    return kernel
+
 
 
 def build_decode_kernel(**spec):
