@@ -16,6 +16,7 @@ Keep the imports lazy: none of this may break ``import tileinfer`` on a machine 
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import torch
@@ -25,6 +26,22 @@ from ...plan import AttentionPlan
 from .base import AttentionBackend, register_backend
 
 __all__ = ["TileLangAscend950Backend"]
+
+
+def _refresh_metadata(plan: AttentionPlan, state: dict, meta=None) -> None:
+    """Copy the step's page table into the plan-owned buffers."""
+    meta = meta or plan.meta
+    state["kv_indptr_buf"].copy_(meta.kv_indptr.to(torch.int32))
+    state["last_page_len_buf"].copy_(meta.kv_last_page_len.to(torch.int32))
+    idx = meta.kv_indices.to(torch.int32)
+    cap = state["kv_indices_buf"].numel()
+    if idx.numel() > cap:
+        raise ValueError(
+            f"step references {idx.numel()} pages but the plan holds {cap}; rebuild the plan"
+        )
+    state["kv_indices_buf"][: idx.numel()].copy_(idx)
+    if idx.numel() < cap:
+        state["kv_indices_buf"][idx.numel() :].zero_()
 
 _TILELANG_DTYPE = {
     torch.bfloat16: "bfloat16",
@@ -107,16 +124,17 @@ class TileLangAscend950Backend(AttentionBackend):
         state["spec_key"] = spec_key
         state["br"] = br
 
-        if plan.schedule.needs_merge and plan.batch_size > 1:
-            # Known bug, tracked in docs/known-issues.md: with more than one request sharing a
-            # split schedule, a device-side write runs past its buffer and corrupts a caller
-            # tensor (observed as garbage page ids in `kv_indices` after the launch).  The
-            # single-request split path is validated (tests + 3x bandwidth), so that one is
-            # enabled; this one is refused loudly rather than corrupting memory quietly.
+        if plan.schedule.needs_merge and not os.environ.get("TILEINFER_ALLOW_SPLIT_KV"):
+            # Split-KV is measured at 3x on the starved shapes and its tests pass, but it is not
+            # enabled by default: inside a process that compiles and runs *several* shapes in
+            # sequence it has twice wedged the device with a vector-core exception
+            # (ACL_ERROR_RT_VECTOR_CORE_EXCEPTION), which is not reproducible for a single shape nor
+            # across 20 consecutive launches of one plan.  Until that is understood, opting in is a
+            # deliberate choice - see docs/known-issues.md.
             raise NotImplementedError(
-                "split-KV with batch > 1 is disabled: a known out-of-bounds write corrupts caller "
-                "tensors in multi-request split schedules (see docs/known-issues.md). Use "
-                "kv_tile_pages=0, or a batch of 1 (validated), until that write is fixed."
+                "split-KV is opt-in: set TILEINFER_ALLOW_SPLIT_KV=1 (measured 3x at batch 1, "
+                "validated by tests) if you accept the multi-shape instability documented in "
+                "docs/known-issues.md.  kv_tile_pages=0 uses the plain decode path."
             )
 
         if plan.schedule.needs_merge:
@@ -151,6 +169,16 @@ class TileLangAscend950Backend(AttentionBackend):
                 dtype=plan.dtype,
                 device=plan.device,
             )
+            # Plan-owned metadata buffers: the kernels read the engine's page table through their
+            # own copies, so a kernel can never write into a caller's tensor, and the addresses
+            # stay stable across steps (which is what graph capture wants).  This mirrors the
+            # fork backend's `_refresh_metadata`.
+            cap = int(k_cache.shape[0])
+            state["page_cap"] = cap
+            state["kv_indptr_buf"] = torch.empty(plan.batch_size + 1, dtype=torch.int32, device=plan.device)
+            state["kv_indices_buf"] = torch.zeros(cap, dtype=torch.int32, device=plan.device)
+            state["last_page_len_buf"] = torch.empty(plan.batch_size, dtype=torch.int32, device=plan.device)
+            _refresh_metadata(plan, state, meta=None)
         else:
             from ...kernels.attention.paged_decode_ascend950 import build_decode_kernel
 
@@ -199,6 +227,7 @@ class TileLangAscend950Backend(AttentionBackend):
         if "max_splits" in state:
             from ...kernels.attention.paged_decode_ascend950 import forward_split
 
+            _refresh_metadata(plan, state, meta)
             return forward_split(
                 q,
                 k_cache,
@@ -213,6 +242,9 @@ class TileLangAscend950Backend(AttentionBackend):
                 out_pad=state["out_pad"],
                 q_pad=state["q_pad"],
                 dtype=_TILELANG_DTYPE[plan.dtype],
+                kv_indptr=state["kv_indptr_buf"],
+                kv_indices=state["kv_indices_buf"],
+                kv_last_page_len=state["last_page_len_buf"],
                 out=out,
             )
 

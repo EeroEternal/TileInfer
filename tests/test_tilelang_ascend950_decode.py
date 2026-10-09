@@ -19,6 +19,8 @@ The cases are chosen to be the ones that actually broke during development:
 
 from __future__ import annotations
 
+import os
+
 import pytest
 import torch
 
@@ -44,6 +46,9 @@ TOL = 3e-2  # bf16 vs the fp32 torch reference
 
 
 def _case(batch, kv_heads, group, page_size, dim, kv_lens, seed=0, kv_tile_pages=0):
+    """Run one case through the public API.  Split-KV cases opt in explicitly (see KI-1)."""
+    if kv_tile_pages:
+        os.environ["TILEINFER_ALLOW_SPLIT_KV"] = "1"
     """Build a ragged paged cache plus its metadata, then run TileInfer's public plan/run path.
 
     The cache blocks are filled directly and each request's page list is shuffled *within the
@@ -67,12 +72,15 @@ def _case(batch, kv_heads, group, page_size, dim, kv_lens, seed=0, kv_tile_pages
     k_cache = torch.randn(total_pages, page_size, kv_heads, dim, dtype=DTYPE, device=device)
     v_cache = torch.randn(total_pages, page_size, kv_heads, dim, dtype=DTYPE, device=device)
 
-    # logical -> physical: identity, then permute inside each request (always a valid page table)
+    # logical -> physical: identity, then permute inside each request (always a valid page table).
+    # NOTE: the permutation must be 0-based for the slice it indexes -- adding `start` here sent the
+    # gather out of range, and Ascend does not bounds-check gathers: it returned garbage page ids
+    # that looked exactly like a kernel scribbling over memory (see docs/known-issues.md).
     indices = torch.arange(total_pages, dtype=torch.int32, device=device)
     gen = torch.Generator(device="cpu").manual_seed(seed)
     for b in range(batch):
         start, end = indptr[b], indptr[b + 1]
-        perm = torch.randperm(end - start, generator=gen) + start
+        perm = torch.randperm(end - start, generator=gen)
         indices[start:end] = indices[start:end][perm.to(device)]
 
     meta = RaggedMetadata(
@@ -130,15 +138,11 @@ def _case(batch, kv_heads, group, page_size, dim, kv_lens, seed=0, kv_tile_pages
         (1, 1, 32, [256], "group == M tile", 0),
         # split-KV: 32 pages -> 4 tiles, the tail lands in the last split
         (1, 2, 8, [4000], "split-KV, 4 tiles", 8),
-        # split-KV across several ragged requests (different split counts per request):
-        # KNOWN BUG (docs/known-issues.md) - the backend refuses it, so this stays xfail until the
-        # out-of-bounds write in multi-request split schedules is fixed.
+        # split-KV across several ragged requests (different split counts per request)
         (2, 2, 8, [4096, 1024], "split-KV, ragged", 8),
     ],
 )
 def test_paged_decode_matches_reference(batch, kv_heads, group, kv_lens, label, kv_tile_pages):
-    if kv_tile_pages and batch > 1:
-        pytest.xfail("known OOB write in multi-request split schedules (docs/known-issues.md)")
     got, expected = _case(batch, kv_heads, group, 128, 128, kv_lens, kv_tile_pages=kv_tile_pages)
     diff = (got - expected).abs().max().item()
     assert diff < TOL, f"{label}: max abs diff {diff:.4f} exceeds {TOL}"

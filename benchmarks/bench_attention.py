@@ -227,8 +227,21 @@ def run_backend(
 
     err: Optional[float] = None
     if check:
-        expected = reference_attention(q, k_cache, v_cache, plan.meta, causal=False)
-        err = (out.float() - expected.float()).abs().max().item()
+        # Reference on the CPU: torch's NPU path routes through CANN ops we do not control (and it
+        # has wedged the device on large shapes - `aclnnGeTensor`, vector-core exception, after
+        # which every later op fails).  The oracle is about numbers, not speed, so it runs where it
+        # is boring and predictable.
+        host_meta = RaggedMetadata(
+            kv_indptr=plan.meta.kv_indptr.cpu(),
+            kv_indices=plan.meta.kv_indices.cpu(),
+            kv_last_page_len=plan.meta.kv_last_page_len.cpu(),
+            page_size=plan.meta.page_size,
+            qo_indptr=None if plan.meta.qo_indptr is None else plan.meta.qo_indptr.cpu(),
+        )
+        expected = reference_attention(
+            q.cpu().float(), k_cache.cpu().float(), v_cache.cpu().float(), host_meta, causal=False
+        )
+        err = (out.cpu().float() - expected.float()).abs().max().item()
 
     latency = timeit(lambda: attn.run(q, k_cache, v_cache, plan=plan), device, warmup, iters)
     note = f"tiles={plan.schedule.num_tiles}"
