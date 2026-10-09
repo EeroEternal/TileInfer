@@ -24,7 +24,9 @@ Status legend: ✅ done · 🟡 in progress · ⏳ not started
 | Port the kernels to `tilelang.ascend` (`T.alloc_l1/l0c/shared`, `T.gemm`, `T.dual_copy`, `T.SimtVF` + `T.alloc_reducer`, `T.serial`) | ✅ done for decode — see `kernels/attention/paged_decode_ascend950.py` and the `tilelang-ascend950` backend |
 | Cover what upstream's FA explicitly refuses: paged KV ✅, ragged lengths ✅, decode ✅, 128-dim path ✅ — remaining: causal/padding masks for prefill, `head_dim != 128`, fp16 | 🟡 decode half done |
 | Report the fork's CV hand-off failure with the minimal reproducer | 🟡 draft ready in [`upstream-issue-pto-cv-hang.md`](upstream-issue-pto-cv-hang.md) (superseded for us, still valid for the fork) |
-| Decode benchmark across (batch, kv_len) including long context, and vs. FIA | ⏳ next (correctness first: `benchmarks/probes/ascend950_paged_decode.py`) |
+| Decode benchmark across (batch, kv_len) including long context | ✅ first baseline in [`performance.md`](performance.md) (147 GB/s peak at b16/kv4096; 51 GB/s at batch 1 — core-starved) |
+| Close the batch-1 / long-context gap: consume the planner's split-KV (`kv_tile_pages`) in the kernel, and/or `T.Persistent` over the cores | ⏳ **next** |
+| FIA baseline on the same shapes for the tile-level comparison | ⏳ needs a working FIA call on this stack |
 | Split-KV merge kernel (`kv_tile_pages > 0`) | ⏳ plan + reference implementation + tests done |
 | **Prefill / append** kernel (causal, `qo_len > 1`, chunked prefill) | ⏳ |
 | Perf pass: `T.Pipelined` over pages, L0 staging, tile-size sweep, and a fair comparison against upstream's 320–362 TFLOPS dense FA | ⏳ |

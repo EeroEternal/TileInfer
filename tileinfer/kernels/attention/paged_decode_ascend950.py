@@ -202,6 +202,13 @@ def padded_rows(group: int) -> int:
     return max(32, ((group + 31) // 32) * 32)
 
 
+_TORCH_TO_TILELANG_DTYPE = {
+    torch.bfloat16: "bfloat16",
+    torch.float16: "float16",
+    torch.float32: "float32",
+}
+
+
 def forward(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -209,7 +216,7 @@ def forward(
     meta,
     *,
     group: int,
-    dtype: str = "bfloat16",
+    dtype: str | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run paged decode for one step: pads ``q``, calls the kernel, slices the padded rows away.
@@ -231,6 +238,9 @@ def forward(
 
     br = padded_rows(group)
     page_size = int(k_cache.shape[1])
+    # Derive the kernel dtype from the tensors: a wrapper that silently disagrees with its inputs
+    # is a debugging session nobody wants.
+    dtype = dtype or _TORCH_TO_TILELANG_DTYPE[q.dtype]
     kernel = build_decode_kernel(
         batch=batch,
         kv_heads=kv_heads,
@@ -238,6 +248,7 @@ def forward(
         dim=dim,
         page_size=page_size,
         num_pages_cap=int(k_cache.shape[0]),
+        dtype=dtype,
     )
 
     # pad: zero rows so the padded half of the tile cannot produce NaN
