@@ -1,7 +1,16 @@
 # Upstream issue draft: PTO cube→vector hand-off hangs on Ascend 950PR (CANN 9.1.1)
 
-Status: **draft, not filed.**  This is the shortest form of a bug we hit while bringing TileInfer up
-on the reference machine.  It blocks every attention kernel we have tried — ours *and* the two
+## Status
+
+**Superseded, but still valid.**  For us this is no longer on the critical path: the *official*
+`tilelang==0.1.15` Ascend backend runs cube→vector kernels correctly on the same device
+(`T.dual_copy` + `T.SimtVF`), so TileInfer is porting to that dialect instead of waiting for the
+fork.  The report below is kept because it is a genuine bug in `tile-ai/tilelang-ascend` on
+`Ascend950PR_9579`, it is minimal, and it is exactly the kind of thing that should not be
+re-discovered by the next person.
+
+Draft, not filed — this is the shortest form of a bug we hit while bringing TileInfer up on the
+reference machine.  It blocks every attention kernel we have tried — ours *and* the two
 upstream ones — so it is worth reporting upstream rather than working around silently.
 
 Repo: `tile-ai/tilelang-ascend`, branch `ascendc_pto` (HEAD at the time of writing, 2026-10-08),

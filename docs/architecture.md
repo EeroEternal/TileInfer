@@ -192,18 +192,61 @@ These cost real debugging time; they are listed here so nobody pays for them twi
 the import, so a CUDA-only TileLang install correctly reports "no Ascend toolchain" instead of
 failing later inside the compiler.
 
-### Toolchain status on the reference machine (Ascend 950PR, Oct 2026)
+### The working stack (verified 2026-10-09)
 
-What is *known to work* there, in order of how much it proves:
+TileInfer's device path is **not** the `tile-ai/tilelang-ascend` fork.  The combination that works on
+the reference box is the **official** TileLang wheel with a **newer CANN**:
 
-| Check | Result |
+| | |
 |---|---|
-| `examples/gemm/example_gemm_pto_developer.py` (upstream, PTO target, cube only) | ✅ `Kernel Output Match!` |
-| trivial TileLang elementwise add, `target="pto"` (vector only) | ✅ max abs diff 0.002 (fp16 rounding) |
+| TileLang | `tilelang==0.1.15` from PyPI — it ships the **Ascend 950 backend** (`tilelang.ascend`, a DeepSeek-built dialect, `target="ascend"`, default arch `dav-3510`) |
+| CANN | **9.3.0** (weekly build), installed side-by-side in a user prefix; the system 9.1.1 and the driver stay untouched |
+| torch / torch_npu | 2.12.0 / 2.12.0.post2 |
+| device | `Ascend950PR_9579` |
+
+Verification, reproduced from a clean shell (see `docs/architecture.md` history for the failing
+fork runs):
+
+```
+source <CANN 9.3.0>/set_env.sh        # + /home/lipi/glibcxx on LD_LIBRARY_PATH
+python check_tilelang_npu_kernel.py   # upstream's Ascend 950 Quick Start: C = relu(A @ B^T)
+  -> tilelang 0.1.15, npu: True (Ascend950PR_9579)
+  -> "GEMM + ReLU passed. All check passed."
+```
+
+That kernel contains a real cube→vector hand-off (`T.dual_copy(C_l0c, C_ub)` then a
+`T.SimtVF(threads=128)` region), i.e. exactly the primitive whose fork/PTO equivalent hung with
+`aicore timeout` on this device for three different CANN versions (below).
+
+What the upstream backend gives us, and what it does **not** (from
+`examples/ascend/flash_attention/README.md`, which is the closest template):
+
+| Have | Missing — i.e. TileInfer's job |
+|---|---|
+| Faster-than-SDPA MHA/GQA forward (320–362 TFLOPS on 950, bf16, `head_dim` 128, dense) | **paged KV** and any engine metadata contract |
+| 128x128 tiles, online softmax, TMEM/L0 staging, automatic Cube/Vector sync | **decode** (one query row per request) and **ragged / variable lengths** |
+| SIMT + SIMD mixing, `T.dual_copy` | **causal masking and padding masks** (upstream explicitly refuses them) |
+| `T.Pipelined`, `T.Persistent`, GQA via flattened `q_len = S1 * G` | attention sinks, MLA/sparse, low precision KV |
+
+So the plan of record becomes: keep TileInfer's metadata / planner / plan-run / reference layers
+(device-independent, already tested), and implement the kernels against `tilelang.ascend`, reusing
+upstream's `examples/ascend/flash_attention/core.py` shape and tiling where it applies.
+
+### The fork, kept for the record
+
+The `tile-ai/tilelang-ascend` fork (branch `ascendc_pto`) was a dead end **for this device**, and
+the reasons are worth keeping because they cost days to establish:
+
+What is *known to work* under the fork, in order of how much it proves:
+
+| Check (fork, `target="pto"` unless noted) | Result |
+|---|---|
+| upstream PTO GEMM example (`examples/gemm/example_gemm_pto_developer.py`, cube only) | ✅ `Kernel Output Match!` |
+| trivial elementwise add (vector only) | ✅ max abs diff 0.002 (fp16 rounding) |
 | **minimal cube→vector hand-off** (`benchmarks/probes/pto_cv_handoff.py`) | ❌ aicore timeout `507014` |
-| upstream PTO attention examples, both the developer-mode and the explicit-scope one | ❌ aicore timeout `507014` |
-| TileInfer paged decode kernel, `target="pto"` | ❌ same aicore timeout (not its own bug) |
-| `examples/flash_attention/paged_flash_attn_bhsd.py` (upstream, classic target) | ❌ `Unresolved call Op(tl.ascend_fill)` |
+| upstream PTO attention examples (developer mode, and the explicit-scope one) | ❌ aicore timeout `507014` |
+| TileInfer paged decode kernel | ❌ same aicore timeout (not its own bug) |
+| upstream `examples/flash_attention/paged_flash_attn_bhsd.py` (`target="auto"`) | ❌ `Unresolved call Op(tl.ascend_fill)` |
 
 The conclusion is uncomfortable but useful: **the cube→vector hand-off under the PTO target does
 not work on this machine**, for upstream's kernels as much as for ours.  Cube-only and vector-only
