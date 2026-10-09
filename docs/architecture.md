@@ -214,15 +214,42 @@ environment matrix and questions) in
 
 Options while that is open, in the order we would try them:
 
-1. **`npuir` branch** — the second, MLIR-based backend route of the same repository; the
-   independently published TileLang FA numbers on Ascend come from there, so it is the most likely
-   route to a working CV path.  Cost: another source build (~20 min) plus re-validating PTO/`npuir`
-   target naming for our kernels.
+1. **`npuir` branch** — the second, MLIR-based backend route of the same repository
+   (`target="npuir"`, explicit `T.Scope("Cube")` / `T.Scope("Vector")`, same `alloc_L1/L0C/ub`
+   vocabulary).  Investigated on the reference machine: the tree is pushed and clean at
+   `third_party/tilelang-npuir`, `bishengir-compile` **is** present in CANN 9.1.1
+   (`/usr/local/Ascend/cann-9.1.1/bin/bishengir-compile`, plus an `-a5` variant), but
+   `install_npuir.sh` additionally requires `python_packages/{bishengir,mlir_core}`, which the CANN
+   toolchain does not ship — so it falls back to building **AscendNPU-IR from the vendored
+   submodule**, i.e. an LLVM/MLIR-scale build needing Clang 15/LLD 15 (not installed on the box):
+   1–2 hours, `--bishengir-path=` then points at `3rdparty/AscendNPU-IR/build/install`.
+   Note the branch's own Docker recipe (`docs/Docker-README.md`) bakes **CANN 8.5.0 + Clang 15 +
+   pre-compiled AscendNPU-IR** into an image, which would combine two of the experiments below
+   *without touching the host* — often the cheapest way to answer this question.
 2. **Vector-only decode kernel** — decode's M is the GQA group, so the whole online-softmax loop
    can in principle run on the vector core with no cube involvement, sidestepping the hand-off.
    Correct and runnable today; slower than the cube path, so it is a functional fallback rather
    than the target design.
-3. **Wait for upstream**, using the reproducer to drive the fix.
+3. **A different CANN** — see the section below on why "newer" is more promising than "older",
+   and why any such change must be a side-by-side userspace install or a container.
+4. **Wait for upstream**, using the reproducer to drive the fix.
+
+### If you are tempted to change the CANN version
+
+The only *proven* version mismatch on this machine is the release wheel (`+linux.cann910`, i.e.
+CANN 9.1.0) against the installed 9.1.1 — and that mismatch is already removed by building from
+source.  Against downgrading: the programming guide requires **CANN ≥ 9.0.0** (9.1.1 is inside
+the supported range), one A5 feature is documented as needing **CANN ≥ 9.3.0**, and the CV hang
+reproduces with upstream's own examples, which points at the PTO/A5 path rather than at version
+pairing.  So if a version change is tried at all, **9.3.0 is the more promising direction than
+9.1.0 or older**.
+
+Hard constraints for any such experiment: never modify the system install
+(`/usr/local/Ascend/cann-9.1.1`) — another user's vLLM service runs against it on this box; CANN is
+version-locked across three packages (`toolkit` + `nnal` + `Ascend-cann-950-ops`, ≈4.4 GB); and the
+clean way is a side-by-side install under `/home/<user>` (or a container) selected per shell via
+`source …/set_env.sh`, leaving the driver alone.  The decisive test is one variable at a time:
+`python benchmarks/probes/pto_cv_handoff.py`.
 
 Two environmental facts that surprised us and are worth keeping:
 
