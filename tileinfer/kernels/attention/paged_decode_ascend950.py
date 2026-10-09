@@ -35,10 +35,14 @@ import tilelang.ascend.language as T
 __all__ = [
     "paged_decode_ascend950",
     "paged_decode_split",
+    "paged_decode_merge",
     "build_decode_kernel",
     "build_split_kernel",
+    "build_merge_kernel",
+    "build_tile_slots",
     "padded_rows",
     "forward",
+    "forward_split",
 ]
 
 
@@ -189,6 +193,7 @@ def paged_decode_ascend950(
 
 _KERNEL_CACHE: dict = {}
 
+
 def paged_decode_split(
     batch: int,
     kv_heads: int,
@@ -197,6 +202,7 @@ def paged_decode_split(
     page_size: int,
     num_pages_cap: int,
     num_tiles: int,
+    max_splits: int,
     dtype: str = "bfloat16",
     threads: int = 128,
 ):
@@ -204,16 +210,17 @@ def paged_decode_split(
 
     Same arithmetic as :func:`paged_decode_ascend950`, but the page range comes from the
     scheduler's tile arrays instead of "all pages of the request", and the epilogue writes the
-    tile's **normalised output plus its log-sum-exp** rather than the final answer.  The merge
-    contract is the one the torch reference implements (``inference.testing.reference``):
+    tile's **normalised output plus its log-sum-exp**.
 
-        out[b] = sum_t exp(lse_t - lse_all) * partial_t[b] / ...   with weights that sum to 1
-
-    which is why a partial is the *normalised* output and the merge is a weighted average.
+    The partials are laid out **densely by slot**: request ``b``'s split ``s`` of KV head ``bh``
+    lives at index ``((b * max_splits + s) * kv_heads + bh)``.  ``tile_slots[tile]`` says which
+    slot a tile must write, which is what makes the merge kernel free of runtime conditionals: the
+    slots a request does not use are *pre-filled* with ``lse = -1e30`` once per plan, so they
+    contribute exactly zero weight (see :func:`paged_decode_merge`).
 
     Parallelism: the grid is ``num_tiles * kv_heads`` instead of ``batch * kv_heads``, so a single
     long request can occupy every core instead of eight of them (the 51 GB/s case in
-    ``docs/performance.md``).
+    ``docs/performance.md`` measures 153 GB/s with 16 splits).
     """
     BR = padded_rows(group)
     BC = page_size
@@ -221,8 +228,9 @@ def paged_decode_split(
     ROWS = BR // 2
     accum = "float32"
     scale = 1.0 / math.sqrt(dim)
+    num_slots = batch * max_splits
 
-    assert BR % 2 == 0 and group % 2 == 0
+    assert BR % 2 == 0 and group % 2 == 0 and group <= BR
     assert dim == 128
     assert page_size % 2 == 0
 
@@ -237,10 +245,9 @@ def paged_decode_split(
         seq_ids: T.Tensor((num_tiles,), "int32"),
         page_starts: T.Tensor((num_tiles,), "int32"),
         page_lens: T.Tensor((num_tiles,), "int32"),
-        PartOut: T.Tensor((num_tiles * kv_heads, BR, dim), dtype),
-        # 1-D on purpose: `dual_copy` requires both sides to have the same rank, and the
-        # per-AIV lse vector is 1-D (see the upstream FA's `store_lse`).
-        PartLse: T.Tensor((num_tiles * kv_heads * BR,), accum),
+        tile_slots: T.Tensor((num_tiles,), "int32"),
+        PartOut: T.Tensor((num_slots * kv_heads, BR, dim), dtype),
+        PartLse: T.Tensor((num_slots * kv_heads * BR,), accum),
     ):
         with T.Kernel(num_tiles * kv_heads) as bx:
             tile = bx // kv_heads
@@ -249,6 +256,7 @@ def paged_decode_split(
             start = page_starts[tile]
             plen = page_lens[tile]
             req_pages = kv_indptr[b + 1] - kv_indptr[b]
+            slot = tile_slots[tile]
 
             q_l1 = T.alloc_l1((BR, D), dtype)
             k_l1 = T.alloc_l1((BC, D), dtype)
@@ -285,10 +293,8 @@ def paged_decode_split(
                 T.gemm(qk_a, qk_b, qk_acc, transpose_B=True, clear_accum=True)
                 T.dual_copy(qk_acc, s_ub)
 
-                # only the request's *last* page can be partially filled, wherever it lands
-                limit = T.if_then_else(
-                    start + p + 1 < req_pages, BC, kv_last_page_len[b]
-                )
+                # only the request's *last* page can be partially filled, wherever the split puts it
+                limit = T.if_then_else(start + p + 1 < req_pages, BC, kv_last_page_len[b])
                 with T.SimtVF(threads=threads):
                     s_frag = T.alloc_fragment((ROWS, BC), accum)
                     for r, c in T.Parallel(ROWS, BC):
@@ -338,11 +344,112 @@ def paged_decode_split(
                 for r in T.Parallel(ROWS):
                     lse_ub[r] = m_ub[r] + T.log(l_ub[r])
 
-            T.dual_copy(out_ub[0:ROWS, 0:D], PartOut[bx, 0:BR, 0:D])
-            T.dual_copy(lse_ub[0:ROWS], PartLse[bx * BR : (bx + 1) * BR])
+            T.dual_copy(out_ub[0:ROWS, 0:D], PartOut[slot * kv_heads + bh, 0:BR, 0:D])
+            T.dual_copy(
+                lse_ub[0:ROWS], PartLse[(slot * kv_heads + bh) * BR : (slot * kv_heads + bh + 1) * BR]
+            )
 
     return main
 
+
+def paged_decode_merge(
+    batch: int,
+    kv_heads: int,
+    group: int,
+    dim: int,
+    max_splits: int,
+    dtype: str = "bfloat16",
+    threads: int = 128,
+):
+    """Merge the split tiles of every request: a weighted average over the split axis.
+
+    Contract (the one the torch reference implements and ``benchmarks/probes/split_kv_decode.py``
+    validated with a host-side merge):
+
+        lse_all[r] = logsumexp_s(lse[s, r])
+        out[r, :]  = sum_s exp(lse[s, r] - lse_all[r]) * partial[s, r, :]
+
+    The weights sum to 1 by construction (``exp(lse_all) = sum_s exp(lse_s)``), so there is no
+    second division.
+
+    No runtime conditionals anywhere: slots a request does not use are pre-filled with
+    ``lse = -1e30``, so ``exp(-1e30 - lse_all)`` is 0 and the max/sum reductions ignore them.  The
+    split axis is *unrolled in Python* (``max_splits`` is a compile-time constant), which keeps the
+    per-split GM→UB staging static and the arithmetic race-free.
+    """
+    BR = padded_rows(group)
+    accum = "float32"
+    num_slots = batch * max_splits
+
+    assert group <= BR
+
+    @T.prim_func
+    def main(
+        PartOut: T.Tensor((num_slots * kv_heads, BR, dim), dtype),
+        PartLse: T.Tensor((num_slots * kv_heads * BR,), accum),
+        Out: T.Tensor((batch, kv_heads * BR, dim), dtype),
+    ):
+        with T.Kernel(batch * kv_heads) as bx:
+            b = bx // kv_heads
+            bh = bx % kv_heads
+
+            lse_g = T.alloc_shared((max_splits, group), accum)
+            out_g = T.alloc_shared((max_splits, group, dim), dtype)
+            w_g = T.alloc_shared((max_splits, group), accum)
+            acc_g = T.alloc_shared((group, dim), accum)
+            res_g = T.alloc_shared((group, dim), dtype)
+
+            for s in T.serial(max_splits):
+                base = (b * max_splits + s) * kv_heads + bh
+                T.copy(PartLse[base * BR : base * BR + group], lse_g[s, 0:group])
+                T.copy(PartOut[base, 0:group, 0:dim], out_g[s, 0:group, 0:dim])
+
+            with T.SimtVF(threads=threads):
+                lse_all = T.alloc_fragment((group,), accum)
+                red_max = T.alloc_reducer((group,), accum, op="max")
+                T.reducer_init(red_max)
+                for r, s in T.Parallel(group, max_splits):
+                    T.reducer_update(red_max[r], lse_g[s, r])
+                T.finalize_reducer(red_max, lse_all)
+
+                red_sum = T.alloc_reducer((group,), accum, op="sum")
+                T.reducer_init(red_sum)
+                for r, s in T.Parallel(group, max_splits):
+                    T.reducer_update(red_sum[r], T.exp(lse_g[s, r] - lse_all[r]))
+                norm = T.alloc_fragment((group,), accum)
+                T.finalize_reducer(red_sum, norm)
+
+                for s in range(max_splits):  # python unroll: static, race-free
+                    for r in T.Parallel(group):
+                        w_g[s, r] = T.exp(lse_g[s, r] - lse_all[r]) / norm[r]
+                for r, d in T.Parallel(group, dim):
+                    acc_g[r, d] = T.float32(0)
+                for s in range(max_splits):  # python unroll
+                    for r, d in T.Parallel(group, dim):
+                        acc_g[r, d] = acc_g[r, d] + w_g[s, r] * T.Cast(accum, out_g[s, r, d])
+                for r, d in T.Parallel(group, dim):
+                    res_g[r, d] = T.Cast(dtype, acc_g[r, d])
+
+            T.copy(res_g[0:group, 0:dim], Out[b, bh * BR : bh * BR + group, 0:dim])
+
+    return main
+
+
+def build_merge_kernel(**spec):
+    """Compile (and cache) the split-merge kernel."""
+    key = ("merge",) + tuple(sorted(spec.items()))
+    kernel = _KERNEL_CACHE.get(key)
+    if kernel is None:
+        kernel = tilelang.compile(
+            paged_decode_merge(**spec),
+            out_idx=[],
+            pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
+        )
+        _KERNEL_CACHE[key] = kernel
+    return kernel
+
+
+_KERNEL_CACHE: dict = {}
 
 def build_split_kernel(**spec):
     """Compile (and cache) a split-KV decode kernel."""
@@ -371,6 +478,98 @@ def build_decode_kernel(**spec):
         )
         _KERNEL_CACHE[key] = kernel
     return kernel
+
+
+def build_tile_slots(schedule, max_splits: int) -> torch.Tensor:
+    """Dense slot index for every tile: ``slot = request * max_splits + split_id``.
+
+    Built once per plan (the schedule is fixed for a shape), which is what lets the split kernel
+    write and the merge kernel read without any runtime conditionals.
+    """
+    return (schedule.seq_ids.to(torch.int32) * max_splits + schedule.split_ids.to(torch.int32)).contiguous()
+
+
+def forward_split(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    meta,
+    schedule,
+    *,
+    group: int,
+    max_splits: int,
+    tile_slots: torch.Tensor,
+    part_out: torch.Tensor,
+    part_lse: torch.Tensor,
+    out_pad: torch.Tensor,
+    q_pad: torch.Tensor,
+    dtype: str | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Two-launch split-KV decode: partial attention, then the weighted merge.
+
+    Every buffer is owned by the plan (see the backend's ``finalize_plan``): the run stage only
+    copies the step's query into ``q_pad`` and launches, so it stays allocation-free and
+    capturable.  ``part_lse``'s padding slots are pre-filled with ``-1e30`` once per plan.
+    """
+    import torch
+
+    batch, num_qo_heads, qo_len, dim = q.shape
+    assert qo_len == 1
+    kv_heads = k_cache.shape[2]
+    page_size = int(k_cache.shape[1])
+    br = padded_rows(group)
+    num_tiles = schedule.num_tiles
+    dtype = dtype or _TORCH_TO_TILELANG_DTYPE[q.dtype]
+
+    split = build_split_kernel(
+        batch=batch,
+        kv_heads=kv_heads,
+        group=group,
+        dim=dim,
+        page_size=page_size,
+        num_pages_cap=int(k_cache.shape[0]),
+        num_tiles=num_tiles,
+        max_splits=max_splits,
+        dtype=dtype,
+    )
+    merge = build_merge_kernel(
+        batch=batch, kv_heads=kv_heads, group=group, dim=dim, max_splits=max_splits, dtype=dtype
+    )
+
+    q_pad.view(batch, kv_heads, br, dim)[:, :, :group] = q[:, :, 0, :].view(
+        batch, kv_heads, group, dim
+    )
+
+    indices = meta.kv_indices.to(torch.int32)
+    cap = int(k_cache.shape[0])
+    if indices.numel() < cap:
+        indices = torch.cat([indices, indices.new_zeros(cap - indices.numel())])
+
+    split(
+        q_pad,
+        k_cache.reshape(-1, page_size, kv_heads, dim),
+        v_cache.reshape(-1, page_size, kv_heads, dim),
+        meta.kv_indptr.to(torch.int32),
+        indices,
+        meta.kv_last_page_len.to(torch.int32),
+        schedule.seq_ids.to(torch.int32),
+        schedule.kv_page_starts.to(torch.int32),
+        schedule.kv_page_lens.to(torch.int32),
+        tile_slots,
+        part_out,
+        part_lse,
+    )
+    merge(part_out, part_lse, out_pad)
+
+    result = out_pad.view(batch, kv_heads, br, dim)[:, :, :group].reshape(
+        batch, num_qo_heads, dim
+    )
+    result = result.unsqueeze(2)
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
 
 
 def padded_rows(group: int) -> int:

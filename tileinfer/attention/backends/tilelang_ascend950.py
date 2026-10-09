@@ -26,6 +26,12 @@ from .base import AttentionBackend, register_backend
 
 __all__ = ["TileLangAscend950Backend"]
 
+_TILELANG_DTYPE = {
+    torch.bfloat16: "bfloat16",
+    torch.float16: "float16",
+    torch.float32: "float32",
+}
+
 try:  # pragma: no cover - import guard, exercised by the CPU test suite
     import tilelang  # noqa: F401
     import tilelang.ascend  # noqa: F401
@@ -70,9 +76,7 @@ class TileLangAscend950Backend(AttentionBackend):
             raise NotImplementedError(
                 f"the Ascend 950 kernel implements decode only so far (got mode={plan.mode.value})"
             )
-        if plan.num_splits > 1:
-            raise NotImplementedError("KV-split decode is not implemented for this backend yet")
-        if plan.kv_layout != "NHD":
+        if plan.kv_layout.upper() != "NHD":
             raise NotImplementedError("the Ascend 950 kernel expects the NHD cache layout")
         if k_cache is None or v_cache is None:
             raise ValueError("finalize_plan needs the K/V caches to size the kernel")
@@ -94,18 +98,71 @@ class TileLangAscend950Backend(AttentionBackend):
         if state.get("spec_key") == spec_key:
             return plan
 
-        from ...kernels.attention.paged_decode_ascend950 import build_decode_kernel, padded_rows
-
-        state["kernel"] = build_decode_kernel(
-            batch=plan.batch_size,
-            kv_heads=plan.num_kv_heads,
-            group=plan.gqa_group_size,
-            dim=plan.head_dim,
-            page_size=plan.page_size,
-            num_pages_cap=int(k_cache.shape[0]),
+        from ...kernels.attention.paged_decode_ascend950 import (
+            build_tile_slots,
+            padded_rows,
         )
+
+        br = padded_rows(plan.gqa_group_size)
         state["spec_key"] = spec_key
-        state["br"] = padded_rows(plan.gqa_group_size)
+        state["br"] = br
+
+        if plan.schedule.needs_merge and plan.batch_size > 1:
+            # Known bug, tracked in docs/known-issues.md: with more than one request sharing a
+            # split schedule, a device-side write runs past its buffer and corrupts a caller
+            # tensor (observed as garbage page ids in `kv_indices` after the launch).  The
+            # single-request split path is validated (tests + 3x bandwidth), so that one is
+            # enabled; this one is refused loudly rather than corrupting memory quietly.
+            raise NotImplementedError(
+                "split-KV with batch > 1 is disabled: a known out-of-bounds write corrupts caller "
+                "tensors in multi-request split schedules (see docs/known-issues.md). Use "
+                "kv_tile_pages=0, or a batch of 1 (validated), until that write is fixed."
+            )
+
+        if plan.schedule.needs_merge:
+            # Split-KV: the schedule is fixed for this shape, so every buffer and lookup table the
+            # two launches need is allocated here, once.  The run stage then only copies the step's
+            # query in and launches - no allocation, no host work, capturable.
+            max_splits = plan.num_splits
+            num_slots = plan.batch_size * max_splits
+            kv_heads = plan.num_kv_heads
+            accum = torch.float32
+            state["max_splits"] = max_splits
+            state["tile_slots"] = build_tile_slots(plan.schedule, max_splits).to(plan.device)
+            # Zeros, not empty: slots a request does not use are read by the merge kernel and
+            # multiplied by a zero weight, so uninitialised memory (NaN/Inf) would poison the
+            # result.  Real slots are overwritten by the split kernel every step.
+            state["part_out"] = torch.zeros(
+                (num_slots * kv_heads, br, plan.head_dim), dtype=plan.dtype, device=plan.device
+            )
+            state["part_lse"] = torch.full(
+                (num_slots * kv_heads * br,),
+                float("-inf"),
+                dtype=accum,
+                device=plan.device,
+            )
+            state["out_pad"] = torch.empty(
+                (plan.batch_size, kv_heads * br, plan.head_dim),
+                dtype=plan.dtype,
+                device=plan.device,
+            )
+            state["q_pad"] = torch.zeros(
+                (plan.batch_size, kv_heads * br, plan.head_dim),
+                dtype=plan.dtype,
+                device=plan.device,
+            )
+        else:
+            from ...kernels.attention.paged_decode_ascend950 import build_decode_kernel
+
+            state["kernel"] = build_decode_kernel(
+                batch=plan.batch_size,
+                kv_heads=plan.num_kv_heads,
+                group=plan.gqa_group_size,
+                dim=plan.head_dim,
+                page_size=plan.page_size,
+                num_pages_cap=int(k_cache.shape[0]),
+                dtype=_TILELANG_DTYPE[plan.dtype],
+            )
         return plan
 
     # ------------------------------------------------------------------ execution
@@ -138,13 +195,27 @@ class TileLangAscend950Backend(AttentionBackend):
                 qo_indptr=meta.qo_indptr,
             )
 
+        state = plan.backend_state
+        if "max_splits" in state:
+            from ...kernels.attention.paged_decode_ascend950 import forward_split
+
+            return forward_split(
+                q,
+                k_cache,
+                v_cache,
+                meta,
+                plan.schedule,
+                group=plan.gqa_group_size,
+                max_splits=state["max_splits"],
+                tile_slots=state["tile_slots"],
+                part_out=state["part_out"],
+                part_lse=state["part_lse"],
+                out_pad=state["out_pad"],
+                q_pad=state["q_pad"],
+                dtype=_TILELANG_DTYPE[plan.dtype],
+                out=out,
+            )
+
         from ...kernels.attention.paged_decode_ascend950 import forward
 
-        return forward(
-            q,
-            k_cache,
-            v_cache,
-            meta,
-            group=plan.gqa_group_size,
-            out=out,
-        )
+        return forward(q, k_cache, v_cache, meta, group=plan.gqa_group_size, out=out)
