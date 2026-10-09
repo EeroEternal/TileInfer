@@ -25,7 +25,8 @@ Status legend: ✅ done · 🟡 in progress · ⏳ not started
 | Cover what upstream's FA explicitly refuses: paged KV ✅, ragged lengths ✅, decode ✅, 128-dim path ✅ — remaining: causal/padding masks for prefill, `head_dim != 128`, fp16 | 🟡 decode half done |
 | Report the fork's CV hand-off failure with the minimal reproducer | 🟡 draft ready in [`upstream-issue-pto-cv-hang.md`](upstream-issue-pto-cv-hang.md) (superseded for us, still valid for the fork) |
 | Decode benchmark across (batch, kv_len) including long context | ✅ first baseline in [`performance.md`](performance.md) (147 GB/s peak at b16/kv4096; 51 GB/s at batch 1 — core-starved) |
-| Close the batch-1 / long-context gap: consume the planner's split-KV (`kv_tile_pages`) in the kernel, and/or `T.Persistent` over the cores | ⏳ **next** |
+| Close the batch-1 / long-context gap: split-KV kernel (consume `kv_tile_pages`) | ✅ split kernel landed and measured: **51.7 → 153.2 GB/s (3.0x)** at b1/32768; merge contract validated on host (2e-4 vs the oracle) — see [`performance.md`](performance.md) |
+| Device **merge kernel** (partial_out/partial_lse over the split axis) + wire `kv_tile_pages` through the backend | ⏳ **next** |
 | FIA baseline on the same shapes for the tile-level comparison | ⏳ needs a working FIA call on this stack |
 | Split-KV merge kernel (`kv_tile_pages > 0`) | ⏳ plan + reference implementation + tests done |
 | **Prefill / append** kernel (causal, `qo_len > 1`, chunked prefill) | ⏳ |
