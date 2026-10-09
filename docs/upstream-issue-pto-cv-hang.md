@@ -85,7 +85,12 @@ it makes `target="pto"` mandatory — worth documenting in the installation guid
 ## Questions for upstream
 
 1. Is the cube→vector hand-off under PTO supported on `Ascend950PR_9579` (as opposed to `_9599`)?
-2. Does the pinned PTO-ISA require a newer CANN than 9.1.1 for the CV sync path?
-3. Should the classic `ascendc` target still support `T.tile.fill`, or is `target="pto"` now the
+2. Does the pinned PTO-ISA require a newer CANN than 9.1.1 for the CV sync path?  **We can already
+   answer half of this: no.**  The reproducer fails identically on CANN 9.1.0, 9.1.1 and
+   9.2.0-beta.2, with and without `ACL_OP_INIT_MODE=2` — see the table in
+   [`architecture.md`](architecture.md#if-you-are-tempted-to-change-the-cann-version).
+3. Is the cross-core synchronisation expected to require a build with `--enable-shmem` (i.e. is the
+   current failure an unsupported configuration rather than a bug)?
+4. Should the classic `ascendc` target still support `T.tile.fill`, or is `target="pto"` now the
    only supported route on A5?
-4. Is there a known-good commit/tag for A5 attention we should pin instead of HEAD?
+5. Is there a known-good commit/tag for A5 attention we should pin instead of HEAD?
