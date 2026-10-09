@@ -43,7 +43,7 @@ DTYPE = torch.bfloat16
 TOL = 3e-2  # bf16 vs the fp32 torch reference
 
 
-def _case(batch, kv_heads, group, page_size, dim, kv_lens, seed=0):
+def _case(batch, kv_heads, group, page_size, dim, kv_lens, seed=0, kv_tile_pages=0):
     """Build a ragged paged cache plus its metadata, then run TileInfer's public plan/run path.
 
     The cache blocks are filled directly and each request's page list is shuffled *within the
@@ -93,11 +93,19 @@ def _case(batch, kv_heads, group, page_size, dim, kv_lens, seed=0):
         num_kv_heads=kv_heads,
         head_dim=dim,
         causal=False,
+        kv_tile_pages=kv_tile_pages,
         k_cache=k_cache,
         v_cache=v_cache,
     )
     got = attn.run(q, k_cache, v_cache, plan=plan)
     torch.npu.synchronize()
+
+    # diagnostic: the reference below reads kv_indices on the host, so any device-side overwrite
+    # of that tensor would surface as a garbage page id rather than as a wrong number
+    idx_after = meta.kv_indices.cpu()
+    assert bool((idx_after >= 0).all()) and int(idx_after.max()) < total_pages, (
+        f"kv_indices corrupted after run: {idx_after.tolist()}"
+    )
 
     host_meta = RaggedMetadata(
         kv_indptr=meta.kv_indptr.cpu(),
@@ -113,16 +121,24 @@ def _case(batch, kv_heads, group, page_size, dim, kv_lens, seed=0):
 
 
 @pytest.mark.parametrize(
-    "batch,kv_heads,group,kv_lens,label",
+    "batch,kv_heads,group,kv_lens,label,kv_tile_pages",
     [
-        (1, 2, 8, [128], "one full page"),
-        (1, 2, 8, [200], "partial tail page"),
-        (1, 2, 8, [1], "single token"),
-        (2, 2, 8, [128, 256], "ragged batch"),
-        (1, 1, 32, [256], "group == M tile"),
+        (1, 2, 8, [128], "one full page", 0),
+        (1, 2, 8, [200], "partial tail page", 0),
+        (1, 2, 8, [1], "single token", 0),
+        (2, 2, 8, [128, 256], "ragged batch", 0),
+        (1, 1, 32, [256], "group == M tile", 0),
+        # split-KV: 32 pages -> 4 tiles, the tail lands in the last split
+        (1, 2, 8, [4000], "split-KV, 4 tiles", 8),
+        # split-KV across several ragged requests (different split counts per request):
+        # KNOWN BUG (docs/known-issues.md) - the backend refuses it, so this stays xfail until the
+        # out-of-bounds write in multi-request split schedules is fixed.
+        (2, 2, 8, [4096, 1024], "split-KV, ragged", 8),
     ],
 )
-def test_paged_decode_matches_reference(batch, kv_heads, group, kv_lens, label):
-    got, expected = _case(batch, kv_heads, group, 128, 128, kv_lens)
+def test_paged_decode_matches_reference(batch, kv_heads, group, kv_lens, label, kv_tile_pages):
+    if kv_tile_pages and batch > 1:
+        pytest.xfail("known OOB write in multi-request split schedules (docs/known-issues.md)")
+    got, expected = _case(batch, kv_heads, group, 128, 128, kv_lens, kv_tile_pages=kv_tile_pages)
     diff = (got - expected).abs().max().item()
     assert diff < TOL, f"{label}: max abs diff {diff:.4f} exceeds {TOL}"
