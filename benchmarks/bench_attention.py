@@ -76,6 +76,17 @@ class Case:
         """2 * (QK^T + PV) for a decode step, in FLOPs."""
         return 4.0 * self.batch * self.qo_len * self.h_q * self.kv_len * self.dim
 
+    def bytes(self, dtype_size: int = 2) -> int:
+        """K and V bytes that must be read once: the real limit for decode, not FLOPs.
+
+        Decode with one query row per request is memory bound, so GB/s is the metric to watch;
+        GFLOP/s mostly measures how well we *hide* the loads.
+        """
+        kv = 2.0 * self.batch * self.h_kv * self.kv_len * self.dim * dtype_size
+        page_table = 4.0 * self.batch * max(1, self.kv_len // max(self.page_size, 1))
+        q = self.batch * self.h_q * self.dim * dtype_size
+        return int(kv + page_table + q)
+
 
 DEFAULT_SWEEP: List[Case] = [
     Case(batch=1, kv_len=4096),
@@ -93,6 +104,25 @@ QUICK_SWEEP: List[Case] = [
     Case(batch=16, kv_len=512),
 ]
 
+#: Decode shapes a serving engine actually produces: short-context/large-batch (chat stepping) and
+#: long-context/small-batch (long documents, coding agents).  Sized to fit next to the vLLM
+#: instance that already holds most of the HBM on the reference machine.
+SERVING_SWEEP: List[Case] = [
+    Case(batch=64, kv_len=512),
+    Case(batch=32, kv_len=2048),
+    Case(batch=16, kv_len=4096),
+    Case(batch=8, kv_len=8192),
+    Case(batch=4, kv_len=16384),
+    Case(batch=1, kv_len=32768),
+    Case(batch=1, kv_len=65536),
+]
+
+LONG_SWEEP: List[Case] = [
+    Case(batch=1, kv_len=32768),
+    Case(batch=4, kv_len=32768),
+    Case(batch=1, kv_len=131072),
+]
+
 SKEWED_SWEEP: List[Case] = []  # filled in by --skew: ragged batches, the real serving case
 
 
@@ -107,15 +137,17 @@ class Result:
     backend: str
     latency_ms: float
     throughput_gflops: float
+    bandwidth_gbps: Optional[float] = None
     max_abs_err: Optional[float] = None
     note: str = ""
     shape: Dict = field(default_factory=dict)
 
     def as_row(self) -> str:
         err = "-" if self.max_abs_err is None else f"{self.max_abs_err:.2e}"
+        bw = "-" if self.bandwidth_gbps is None else f"{self.bandwidth_gbps:.0f}"
         return (
-            f"{self.label:<44} {self.backend:<12} {self.latency_ms:>10.3f} "
-            f"{self.throughput_gflops:>10.1f} {err:>10} {self.note}"
+            f"{self.label:<40} {self.backend:<18} {self.latency_ms:>9.3f} "
+            f"{self.throughput_gflops:>9.1f} {bw:>8} {err:>9} {self.note}"
         )
 
 
@@ -202,11 +234,13 @@ def run_backend(
     note = f"tiles={plan.schedule.num_tiles}"
     if plan.needs_merge:
         note += " (split)"
+    dtype_size = torch.tensor([], dtype=dtype).element_size()
     return Result(
         label=case.label,
         backend=name,
         latency_ms=latency,
         throughput_gflops=case.flops() / (latency * 1e-3) / 1e9,
+        bandwidth_gbps=case.bytes(dtype_size) / (latency * 1e-3) / 1e9,
         max_abs_err=err,
         note=note,
         shape=case.as_dict(),
@@ -254,6 +288,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--sweep", action="store_true", help="run the default shape sweep")
     parser.add_argument("--quick", action="store_true", help="two shapes only")
+    parser.add_argument(
+        "--preset",
+        choices=["quick", "serving", "long"],
+        default=None,
+        help="curated shape sets; 'serving' is the decode grid we care about",
+    )
+    parser.add_argument(
+        "--dtype", choices=["bf16", "fp16"], default="bf16", help="compute dtype (Ascend 950: bf16)"
+    )
     parser.add_argument("--skew", action="store_true", help="ragged, load-balanced batches")
     parser.add_argument("--fia", action="store_true", help="also try the CANN FIA baseline")
     parser.add_argument("--kv-tile-pages", type=int, default=0, help="split-KV tile size in pages")
@@ -266,11 +309,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     device = torch.device("npu", 0) if args.device == "auto" and is_npu_available() else torch.device(
         args.device if args.device != "auto" else "cpu"
     )
-    cases = QUICK_SWEEP if args.quick else (DEFAULT_SWEEP if args.sweep or not args.skew else [])
+    presets = {
+        "quick": QUICK_SWEEP,
+        "serving": SERVING_SWEEP,
+        "long": LONG_SWEEP,
+    }
+    if args.preset:
+        cases = presets[args.preset]
+    else:
+        cases = QUICK_SWEEP if args.quick else (DEFAULT_SWEEP if (args.sweep or not args.skew) else [])
+    dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
 
     print(f"TileInfer micro-benchmark | device={device_name(device)} | torch={torch.__version__}")
     print(f"backends available: {BatchAttention.available_backends(available_only=True)}")
-    header = f"{'shape':<44} {'backend':<12} {'ms':>10} {'GFLOP/s':>10} {'maxerr':>10} note"
+    header = (
+        f"{'shape':<40} {'backend':<18} {'ms':>9} {'GFLOP/s':>9} {'GB/s':>8} {'maxerr':>9} note"
+    )
     print(header)
     print("-" * len(header))
 
@@ -282,7 +336,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 run_backend(
                     args.backend,
                     case,
-                    torch.float16,
+                    dtype,
                     device,
                     kwargs,
                     not args.no_check,
@@ -295,7 +349,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             continue
         print(results[-1].as_row())
         if args.fia:
-            fia = run_fia(case, torch.float16, device, args.warmup, args.iters)
+            fia = run_fia(case, dtype, device, args.warmup, args.iters)
             if fia is not None:
                 results.append(fia)
                 print(fia.as_row())
@@ -311,7 +365,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             batch = len(kv_lens)
             case = Case(batch=batch, kv_len=max(kv_lens))
             k = torch.randn(
-                batch, case.h_kv, case.kv_len, case.dim, dtype=torch.float16, device=device
+                batch, case.h_kv, case.kv_len, case.dim, dtype=dtype, device=device
             )
             v = torch.randn_like(k)
             k_cache, v_cache, base_meta = build_paged_cache(
