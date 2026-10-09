@@ -18,16 +18,16 @@ Status legend: ✅ done · 🟡 in progress · ⏳ not started
 
 | Item | Status |
 |---|---|
-| Paged **decode** kernel, GQA/MQA, NHD layout, tail-page masking | 🟡 written; compiles with `target="pto"`; cannot be validated until the toolchain's cube→vector path works |
-| Correctness vs reference on the 950 (rtol/atol 5e-2, fp16) | ⛔ blocked **upstream**: the minimal cube→vector hand-off hangs (`benchmarks/probes/pto_cv_handoff.py`), and so do both upstream PTO attention examples |
-| Fix the toolchain: build `tilelang-ascend` from source against local CANN | ✅ done — upstream PTO GEMM and a vector-only kernel are correct on the device |
-| Getting a working CV path: try the `npuir` branch, or a vector-only decode kernel as a functional fallback | ⏳ next (see [`architecture.md`](architecture.md#toolchain-status-on-the-reference-machine-ascend-950pr-oct-2026)) |
-| Report the hand-off failure upstream with the minimal reproducer | 🟡 draft ready in [`upstream-issue-pto-cv-hang.md`](upstream-issue-pto-cv-hang.md) |
-| Keep the GQA group ≥ 16 (the pinned `pto-isa` cannot `T.assign` small Accumulator tiles) | ⏳ next (pad the group or pick a kernel variant) |
-| Decode benchmark across (batch, kv_len) including 128k context | ⏳ needs a working CV path |
+| Paged **decode** kernel, GQA/MQA, NHD layout, tail-page masking | 🟡 written against the fork's API; to be **ported to the `tilelang.ascend` dialect** (row 4) |
+| Correctness vs reference on the 950 (rtol/atol 5e-2, fp16) | ⏳ unblocked — the working stack is CANN 9.3.0 + official `tilelang==0.1.15`, verified on `Ascend950PR_9579` by running upstream's GEMM+ReLU Quick Start (it contains a real cube→vector hand-off) |
+| Fix the toolchain | ✅ done twice over: source build against local CANN for the fork (cube/vector correct, cube→vector hangs on three CANN versions), then the **official 0.1.15 Ascend backend + CANN 9.3.0**, which runs CV kernels correctly |
+| **Port the kernels to `tilelang.ascend`** (`target="ascend"`, `T.const` symbolic shapes, `T.alloc_l1/l0c/shared`, `T.gemm`, `T.dual_copy`, `T.SimtVF` + `T.Parallel`, `T.Pipelined`), with upstream `examples/ascend/flash_attention/core.py` as the shape/tiling reference | ⏳ **next** |
+| Cover what upstream's FA explicitly refuses — which is our whole feature list: paged KV, ragged/variable lengths, decode (`q_len == 1`), causal + padding masks, `head_dim != 128`, fp16 | ⏳ next |
+| Report the fork's CV hand-off failure with the minimal reproducer | 🟡 draft ready in [`upstream-issue-pto-cv-hang.md`](upstream-issue-pto-cv-hang.md) (superseded for us, still valid for the fork) |
+| Decode benchmark across (batch, kv_len) including 128k context, and vs. FIA | ⏳ |
 | Split-KV merge kernel (`kv_tile_pages > 0`) | ⏳ plan + reference implementation + tests done |
 | **Prefill / append** kernel (causal, `qo_len > 1`, chunked prefill) | ⏳ |
-| Perf pass: `T.Pipelined` over pages, L0 double buffering, block-size sweep | ⏳ |
+| Perf pass: `T.Pipelined` over pages, L0 staging, tile-size sweep, and a fair comparison against upstream's 320–362 TFLOPS dense FA | ⏳ |
 
 Exit criteria: decode matches the reference on device for the full shape grid; prefill matches for
 causal and append; published numbers against FIA on the same shapes.
