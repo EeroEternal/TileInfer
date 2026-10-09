@@ -201,7 +201,7 @@ def get_backend(name: str = "auto", **kwargs) -> AttentionBackend:
     """
     _ensure_builtin_backends()
     if name == "auto":
-        for candidate in ("tilelang", "reference"):
+        for candidate in ("tilelang-ascend950", "tilelang", "reference"):
             cls = _REGISTRY.get(candidate)
             if cls is not None and cls.is_available():
                 return cls(**kwargs)
@@ -217,3 +217,4 @@ def _ensure_builtin_backends() -> None:
         return
     from . import reference as _reference  # noqa: F401
     from . import tilelang_ascend as _tilelang  # noqa: F401
+    from . import tilelang_ascend950 as _tilelang950  # noqa: F401

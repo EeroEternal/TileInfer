@@ -228,6 +228,20 @@ What the upstream backend gives us, and what it does **not** (from
 | SIMT + SIMD mixing, `T.dual_copy` | **causal masking and padding masks** (upstream explicitly refuses them) |
 | `T.Pipelined`, `T.Persistent`, GQA via flattened `q_len = S1 * G` | attention sinks, MLA/sparse, low precision KV |
 
+**Port status (same day).**  The decode kernel is ported and validated: `tilelang-ascend950`
+backend -> `kernels/attention/paged_decode_ascend950.py`, 5 device cases (full page, partial tail,
+single token, ragged batch, group == M tile) match the torch reference to ~1e-3 with bf16 on
+`Ascend950PR_9579`.  Three constraints of the dialect are worth knowing before writing another
+kernel:
+
+* the ND→NZ copy template asserts `ROWS % 16 == 0`, and `dual_copy` splits M across the two AIVs,
+  so the M tile must be a multiple of 32 — a GQA group of 8 is padded to 32 (the caller passes
+  zero-padded `Q`/`Out` and slices back);
+* the kernel's page-index argument is a **fixed-size** ABI slot: pad `kv_indices` to the compiled
+  pool size instead of recompiling per step (unused slots are never dereferenced);
+* `from __future__ import annotations` breaks the eager builder too — it calls `get_type_hints`,
+  which then cannot resolve the enclosing function's locals.
+
 So the plan of record becomes: keep TileInfer's metadata / planner / plan-run / reference layers
 (device-independent, already tested), and implement the kernels against `tilelang.ascend`, reusing
 upstream's `examples/ascend/flash_attention/core.py` shape and tiling where it applies.

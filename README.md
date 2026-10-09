@@ -47,7 +47,7 @@ hot paths that need it.
 | `plan` / `run` API, metadata, workspace, backend registry | ✅ implemented |
 | `reference` backend (torch, CPU + NPU) — correctness oracle | ✅ implemented |
 | Load-balanced scheduler (query tiling, KV split, LPT ordering) | ✅ implemented |
-| Paged decode TileLang kernel (GQA, NHD, tail-page masking) | 🟡 written; being ported to the `tilelang.ascend` dialect (the working stack — see the note below) |
+| Paged decode TileLang kernel (GQA, NHD, tail-page masking) | ✅ **runs on Ascend950PR and matches the torch reference** (~1e-3, bf16) — `tilelang-ascend950` backend |
 | Prefill / append kernel | ⏳ Phase 1 |
 | Split-KV merge kernel | ⏳ Phase 1 (plan + reference implementation done) |
 | Micro-benchmark harness (vs. torch reference / FIA) | ✅ implemented |
