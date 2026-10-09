@@ -67,6 +67,18 @@ tested in the torch reference) — fills the grid instead:
 | b1 / 65536 tok, 16 pages per tile | 32 / 256 | 1.741 | **154.2** |
 | b64 / 512 tok (wide control) | 64 / 512 | 0.886 | 151.4 |
 
+Through the **public API** (`BatchAttention.plan(..., kv_tile_pages=16)` with
+`TILEINFER_ALLOW_SPLIT_KV=1`, one shape per process — see KI-1):
+
+| shape | splits | ms | GB/s | vs unsplit |
+|---|---|---|---|---|
+| b1 / 65536 tok | 32 | 1.866 | **143.9** | 51 -> **2.8x** |
+| b4 / 16384 tok | 8 | 1.853 | **144.9** | 97 -> +49% |
+| b8 / 8192 tok | 4 | 1.859 | **144.4** | 125 -> +15% |
+
+All three match the CPU oracle to <= 2e-4.  The 2.8x at the long-context single-request case is the
+whole point: that is the shape a coding agent or a long-document request produces.
+
 **3.0x** on the long-context single-request case, and the whole grid now sits at ~150 GB/s, i.e. the
 split kernel *at the wide shape* is already as fast as the unsplit one — the extra partial/lse
 traffic (~3% of the K/V traffic) is not visible.
@@ -75,12 +87,20 @@ Correctness of the split path: a 4096-token request split into 4 tiles, partials
 with the reference's weighting (`out = Σ exp(lse_t − lse_all) · partial_t`, weights summing to 1),
 matches the dense oracle to **2e-4**.
 
-Reproduce: `python benchmarks/probes/split_kv_decode.py`.
+Reproduce: `python benchmarks/probes/split_kv_decode.py` (host-side merge, used to validate the
+contract) — for the end-to-end path use the API with the opt-in:
 
-Status: the split **kernel** is landed and measured; the merge is still done on the host in the
-probe (a Python loop per request — fine to validate the contract, unusable in serving).  Wiring
-`kv_tile_pages > 0` through the backend therefore needs the device merge kernel next; until then
-the public API keeps using the unsplit path.
+```bash
+TILEINFER_ALLOW_SPLIT_KV=1 python -c "..."   # BatchAttention.plan(..., kv_tile_pages=16)
+```
+
+Status: **split kernel + device merge kernel are landed, wired through the backend, and validated**
+by `tests/test_tilelang_ascend950_decode.py` (single request with 4 splits; ragged 2-request batch
+with different split counts).  Split-KV is **opt-in** (`TILEINFER_ALLOW_SPLIT_KV=1`) because it has
+twice wedged the device with a vector-core exception when several shapes are compiled and run in one
+process — not reproducible for a single shape, nor across 20 consecutive launches of one plan; see
+[`known-issues.md`](known-issues.md#ki-1--split-kv-wedges-the-device-when-several-shapes-share-one-process-open).
+Measurements are therefore taken one shape per process.
 
 ## What is *not* measured yet
 
