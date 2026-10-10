@@ -117,6 +117,14 @@ SERVING_SWEEP: List[Case] = [
     Case(batch=1, kv_len=65536),
 ]
 
+#: The three shapes that reproduced KI-1 before the split kernel's first failure, in order: two
+#: unsplit shapes followed by the first split shape.  Kept as a regression harness for that bug.
+REPRO_SWEEP: List[Case] = [
+    Case(batch=64, kv_len=512),
+    Case(batch=32, kv_len=2048),
+    Case(batch=16, kv_len=4096),
+]
+
 LONG_SWEEP: List[Case] = [
     Case(batch=1, kv_len=32768),
     Case(batch=4, kv_len=32768),
@@ -303,7 +311,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--quick", action="store_true", help="two shapes only")
     parser.add_argument(
         "--preset",
-        choices=["quick", "serving", "long"],
+        choices=["quick", "serving", "long", "repro"],
         default=None,
         help="curated shape sets; 'serving' is the decode grid we care about",
     )
@@ -326,6 +334,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "quick": QUICK_SWEEP,
         "serving": SERVING_SWEEP,
         "long": LONG_SWEEP,
+        "repro": REPRO_SWEEP,
     }
     if args.preset:
         cases = presets[args.preset]

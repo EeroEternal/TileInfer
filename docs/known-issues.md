@@ -100,17 +100,54 @@ A vector-core exception is not a wrong number: it wedges the device for the rest
 any engine that hit it would take the whole serving process down.  Until it is understood, split-KV
 is opt-in, and the documented way to get the 3x is to run it per shape (or in a fresh process).
 
+### Reproducer, and what has been ruled out (updated)
+
+```bash
+source <CANN 9.3.x>/set_env.sh
+export TILEINFER_ALLOW_SPLIT_KV=1
+python benchmarks/bench_attention.py --preset repro --backend tilelang-ascend950 \
+       --dtype bf16 --kv-tile-pages 16
+# b64/kv512   -> ok
+# b32/kv2048  -> ok
+# b16/kv4096  -> ACL_ERROR_RT_VECTOR_CORE_EXCEPTION (reported by the next torch op)
+```
+
+`--preset repro` is exactly the three-shape prefix that fails, and it is kept in the harness for
+this purpose.
+
+Ruled out, each by running the reproducer above with one thing changed:
+
+| Hypothesis | Experiment | Result |
+|---|---|---|
+| the harness' NPU reference | `--no-check` | still faults |
+| repeated launches / benchmark loop | `--warmup 0 --iters 1` | still faults |
+| a stale disk-cached kernel | `TILELANG_CLEAR_CACHE=1` (forces a recompile) | still faults |
+| a stale in-memory kernel | code read: the cache key is a SHA-256 of the compiled function, not its name | impossible |
+| the shape itself | `b16/kv4096 kv_tile_pages=16` alone, and 20 consecutive launches of one plan | clean |
+| "unsplit kernel first, then split" | a probe running that pair in both orders | clean |
+| the exact case construction | a probe mirroring `make_case_tensors` (same `randn`, `shuffle_pages=True`, `qo_indptr`, three launches with per-launch sync) for the same three shapes | **clean** |
+
+The last row is the interesting one: an exact mirror of the *cases* passes, so the trigger is not the
+shapes, the arguments or the page table but some **process state the harness has and the probe does
+not** (allocation history/layout is the obvious candidate - it is what made an earlier guard-tensor
+experiment "prove" a layout-dependent overrun in PM-1 as well).  A device debugger, or
+`ASCEND_LAUNCH_BLOCKING=1` plus per-launch attribution, is the way in.
+
+Because a device fault takes the process with it, split-KV stays opt-in meanwhile.
+
 ### Next steps
 
-1. Bisect by shape pairs: compile+run b64/kv512 (unsplit) and then b16/kv4096 (split) in one
-   process — if that is enough to fault, the trigger is "an unsplit kernel followed by a split
-   kernel" rather than the number of shapes.
-2. Set `TILELANG_CLEAR_CACHE=1` (or a fresh `TILELANG_CACHE_DIR`) for the sweep: if the fault
-   disappears, the disk cache is involved after all.
-3. Compare the generated CCE for the split kernel when compiled *after* an unsplit kernel in the
-   same process (the JIT is in-process, so a compiler-state leak is plausible).
-4. Reproduce under `ASCEND_LAUNCH_BLOCKING=1` to get the fault attributed to the launch that causes
-   it instead of to the next op.
+1. Run the reproducer under `ASCEND_LAUNCH_BLOCKING=1` so the fault is attributed to the launch that
+   causes it rather than to the next op; that alone should say whether it is the split kernel or the
+   merge kernel.
+2. Instrument the harness path to dump the device pointers and shapes of every tensor handed to the
+   kernels, and diff that against the probe run that passes - if a *layout* difference is the trigger,
+   the addresses will show it (e.g. a buffer landing next to an unmapped page).
+3. Try the harness with the plan buffers allocated through a different allocator path (e.g. one extra
+   dummy allocation between them) to test the layout sensitivity directly.
+4. Ask upstream with the reproducer: a `T.SimtVF` + `dual_copy` kernel that faults only in some
+   allocation layouts is worth their attention regardless of whose bug it is.
+
 
 ## PM-2 — multi-tile prefill was off by a row offset (resolved)
 
