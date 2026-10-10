@@ -39,6 +39,7 @@ Three serving realities this file has to deal with
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 import torch
@@ -81,9 +82,12 @@ class TileInferDecodeAttention:
         self.dtype = dtype
         self.kv_tile_pages = kv_tile_pages
         self._attn = None
-        self._plans: Dict[Tuple[int, int, int], Any] = {}
+        self._plans: Dict[Tuple[int, int, int, int], Any] = {}
         self._q_pad: Dict[int, torch.Tensor] = {}
         self._warned = False
+        self._lock = threading.Lock()
+        self._building: set = set()
+        self._failed: set = set()
 
     # ------------------------------------------------------------------ availability
 
@@ -109,11 +113,49 @@ class TileInferDecodeAttention:
 
     # ------------------------------------------------------------------ plan cache
 
-    def _plan(self, bucket: int, max_pages: int, block_size: int, key_cache: torch.Tensor):
-        key = (bucket, max_pages, block_size)
+    def plan_if_ready(self, bucket: int, max_pages: int, block_size: int, key_cache: torch.Tensor):
+        """Return the plan for this shape, or ``None`` while it is being compiled.
+
+        The first decode of a new shape compiles a TileLang kernel, which takes minutes - far longer
+        than a serving step may block, and far longer than a client will wait.  So the compile runs in
+        a **background thread** and this step (and every step until it finishes) falls back to the
+        Ascend FIA path.  Serving is never interrupted by a compile; the kernel just appears.
+        """
+        key = (bucket, max_pages, block_size, int(key_cache.shape[0]))
         plan = self._plans.get(key)
-        if plan is not None:
+        if plan is not None or key in self._failed:
             return plan
+
+        with self._lock:
+            if key in self._building:
+                return None
+            self._building.add(key)
+
+        logger.info(
+            "TileInfer: compiling the decode kernel for bucket=%d max_pages=%d block_size=%d pool=%d "
+            "pages in the background; serving through FIA until it is ready",
+            bucket,
+            max_pages,
+            block_size,
+            int(key_cache.shape[0]),
+        )
+        threading.Thread(
+            target=self._compile_plan, args=(key, bucket, max_pages, block_size, key_cache), daemon=True
+        ).start()
+        return None
+
+    def _compile_plan(self, key, bucket, max_pages, block_size, key_cache) -> None:
+        try:
+            self._build_plan(key, bucket, max_pages, block_size, key_cache)
+        except Exception:  # noqa: BLE001 - a background failure must not kill the engine
+            logger.exception("TileInfer: background compilation failed; staying on the FIA path")
+            with self._lock:
+                self._failed.add(key)
+        finally:
+            with self._lock:
+                self._building.discard(key)
+
+    def _build_plan(self, key, bucket: int, max_pages: int, block_size: int, key_cache: torch.Tensor):
 
         from tileinfer import BatchAttention
         from tileinfer.metadata import RaggedMetadata
@@ -145,12 +187,12 @@ class TileInferDecodeAttention:
             k_cache=key_cache,
             v_cache=torch.empty_like(key_cache),
         )
-        self._plans[key] = plan
         self._q_pad[bucket] = torch.zeros(
             (bucket, self.num_heads, 1, self.head_size), dtype=self.dtype, device=self.device
         )
+        self._plans[key] = plan
         logger.info(
-            "TileInfer plan ready: bucket=%d max_pages=%d block_size=%d -> %s",
+            "TileInfer plan READY: bucket=%d max_pages=%d block_size=%d -> %s",
             bucket,
             max_pages,
             block_size,
@@ -175,7 +217,9 @@ class TileInferDecodeAttention:
 
         num_reqs = int(seq_lens.numel())
         bucket = _bucket_for(num_reqs)
-        plan = self._plan(bucket, int(block_tables.shape[1]), block_size, key_cache)
+        plan = self.plan_if_ready(bucket, int(block_tables.shape[1]), block_size, key_cache)
+        if plan is None:
+            return None  # still compiling (or it failed): let the caller take the FIA path
 
         meta = ragged_from_page_table_device(
             block_tables[:num_reqs], seq_lens[:num_reqs], block_size, device=self.device
@@ -311,7 +355,7 @@ def _build_classes():
 
             try:
                 num_reqs = int(attn_metadata.seq_lens.numel())
-                return impl.run(
+                out = impl.run(
                     query=query[:num_reqs],
                     key_cache=self.key_cache,
                     value_cache=self.value_cache,
@@ -320,6 +364,9 @@ def _build_classes():
                     block_size=block_size,
                     output=output,
                 )
+                if out is None:  # kernel not compiled yet - keep serving through FIA
+                    return super().forward_impl(query, key, value, kv_cache, attn_metadata, output)
+                return out
             except Exception:  # noqa: BLE001 - a serving process must survive
                 self._tileinfer_failed = True
                 logger.exception(
