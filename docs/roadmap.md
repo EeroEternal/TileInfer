@@ -27,7 +27,7 @@ Status legend: ✅ done · 🟡 in progress · ⏳ not started
 | Decode benchmark across (batch, kv_len) including long context | ✅ first baseline in [`performance.md`](performance.md) (147 GB/s peak at b16/kv4096; 51 GB/s at batch 1 — core-starved) |
 | Close the batch-1 / long-context gap: split-KV kernel (consume `kv_tile_pages`) | ✅ split kernel landed and measured: **51.7 → 153.2 GB/s (3.0x)** at b1/32768; merge contract validated on host (2e-4 vs the oracle) — see [`performance.md`](performance.md) |
 | Device **merge kernel** + wiring `kv_tile_pages` through the backend | ✅ done and validated; **opt-in** (`TILEINFER_ALLOW_SPLIT_KV=1`) because of KI-1 |
-| Investigate KI-1 (vector-core exception when several split shapes share a process) | ⏳ **next** |
+| Investigate KI-1 (vector-core exception when several split shapes share a process) | ⏳ open, with a reproducer (`--preset repro`) and 7 ruled-out hypotheses - see [`known-issues.md`](known-issues.md#ki-1--split-kv-wedges-the-device-when-several-shapes-share-one-process-open) |
 | FIA baseline on the same shapes for the tile-level comparison | ⏳ needs a working FIA call on this stack |
 | Split-KV merge kernel (`kv_tile_pages > 0`) | ⏳ plan + reference implementation + tests done |
 | **Prefill / append** kernel (causal, `qo_len > 1`, chunked prefill) | ✅ validated on device (prefill, append, partial tail page, ragged batch) — tiles are planned at `block_q // 2` rows because the causal mask needs the global row index (PM-2) |
