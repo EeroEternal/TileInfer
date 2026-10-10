@@ -112,25 +112,39 @@ is opt-in, and the documented way to get the 3x is to run it per shape (or in a 
 4. Reproduce under `ASCEND_LAUNCH_BLOCKING=1` to get the fault attributed to the launch that causes
    it instead of to the next op.
 
-## WIP-1 — multi-tile prefill is off (open)
+## PM-2 — multi-tile prefill was off by a row offset (resolved)
 
-**Status:** open · `tilelang-ascend950`, prefill/append path.
+**Status:** resolved (with a documented cost) · `tilelang-ascend950` prefill path.
 
-`tests/test_tilelang_ascend950_prefill.py` covers four cases.  The **single-tile** one passes,
-including the case that matters most for correctness — *append* (`qo_len=4` over 128 cached tokens),
-where the causal offset `kv_len - qo_len` has to be right, plus a partial tail page.  Cases that span
-**more than one query tile** (`qo_len * group > block_q`) are wrong by ~3.0, which is the magnitude of
-a *misplaced row* rather than of a precision problem.
+### Symptom
 
-That isolates it nicely: the softmax, the paging, the causal mask and the append offset are all
-exercised by the passing case; what is left is the tile/row mapping for tiles whose row offset is
-non-zero, i.e. either
+Prefill/append matched the reference for a single query tile, and was wrong by ~3.0 - the magnitude
+of a *misplaced row*, not of a precision problem - as soon as a request spanned more than one tile.
+The single-tile case that passed included the append offset `kv_len - qo_len`, so the mask, the
+paging and the softmax were all fine; only the row mapping could be wrong.
 
-* the wrapper's packing/unpacking (`forward_prefill` maps `q_flat[b, bh, q_off : q_off + rows]`), or
-* the kernel's row → query-position map `q_pos = (q_off + r) // group`.
+### Root cause
 
-Next step is a two-tile unit case with a hand-checked mask (e.g. `group=1`, `block_q=32`, `qo_len=64`
-so that tile 1 starts exactly at a query position) which separates the two.
+The causal mask needs the row's *global* query position, and the number the kernel can compute inside
+the vector region is the *per-AIV* row index: `dual_copy` splits the M tile over the two AIVs and each
+one sees `ROWS = block_q // 2` rows **starting at 0**.  For a tile whose live rows all fall in the
+first half, local == global (hence the single-tile pass); otherwise the second AIV computes its mask as
+if it held the first half's rows - and its output is *not* discarded, it is written into the upper half
+of the packed tile.
 
-The kernel is kept in the tree, and the test asserts the single-tile configuration and `xfail`s the
-rest, so the WIP cannot be mistaken for a working path.
+The dialect does not expose the AIV index to a `T.SimtVF` region.  It is available only through the
+explicit mixed-kernel structure: `with T.Vector(vector=2) as sid:` (documented in
+`tilelang/ascend/language/frame.py`, where `sid = asc_get_sub_block_id()`), which also implies
+wrapping the cube work in `with T.Cube():`.
+
+### Resolution
+
+For now: **the caller plans its query tiles with `block_q // 2` rows**, so every live row is in the
+first AIV half.  `forward_prefill` enforces it and explains why; the tests cover multi-tile prefill,
+append, a partial tail page and a ragged batch.  The cost is that half of the M tile is padding, i.e.
+~2x the cube work a prefill could need.
+
+The proper fix - worth ~2x on prefill - is to restructure the kernel into explicit `T.Cube()` /
+`T.Vector(vector=2) as sid:` regions and mask with `sid * ROWS + r`.  That is a bigger change (it also
+moves the `dual_copy`s into the vector region) and it needs device iteration, so it is a standalone
+task rather than a footnote to this one.

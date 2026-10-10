@@ -34,7 +34,8 @@ pytestmark = [
 
 DTYPE = torch.bfloat16
 TOL = 3e-2
-BLOCK_Q = 128
+BLOCK_Q = 128      # the kernel's M tile
+TILE_ROWS = BLOCK_Q // 2   # rows per planned tile (see the kernel docstring)
 
 
 def _case(batch, kv_heads, group, page_size, dim, kv_lens, qo_lens, seed=0):
@@ -75,7 +76,7 @@ def _case(batch, kv_heads, group, page_size, dim, kv_lens, qo_lens, seed=0):
     # plan tiles over the *flattened* (q_pos, head) rows of every request
     page_counts = (meta.kv_indptr[1:] - meta.kv_indptr[:-1]).to(torch.int64)
     schedule = plan_query_tiles(
-        (qo * group).to(torch.int64), page_counts, block_q=BLOCK_Q, load_balance=False
+        (qo * group).to(torch.int64), page_counts, block_q=TILE_ROWS, load_balance=False
     )
     got = forward_prefill(
         q, k_cache, v_cache, meta, schedule, qo, group=group, block_q=BLOCK_Q
@@ -126,9 +127,4 @@ def _case(batch, kv_heads, group, page_size, dim, kv_lens, qo_lens, seed=0):
 )
 def test_paged_prefill_matches_reference(batch, kv_heads, group, kv_lens, qo_lens, label):
     diff = _case(batch, kv_heads, group, 128, 128, kv_lens, qo_lens)
-    if max(qo_lens) * group > BLOCK_Q:
-        # WIP (docs/known-issues.md#wip-1): single-tile prefill/append is correct (the append case
-        # below passes, causal offset included), multi-tile results are off - the tile/row mapping
-        # in the wrapper or the mask is wrong for tiles with a non-zero row offset.
-        pytest.xfail("multi-tile prefill is WIP (see known-issues.md)")
     assert diff < TOL, f"{label}: max abs diff {diff:.4f} exceeds {TOL}"

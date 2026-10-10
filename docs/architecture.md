@@ -247,7 +247,12 @@ kernel:
 * the kernel's page-index argument is a **fixed-size** ABI slot: pad `kv_indices` to the compiled
   pool size instead of recompiling per step (unused slots are never dereferenced);
 * `from __future__ import annotations` breaks the eager builder too — it calls `get_type_hints`,
-  which then cannot resolve the enclosing function's locals.
+  which then cannot resolve the enclosing function's locals;
+* **the AIV index is only reachable through `with T.Vector(vector=2) as sid:`** (the explicit
+  mixed-kernel structure).  A `T.SimtVF` region does not expose it, and `dual_copy` splits the M tile
+  over the two AIVs *implicitly*, each seeing rows `0..ROWS-1`.  Any kernel with a **row-dependent**
+  mask (causal attention!) must either restructure into explicit Cube/Vector regions or keep all live
+  rows in the first half - see PM-2 in [`known-issues.md`](known-issues.md).
 
 So the plan of record becomes: keep TileInfer's metadata / planner / plan-run / reference layers
 (device-independent, already tested), and implement the kernels against `tilelang.ascend`, reusing
