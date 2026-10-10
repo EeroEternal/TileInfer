@@ -108,3 +108,35 @@ Measurements are therefore taken one shape per process.
 * end-to-end serving (TTFT / TPOT / throughput inside vLLM-Ascend);
 * the CANN FIA baseline on the same shapes (the harness has the hook, it needs a working FIA call
   on this stack — see `run_fia`).
+
+## End-to-end: TileInfer against the stock FIA operator inside vLLM
+
+Qwen2.5-1.5B-Instruct (hidden 1536, 12 heads, 2 KV heads, head_dim 128, GQA group 6) served by
+vLLM 0.23.0 + vLLM-Ascend 0.23.0, `--enforce-eager`, `--max-model-len 2048`, KV pool pinned with
+`--num-gpu-blocks-override 8192`, one prompt, greedy.  TileInfer's decode plan was built **inside the
+EngineCore** (`TileInfer plan READY ... backend=tilelang-ascend950`) and the measured window had
+**zero fallbacks to FIA**; the baseline is the same server started with `TILEINFER_DISABLE=1`, so
+vLLM-Ascend serves through the stock FIA operator.
+
+| workload | TileInfer | stock FIA | ratio |
+|---|---|---|---|
+| 1-token request (TTFT + one step), median of 5 | 23 ms | 22 ms | 1.05x |
+| 128-token greedy completion, 4 runs | 75.6 / 82.9 / 81.7 / 89.0 tok/s | 87.3 / 88.8 / 85.9 / 91.7 tok/s | 0.94x |
+| 4 concurrent requests, 64 tokens each | 223.9 tok/s | 319.6 tok/s | 0.70x |
+
+Reading it honestly: for a single stream our decode path is within ~6 % of the production operator,
+and at four concurrent requests it is ~30 % behind.  Both sides run eager (no ACLGraph) and the
+context never exceeds 2048 tokens, so this is the *short-context* regime — the one where our kernel
+has no structural advantage:
+
+* the split-KV path (2.8x standalone at 32k-64k tokens) only pays off from roughly 8k tokens up and is
+  still off by default because of KI-1, so nothing here exercises it;
+* at batch 4 the difference is scheduling, not numerics: our plan gives each request one work tile per
+  step, while FIA's operator packs the batch into its own tiling.  That is what the batch-bucketing
+  work (T6) is for;
+* the prefill M-tile fix and the SIMD softmax (T4/T5) are the two known ~2x items still on the table.
+
+Method notes that mattered: the kernels must be pre-warmed **out of process** (a compile inside the
+engine stalls it, see `architecture.md`), the KV pool must be pinned (`--num-gpu-blocks-override`) so
+the pre-warm key is reproducible, and a bare `wait` in the harness waits for the server process too -
+which is what made three earlier "engine hangs" look like engine hangs when the engine was idle.

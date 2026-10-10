@@ -9,6 +9,7 @@ Ascend C / PTO one) only has to describe its kernels.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import threading
 from typing import Dict, List, Optional, Tuple, Type
 
 import torch
@@ -218,6 +219,7 @@ def get_backend(name: str = "auto", **kwargs) -> AttentionBackend:
 #: backend" is a useless message when the module was there but its dependencies were not.
 _IMPORT_ERRORS: Dict[str, BaseException] = {}
 _BACKENDS_LOADED = False
+_BACKENDS_LOCK = threading.Lock()
 
 
 def _ensure_builtin_backends() -> None:
@@ -227,11 +229,24 @@ def _ensure_builtin_backends() -> None:
     ``reference`` was registered, so a failure while importing a later backend left the registry
     permanently incomplete — which is exactly what happened inside a vLLM EngineCore, where the
     plugin then asked for a backend that "did not exist".
+
+    The import runs under a lock and the "loaded" flag is set *after* it.  Engines call this from
+    several threads at once — vLLM builds one backend object per attention layer and the first
+    decode step of every layer asks for the registry at the same moment — and a flag set too early
+    let one thread look a backend up while another was still importing it, which surfaced as
+    ``unknown backend 'tilelang-ascend950'; known: ['reference']``.
     """
     global _BACKENDS_LOADED
     if _BACKENDS_LOADED:
         return
-    _BACKENDS_LOADED = True
+    with _BACKENDS_LOCK:
+        if _BACKENDS_LOADED:  # another thread finished while this one waited for the lock
+            return
+        _load_builtin_backends()
+        _BACKENDS_LOADED = True
+
+
+def _load_builtin_backends() -> None:
     for name, module in (
         ("reference", "reference"),
         ("tilelang", "tilelang_ascend"),
@@ -242,14 +257,14 @@ def _ensure_builtin_backends() -> None:
 
         try:
             mod = importlib.import_module(f"{__package__}.{module}")
-            logging.getLogger("tileinfer.attention.backends").warning(
-                "TileInfer diag[import %s]: ok module=%s registry=%s",
+            logging.getLogger("tileinfer.attention.backends").debug(
+                "imported %s from %s; registry=%s",
                 name,
                 getattr(mod, "__file__", "?"),
                 sorted(_REGISTRY),
             )
         except Exception as exc:  # noqa: BLE001 - optional dependency
             _IMPORT_ERRORS[name] = exc
-            logging.getLogger("tileinfer.attention.backends").warning(
-                "TileInfer diag[import %s]: FAILED %r registry=%s", name, exc, sorted(_REGISTRY)
+            logging.getLogger("tileinfer.attention.backends").debug(
+                "%s failed to import: %r; registry=%s", name, exc, sorted(_REGISTRY)
             )

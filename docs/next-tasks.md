@@ -48,6 +48,9 @@ have is from a run with 27 compiles failing in the background, so it measures a 
 TileInfer and for the stock FIA path.  Add a batch-2/4 case (concurrent `curl`s) and an `npu-smi` line
 next to each measurement so contention is visible in the numbers.
 
+*Status*: done for short contexts - see the table in `docs/performance.md` (ours within ~6 % of FIA
+single-stream, ~30 % behind at batch 4).  What remains: a long-context run (`--max-model-len` beyond 8k)
+where the split-KV path is what should show up, and a repeat on a settled kernel.
 *Done when*: a table with TTFT-proxy, tokens/s and (if possible) a decode-step latency for both
 backends on the same prompts, with the fallback counter at zero for the TileInfer rows, and the
 `docs/performance.md` section updated.  Also: explain why the earlier baseline run died
@@ -190,6 +193,11 @@ MoE grouped GEMM, sampling.  Each starts as a new kernel module plus a reference
 
 ## Operational notes (state of the reference box)
 
+* The pre-warm key needs `--num-gpu-blocks-override` (or an equally deterministic KV pool): vLLM
+  computes the pool from a memory snapshot, so it came out as 9425 in one run and 9899 in the next,
+  which silently invalidated a pre-warm and pushed compilation back inside the engine.
+* Harness trap worth remembering: a bare `wait` in bash also waits for the server process launched
+  with `&`, so "warming up" stalled forever while the engine sat idle - use `wait $pids`.
 * **The box stopped answering** during the T2 run (`ssh` handshakes but sends no banner, the vLLM port
   is silent).  See the note in `architecture.md`; it needs console access if it does not recover.
   Detached runs keep writing logs, so **collect `/home/lipi/logs/ab_v4.log`, `v4_ours.log`,
