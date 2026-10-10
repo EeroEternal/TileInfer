@@ -182,6 +182,31 @@ import, so a CUDA-only TileLang install correctly reports "no Ascend toolchain" 
 later inside the compiler.  Conversely `TileLangAscend950Backend.is_available()` requires
 `tilelang.ascend`, so the two backends never confuse each other.
 
+### If the machine stops answering (observed twice)
+
+Symptom: `ssh` completes the TCP handshake but **never sends a banner**, the vLLM port answers nothing,
+and nothing in the log says why.  The first episode (2026-10-09 17:01) coincided with a reboot, after
+which the root filesystem had been cleaned; the second (2026-10-10, during the clean A/B run) was an
+application-level hang from which the box had not recovered when this note was written.
+
+What both episodes had in common: the NPU was busy with **a kernel compile plus another user's test
+run**.  That is not proof, but it is the one correlation we have, so: do not run heavy Ascend tests
+concurrently with a TileLang compile until someone can look at the box's console.
+
+What to do:
+
+* **collect before re-running.**  The A/B and probe drivers are detached (`setsid nohup`) and keep
+  writing their logs, so a run interrupted by a hang still produces results:
+  `/home/lipi/logs/ab_v4.log` (the driver), `v4_ours.log` (TileInfer run), `v4_fia.log` (baseline).
+  `ab_v4.sh` is the clean A/B: it warms buckets 1/2/4, prints the `plan READY` and `falling back`
+  counters after each warm-up round, then measures 1-token latency and 128-token generation for both
+  backends;
+* if it does not come back on its own it needs **console / BMC access** - nothing in this repository can
+  reach it;
+* after a reboot: `npu-smi info` should show the card, `/home/lipi/env.sh` restores the toolchain
+  environment, and `/home/lipi/third_party/tilelang-ascend` is only needed for the fork experiments
+  (the working kernel path is the PyPI wheel, see below).
+
 ### Known environment traps (Ascend 950PR / CANN 9.1.1)
 
 These cost real debugging time; they are listed here so nobody pays for them twice.
