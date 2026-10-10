@@ -429,14 +429,15 @@ def _install_backend_selection_shim() -> None:
 def _diag(tag: str) -> None:
     """One-shot diagnostics for KI-2: what does the registry look like in *this* process?
 
-    Temporary, warning-level on purpose (vLLM's default level filters our INFO lines), and it names
-    the module file so a duplicate-module-identity problem is visible at a glance.
+    It names the module file so a duplicate-module-identity problem is visible at a glance.  Kept at
+    debug: it is what identified the un-serialised backend import (see `_ensure_builtin_backends`),
+    but it fires on every plan build and is noise in a normal run.
     """
     try:
         import tileinfer
         from tileinfer.attention.backends.base import _IMPORT_ERRORS, _REGISTRY, list_backends
 
-        logger.warning(
+        logger.debug(
             "TileInfer diag[%s]: module=%s registry=%s errors=%s",
             tag,
             getattr(tileinfer, "__file__", "?"),

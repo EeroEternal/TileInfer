@@ -64,11 +64,24 @@ every write is tile-aligned and in-bounds by construction.
 
 ## KI-2 — bundled backends did not register inside a vLLM EngineCore (resolved)
 
-**Status:** resolved - `_ensure_builtin_backends()` returned early as soon as `reference` was
-registered, so a failure while importing a later backend left the registry permanently incomplete and
-the user saw "unknown backend" with no reason.  It now imports each backend independently, collects
-failures in `_IMPORT_ERRORS`, and quotes them in the error message.  Verified inside an EngineCore:
-`registry=['reference', 'tilelang', 'tilelang-ascend950']` with `errors={}`.
+**Status:** resolved, and the first diagnosis was incomplete.  Two separate defects, both in
+`_ensure_builtin_backends()`:
+
+1. it returned early once `reference` was registered, so a failure while importing a later backend left
+   the registry permanently incomplete (fixed first: each backend is now imported independently and its
+   failure is collected in `_IMPORT_ERRORS` and quoted in the error message);
+2. the "loaded" flag was set **before** the imports and nothing was synchronised.  Engines call this
+   from several threads at once — vLLM builds one backend object per attention layer and the first
+   decode step of every layer asks the registry simultaneously — so one thread returned immediately,
+   looked up `tilelang-ascend950`, and raised `unknown backend ...; known: ['reference']` while another
+   thread was still importing.  A single-threaded test could never see it, which is why the earlier
+   "resolved" was wrong.  The import now runs under a lock and the flag is set after it, and
+   `tests/test_backend_registry.py` races eight threads at the registry (verified to fail against the
+   old ordering).
+
+Both defects are the same user-visible message, which is what made this expensive to untangle: it took
+one log line per import (the `_diag` calls, now at debug level) to see `registry=[]` and
+`registry=['reference']` on consecutive lines.
 
 The original note follows.
 
