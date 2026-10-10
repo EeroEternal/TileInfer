@@ -1,0 +1,36 @@
+#!/bin/bash
+# Serve a model through vLLM-Ascend with TileInfer taking the decode path.
+#
+# Verified setup on the reference box: CANN 9.3.0 (user-local) + a venv that has
+# vllm 0.23 + vllm_ascend 0.23 (the 950 build) + torch/torch_npu 2.12 + tilelang 0.1.15.
+# Copy to run_vllm_tileinfer.sh, edit the paths, run it.
+set -euo pipefail
+
+# --- environment -------------------------------------------------------------------------
+export TILEINFER_CANN=${TILEINFER_CANN:-/path/to/cann-9.3.0}
+source "$TILEINFER_CANN/set_env.sh"
+export ACL_OP_INIT_MODE=1
+export LD_LIBRARY_PATH=/path/to/glibcxx:${LD_LIBRARY_PATH}      # GLIBCXX_3.4.30, see docs/architecture.md
+export TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR:-$HOME/.cache/tilelang-ascend950}
+
+export TILEINFER_VENV=${TILEINFER_VENV:-/path/to/venv-with-vllm-and-tilelang}
+source "$TILEINFER_VENV/bin/activate"
+
+export TILEINFER_ROOT=${TILEINFER_ROOT:-/path/to/TileInfer}
+export PYTHONPATH="$TILEINFER_ROOT:${PYTHONPATH:-}"
+
+# Split-KV is opt-in (docs/known-issues.md KI-1).  Leave it off while validating the integration;
+# the decode kernel alone already replaces the CANN paged-attention op.
+# export TILEINFER_ALLOW_SPLIT_KV=1
+
+# --- serve -------------------------------------------------------------------------------
+MODEL=${MODEL:-/home/models/Qwen2.5-0.5B-Instruct}
+PORT=${PORT:-8100}          # not 8000: someone else's server may be there
+exec python "$TILEINFER_ROOT/scripts/vllm_tileinfer_launch.py" serve "$MODEL" \
+    --host 0.0.0.0 \
+    --port "$PORT" \
+    --served-model-name tileinfer-qwen \
+    --attention-backend CUSTOM \
+    --max-model-len 1024 \
+    --enforce-eager \
+    --trust-remote-code
