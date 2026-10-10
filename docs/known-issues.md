@@ -62,6 +62,25 @@ Two changes made while chasing this are worth keeping and are now permanent: the
 the merge kernel stores a **full padded tile** (`BR` rows) rather than only the live `group` rows, so
 every write is tile-aligned and in-bounds by construction.
 
+## KI-2 — bundled backends do not register inside a vLLM EngineCore (open)
+
+**Status:** open · affects the vLLM integration only (the standalone library is fine).
+
+In the vLLM plugin's own process every bundled backend registers
+(`['reference', 'tilelang', 'tilelang-ascend950']`); inside the EngineCore `list_backends()` returns
+`['reference']`, and asking for `tilelang-ascend950` raises `unknown backend ... known: ['reference']`
+**without** any import error being recorded - which `_ensure_builtin_backends()` (independent imports,
+failures collected in `_IMPORT_ERRORS` and quoted in the message) cannot produce as written, so
+something about the engine process is *undone* rather than failing.
+
+Eliminated already: a duplicate module identity from having TileInfer both editable-installed and on
+`PYTHONPATH` (removed, no change).
+
+Next: one probe that logs `list_backends()`, `_REGISTRY.keys()` and `_IMPORT_ERRORS` at plugin load
+time and again inside `_build_plan()`.  That distinguishes "imported but unregistered" from "never
+imported" and points at the line to fix.  Meanwhile the plugin falls back to FIA, which is why the
+integration is still opt-in.
+
 ## KI-1 — split-KV wedges the device when several shapes share one process (open)
 
 **Status:** open · **Affected:** `tilelang-ascend950` with `kv_tile_pages > 0` ·

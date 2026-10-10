@@ -207,14 +207,37 @@ def get_backend(name: str = "auto", **kwargs) -> AttentionBackend:
                 return cls(**kwargs)
         raise RuntimeError(f"no usable attention backend among {list_backends()}")
     if name not in _REGISTRY:
-        raise ValueError(f"unknown backend {name!r}; known: {list_backends()}")
+        hint = ""
+        if name in _IMPORT_ERRORS:
+            hint = f" (it failed to import: {_IMPORT_ERRORS[name]!r})"
+        raise ValueError(f"unknown backend {name!r}; known: {list_backends()}{hint}")
     return _REGISTRY[name](**kwargs)
 
 
+#: Why a bundled backend failed to import (if it did) - surfaced by get_backend, because "unknown
+#: backend" is a useless message when the module was there but its dependencies were not.
+_IMPORT_ERRORS: Dict[str, BaseException] = {}
+_BACKENDS_LOADED = False
+
+
 def _ensure_builtin_backends() -> None:
-    """Import the bundled backends lazily so that heavy deps stay optional."""
-    if "reference" in _REGISTRY:
+    """Import the bundled backends lazily so that heavy deps stay optional.
+
+    Each backend is imported **independently**: an earlier version returned early as soon as
+    ``reference`` was registered, so a failure while importing a later backend left the registry
+    permanently incomplete — which is exactly what happened inside a vLLM EngineCore, where the
+    plugin then asked for a backend that "did not exist".
+    """
+    global _BACKENDS_LOADED
+    if _BACKENDS_LOADED:
         return
-    from . import reference as _reference  # noqa: F401
-    from . import tilelang_ascend as _tilelang  # noqa: F401
-    from . import tilelang_ascend950 as _tilelang950  # noqa: F401
+    _BACKENDS_LOADED = True
+    for name, module in (
+        ("reference", "reference"),
+        ("tilelang", "tilelang_ascend"),
+        ("tilelang-ascend950", "tilelang_ascend950"),
+    ):
+        try:
+            __import__(f"{__package__}.{module}")
+        except Exception as exc:  # noqa: BLE001 - optional dependency
+            _IMPORT_ERRORS[name] = exc

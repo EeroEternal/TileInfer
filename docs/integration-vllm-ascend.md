@@ -36,7 +36,27 @@ trace.  Verified: `importlib.metadata.entry_points(group="vllm.general_plugins")
 compiled inside the engine** (the generated CCE with the CANN headers) - i.e. `forward_impl` reached
 `_plan()`.
 
-**What is not solved: the first-use compile inside the engine.**  Standalone that compile takes ~2
+**Compilation moved off the request path.**  The plugin compiles in a **background thread** and serves
+through FIA until the kernel is ready (`TileInferDecodeAttention.plan_if_ready`), because a serving
+step must never block on a compile and a client will not wait minutes.  Verified in the engine: when
+a background compile fails, the server keeps answering requests (the throwaway request that triggers
+it returns normally, and the log says "staying on the FIA path") - no crash, no hang, no stall.
+
+**What is not solved: the backend is not visible in the EngineCore's registry.**  In the plugin's own
+process `list_backends()` is `['reference', 'tilelang', 'tilelang-ascend950']`, but inside the
+EngineCore the same call gives `['reference']` and `get_backend("tilelang-ascend950")` raises
+`unknown backend ... known: ['reference']` **with no import error recorded** - i.e. the two later
+backends neither registered nor failed to import, which the current code cannot produce by reading it
+(the imports are independent, and a failure would be reported in the message).  The plugin therefore
+falls back to FIA, exactly as designed, and the model serves.
+
+Tested and eliminated: a second `tileinfer` on `PYTHONPATH` alongside the editable install (two module
+objects would fill one registry and consult the other) - removing the `PYTHONPATH` entry changes
+nothing.  The next step is one diagnostic run: log `list_backends()` and `_IMPORT_ERRORS` both at
+plugin-load time and at plan time inside the EngineCore, which will say whether the modules are
+imported but unregistered, or never imported.  `benchmarks/probes/` is the place for that probe.
+
+**What is also not solved: the first-use compile inside the engine.**  Standalone that compile takes ~2
 minutes; inside the EngineCore it was still running after 20+ minutes (the compiler's diagnostics
 flood the EngineCore's logger, and the process is CPU-starved next to vLLM's workers).  A serving
 process cannot compile on the first request anyway, so the fix is a **warm-up**: compile the buckets a
