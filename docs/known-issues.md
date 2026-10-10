@@ -100,6 +100,35 @@ A vector-core exception is not a wrong number: it wedges the device for the rest
 any engine that hit it would take the whole serving process down.  Until it is understood, split-KV
 is opt-in, and the documented way to get the 3x is to run it per shape (or in a fresh process).
 
+### Second reproducer: the first decode inside a vLLM EngineCore
+
+The integration (`docs/integration-vllm-ascend.md`) reaches the kernel and then dies the same way.
+With a deliberately tiny model whose shape the kernel supports (`head_dim=128`, `group=2`, one
+decode step, `max_tokens=1`):
+
+```
+(EngineCore) rtEventSynchronize execution failed, reason=vector core exception
+(EngineCore) RuntimeError: npuSynchronizeDevice ... error code is 507035
+```
+
+Same kernel, same shapes, standalone (colleague's venv, CANN 9.3.0, `group` in {2,4,8}):
+`max|diff| <= 0.0012` — clean.  So the shapes are fine and the *context* is not:
+
+| context | result |
+|---|---|
+| lean process, one shape (device tests, probes) | clean |
+| lean process, small group (2/4/8) | clean |
+| benchmark sweep, three shapes in one process | faults on the third |
+| vLLM EngineCore, one decode step | faults |
+
+**Hypothesis worth testing next**: buffer *alignment / allocation history*.  The kernel binary is
+fixed (its UB/L1 layout is decided at compile time), so what varies between these contexts is the
+addresses and alignment of the tensors handed to it — `torch.randn` in a fresh process gives
+different (aligned) addresses than a fragmented pool or vLLM's own NPU allocator.  The experiment is
+small: slice the KV cache and the page table out of a larger allocation at unaligned offsets and see
+whether the standalone case starts faulting.  If it does, the fix is in the kernel's DMA widths
+(vectorised copies assume an alignment the caller cannot guarantee), and the same fix closes KI-1.
+
 ### Reproducer, and what has been ruled out (updated)
 
 ```bash

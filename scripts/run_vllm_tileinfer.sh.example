@@ -16,8 +16,13 @@ export TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR:-$HOME/.cache/tilelang-ascend950}
 export TILEINFER_VENV=${TILEINFER_VENV:-/path/to/venv-with-vllm-and-tilelang}
 source "$TILEINFER_VENV/bin/activate"
 
+# The integration is opt-in: decode through the kernel currently faults the device inside an
+# EngineCore (docs/known-issues.md KI-1).  Set this only when working on that bug.
+export TILEINFER_VLLM=1
+export VLLM_NO_USAGE_STATS=1
+export VLLM_DO_NOT_TRACK=1
 export TILEINFER_ROOT=${TILEINFER_ROOT:-/path/to/TileInfer}
-export PYTHONPATH="$TILEINFER_ROOT:${PYTHONPATH:-}"
+export PYTHONPATH="$TILEINFER_ROOT:${PYTHONPATH:-}"   # append: CANN's set_env.sh put its own site-packages here
 
 # Split-KV is opt-in (docs/known-issues.md KI-1).  Leave it off while validating the integration;
 # the decode kernel alone already replaces the CANN paged-attention op.
@@ -33,4 +38,5 @@ exec python "$TILEINFER_ROOT/scripts/vllm_tileinfer_launch.py" serve "$MODEL" \
     --attention-backend CUSTOM \
     --max-model-len 1024 \
     --enforce-eager \
+    --gpu-memory-utilization 0.07 \
     --trust-remote-code
