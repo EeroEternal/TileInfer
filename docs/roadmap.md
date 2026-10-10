@@ -1,5 +1,8 @@
 # Roadmap
 
+> The concrete, ordered task list lives in [`next-tasks.md`](next-tasks.md); this document is the
+> phased plan it serves.
+
 Status legend: ✅ done · 🟡 in progress · ⏳ not started
 
 ## Phase 0 — environment and baseline ✅
