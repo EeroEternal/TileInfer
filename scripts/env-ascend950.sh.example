@@ -1,0 +1,37 @@
+#!/bin/bash
+# TileInfer on Ascend 950 — copy to env-ascend950.sh, edit the paths, then `source` it.
+#
+# Verified on Ascend950PR_9579 with CANN 9.3.0 + torch/torch_npu 2.12 + tilelang 0.1.15 (PyPI).
+# Prefer a user-local CANN install: the system one may be serving someone else, and the driver is
+# shared and kernel-side anyway.
+
+# --- CANN (edit the prefix) ---------------------------------------------------------------
+export TILEINFER_CANN=/path/to/cann-9.3.0
+source "$TILEINFER_CANN/set_env.sh"
+
+# CANN wants this for custom kernels.  Unset, the failure mode is *wrong numbers* rather than an
+# error; CANN upgrades 1 -> 2 on this device ("aclops disabled") and says so in its log.
+export ACL_OP_INIT_MODE=1
+
+# --- libstdc++ (edit or drop) -------------------------------------------------------------
+# openEuler 22.03 ships 6.0.28; the CANN opmaster needs GLIBCXX_3.4.29 and some libs 3.4.30.
+# A conda-forge `libstdcxx-ng 12.2.0` unpacked anywhere does the job.
+export LD_LIBRARY_PATH=/path/to/glibcxx:${LD_LIBRARY_PATH}
+
+# --- python env (venv with torch / torch_npu / tilelang) ---------------------------------
+export TILEINFER_VENV=/path/to/venv
+source "$TILEINFER_VENV/bin/activate"
+
+# --- kernel cache ------------------------------------------------------------------------
+# Keep it somewhere writable and per-user; TileLang reuses compiled kernels from here, and a first
+# compile takes ~1-2 minutes per shape.
+export TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR:-$HOME/.cache/tilelang-ascend950}
+
+# --- optional ----------------------------------------------------------------------------
+# Split-KV is measured at 3x on long single-request decode but is opt-in: several split shapes in
+# one process have wedged the device (docs/known-issues.md KI-1).  Benchmark one shape per process.
+# export TILEINFER_ALLOW_SPLIT_KV=1
+
+# --- sanity check ------------------------------------------------------------------------
+# python benchmarks/probes/ascend950_paged_decode.py     # expect 5/5 PASS
+# python -m pytest tests -m "not npu"                    # expect 33 passed

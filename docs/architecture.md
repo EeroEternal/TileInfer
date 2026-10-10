@@ -133,37 +133,43 @@ kernel handles a plan, and how to launch it.  `get_backend("auto")` prefers `til
 available and falls back to `reference`, which keeps the same user code running on a laptop and on
 the NPU.
 
-## 6. Environment (Ascend)
+## 6. Environment (Ascend 950)
 
-The plain PyPI `tilelang` wheel has **no Ascend backend**.  The supported combination on an
-Ascend 950 / CANN 9.1.x / Python 3.12 / x86_64 machine is:
+The combination that works on the reference `Ascend950PR_9579` is:
+
+| | |
+|---|---|
+| CANN | **9.3.x** — a user-local, side-by-side install is fine and preferred |
+| Python | 3.12 |
+| torch / torch_npu | 2.12.0 / 2.12.0.post2 |
+| TileLang | **`tilelang==0.1.15` from PyPI** — the wheel that ships the Ascend 950 backend (`tilelang.ascend`, target `"ascend"`, arch `dav-3510`) |
 
 ```bash
-# 1. CANN runtime + the NNAL ATB ops (libatb.so lives in nnal)
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
-source /usr/local/Ascend/nnal/atb/set_env.sh
+# CANN (user-local prefix keeps the system install and the driver untouched)
+source <CANN 9.3.x>/ascend-toolkit/set_env.sh
 
-# 2. tilelang-ascend refuses to share a process with torch_npu without this: both runtimes
-#    initialise the ACL op library, and the failure mode is *silently wrong results*, not an
-#    error.  This is the first line of the toolchain's own set_env.sh.
+# CANN wants this for custom kernels; with it unset the failure mode is *wrong numbers*, not an
+# error.  CANN upgrades it to 2 on this device ("aclops disabled") and says so.
 export ACL_OP_INIT_MODE=1
 
-# 3. a libstdc++ with GLIBCXX_3.4.30 in front of the system one
-#    (openEuler 22.03 ships 6.0.28; CANN's opmaster needs 3.4.29, libtvm.so needs 3.4.30)
-export LD_LIBRARY_PATH=/path/to/glibcxx:${LD_LIBRARY_PATH}
+# openEuler 22.03 ships libstdc++ 6.0.28; the CANN opmaster needs 3.4.29 and some libs 3.4.30
+export LD_LIBRARY_PATH=/path/to/glibcxx:${LD_LIBRARY_PATH}   # e.g. conda-forge libstdcxx-ng 12.2.0
 
-# 3. torch (CPU build is enough; torch_npu owns the device) + torch_npu
-pip install torch==2.10.0+cpu --index-url https://download.pytorch.org/whl/cpu
-pip install torch_npu==2.10.0.post4
-
-# 4. the TileLang Ascend toolchain (GitHub release of tile-ai/tilelang-ascend):
-#    branch ascendc_pto (Ascend C / PTO backend, the default) or npuir (MLIR backend)
-pip install "tilelang-0.1.4+linux.cann910-cp312-cp312-linux_x86_64.whl"
-
-# 5. TileInfer itself
+pip install torch==2.12.0 torch_npu==2.12.0.post2 tilelang==0.1.15
 pip install -e .
-python -c "import torch, torch_npu; print(torch_npu.npu.device_count())"
+
+python -c "import torch, torch_npu, tilelang.ascend; \
+           print(torch.npu.is_available(), torch.npu.get_device_name(0))"
+python benchmarks/probes/ascend950_paged_decode.py     # the canary: 5/5 PASS when the stack is good
 ```
+
+`scripts/env-ascend950.sh.example` is the same recipe as a file to copy and edit.
+
+**Do not reach for `tile-ai/tilelang-ascend` (the fork) unless you are fixing the fork.**  It used to
+be the only route and it cost days: its PTO cube→vector hand-off hangs on this SKU across three CANN
+versions, and its classic `ascendc` target cannot lower `T.tile.fill`.  That history is kept below
+because the reproducer is minimal and still worth reporting upstream — but the official wheel plus
+CANN 9.3 does the job today.
 
 Note that `torch_npu` needs membership in the group owning `/dev/davinci*` (usually `HwHiAiUser`):
 
@@ -171,9 +177,10 @@ Note that `torch_npu` needs membership in the group owning `/dev/davinci*` (usua
 usermod -aG HwHiAiUser <user>
 ```
 
-`have_tilelang()` in `tileinfer/utils.py` checks for the Ascend pass-config keys rather than just
-the import, so a CUDA-only TileLang install correctly reports "no Ascend toolchain" instead of
-failing later inside the compiler.
+`have_tilelang()` in `tileinfer/utils.py` checks for the Ascend pass-config keys rather than just the
+import, so a CUDA-only TileLang install correctly reports "no Ascend toolchain" instead of failing
+later inside the compiler.  Conversely `TileLangAscend950Backend.is_available()` requires
+`tilelang.ascend`, so the two backends never confuse each other.
 
 ### Known environment traps (Ascend 950PR / CANN 9.1.1)
 
