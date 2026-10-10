@@ -1,5 +1,7 @@
 # Roadmap
 
+> The scoreboard - what is actually done, with evidence - is [`status.md`](status.md).
+
 > The concrete, ordered task list lives in [`next-tasks.md`](next-tasks.md); this document is the
 > phased plan it serves.
 
