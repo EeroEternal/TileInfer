@@ -237,7 +237,19 @@ def _ensure_builtin_backends() -> None:
         ("tilelang", "tilelang_ascend"),
         ("tilelang-ascend950", "tilelang_ascend950"),
     ):
+        import importlib
+        import logging
+
         try:
-            __import__(f"{__package__}.{module}")
+            mod = importlib.import_module(f"{__package__}.{module}")
+            logging.getLogger("tileinfer.attention.backends").warning(
+                "TileInfer diag[import %s]: ok module=%s registry=%s",
+                name,
+                getattr(mod, "__file__", "?"),
+                sorted(_REGISTRY),
+            )
         except Exception as exc:  # noqa: BLE001 - optional dependency
             _IMPORT_ERRORS[name] = exc
+            logging.getLogger("tileinfer.attention.backends").warning(
+                "TileInfer diag[import %s]: FAILED %r registry=%s", name, exc, sorted(_REGISTRY)
+            )

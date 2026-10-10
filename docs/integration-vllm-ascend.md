@@ -42,6 +42,40 @@ step must never block on a compile and a client will not wait minutes.  Verified
 a background compile fails, the server keeps answering requests (the throwaway request that triggers
 it returns normally, and the log says "staying on the FIA path") - no crash, no hang, no stall.
 
+**Milestone reached: the kernel runs inside vLLM.**  With the three fixes below, the EngineCore builds
+the plan and serves the decode step through TileInfer:
+
+```
+(EngineCore) TileInfer plan READY: bucket=1 max_pages=16 block_size=128
+             -> <AttentionPlan decode backend=tilelang-ascend950 ...>
+```
+
+and the first decode step of Qwen2.5-1.5B (`head_dim=128`, group 6) produces the **same top-5
+logprobs as the stock FIA operator, to four decimals** (`Tiles -0.0085, T -5.5085, Tile -6.6335,
+A -6.7585, Sure -7.3835`).  Three things had to be fixed to get there, in order of discovery:
+
+1. **registration mechanism** - the official `vllm.general_plugins` entry point (a `sitecustomize`
+   hook runs before vLLM is importable and fails silently);
+2. **the backend registry** - `_ensure_builtin_backends()` returned early once `reference` was
+   registered, so a failure on a later backend left the registry permanently incomplete; the
+   per-import diagnostics that found this are still in the code (KI-2);
+3. **a bug in the TileLang wheel** - `tl_templates/ascend/numeric_limits.h` uses `std::bit_cast`
+   without including `<bit>`, so *every* kernel compile fails on this CANN release with
+   `no member named 'bit_cast' in namespace 'std'`.  `scripts/patch-tilelang-ascend-bitcast.py`
+   rewrites those call sites to `__builtin_bit_cast` - which is what the colleague's working
+   environment had already done by hand, and how this was spotted (the two `numeric_limits.h` files
+   differed in exactly those nine lines).
+
+**Performance is not measured yet, and the one number we have is not trustworthy.**  The A/B run that
+produced the logprobs above still had 27 compile attempts failing in the background (the fixes landed
+mid-run) and the plan only became READY at the very end, so its 91.7 s for 117 tokens is dominated by
+compilation starving the engine, not by the kernel.  A clean measurement needs all buckets warmed first
+and zero fallbacks during the measured window.
+
+**What is still open: the stock-FIA baseline crashed in that same A/B** (`EngineDeadError` after its
+first step, on the same model and settings), which is unexplained and has to be looked at before the
+two backends can be compared over a full generation.
+
 **What is not solved: the backend is not visible in the EngineCore's registry.**  In the plugin's own
 process `list_backends()` is `['reference', 'tilelang', 'tilelang-ascend950']`, but inside the
 EngineCore the same call gives `['reference']` and `get_backend("tilelang-ascend950")` raises
