@@ -182,30 +182,36 @@ import, so a CUDA-only TileLang install correctly reports "no Ascend toolchain" 
 later inside the compiler.  Conversely `TileLangAscend950Backend.is_available()` requires
 `tilelang.ascend`, so the two backends never confuse each other.
 
-### If the machine stops answering (observed twice)
+### Compiles block the process that runs them (and what that looked like)
 
-Symptom: `ssh` completes the TCP handshake but **never sends a banner**, the vLLM port answers nothing,
-and nothing in the log says why.  The first episode (2026-10-09 17:01) coincided with a reboot, after
-which the root filesystem had been cleaned; the second (2026-10-10, during the clean A/B run) was an
-application-level hang from which the box had not recovered when this note was written.
+A TileLang compile takes ~70 s and **holds the Python interpreter**.  Inside a serving process that
+means the process stops answering: the EngineCore does not schedule a step, requests time out, and it
+looks exactly like the engine hanging.  During one A/B run this compounded with another user's test
+load until the machine's `ssh` would not even send a banner, and the run wedged.
 
-What both episodes had in common: the NPU was busy with **a kernel compile plus another user's test
-run**.  That is not proof, but it is the one correlation we have, so: do not run heavy Ascend tests
-concurrently with a TileLang compile until someone can look at the box's console.
+The fix is to compile **out of process, before the server starts**:
 
-What to do:
+```bash
+TILELANG_CACHE_DIR=/tmp/tl_cache_vllm python scripts/prewarm-tileinfer-kernels.py \
+    --kv-heads 2 --group 6 --dim 128 --page-size 128 --num-pages-cap 9425 --buckets 1 2 4
+```
 
-* **collect before re-running.**  The A/B and probe drivers are detached (`setsid nohup`) and keep
-  writing their logs, so a run interrupted by a hang still produces results:
-  `/home/lipi/logs/ab_v4.log` (the driver), `v4_ours.log` (TileInfer run), `v4_fia.log` (baseline).
-  `ab_v4.sh` is the clean A/B: it warms buckets 1/2/4, prints the `plan READY` and `falling back`
-  counters after each warm-up round, then measures 1-token latency and 128-token generation for both
-  backends;
-* if it does not come back on its own it needs **console / BMC access** - nothing in this repository can
-  reach it;
-* after a reboot: `npu-smi info` should show the card, `/home/lipi/env.sh` restores the toolchain
-  environment, and `/home/lipi/third_party/tilelang-ascend` is only needed for the fork experiments
-  (the working kernel path is the PyPI wheel, see below).
+The kernel key includes the KV pool capacity (it is part of the buffer ABI: `kv_indices` is padded to
+it), so pre-warming needs the capacity the server will use.  It is deterministic for a fixed model,
+`--gpu-memory-utilization` and `--max-model-len`, and the plugin logs it (`pool=9425 pages`); vLLM also
+prints the KV cache size at startup.  After a pre-warm the server's own compile is a cache hit and the
+first decode step is served without a stall, with no fallback to FIA.
+
+Two consequences worth remembering:
+
+* a deployment should pre-warm the buckets it declares - this is not an optimisation, it is what makes
+  the integration usable (task T6 in `next-tasks.md`);
+* an in-engine compile still works (the plan is built in a background thread and requests fall back to
+  FIA meanwhile), but on this box it starved the engine, so pre-warming is the supported path.
+
+If the machine *does* stop answering, the operational note is the same as before: detached runs keep
+writing their logs, so collect `/home/lipi/logs/ab_v*.log` before re-running anything, and it needs
+console access if it does not recover.
 
 ### Known environment traps (Ascend 950PR / CANN 9.1.1)
 

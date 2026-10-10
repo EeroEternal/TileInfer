@@ -100,14 +100,16 @@ makes softmax time visible (long context), then port one softmax step at a time 
 
 *Done when*: the probe shows a measurable gain and the device tests still match the oracle.
 
-### T6 · Warm-up and batch bucketing as first-class features
+### T6 · Warm-up and batch bucketing as first-class features (partly done)
 
 *Why*: a TileLang kernel is compiled per shape (~2 min standalone), a serving batch changes size every
 step (hence bucket padding), and a compile must never sit in a request (hence the background thread +
 FIA fallback).  All three mechanisms exist but are spread across the plugin.
 
-*First step*: expose `warmup(buckets, shape_hint)` on the backend (compile the buckets a deployment
-declares) and document the deployment recipe (buckets, `TILELANG_CACHE_DIR`, expected compile time).
+*Done so far*: `scripts/prewarm-tileinfer-kernels.py` compiles the declared buckets out of process
+into `TILELANG_CACHE_DIR`, which is what keeps the engine from stalling (see `architecture.md`).
+*First step*: tie it to the backend (`warmup(buckets)`), and make the pool capacity reproducible so
+the pre-warm can be derived from the server config instead of copied from a log.
 
 *Done when*: a served model reaches "zero compiles after start-up" and the docs say how.
 

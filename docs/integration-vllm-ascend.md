@@ -72,6 +72,12 @@ mid-run) and the plan only became READY at the very end, so its 91.7 s for 117 t
 compilation starving the engine, not by the kernel.  A clean measurement needs all buckets warmed first
 and zero fallbacks during the measured window.
 
+**The background compile is not free: it blocks the engine.**  A TileLang compile holds the Python
+interpreter, so while the background thread compiles, the EngineCore stops answering - one A/B run
+wedged that way.  The supported recipe is therefore to pre-warm the buckets **before** starting the
+server (`scripts/prewarm-tileinfer-kernels.py`, see `architecture.md`), so the engine's own compile
+call is a cache hit; the background thread stays as a safety net, not as the normal path.
+
 **What is still open: the stock-FIA baseline crashed in that same A/B** (`EngineDeadError` after its
 first step, on the same model and settings), which is unexplained and has to be looked at before the
 two backends can be compared over a full generation.
