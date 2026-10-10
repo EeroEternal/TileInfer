@@ -6,6 +6,38 @@ The runnable reference implementation of everything below is
 [`examples/vllm_ascend_tileinfer_backend.py`](../examples/vllm_ascend_tileinfer_backend.py); this
 document explains the design decisions behind it.
 
+## Status (2026-10-10)
+
+**Wired and selected, not yet usable.**  What is verified end to end on the reference box
+(CANN 9.3.0 + vLLM 0.23 + vllm_ascend 0.23 (950) + tilelang 0.1.15, model served via the OpenAI API):
+
+* the plugin registers and vLLM resolves the class (`AttentionBackendEnum.CUSTOM.get_class()` is
+  `tileinfer.integrations.vllm_ascend.TileInferBackend`, checked at startup so a silent fallback
+  cannot happen);
+* `forward_impl` is entered for decode-only batches, and the plugin **declines** configurations its
+  kernel does not support, with a logged reason (`head_size=64` for Qwen2.5-0.5B on the reference
+  box) and falls back to the Ascend FIA path, which is the designed behaviour;
+* the server serves coherent completions on the stock path (37 prompt + 24 generated tokens in 2.8 s
+  on Qwen2.5-0.5B).
+
+**Blocked on KI-1**: the first decode *through the TileLang kernel* inside the EngineCore faults the
+device (`vector core exception`, 507035) even though the identical shape passes standalone, so the
+integration is **opt-in** (`TILEINFER_VLLM=1`) and must stay off until that is fixed.  See
+[`known-issues.md`](known-issues.md#ki-1--split-kv-wedges-the-device-when-several-shapes-share-one-process-open).
+
+Four things about the platform cost real time and are worth knowing before touching this code:
+
+1. `vllm_ascend.platform.NPUPlatform.get_attn_backend_cls` **ignores `--attention-backend`** for
+   everything except FLASH_ATTN ("Ascend NPU will use its registered plugin backend instead"), so a
+   registry entry alone changes nothing; the plugin wraps that method.
+2. vLLM runs the engine in a **separate process**: a patch applied by the launcher reaches the API
+   server only, so the registration and the shim live in a `sitecustomize.py` that every interpreter
+   in the venv loads.
+3. `import vllm_ascend.attention.attention_v1` first raises a circular-import error
+   (`DeviceOperator`); `import vllm_ascend.ops` has to come first.
+4. vLLM's usage-reporting thread dies on this box (`cpuinfo` JSONDecodeError) and takes EngineCore
+   with it — `VLLM_NO_USAGE_STATS=1 VLLM_DO_NOT_TRACK=1` are required.
+
 ## Where it plugs in
 
 ```

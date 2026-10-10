@@ -207,8 +207,19 @@ class TileInferDecodeAttention:
 
 
 def _build_classes():
-    """Create the backend/impl pair against the *installed* vLLM-Ascend."""
+    """Create the backend/impl pair against the *installed* vLLM-Ascend.
+
+    Called at import time (see the bottom of the file) because vLLM's registry stores backend
+    *paths* - it imports the class by dotted name - so the classes have to be module globals.
+    """
     from vllm.v1.attention.backend import AttentionBackend
+
+    # Import-order workaround: `vllm_ascend.attention.attention_v1` pulls in `vllm_ascend.ops`, whose
+    # `fused_moe` imports `vllm_ascend.device.device_op` *while that module is still initialising* -
+    # a circular import that raises `cannot import name 'DeviceOperator'`.  Importing the ops package
+    # first initialises it in the order vLLM-Ascend expects.  (Verified on vllm_ascend 0.23: only this
+    # order works, `attention_v1` or `platform` first both fail.)
+    import vllm_ascend.ops  # noqa: F401
 
     from vllm_ascend.attention.attention_v1 import (
         AscendAttentionBackendImpl,
@@ -274,22 +285,31 @@ def _build_classes():
 
         # -- the one overridden path ----------------------------------------------
 
-        def forward_paged_attention(self, query, attn_metadata, output=None):
-            """decode-only batches: try TileInfer, fall back to FIA on anything unexpected.
+        def forward_impl(self, query, key, value, kv_cache, attn_metadata, output):
+            """The single dispatch point of vLLM-Ascend's attention.
 
-            Falling back is not politeness: vLLM-Ascend's own implementation is the correctness
-            reference here, and a serving process must not die because one batch was shaped oddly.
+            ``forward`` has already written the step's K/V into the cache by the time this runs, so
+            for a decode-only batch TileInfer can read the same cache the FIA path would.
+
+            Overriding ``forward_impl`` rather than ``forward_paged_attention`` matters: the parent
+            only routes to that method when ``using_paged_attention(num_tokens, vllm_config,
+            head_size)`` agrees, and when it does not the batch silently goes to FIA - which is what
+            happened on the first attempt at this integration (a 0.47 s response with no TileInfer
+            trace in the log).  Here the decision is explicit and, if the batch is one we cannot
+            handle, the fallback is still the parent implementation.
             """
             if self._tileinfer_failed or self.key_cache is None:
-                return super().forward_paged_attention(query, attn_metadata, output)
+                return super().forward_impl(query, key, value, kv_cache, attn_metadata, output)
+
+            if attn_metadata.attn_state != AscendAttentionState.DecodeOnly:
+                return super().forward_impl(query, key, value, kv_cache, attn_metadata, output)
 
             block_size = int(self.key_cache.shape[1])
             impl = self._decode(block_size)
             if impl is None:
-                return super().forward_paged_attention(query, attn_metadata, output)
+                return super().forward_impl(query, key, value, kv_cache, attn_metadata, output)
 
             try:
-                out = output if output is not None else torch.empty_like(query)
                 num_reqs = int(attn_metadata.seq_lens.numel())
                 return impl.run(
                     query=query[:num_reqs],
@@ -298,14 +318,70 @@ def _build_classes():
                     block_tables=attn_metadata.block_tables[:num_reqs],
                     seq_lens=attn_metadata.seq_lens[:num_reqs],
                     block_size=block_size,
-                    output=out,
+                    output=output,
                 )
             except Exception:  # noqa: BLE001 - a serving process must survive
                 self._tileinfer_failed = True
-                logger.exception("TileInfer decode failed; falling back to the Ascend FIA path")
-                return super().forward_paged_attention(query, attn_metadata, output)
+                logger.exception(
+                    "TileInfer decode failed; falling back to the Ascend FIA path for this process"
+                )
+                return super().forward_impl(query, key, value, kv_cache, attn_metadata, output)
 
     return TileInferBackend, TileInferImpl
+
+
+# Build at import time when vLLM is around; the module still imports cleanly without it (the CPU
+# test suite relies on that).
+TileInferBackend: Any = None
+TileInferImpl: Any = None
+try:  # pragma: no cover - needs vLLM + vllm_ascend
+    if not __import__("os").environ.get("TILEINFER_SKIP_CLASS_BUILD"):
+        TileInferBackend, TileInferImpl = _build_classes()
+except Exception as _exc:  # pragma: no cover
+    logger.debug("vLLM-Ascend classes not built here: %s", _exc)
+
+
+def _install_backend_selection_shim() -> None:
+    """Make ``vllm_ascend`` actually *use* the backend this plugin registers.
+
+    Registering in vLLM's registry is necessary but not sufficient on this platform:
+    ``vllm_ascend.platform.NPUPlatform.get_attn_backend_cls`` ignores the user's
+    ``--attention-backend`` for everything except FLASH_ATTN (it logs "Ascend NPU will use its
+    registered plugin backend instead. Resetting to None") and returns one of its own class paths
+    from a fixed map.  So the selection is wrapped here: plain MHA/GQA goes to TileInfer, MLA /
+    sparse / compressed keep the Ascend default.
+
+    This is a shim over an upstream decision, not a capability of the plugin API, and it is isolated
+    in this function so it can be deleted the day vLLM-Ascend exposes a hook.
+    """
+    from vllm_ascend.platform import NPUPlatform
+
+    if getattr(NPUPlatform, "_tileinfer_shim", False):
+        return
+    original = NPUPlatform.get_attn_backend_cls.__func__
+    path = f"{__name__}.TileInferBackend"
+
+    @classmethod
+    def get_attn_backend_cls(cls, selected_backend, attn_selector_config, num_heads=None):
+        native = (
+            getattr(attn_selector_config, "use_mla", False)
+            or getattr(attn_selector_config, "use_sparse", False)
+            or getattr(attn_selector_config, "use_compress", False)
+        )
+        if not native:
+            logger.info("TileInfer: taking the attention backend slot for plain MHA/GQA")
+            return path
+        return original(cls, selected_backend, attn_selector_config, num_heads)
+
+    NPUPlatform.get_attn_backend_cls = get_attn_backend_cls
+    NPUPlatform._tileinfer_shim = True
+    logger.info("TileInfer: vLLM-Ascend backend selection shim installed")
+
+
+def _build_classes_into_module() -> None:
+    """(Re)build the vLLM-Ascend classes into this module's globals."""
+    global TileInferBackend, TileInferImpl
+    TileInferBackend, TileInferImpl = _build_classes()
 
 
 def install(raise_on_failure: bool = True) -> bool:
@@ -314,11 +390,33 @@ def install(raise_on_failure: bool = True) -> bool:
     Call this *after* ``vllm_ascend`` has been imported and *before* vLLM selects a backend (the
     runner script does it before touching the CLI).  Returns ``True`` when the registration took.
     """
+    if not __import__("os").environ.get("TILEINFER_VLLM"):
+        logger.warning(
+            "TileInfer's vLLM integration is opt-in: set TILEINFER_VLLM=1 to enable it.  Decode "
+            "through the kernel currently faults the device inside an EngineCore (see "
+            "docs/known-issues.md KI-1), so it stays off unless asked for explicitly."
+        )
+        return False
+
     try:
         from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 
-        backend_cls, _ = _build_classes()
-        register_backend(AttentionBackendEnum.CUSTOM, backend_cls)
+        if TileInferBackend is None:
+            _build_classes_into_module()
+
+        path = f"{__name__}.TileInferBackend"
+        # vLLM's registry stores a *dotted path* and resolves it with importlib + rsplit; handing it
+        # a class object registers nothing and vLLM then falls back to the default backend without
+        # complaining.  Hence the path, and hence the check below.
+        register_backend(AttentionBackendEnum.CUSTOM, path)
+
+        _install_backend_selection_shim()
+        resolved = AttentionBackendEnum.CUSTOM.get_class()
+        if resolved is not TileInferBackend:
+            raise RuntimeError(
+                f"the CUSTOM slot resolves to {resolved!r}, not TileInferBackend - the registration "
+                "did not take effect (another plugin registered after us?)"
+            )
         logger.info(
             "TileInfer registered as the CUSTOM attention backend (decode accelerated, "
             "prefill falls back to vLLM-Ascend)"

@@ -14,11 +14,21 @@ import sys
 
 
 def main() -> int:
+    import os
+
     import vllm_ascend  # noqa: F401  (its platform registers the Ascend backends)
 
-    from tileinfer.integrations import vllm_ascend as ti
+    if os.environ.get("TILEINFER_DISABLE"):
+        # the baseline: vLLM-Ascend's own (FIA) path, for an A/B comparison of the same prompt
+        print("[tileinfer] TILEINFER_DISABLE is set - serving with the stock Ascend backends")
+    else:
+        from tileinfer.integrations import vllm_ascend as ti
 
-    ti.install()
+        if not ti.install():
+            raise SystemExit("TileInfer could not register its attention backend")
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        print("[tileinfer] CUSTOM backend resolves to:", AttentionBackendEnum.CUSTOM.get_class())
 
     from vllm.entrypoints.cli.main import main as vllm_main
 
