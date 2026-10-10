@@ -1,5 +1,7 @@
 # Next tasks
 
+> Where each of these stands, and what is already finished, is in [`status.md`](status.md).
+
 A working list, ordered by value ÷ cost.  Each entry says **what**, **why**, the **first step** (a file
 or a command, not a plan) and **done when**.  Everything here is grounded in what the repo already
 contains; nothing is speculative.
