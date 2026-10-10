@@ -29,6 +29,8 @@ import torch
 
 __all__ = [
     "AttentionMode",
+    "ragged_from_page_table_device",
+    "pad_batch",
     "RaggedMetadata",
     "PageTable",
     "as_int32",
@@ -354,6 +356,91 @@ class RaggedMetadata:
             int(self.kv_lens.min().item()) if self.batch_size else 0,
             str(self.kv_indptr.device),
         )
+
+
+def ragged_from_page_table_device(
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_size: int,
+    device: Optional[torch.device] = None,
+) -> RaggedMetadata:
+    """Dense page table → ragged metadata, **on the device and without host syncs**.
+
+    Engines hand over a dense ``block_tables`` whose *contents* change every step (a new token needs
+    a new slot, a new page).  :meth:`PageTable.to_ragged` cannot be used there: it walks requests in
+    a Python loop and therefore costs a host sync per request, which is exactly what a captured step
+    must not do.  This does the same conversion with vectorised tensor ops instead:
+
+    * ``kv_indptr`` = cumulative used pages,
+    * ``kv_indices`` = the used entries of the table, in row-major order (i.e. per request, in logical
+      page order — which is what the kernels rely on),
+    * ``kv_last_page_len`` = ``(seq_len - 1) % page_size + 1``.
+
+    The number of pages covered is the table's *shape*, so the metadata is stable across steps and a
+    plan built from it stays valid while the contents move.
+    """
+    device = device or block_table.device
+    table = block_table.to(device)
+    lens = as_int32(seq_lens, device)
+    pages_per_seq = (lens + page_size - 1) // page_size  # [batch]
+
+    indptr = torch.zeros(lens.numel() + 1, dtype=torch.int32, device=device)
+    indptr[1:] = torch.cumsum(pages_per_seq.to(torch.int64), dim=0).to(torch.int32)
+
+    max_pages = table.shape[1]
+    cols = torch.arange(max_pages, dtype=torch.int32, device=device).unsqueeze(0)
+    used = cols < pages_per_seq.unsqueeze(1)  # [batch, max_pages]
+    indices = table.to(torch.int32).masked_select(used)  # row-major: request by request, in order
+    last_page_len = ((lens - 1) % page_size + 1).to(torch.int32)
+
+    return RaggedMetadata(
+        kv_indptr=indptr,
+        kv_indices=indices.contiguous(),
+        kv_last_page_len=last_page_len,
+        page_size=page_size,
+    )
+
+
+def pad_batch(meta: RaggedMetadata, bucket: int, page_size: int, dummy_page: int = 0) -> RaggedMetadata:
+    """Pad a batch up to ``bucket`` requests with a harmless dummy request.
+
+    Serving steps change batch size constantly; a kernel compiled for every size would recompile
+    forever, so engines run a handful of buckets instead.  Padded requests must still look *valid* to
+    the kernel - one page with one valid token - otherwise the softmax denominator is zero and the
+    padded rows come out as ``0/0``.  Their outputs are simply never read.
+    """
+    if meta.batch_size > bucket:
+        raise ValueError(f"batch of {meta.batch_size} does not fit the bucket {bucket}")
+    pad = bucket - meta.batch_size
+    if pad == 0:
+        return meta
+
+    device = meta.device
+    indptr = torch.cat(
+        [meta.kv_indptr, meta.kv_indptr[-1] + torch.arange(1, pad + 1, dtype=torch.int32, device=device)]
+    )
+    indices = torch.cat(
+        [meta.kv_indices, torch.full((pad,), dummy_page, dtype=torch.int32, device=device)]
+    )
+    assert meta.kv_last_page_len is not None
+    last_page_len = torch.cat(
+        [meta.kv_last_page_len, torch.ones(pad, dtype=torch.int32, device=device)]
+    )
+    qo_indptr = None
+    if meta.qo_indptr is not None:
+        qo_indptr = torch.cat(
+            [
+                meta.qo_indptr,
+                meta.qo_indptr[-1] + torch.arange(1, pad + 1, dtype=torch.int32, device=device),
+            ]
+        )
+    return RaggedMetadata(
+        kv_indptr=indptr,
+        kv_indices=indices,
+        kv_last_page_len=last_page_len,
+        page_size=max(page_size, meta.page_size, 1),
+        qo_indptr=qo_indptr,
+    )
 
 
 def detect_mode(

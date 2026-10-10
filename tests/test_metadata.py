@@ -112,3 +112,63 @@ def test_pad_to_multiple():
     assert pad_to_multiple(129, 128) == 256
     with pytest.raises(ValueError):
         pad_to_multiple(4, 0)
+
+
+def test_ragged_from_page_table_device_matches_the_host_conversion():
+    """The device-side conversion must agree with the (slow) host one, padding and all."""
+    from tileinfer.metadata import ragged_from_page_table_device
+
+    seq_lens = torch.tensor([130, 256, 1, 128], dtype=torch.int32)
+    table = PageTable.from_seq_lens(seq_lens, page_size=128).table
+
+    host = PageTable(table=table, seq_lens=seq_lens, page_size=128).to_ragged()
+    device = ragged_from_page_table_device(table, seq_lens, page_size=128)
+
+    assert device.kv_indptr.tolist() == host.kv_indptr.tolist()
+    assert device.kv_indices.tolist() == host.kv_indices.tolist()
+    assert device.kv_last_page_len.tolist() == host.kv_last_page_len.tolist()
+    device.validate()
+
+
+def test_ragged_from_page_table_device_with_a_perturbed_table():
+    """A table whose contents moved (the serving case) converts to the moved contents."""
+    from tileinfer.metadata import ragged_from_page_table_device
+
+    seq_lens = torch.tensor([300, 100], dtype=torch.int32)
+    table = PageTable.from_seq_lens(seq_lens, page_size=128).table
+    table = table[:, :3].clone()
+    table[0, 0], table[1, 0] = 7, 9  # values change between steps
+
+    meta = ragged_from_page_table_device(table, seq_lens, page_size=128)
+    assert meta.kv_indptr.tolist() == [0, 3, 4]
+    assert meta.kv_indices.tolist() == [7, 1, 2, 9]
+    assert meta.kv_last_page_len.tolist() == [44, 100]
+
+
+def test_pad_batch_keeps_the_live_requests_and_makes_padding_valid():
+    from tileinfer.metadata import pad_batch
+
+    meta = RaggedMetadata.contiguous([128, 200], page_size=128, qo_lens=[1, 1])
+    padded = pad_batch(meta, bucket=4, page_size=128)
+
+    assert padded.batch_size == 4
+    # the live part is untouched
+    assert padded.kv_lens.tolist()[:2] == [128, 200]
+    assert padded.kv_indptr.tolist() == [0, 1, 3, 4, 5]
+    # padded requests are *valid*: one page, one token (otherwise the softmax divides by zero)
+    assert padded.kv_last_page_len.tolist()[2:] == [1, 1]
+    assert padded.kv_lens.tolist()[2:] == [1, 1]
+    assert padded.qo_lens.tolist() == [1, 1, 1, 1]
+    padded.validate()
+
+
+def test_vllm_integration_imports_without_vllm_and_buckets():
+    """The integration module must import in a plain environment (vLLM is optional) and its bucket
+    lookup must never silently overflow."""
+    import tileinfer.integrations.vllm_ascend as ti
+
+    assert ti._bucket_for(1) == 1
+    assert ti._bucket_for(3) == 4
+    assert ti._bucket_for(256) == 256
+    with pytest.raises(ValueError, match="exceeds the largest TileInfer bucket"):
+        ti._bucket_for(257)
