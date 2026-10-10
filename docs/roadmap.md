@@ -30,7 +30,8 @@ Status legend: ✅ done · 🟡 in progress · ⏳ not started
 | Investigate KI-1 (vector-core exception when several split shapes share a process) | ⏳ **next** |
 | FIA baseline on the same shapes for the tile-level comparison | ⏳ needs a working FIA call on this stack |
 | Split-KV merge kernel (`kv_tile_pages > 0`) | ⏳ plan + reference implementation + tests done |
-| **Prefill / append** kernel (causal, `qo_len > 1`, chunked prefill) | 🟡 written + wired (`forward_prefill`); single-tile (incl. the append causal offset) validated, multi-tile WIP — see [`known-issues.md`](known-issues.md#wip-1--multi-tile-prefill-is-off-open) |
+| **Prefill / append** kernel (causal, `qo_len > 1`, chunked prefill) | ✅ validated on device (prefill, append, partial tail page, ragged batch) — tiles are planned at `block_q // 2` rows because the causal mask needs the global row index (PM-2) |
+| Prefill: recover the wasted half of the M tile via explicit `T.Cube()` / `T.Vector(2) as sid:` blocks (~2x on prefill) | ⏳ **next** |
 | Perf pass: `T.Pipelined` over pages, L0 staging, tile-size sweep, and a fair comparison against upstream's 320–362 TFLOPS dense FA | ⏳ |
 
 Exit criteria: decode matches the reference on device for the full shape grid; prefill matches for

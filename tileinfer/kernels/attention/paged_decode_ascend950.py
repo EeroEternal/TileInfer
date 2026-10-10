@@ -516,6 +516,18 @@ def paged_prefill_ascend950(
       ``<= p_q + causal_shift``, where ``causal_shift = kv_len - qo_len``.  That is the offset that
       makes chunked prefill and speculative decoding correct: row 0 of a chunk sees the cached
       prefix, not position 0.
+
+    **Constraint on the tile size (read before changing `block_q`).**  The mask is row-dependent, and
+    the row index available inside the vector region is *per-AIV*: `dual_copy` splits the M tile over
+    the two AIVs and each one sees `ROWS = block_q // 2` rows starting at 0.  A local row index equals
+    the global one only when every *live* row of the tile lands in the first half, i.e. when
+
+        tile rows <= ROWS = block_q // 2
+
+    The caller must therefore plan its query tiles with `block_q // 2` rows; ``forward_prefill``
+    enforces that.  The cost is that half of the M tile is padding.  The proper fix is to get the AIV
+    index (``with T.Vector(vector=2) as sid:``, the explicit Cube/Vector structure) and mask with
+    ``sid * ROWS + r``; that restructure is tracked in docs/known-issues.md.
     """
     BR = block_q
     BC = page_size
@@ -815,6 +827,15 @@ def forward_prefill(
     br = block_q
     num_tiles = schedule.num_tiles
     assert num_qo_heads == kv_heads * group
+    # see the kernel docstring: a tile's live rows must fit in the first AIV half, otherwise the
+    # per-AIV row index used by the causal mask is not the global one
+    if num_tiles and int(schedule.q_lens.max().item()) > br // 2:
+        raise ValueError(
+            f"prefill tiles carry up to {int(schedule.q_lens.max().item())} rows but the kernel's "
+            f"block_q={br} only supports {br // 2} live rows per tile.  Plan the query tiles with "
+            f"block_q={br // 2} (see the kernel docstring: the causal mask needs the global row "
+            f"index, and only the first AIV half has it)."
+        )
 
     # [batch, kv_heads, group, q_pos, dim] -> [batch, kv_heads, q_pos * group, dim]
     q_flat = (
