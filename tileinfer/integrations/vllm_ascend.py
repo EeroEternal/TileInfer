@@ -160,6 +160,7 @@ class TileInferDecodeAttention:
         from tileinfer import BatchAttention
         from tileinfer.metadata import RaggedMetadata
 
+        _diag("build_plan")
         if self._attn is None:
             self._attn = BatchAttention(backend="tilelang-ascend950", device=self.device, dtype=self.dtype)
 
@@ -425,6 +426,27 @@ def _install_backend_selection_shim() -> None:
     logger.info("TileInfer: vLLM-Ascend backend selection shim installed")
 
 
+def _diag(tag: str) -> None:
+    """One-shot diagnostics for KI-2: what does the registry look like in *this* process?
+
+    Temporary, warning-level on purpose (vLLM's default level filters our INFO lines), and it names
+    the module file so a duplicate-module-identity problem is visible at a glance.
+    """
+    try:
+        import tileinfer
+        from tileinfer.attention.backends.base import _IMPORT_ERRORS, _REGISTRY, list_backends
+
+        logger.warning(
+            "TileInfer diag[%s]: module=%s registry=%s errors=%s",
+            tag,
+            getattr(tileinfer, "__file__", "?"),
+            sorted(_REGISTRY),
+            {k: f"{type(v).__name__}: {v}"[:90] for k, v in _IMPORT_ERRORS.items()},
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("TileInfer diag[%s] failed: %r", tag, exc)
+
+
 def _build_classes_into_module() -> None:
     """(Re)build the vLLM-Ascend classes into this module's globals."""
     global TileInferBackend, TileInferImpl
@@ -443,6 +465,9 @@ def install(raise_on_failure: bool = True) -> bool:
     global _INSTALLED
     if _INSTALLED:
         return True
+
+    logging.getLogger("tileinfer").setLevel(logging.INFO)
+    _diag("install")
 
     if not __import__("os").environ.get("TILEINFER_VLLM"):
         logger.warning(

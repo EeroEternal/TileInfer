@@ -62,9 +62,17 @@ Two changes made while chasing this are worth keeping and are now permanent: the
 the merge kernel stores a **full padded tile** (`BR` rows) rather than only the live `group` rows, so
 every write is tile-aligned and in-bounds by construction.
 
-## KI-2 — bundled backends do not register inside a vLLM EngineCore (open)
+## KI-2 — bundled backends did not register inside a vLLM EngineCore (resolved)
 
-**Status:** open · affects the vLLM integration only (the standalone library is fine).
+**Status:** resolved - `_ensure_builtin_backends()` returned early as soon as `reference` was
+registered, so a failure while importing a later backend left the registry permanently incomplete and
+the user saw "unknown backend" with no reason.  It now imports each backend independently, collects
+failures in `_IMPORT_ERRORS`, and quotes them in the error message.  Verified inside an EngineCore:
+`registry=['reference', 'tilelang', 'tilelang-ascend950']` with `errors={}`.
+
+The original note follows.
+
+**History:** affects the vLLM integration only (the standalone library is fine).
 
 In the vLLM plugin's own process every bundled backend registers
 (`['reference', 'tilelang', 'tilelang-ascend950']`); inside the EngineCore `list_backends()` returns
