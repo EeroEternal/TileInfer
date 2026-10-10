@@ -384,12 +384,19 @@ def _build_classes_into_module() -> None:
     TileInferBackend, TileInferImpl = _build_classes()
 
 
+_INSTALLED = False
+
+
 def install(raise_on_failure: bool = True) -> bool:
     """Register TileInfer in vLLM's ``CUSTOM`` attention slot.
 
     Call this *after* ``vllm_ascend`` has been imported and *before* vLLM selects a backend (the
     runner script does it before touching the CLI).  Returns ``True`` when the registration took.
     """
+    global _INSTALLED
+    if _INSTALLED:
+        return True
+
     if not __import__("os").environ.get("TILEINFER_VLLM"):
         logger.warning(
             "TileInfer's vLLM integration is opt-in: set TILEINFER_VLLM=1 to enable it.  Decode "
@@ -417,6 +424,7 @@ def install(raise_on_failure: bool = True) -> bool:
                 f"the CUSTOM slot resolves to {resolved!r}, not TileInferBackend - the registration "
                 "did not take effect (another plugin registered after us?)"
             )
+        _INSTALLED = True
         logger.info(
             "TileInfer registered as the CUSTOM attention backend (decode accelerated, "
             "prefill falls back to vLLM-Ascend)"

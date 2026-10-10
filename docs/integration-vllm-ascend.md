@@ -20,10 +20,37 @@ document explains the design decisions behind it.
 * the server serves coherent completions on the stock path (37 prompt + 24 generated tokens in 2.8 s
   on Qwen2.5-0.5B).
 
-**Blocked on KI-1**: the first decode *through the TileLang kernel* inside the EngineCore faults the
-device (`vector core exception`, 507035) even though the identical shape passes standalone, so the
-integration is **opt-in** (`TILEINFER_VLLM=1`) and must stay off until that is fixed.  See
-[`known-issues.md`](known-issues.md#ki-1--split-kv-wedges-the-device-when-several-shapes-share-one-process-open).
+**Registered as an official vLLM plugin, and the decode path is reached.**  The correct mechanism is
+an entry point, not an import hook:
+
+```toml
+[project.entry-points."vllm.general_plugins"]
+tileinfer = "tileinfer.integrations.vllm_ascend:install"
+```
+
+vLLM calls it in *every* process that loads plugins (API server, EngineCore, workers), after its own
+imports are done - which is what a `sitecustomize.py` cannot do: that runs before vLLM is importable,
+`import vllm_ascend.ops` fails, and the swallowed exception leaves the backend unregistered with no
+trace.  Verified: `importlib.metadata.entry_points(group="vllm.general_plugins")` lists
+`tileinfer`, and with `TILEINFER_VLLM=1` the EngineCore log shows **our TileLang kernel being
+compiled inside the engine** (the generated CCE with the CANN headers) - i.e. `forward_impl` reached
+`_plan()`.
+
+**What is not solved: the first-use compile inside the engine.**  Standalone that compile takes ~2
+minutes; inside the EngineCore it was still running after 20+ minutes (the compiler's diagnostics
+flood the EngineCore's logger, and the process is CPU-starved next to vLLM's workers).  A serving
+process cannot compile on the first request anyway, so the fix is a **warm-up**: compile the buckets a
+deployment will use at start-up (`build_decode_kernel(...)` for each bucket, with `TILELANG_CACHE_DIR`
+warm), and keep the compile out of the request path.  Until that is done the integration stays
+**opt-in** (`TILEINFER_VLLM=1`).
+
+Two earlier claims are worth correcting explicitly:
+
+* an intermittent device fault seen in the EngineCore was **not** ours - the same server, model and
+  request with TileInfer switched off (`TILEINFER_DISABLE=1`) crashes identically, so that model
+  (a hand-made tiny Qwen2) is at fault; the retraction is recorded in `known-issues.md`;
+* the numerical A/B run *before* the plugin mechanism was fixed compared FIA against FIA (identical
+  logprobs to 4 decimals), so it proved nothing about our kernel - it is not quoted as a result.
 
 Four things about the platform cost real time and are worth knowing before touching this code:
 

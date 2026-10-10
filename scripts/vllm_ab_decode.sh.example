@@ -1,0 +1,64 @@
+#!/bin/bash
+# A/B the vLLM decode path: TileInfer vs the stock Ascend FIA, on a real head_dim=128 model.
+# One server at a time, same prompt; compares the first decode step's top-5 logprobs and the wall
+# time of a 128-token greedy generation.  See docs/integration-vllm-ascend.md.
+# A/B on a real head_dim=128 model: TileInfer decode vs the stock Ascend FIA path.
+set -u
+Z=/home/userlist/zxs/TileInfer
+source $Z/.work/cann930/install/cann/set_env.sh
+export LD_LIBRARY_PATH=/home/lipi/glibcxx:${LD_LIBRARY_PATH}
+export ACL_OP_INIT_MODE=1 TILELANG_CACHE_DIR=/tmp/tl_cache_vllm
+export TILEINFER_ROOT=/home/lipi/TileInfer PYTHONPATH=/home/lipi/TileInfer:${PYTHONPATH:-}
+export VLLM_NO_USAGE_STATS=1 VLLM_DO_NOT_TRACK=1 VLLM_LOGGING_LEVEL=INFO
+MODEL=/home/lipi/models/qwen2.5-1.5b
+PY=/home/lipi/venv_vllm/bin/python
+PROMPT='Write a short paragraph about tiles.'
+
+stop() { for p in $(ps -eo pid,args --no-headers | awk '/vllm_tileinfer_launch|VLLM::EngineCore/ && !/awk/ {print $1}'); do kill -TERM "$p" 2>/dev/null; done; sleep 12; }
+
+start() {  # $1 log, $2 env
+  stop
+  env $2 setsid nohup $PY $TILEINFER_ROOT/scripts/vllm_tileinfer_launch.py serve $MODEL \
+    --host 127.0.0.1 --port 8100 --served-model-name ti --attention-backend CUSTOM \
+    --max-model-len 2048 --enforce-eager --gpu-memory-utilization 0.3 --trust-remote-code \
+    > "$1" 2>&1 < /dev/null &
+  for i in $(seq 1 90); do grep -aq "Application startup complete" "$1" && return 0; sleep 10; done
+  echo "  server did not start"; return 1
+}
+
+steps() {  # $1 = label
+  echo "--- $1: first decode step (top-5 logprobs) ---"
+  curl -s --max-time 1800 http://127.0.0.1:8100/v1/chat/completions -H "Content-Type: application/json" \
+    -d "{\"model\":\"ti\",\"messages\":[{\"role\":\"user\",\"content\":\"$PROMPT\"}],\"max_tokens\":1,\"temperature\":0,\"logprobs\":true,\"top_logprobs\":5}" \
+  | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+items=(d['choices'][0].get('logprobs') or {}).get('content') or []
+for it in items[:1]:
+    print('   token:', repr(it['token']), '| top5:', [(t['token'], round(t['logprob'],4)) for t in (it.get('top_logprobs') or [])])
+" 2>&1 | tail -2
+  echo "--- $1: 128-token greedy generation (wall time) ---"
+  T0=$(date +%s.%N)
+  curl -s --max-time 1800 -o /tmp/gen_$1.json http://127.0.0.1:8100/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d "{\"model\":\"ti\",\"messages\":[{\"role\":\"user\",\"content\":\"$PROMPT\"}],\"max_tokens\":128,\"temperature\":0}"
+  T1=$(date +%s.%N)
+  echo "   wall=$(python3 -c "print(f'{$T1-$T0:.2f}s')")"
+  python3 -c "
+import json
+d=json.load(open('/tmp/gen_$1.json'))
+print('   completion_tokens:', d['usage']['completion_tokens'])
+print('   text head:', repr(d['choices'][0]['message']['content'][:70]))
+" 2>&1 | tail -2
+}
+
+echo "########## A) TileInfer decode (TILEINFER_VLLM=1) ##########"
+if start /home/lipi/logs/real_ours2.log "TILEINFER_VLLM=1"; then
+  steps ours
+  echo "--- TileInfer traces ---"; grep -aE "TileInfer plan ready|begins to compile|decode disabled|falling back" /home/lipi/logs/real_ours2.log | tail -3
+fi
+
+echo "########## B) stock Ascend FIA (TILEINFER_DISABLE=1) ##########"
+if start /home/lipi/logs/real_fia.log "TILEINFER_DISABLE=1"; then steps fia; fi
+stop
+echo "done"

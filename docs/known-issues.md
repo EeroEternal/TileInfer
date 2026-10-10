@@ -100,34 +100,30 @@ A vector-core exception is not a wrong number: it wedges the device for the rest
 any engine that hit it would take the whole serving process down.  Until it is understood, split-KV
 is opt-in, and the documented way to get the 3x is to run it per shape (or in a fresh process).
 
-### Second reproducer: the first decode inside a vLLM EngineCore
+### Retracted: the vLLM EngineCore fault was not ours
 
-The integration (`docs/integration-vllm-ascend.md`) reaches the kernel and then dies the same way.
-With a deliberately tiny model whose shape the kernel supports (`head_dim=128`, `group=2`, one
-decode step, `max_tokens=1`):
+An earlier revision of this file claimed a second reproducer - the first decode inside a vLLM
+EngineCore faulting with the same 507035.  That is **withdrawn**: the same server, same model, same
+request with TileInfer switched off (`TILEINFER_DISABLE=1`, so the stock Ascend FIA path) crashes
+identically.  The model in that experiment was a hand-made tiny Qwen2 (2 layers, vocab 1024, random
+weights) built to get `head_dim=128` on a box that has none; something in that configuration faults on
+this stack regardless of the attention backend, and it is not our bug.
 
-```
-(EngineCore) rtEventSynchronize execution failed, reason=vector core exception
-(EngineCore) RuntimeError: npuSynchronizeDevice ... error code is 507035
-```
+What *is* verified in vLLM is in [`integration-vllm-ascend.md`](integration-vllm-ascend.md): the
+backend registers, is selected, is entered for decode-only batches, and declines configurations its
+kernel cannot serve (Qwen2.5-0.5B's `head_size=64`) with a logged reason before falling back to FIA.
 
-Same kernel, same shapes, standalone (colleague's venv, CANN 9.3.0, `group` in {2,4,8}):
-`max|diff| <= 0.0012` — clean.  So the shapes are fine and the *context* is not:
+Three more hypotheses for KI-1 were tested and **refuted** while chasing this, and each one is a
+result worth keeping:
 
-| context | result |
-|---|---|
-| lean process, one shape (device tests, probes) | clean |
-| lean process, small group (2/4/8) | clean |
-| benchmark sweep, three shapes in one process | faults on the third |
-| vLLM EngineCore, one decode step | faults |
+| Hypothesis | Experiment | Result |
+|---|---|---|
+| caller buffers unaligned | slice every input out of a bigger allocation at 2 B / 16 B / 128 B / 512 B offsets | clean at every offset |
+| pool larger than 2 GiB overflows 32-bit addressing | compile and run against pools of 0.5 / 2.4 / 7.3 GiB | clean at every size |
+| the kernel ignores the caller's NPU stream | write the page on a non-default stream, launch immediately, ask which content it saw | saw the new content: ordering respected |
 
-**Hypothesis worth testing next**: buffer *alignment / allocation history*.  The kernel binary is
-fixed (its UB/L1 layout is decided at compile time), so what varies between these contexts is the
-addresses and alignment of the tensors handed to it — `torch.randn` in a fresh process gives
-different (aligned) addresses than a fragmented pool or vLLM's own NPU allocator.  The experiment is
-small: slice the KV cache and the page table out of a larger allocation at unaligned offsets and see
-whether the standalone case starts faulting.  If it does, the fix is in the kernel's DMA widths
-(vectorised copies assume an alignment the caller cannot guarantee), and the same fix closes KI-1.
+So KI-1 remains what it was: the split path, several shapes in one process, no reproducer outside the
+sweep.
 
 ### Reproducer, and what has been ruled out (updated)
 

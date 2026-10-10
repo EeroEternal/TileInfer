@@ -28,6 +28,12 @@ dependencies = ["torch>=2.0"]
 dev = ["pytest>=7", "pytest-timeout", "tabulate", "rich"]
 npu = ["torch_npu"]
 
+# vLLM loads these in *every* process of a server (API server, EngineCore, workers), which is
+# exactly what an attention backend needs - see docs/integration-vllm-ascend.md.  The plugin is a
+# no-op unless TILEINFER_VLLM=1.
+[project.entry-points."vllm.general_plugins"]
+tileinfer = "tileinfer.integrations.vllm_ascend:install"
+
 [project.urls]
 Homepage = "https://github.com/EeroEternal/TileInfer"
 Documentation = "https://github.com/EeroEternal/TileInfer/tree/main/docs"
