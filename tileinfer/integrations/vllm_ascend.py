@@ -127,6 +127,219 @@ def _bucket_for(num_reqs: int) -> int:
     )
 
 
+# ---------------------------------------------------------------------------------------
+# B1: prefill / append through the TileLang prefill kernel.
+#
+# Unlike decode, a prefill step always runs eager (never inside an ACLGraph capture), so the
+# host-side work here — per-request loops, ``.item()`` syncs, a ``masked_select`` page-table
+# walk — is acceptable; the B3 profile decides later how much of it matters.  What *does*
+# matter is kernel-variant control: the prefill kernel compiles per
+# ``(batch, kv_heads, group, dim, page, pool_pages, num_tiles, block_q)``, and ``num_tiles``
+# depends on the prompt/chunk sizes.  :class:`PrefillShapeManager` compiles every new shape in
+# a background thread (FIA serves meanwhile) and caps the total number of variants so a weird
+# workload can neither stall a step with a synchronous compile nor compile without bound.
+# ---------------------------------------------------------------------------------------
+
+#: Upper bound on tiles per prefill step; above this the shape stays on FIA for good (a tile is
+#: 128 ``(q_pos, head)`` rows, so 4096 tiles ≈ a 64K-token chunk at group=8).
+PREFILL_MAX_TILES = int(__import__("os").environ.get("TILEINFER_PREFILL_MAX_TILES", "4096"))
+
+
+class PrefillShapeManager:
+    """Lazy background compiler for the prefill kernel's shape variants (BACKLOG B1)."""
+
+    _ready: set = set()
+    _building: set = set()
+    _lock = threading.Lock()
+    _cap = int(__import__("os").environ.get("TILEINFER_PREFILL_MAX_VARIANTS", "32"))
+
+    @classmethod
+    def usable(cls, spec: tuple) -> bool:
+        """True when ``spec`` is compiled; otherwise kick off a background compile (once).
+
+        The caller must fall back to FIA for this step when False — a compile takes ~90 s and
+        must never run on the serving path.
+        """
+        if spec in cls._ready:
+            return True
+        with cls._lock:
+            if spec in cls._building:
+                return False
+            if len(cls._ready) >= cls._cap:
+                return False  # variant budget exhausted: this shape permanently stays on FIA
+            cls._building.add(spec)
+        logger.info("TileInfer: compiling prefill kernel for shape %s in the background", spec)
+        threading.Thread(target=cls._compile, args=(spec,), daemon=True).start()
+        return False
+
+    @classmethod
+    def _compile(cls, spec: tuple) -> None:
+        try:
+            from tileinfer.kernels.attention.paged_decode_ascend950 import build_prefill_kernel
+
+            (
+                batch,
+                kv_heads,
+                group,
+                dim,
+                page,
+                pool_pages,
+                num_tiles,
+                block_q,
+                dtype_name,
+            ) = spec
+            build_prefill_kernel(
+                batch=batch,
+                kv_heads=kv_heads,
+                group=group,
+                dim=dim,
+                page_size=page,
+                num_pages_cap=pool_pages,
+                num_tiles=num_tiles,
+                block_q=block_q,
+                dtype=dtype_name,
+            )
+            cls._ready.add(spec)
+            logger.info("TileInfer prefill kernel READY: %s", spec)
+        except Exception:  # noqa: BLE001 - a compile failure must not kill the engine
+            logger.exception("TileInfer: prefill compile failed for %s; staying on FIA", spec)
+        finally:
+            with cls._lock:
+                cls._building.discard(spec)
+
+
+_REFUSE_LOGGED: set = set()
+
+
+def _refuse(reason: str, got, expect) -> None:
+    """Log a prefill refusal once per reason (the counters still record every step)."""
+    if reason not in _REFUSE_LOGGED:
+        _REFUSE_LOGGED.add(reason)
+        logger.info("TileInfer prefill refused (%s): got=%s expect=%s", reason, got, expect)
+
+
+def prefill_step(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    block_size: int,
+    output: torch.Tensor,
+    *,
+    num_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+    scale: float,
+) -> bool:
+    """One prefill/append step through the TileLang prefill kernel (BACKLOG B1).
+
+    ``query`` is ``[num_tokens, num_heads, head_size]`` with ``num_tokens == sum(qo_lens)``;
+    ``seq_lens`` are the *full* KV lengths in tokens (the step's K/V has already been written to
+    the pool by ``reshape_and_cache`` before this runs — verified against vllm-ascend's
+    ``forward``); ``query_start_loc`` is the cumulative token offset per request.  Covers
+    PrefillNoCache (``kv_len == qo_len``), PrefillCacheHit and ChunkedPrefill (append to a cached
+    prefix) uniformly: the kernel's per-row causal threshold ``q_pos + (kv_len - qo_len)`` makes
+    all three the same computation.
+
+    Returns True when TileInfer served the step; False means "use FIA" (shape not compiled yet
+    or structurally unsupported).  Eager-only: must not be called under a graph capture.
+    """
+    num_reqs = int(seq_lens.numel())
+    if num_reqs == 0 or num_reqs != int(query_start_loc.numel()) - 1:
+        _refuse("req/qsl mismatch", num_reqs, int(query_start_loc.numel()) - 1)
+        return False
+    group = max(1, num_heads // num_kv_heads)
+    qo_host = (query_start_loc[1:] - query_start_loc[:-1]).to(torch.int64).cpu().tolist()
+    if sum(qo_host) != int(query.shape[0]):
+        # 常见原因:runner 对 query 做了 token 填充(短批尤甚)。padding 行的输出会被 vLLM
+        # 裁掉,因此只要 sum(qo) <= num_tokens 就可以安全接管,多余行不读不写。
+        if sum(qo_host) > int(query.shape[0]):
+            _refuse("qo sum exceeds tokens", sum(qo_host), int(query.shape[0]))
+            return False
+    max_tiles = sum((q * group + 127) // 128 for q in qo_host)
+    if max_tiles == 0 or max_tiles > PREFILL_MAX_TILES:
+        _refuse("tile bound", max_tiles, PREFILL_MAX_TILES)
+        return False
+
+    from tileinfer.metadata import ragged_from_page_table_device
+    from tileinfer.plan import plan_query_tiles
+
+    device = query.device
+    sub = _sub_pages(block_size)
+    table_exp = _expand_page_table(block_tables[:num_reqs], sub)
+    # Kernel-page metadata: the same masking the decode path does, but eager (masked_select's
+    # implicit sync is fine outside a capture).
+    meta = ragged_from_page_table_device(table_exp, seq_lens[:num_reqs], KERNEL_PAGE_SIZE)
+
+    max_qo = max(qo_host)
+    # [num_tokens, H, D] -> [batch, H, max_qo, D]: one permuted copy per request.  Rows past
+    # qo_lens[b] stay zero; the kernel's row thresholds mask them out of the softmax.
+    q_pad = torch.zeros(
+        (num_reqs, num_heads, max_qo, head_size), dtype=query.dtype, device=device
+    )
+    offset = 0
+    for b, qo in enumerate(qo_host):
+        if qo:
+            q_pad[b, :, :qo].copy_(query[offset : offset + qo].permute(1, 0, 2))
+        offset += qo
+
+    dtype_name = _TORCH_DTYPE_NAME.get(query.dtype)
+    if dtype_name is None:
+        _refuse("dtype", str(query.dtype), "bfloat16/float16")
+        return False
+    pool_pages = int(_pool_sub_view(key_cache, sub).shape[0])
+    spec = (
+        num_reqs,
+        num_kv_heads,
+        group,
+        head_size,
+        KERNEL_PAGE_SIZE,
+        pool_pages,
+        max_tiles,
+        128,
+        dtype_name,
+    )
+    if not PrefillShapeManager.usable(spec):
+        return False
+
+    schedule = plan_query_tiles(
+        (torch.tensor(qo_host, dtype=torch.int64, device=device) * group),
+        (meta.kv_indptr[1:] - meta.kv_indptr[:-1]).to(torch.int64),
+        block_q=128,
+        load_balance=False,
+    )
+    qo_dev = torch.tensor(qo_host, dtype=torch.int32, device=device)
+    from tileinfer.kernels.attention.paged_decode_ascend950 import forward_prefill
+
+    out4 = forward_prefill(
+        q_pad,
+        _pool_sub_view(key_cache, sub),
+        _pool_sub_view(value_cache, sub),
+        meta,
+        schedule,
+        qo_dev,
+        group=group,
+        block_q=128,
+    )
+    # Unpack [batch, H, max_qo, D] -> [num_tokens, H, D] with the engine's layout.
+    offset = 0
+    for b, qo in enumerate(qo_host):
+        if qo:
+            output[offset : offset + qo].copy_(out4[b, :, :qo].permute(1, 0, 2))
+        offset += qo
+    cls_stats = TileInferDecodeAttention._stats
+    cls_stats["prefill_calls"] = cls_stats.get("prefill_calls", 0) + 1
+    return True
+
+
+_TORCH_DTYPE_NAME = {
+    torch.bfloat16: "bfloat16",
+    torch.float16: "float16",
+}
+
+
 class TileInferDecodeAttention:
     """Decode attention for one layer: bucketed plans plus the per-step metadata refresh.
 
@@ -142,6 +355,24 @@ class TileInferDecodeAttention:
     * Under an active capture ``run()`` consults the plan cache only; a missing plan falls back to
       FIA by returning ``None`` — it must not raise and must not start a compile.
     """
+
+    # The plan cache, its in-flight/failed sets and the serving counters belong to the
+    # *configuration*, not to the layer: vLLM instantiates one of these per layer (28 for this
+    # model), and building a plan per layer multiplied a once-only cost by the layer count.
+    # Class-level (not lazily created by the first instance): the prefill path bumps the
+    # counters without ever constructing an instance.
+    _plans: Dict[Any, Any] = {}
+    _building: set = set()
+    _failed: set = set()
+    _lock = threading.Lock()
+    _attn = None
+    _marker = None
+    _stats: Dict[str, int] = {
+        "capture_calls": 0,
+        "eager_calls": 0,
+        "fallbacks": 0,
+        "exceptions": 0,
+    }
 
     def __init__(
         self,
@@ -164,23 +395,6 @@ class TileInferDecodeAttention:
         self.max_num_reqs = max_num_reqs or 0
         self._warned = False
 
-        # The plan cache, its in-flight/failed sets and the serving counters belong to the
-        # *configuration*, not to the layer: vLLM instantiates one of these per layer (28 for this
-        # model), and building a plan per layer multiplied a once-only cost by the layer count.
-        cls = TileInferDecodeAttention
-        if not hasattr(cls, "_plans"):
-            cls._plans: Dict[Any, Any] = {}
-            cls._building: set = set()
-            cls._failed: set = set()
-            cls._lock = threading.Lock()
-            cls._attn = None
-            cls._marker = None
-            cls._stats = {
-                "capture_calls": 0,
-                "eager_calls": 0,
-                "fallbacks": 0,
-                "exceptions": 0,
-            }
         self._config_key = (
             num_heads,
             num_kv_heads,
@@ -625,10 +839,26 @@ def _build_classes():
             if self._tileinfer_failed or self.key_cache is None:
                 return super().forward_impl(query, key, value, kv_cache, attn_metadata, output)
 
-            if not ops_enabled("decode"):
+            state = attn_metadata.attn_state
+            if state in (
+                AscendAttentionState.PrefillNoCache,
+                AscendAttentionState.PrefillCacheHit,
+                AscendAttentionState.ChunkedPrefill,
+            ):
+                # B1: prefill/append through the TileLang prefill kernel; every refusal
+                # (op switch off, shape not compiled yet, layout drift, exception) falls
+                # back to the parent FIA implementation for this step.
+                if not ops_enabled("prefill"):
+                    return super().forward_impl(query, key, value, kv_cache, attn_metadata, output)
+                out = self._forward_prefill_impl(query, attn_metadata, output)
+                if out is None:
+                    return super().forward_impl(query, key, value, kv_cache, attn_metadata, output)
+                return out
+
+            if state != AscendAttentionState.DecodeOnly:
                 return super().forward_impl(query, key, value, kv_cache, attn_metadata, output)
 
-            if attn_metadata.attn_state != AscendAttentionState.DecodeOnly:
+            if not ops_enabled("decode"):
                 return super().forward_impl(query, key, value, kv_cache, attn_metadata, output)
 
             block_size = int(self.key_cache.shape[1])
@@ -666,6 +896,42 @@ def _build_classes():
                     "TileInfer decode failed; falling back to the Ascend FIA path for this process"
                 )
                 return super().forward_impl(query, key, value, kv_cache, attn_metadata, output)
+
+        def _forward_prefill_impl(self, query, attn_metadata, output):
+            """Prefill/append through TileInfer; False/None means FIA (never raises)."""
+            try:
+                # Prefill always runs eager; if a capture is somehow active, do not touch it.
+                if torch.npu.is_current_stream_capturing():
+                    return None
+                device_lens = getattr(attn_metadata, "seq_lens_device", None)
+                if device_lens is None:
+                    device_lens = attn_metadata.seq_lens
+                served = prefill_step(
+                    query=query,
+                    key_cache=self.key_cache,
+                    value_cache=self.value_cache,
+                    block_tables=attn_metadata.block_tables,
+                    seq_lens=device_lens,
+                    query_start_loc=attn_metadata.query_start_loc,
+                    block_size=int(self.key_cache.shape[1]),
+                    output=output,
+                    num_heads=self.num_heads,
+                    num_kv_heads=self.num_kv_heads,
+                    head_size=self.head_size,
+                    scale=self.scale,
+                )
+                if not served:
+                    TileInferDecodeAttention._stats["prefill_fallbacks"] = (
+                        TileInferDecodeAttention._stats.get("prefill_fallbacks", 0) + 1
+                    )
+                    return None
+                return output
+            except Exception:  # noqa: BLE001 - a serving process must survive
+                logger.exception("TileInfer prefill failed; falling back to FIA for this step")
+                TileInferDecodeAttention._stats["prefill_exceptions"] = (
+                    TileInferDecodeAttention._stats.get("prefill_exceptions", 0) + 1
+                )
+                return None
 
     return TileInferBackend, TileInferImpl
 
