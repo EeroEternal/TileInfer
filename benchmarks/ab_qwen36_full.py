@@ -130,7 +130,8 @@ def scenario_single(base, model, label, prompt, max_tokens, runs):
         "ttft_ms_p50": pct(ttfts, 50), "ttft_ms_p99": pct(ttfts, 99),
         "tpot_ms_p50": pct(tpots, 50), "tpot_ms_p99": pct(tpots, 99),
         "itl_ms_p50": pct(itls, 50), "itl_ms_p99": pct(itls, 99),
-        "out_toks_median": round(statistics.median(tputs), 2),
+        # 1-token 场景无输出吞吐口径(tokens-1=0),置 None 而非报错
+        "out_toks_median": round(statistics.median(tputs), 2) if tputs else None,
     }
     print(json.dumps(out, ensure_ascii=False), flush=True)
     return out
