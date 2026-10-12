@@ -517,17 +517,14 @@ def paged_prefill_ascend950(
       makes chunked prefill and speculative decoding correct: row 0 of a chunk sees the cached
       prefix, not position 0.
 
-    **Constraint on the tile size (read before changing `block_q`).**  The mask is row-dependent, and
-    the row index available inside the vector region is *per-AIV*: `dual_copy` splits the M tile over
-    the two AIVs and each one sees `ROWS = block_q // 2` rows starting at 0.  A local row index equals
-    the global one only when every *live* row of the tile lands in the first half, i.e. when
-
-        tile rows <= ROWS = block_q // 2
-
-    The caller must therefore plan its query tiles with `block_q // 2` rows; ``forward_prefill``
-    enforces that.  The cost is that half of the M tile is padding.  The proper fix is to get the AIV
-    index (``with T.Vector(vector=2) as sid:``, the explicit Cube/Vector structure) and mask with
-    ``sid * ROWS + r``; that restructure is tracked in docs/known-issues.md.
+    **Causal mask and the two AIVs.**  The mask is row-dependent, and the row index inside the vector
+    region is *per-AIV*: `dual_copy` splits the M tile over the two AIVs and each one sees
+    `ROWS = block_q // 2` rows starting at 0.  The global row a local ``r`` belongs to is therefore
+    ``sid * ROWS + r``, and ``sid`` is not exposed to a ``T.SimtVF`` region.  Instead of deriving the
+    mask from the row index, the *caller* precomputes each row's causal threshold ``q_pos + shift``
+    into ``RowThr`` (rows past the live count get -1), and the kernel ``dual_copy``s that 1-D array
+    exactly like ``s_ub`` -- so each AIV half receives its own half of the thresholds and the mask is
+    correct on both.  Callers may use the full ``block_q`` tile; there is no tile-size restriction.
     """
     BR = block_q
     BC = page_size
@@ -553,6 +550,7 @@ def paged_prefill_ascend950(
         q_offsets: T.Tensor((num_tiles,), "int32"),
         tile_rows: T.Tensor((num_tiles,), "int32"),
         causal_shift: T.Tensor((batch,), "int32"),
+        RowThr: T.Tensor((num_tiles * BR,), "int32"),
         OutPacked: T.Tensor((num_tiles * kv_heads, BR, dim), dtype),
     ):
         with T.Kernel(num_tiles * kv_heads) as bx:
@@ -583,8 +581,13 @@ def paged_prefill_ascend950(
             out_ub = T.alloc_shared((ROWS, D), dtype)
             m_ub = T.alloc_shared((ROWS,), accum)
             l_ub = T.alloc_shared((ROWS,), accum)
+            # Per-row causal threshold for *this AIV's* half of the M tile.  `dual_copy` splits it
+            # exactly like `s_ub`, so a local row r holds the threshold of global row
+            # `sid * ROWS + r` without the kernel ever needing the AIV index.
+            thr_ub = T.alloc_shared((ROWS,), "int32")
 
             T.copy(QPacked[bx, 0:BR, 0:D], q_l1)
+            T.dual_copy(RowThr[tile * BR : (tile + 1) * BR], thr_ub)
             T.fill(m_ub, T.float32(-1e30))
             T.fill(l_ub, T.float32(0))
             T.fill(o_ub, T.float32(0))
@@ -602,13 +605,13 @@ def paged_prefill_ascend950(
                 with T.SimtVF(threads=threads):
                     s_frag = T.alloc_fragment((ROWS, BC), accum)
                     for r, c in T.Parallel(ROWS, BC):
-                        # row r -> query position, then causal + padding masks, all before exp
-                        q_pos = (q_off + r) // group
+                        # causal + tail masks, both before exp.  The row's global query position
+                        # arrives as a precomputed threshold (`thr_ub`, split like `s_ub`), so the
+                        # mask is correct for either AIV half; padded rows carry thr < 0 and are
+                        # therefore fully masked.
                         kv_pos = p * BC + c
                         s_frag[r, c] = T.if_then_else(
-                            (c < limit)
-                            and (r < rows)
-                            and (kv_pos <= q_pos + shift),
+                            (c < limit) and (kv_pos <= thr_ub[r]),
                             s_ub[r, c] * T.float32(scale),
                             T.float32(-1e30),
                         )
@@ -827,15 +830,6 @@ def forward_prefill(
     br = block_q
     num_tiles = schedule.num_tiles
     assert num_qo_heads == kv_heads * group
-    # see the kernel docstring: a tile's live rows must fit in the first AIV half, otherwise the
-    # per-AIV row index used by the causal mask is not the global one
-    if num_tiles and int(schedule.q_lens.max().item()) > br // 2:
-        raise ValueError(
-            f"prefill tiles carry up to {int(schedule.q_lens.max().item())} rows but the kernel's "
-            f"block_q={br} only supports {br // 2} live rows per tile.  Plan the query tiles with "
-            f"block_q={br // 2} (see the kernel docstring: the causal mask needs the global row "
-            f"index, and only the first AIV half has it)."
-        )
 
     # [batch, kv_heads, group, q_pos, dim] -> [batch, kv_heads, q_pos * group, dim]
     q_flat = (
@@ -862,6 +856,20 @@ def forward_prefill(
     # chunked prefill, which is what makes row 0 of a chunk see the cached prefix.
     causal_shift = (meta.kv_lens.to(torch.int32) - qo_lens.to(torch.int32)).contiguous()
 
+    # Per-row causal threshold, one entry per (tile, M row).  Global row ``q_off + r`` carries query
+    # position ``(q_off + r) // group`` and may attend to ``kv_pos <= q_pos + shift``; rows past the
+    # live count get -1 so they mask everything.  The kernel ``dual_copy``s this exactly like
+    # ``s_ub``, so each AIV half receives its own half of the tile -- the mask is correct on both
+    # without the kernel ever needing the AIV index (the old block_q//2 host restriction is gone).
+    row_thr = torch.full((num_tiles * br,), -1, dtype=torch.int32, device=q.device)
+    if num_tiles:
+        ar = torch.arange(br, dtype=torch.int64, device=q.device).unsqueeze(0)
+        q_off64 = schedule.q_offsets.to(torch.int64).unsqueeze(1)
+        rows64 = schedule.q_lens.to(torch.int64).unsqueeze(1)
+        shift = causal_shift.to(torch.int64)[schedule.seq_ids.to(torch.int64)].unsqueeze(1)
+        thr = ((q_off64 + ar) // group) + shift
+        row_thr = torch.where(ar < rows64, thr, torch.full_like(thr, -1)).reshape(-1).to(torch.int32)
+
     kernel = build_prefill_kernel(
         batch=batch,
         kv_heads=kv_heads,
@@ -884,6 +892,7 @@ def forward_prefill(
         schedule.q_offsets.to(torch.int32),
         schedule.q_lens.to(torch.int32),
         causal_shift,
+        row_thr,
         out_packed,
     )
 

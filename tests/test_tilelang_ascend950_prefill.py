@@ -35,7 +35,7 @@ pytestmark = [
 DTYPE = torch.bfloat16
 TOL = 3e-2
 BLOCK_Q = 128      # the kernel's M tile
-TILE_ROWS = BLOCK_Q // 2   # rows per planned tile (see the kernel docstring)
+TILE_ROWS = BLOCK_Q   # full M tile: the per-row causal threshold makes both AIV halves correct
 
 
 def _case(batch, kv_heads, group, page_size, dim, kv_lens, qo_lens, seed=0):
