@@ -29,8 +29,19 @@ __all__ = ["TileLangAscend950Backend"]
 
 
 def _refresh_metadata(plan: AttentionPlan, state: dict, meta=None) -> None:
-    """Copy the step's page table into the plan-owned buffers."""
+    """Copy the step's page table into the plan-owned buffers.
+
+    If ``meta`` *is* the plan-owned buffers themselves (the engine integration refreshes them in
+    place every step), the copy is skipped — the kernel then reads exactly what the engine staged.
+    """
     meta = meta or plan.meta
+    bufs = (state["kv_indptr_buf"], state["kv_indices_buf"], state["last_page_len_buf"])
+    if (
+        meta.kv_indptr.data_ptr() == bufs[0].data_ptr()
+        and meta.kv_indices.data_ptr() == bufs[1].data_ptr()
+        and meta.kv_last_page_len.data_ptr() == bufs[2].data_ptr()
+    ):
+        return
     state["kv_indptr_buf"].copy_(meta.kv_indptr.to(torch.int32))
     state["last_page_len_buf"].copy_(meta.kv_last_page_len.to(torch.int32))
     idx = meta.kv_indices.to(torch.int32)
@@ -190,7 +201,28 @@ class TileLangAscend950Backend(AttentionBackend):
                 page_size=plan.page_size,
                 num_pages_cap=int(k_cache.shape[0]),
                 dtype=_TILELANG_DTYPE[plan.dtype],
+                out_manual=True,
             )
+            # Plan-owned staging for the plain path too (the split path already had it): padded
+            # query, padded output and the metadata buffers the kernel actually reads.  Nothing is
+            # allocated at run time, so a serving step is capturable and allocation-free.
+            kv_heads = plan.num_kv_heads
+            state["q_pad"] = torch.zeros(
+                (plan.batch_size, kv_heads * br, plan.head_dim), dtype=plan.dtype, device=plan.device
+            )
+            state["out_pad"] = torch.empty(
+                (plan.batch_size, kv_heads * br, plan.head_dim), dtype=plan.dtype, device=plan.device
+            )
+            cap = int(k_cache.shape[0])
+            state["page_cap"] = cap
+            state["kv_indptr_buf"] = torch.empty(
+                (plan.batch_size + 1,), dtype=torch.int32, device=plan.device
+            )
+            state["kv_indices_buf"] = torch.zeros((cap,), dtype=torch.int32, device=plan.device)
+            state["last_page_len_buf"] = torch.empty(
+                (plan.batch_size,), dtype=torch.int32, device=plan.device
+            )
+            _refresh_metadata(plan, state, meta=None)
         return plan
 
     # ------------------------------------------------------------------ execution
@@ -209,10 +241,11 @@ class TileLangAscend950Backend(AttentionBackend):
         if "kernel" not in plan.backend_state:
             self.finalize_plan(plan, k_cache, v_cache)
 
+        from ...metadata import RaggedMetadata
+        from ...kernels.attention.paged_decode_ascend950 import pool_view
+
         meta = plan.meta
         if kv_indptr is not None or kv_indices is not None or kv_last_page_len is not None:
-            from ...metadata import RaggedMetadata
-
             meta = RaggedMetadata(
                 kv_indptr=kv_indptr if kv_indptr is not None else meta.kv_indptr,
                 kv_indices=kv_indices if kv_indices is not None else meta.kv_indices,
@@ -248,6 +281,29 @@ class TileLangAscend950Backend(AttentionBackend):
                 out=out,
             )
 
-        from ...kernels.attention.paged_decode_ascend950 import forward
+        _refresh_metadata(plan, state, meta)
 
-        return forward(q, k_cache, v_cache, meta, group=plan.gqa_group_size, out=out)
+        batch = plan.batch_size
+        kv_heads = plan.num_kv_heads
+        br = state["br"]
+        # Stage the padded query into the plan-owned buffer: head order is already
+        # ``kv_head * group + i`` (what vLLM-Ascend passes), so this is a pure copy.  The engine
+        # integration stages it itself and passes ``q_pad`` back in — detected by pointer.
+        if q.data_ptr() != state["q_pad"].data_ptr():
+            state["q_pad"].view(batch, kv_heads, br, plan.head_dim)[
+                :, :, : plan.gqa_group_size
+            ].copy_(q.reshape(batch, kv_heads, plan.gqa_group_size, plan.head_dim))
+        state["kernel"](
+            state["q_pad"],
+            pool_view(k_cache, int(k_cache.shape[0])),
+            pool_view(v_cache, int(v_cache.shape[0])),
+            state["kv_indptr_buf"],
+            state["kv_indices_buf"],
+            state["last_page_len_buf"],
+            state["out_pad"],
+        )
+        result = state["out_pad"].view(batch, kv_heads, br, plan.head_dim)[:, :, : plan.gqa_group_size]
+        if out is not None:
+            out.copy_(result.reshape(out.shape))
+            return out
+        return result.reshape(batch, kv_heads * plan.gqa_group_size, 1, plan.head_dim)

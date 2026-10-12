@@ -546,13 +546,18 @@ def build_decode_kernel(**spec):
     ``num_pages_cap`` is the *real* pool size, deliberately not rounded: the kernel declares the
     K/V cache as ``(num_pages_cap, page_size, kv_heads, dim)``, and the storage must actually cover
     it (see `pool_view`), so a rounded-up cap makes the FFI view overrun the tensor.
+
+    ``out_manual=True`` compiles the same kernel with ``out_idx=[]`` so the caller hands in the
+    output tensor (``Out`` becomes the 7th positional argument).  That is what serving wants: the
+    output buffer is owned by the plan and reused every step, so a captured step never allocates.
     """
-    key = tuple(sorted(spec.items()))
+    out_manual = bool(spec.pop("out_manual", False))
+    key = ("decode", "manual" if out_manual else "auto") + tuple(sorted(spec.items()))
     kernel = _KERNEL_CACHE.get(key)
     if kernel is None:
         kernel = tilelang.compile(
             paged_decode_ascend950(**spec),
-            out_idx=-1,
+            out_idx=[] if out_manual else -1,
             pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
         )
         _KERNEL_CACHE[key] = kernel

@@ -44,8 +44,6 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 
 import torch
 
-from ..utils import quantize_capacity
-
 logger = logging.getLogger("tileinfer.vllm_ascend")
 
 #: Batch sizes the kernel is compiled for.  Serving batch sizes cluster well below these ceilings,
@@ -71,6 +69,28 @@ def _sub_pages(block_size: int) -> int:
             "the TileInfer kernel cannot tile it"
         )
     return max(1, block_size // KERNEL_PAGE_SIZE)
+
+
+#: Operator-granularity switch (BACKLOG B6): ``TILEINFER_OPS=decode,prefill,gdn,moe`` enables
+#: individual takeovers; unset or empty means *all on*.  One flip + server restart (a restart is
+#: seconds, not the recompile a config change would be) takes a suspicious op out of the chain
+#: without touching the others — the fallback for every disabled op is the stock FIA path.
+_OPS_ALL = {"decode", "prefill", "gdn", "moe"}
+
+
+def ops_enabled(op: str) -> bool:
+    """Whether the given operator takeover is switched on (``TILEINFER_OPS``, default: all)."""
+    import os
+
+    spec = os.environ.get("TILEINFER_OPS")
+    if spec is None or not spec.strip():
+        return True
+    unknown = {s.strip().lower() for s in spec.split(",") if s.strip()} - _OPS_ALL
+    if unknown:
+        raise ValueError(
+            f"TILEINFER_OPS contains unknown ops {sorted(unknown)}; valid: {sorted(_OPS_ALL)}"
+        )
+    return op.lower() in {s.strip().lower() for s in spec.split(",") if s.strip()}
 
 
 def _expand_page_table(block_tables: torch.Tensor, sub: int) -> torch.Tensor:
@@ -108,7 +128,20 @@ def _bucket_for(num_reqs: int) -> int:
 
 
 class TileInferDecodeAttention:
-    """Decode attention for one layer: bucketed plans plus the per-step metadata refresh."""
+    """Decode attention for one layer: bucketed plans plus the per-step metadata refresh.
+
+    Serving-safety contract (the reason this class looks the way it does):
+
+    * Plans are **prebuilt before graph capture**: the first non-captured decode step (vLLM's
+      warmup run) synchronously compiles every bucket up to ``max_num_reqs``, so by the time
+      ACLGraph capture starts each ``run()`` finds its plan in the cache.  A plan built *during*
+      capture would allocate/sync on the captured stream — ACL rejects that and the process used
+      to silently fall back to FIA (BACKLOG B5).
+    * ``run()`` never blocks and never allocates: the page table, the query and the output live in
+      plan-owned buffers that are refreshed with pure device-side copies.
+    * Under an active capture ``run()`` consults the plan cache only; a missing plan falls back to
+      FIA by returning ``None`` — it must not raise and must not start a compile.
+    """
 
     def __init__(
         self,
@@ -119,6 +152,7 @@ class TileInferDecodeAttention:
         device: torch.device,
         dtype: torch.dtype = torch.bfloat16,
         kv_tile_pages: int = 0,
+        max_num_reqs: int = 0,
     ) -> None:
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
@@ -127,21 +161,26 @@ class TileInferDecodeAttention:
         self.device = device
         self.dtype = dtype
         self.kv_tile_pages = kv_tile_pages
+        self.max_num_reqs = max_num_reqs or 0
         self._warned = False
 
-        # The plan cache, its in-flight/failed sets, the padded-query buffers and the engine-facing
-        # `BatchAttention` belong to the *configuration*, not to the layer: vLLM instantiates one of
-        # these per layer (28 for this model), and building a plan per layer multiplied a once-only
-        # cost by the layer count -- the first request then spent its window compiling plans and
-        # falling back to FIA.  Share them on the class, keyed by the configuration below.
+        # The plan cache, its in-flight/failed sets and the serving counters belong to the
+        # *configuration*, not to the layer: vLLM instantiates one of these per layer (28 for this
+        # model), and building a plan per layer multiplied a once-only cost by the layer count.
         cls = TileInferDecodeAttention
         if not hasattr(cls, "_plans"):
             cls._plans: Dict[Any, Any] = {}
-            cls._q_pad: Dict[Any, torch.Tensor] = {}
             cls._building: set = set()
             cls._failed: set = set()
             cls._lock = threading.Lock()
             cls._attn = None
+            cls._marker = None
+            cls._stats = {
+                "capture_calls": 0,
+                "eager_calls": 0,
+                "fallbacks": 0,
+                "exceptions": 0,
+            }
         self._config_key = (
             num_heads,
             num_kv_heads,
@@ -183,30 +222,69 @@ class TileInferDecodeAttention:
 
     # ------------------------------------------------------------------ plan cache
 
+    def _plan_key(self, bucket: int, width: int, block_size: int, pool_pages: int) -> tuple:
+        """Plan cache key.
+
+        ``width`` is the request's *actual* block-table width in kernel pages (a constant buffer
+        width in vLLM: ``ceil(max_model_len / engine_block)`` sub-pages), so one plan covers a
+        whole run and the plan-owned staging buffers can be sized to it exactly.
+        """
+        return (self._config_key, bucket, width, block_size, pool_pages)
+
+    def prewarm(self, width: int, block_size: int, key_cache: torch.Tensor) -> None:
+        """Synchronously build a plan for *every* bucket up to ``max_num_reqs``.
+
+        Called from the first non-captured decode step — vLLM's pre-capture warmup run — so the
+        whole plan set exists before ACLGraph capture begins.  A compile takes ~100 s cold and
+        hits the TileLang disk cache when warm, which is acceptable exactly once at startup.
+
+        ``width`` counts kernel pages (engine table width × sub-pages).  Plans are built on
+        kernel pages (see KERNEL_PAGE_SIZE) and the pool is presented as its 128-token view.
+        """
+        cls = TileInferDecodeAttention
+        pool_eff = int(key_cache.shape[0])
+        # ``max_num_reqs`` comes from the impl's vLLM config; when it is unavailable build every
+        # bucket anyway (compiles hit the TileLang disk cache, so the cost is one-time).
+        limit = int(self.max_num_reqs) if self.max_num_reqs else BATCH_BUCKETS[-1]
+        built = 0
+        for bucket in BATCH_BUCKETS:
+            if bucket > limit:
+                break
+            key = self._plan_key(bucket, width, block_size, pool_eff)
+            with cls._lock:
+                if key in cls._plans or key in cls._failed or key in cls._building:
+                    continue
+                cls._building.add(key)
+            try:
+                self._build_plan(key, bucket, width, block_size, key_cache)
+                built += 1
+            except Exception:  # noqa: BLE001 - one bad bucket must not kill the engine
+                logger.exception("TileInfer: prewarm compilation failed for bucket=%d", bucket)
+                with cls._lock:
+                    cls._failed.add(key)
+            finally:
+                with cls._lock:
+                    cls._building.discard(key)
+        if built:
+            logger.info(
+                "TileInfer: prewarmed %d plan(s) (buckets up to %d, table width %d pages) "
+                "before graph capture",
+                built,
+                limit,
+                width,
+            )
+
     def plan_if_ready(self, bucket: int, max_pages: int, block_size: int, key_cache: torch.Tensor):
         """Return the plan for this shape, or ``None`` while it is being compiled.
 
-        The first decode of a new shape compiles a TileLang kernel, which takes minutes - far longer
-        than a serving step may block, and far longer than a client will wait.  So the compile runs in
-        a **background thread** and this step (and every step until it finishes) falls back to the
-        Ascend FIA path.  Serving is never interrupted by a compile; the kernel just appears.
+        Kept as the *fallback* path for a step that needs a shape ``prewarm`` did not cover (for
+        example a wider table after a config change): such a step compiles in the background and
+        serves through FIA until the plan shows up.  The graph-capture path never comes here.
         """
-        # The plan is shaped by the pool it must cover, not by the request's *current* block-table
-        # width: keying on the exact `max_pages` made a brand-new plan -- and a full TileLang compile
-        # inside the serving process -- appear every time the block table grew by one page, so most
-        # steps fell back to FIA while the compile starved the engine.  Round the width up to a power
-        # of two so one plan covers a whole run (and the plan's workspace stays bounded: the dummy
-        # page table sizes it, so using the whole pool would OOM).
-        # `max_pages` (the request's block-table width) is rounded up because it moves *within* a run
-        # and the plan is sized by a dummy table, not by storage.  The *pool* is deliberately left
-        # exact: the kernel declares the K/V cache as `(pool, page_size, kv_heads, dim)` and the FFI
-        # view requires the storage to actually cover it, so a rounded-up pool overruns the tensor.
-        # Widths are counted in *kernel* pages (128 tokens): a hybrid model's 2048-token page is 16
-        # of them (see KERNEL_PAGE_SIZE), and the plan's schedule must cover the expanded table.
         sub = _sub_pages(block_size)
-        max_pages_eff = quantize_capacity(max_pages * sub)
+        width = max_pages * sub
         pool_eff = int(key_cache.shape[0])
-        key = (self._config_key, bucket, max_pages_eff, block_size, pool_eff)
+        key = self._plan_key(bucket, width, block_size, pool_eff)
         plan = self._plans.get(key)
         if plan is not None or key in self._failed:
             return plan
@@ -220,18 +298,18 @@ class TileInferDecodeAttention:
             "TileInfer: compiling the decode kernel for bucket=%d pages<=%d block_size=%d pool=%d "
             "pages in the background; serving through FIA until it is ready",
             bucket,
-            max_pages_eff,
+            width,
             block_size,
             pool_eff,
         )
         threading.Thread(
-            target=self._compile_plan, args=(key, bucket, max_pages_eff, block_size, key_cache), daemon=True
+            target=self._compile_plan, args=(key, bucket, width, block_size, key_cache), daemon=True
         ).start()
         return None
 
-    def _compile_plan(self, key, bucket, max_pages, block_size, key_cache) -> None:
+    def _compile_plan(self, key, bucket, width, block_size, key_cache) -> None:
         try:
-            self._build_plan(key, bucket, max_pages, block_size, key_cache)
+            self._build_plan(key, bucket, width, block_size, key_cache)
         except Exception:  # noqa: BLE001 - a background failure must not kill the engine
             logger.exception("TileInfer: background compilation failed; staying on the FIA path")
             with self._lock:
@@ -240,7 +318,7 @@ class TileInferDecodeAttention:
             with self._lock:
                 self._building.discard(key)
 
-    def _build_plan(self, key, bucket: int, max_pages: int, block_size: int, key_cache: torch.Tensor):
+    def _build_plan(self, key, bucket: int, width: int, block_size: int, key_cache: torch.Tensor):
 
         from tileinfer import BatchAttention
         from tileinfer.metadata import RaggedMetadata
@@ -251,11 +329,10 @@ class TileInferDecodeAttention:
             cls._attn = BatchAttention(backend="tilelang-ascend950", device=self.device, dtype=self.dtype)
 
         # A *dummy* page table: only its shape matters (it sizes the plan's workspace, so it is the
-        # rounded-up width from plan_if_ready, not the whole pool).  Decode without KV splitting
-        # produces one work tile per request, so the schedule does not depend on the lengths; the
-        # values are refreshed every step by the caller.  Plans are always built on kernel pages
-        # (128 tokens) — `max_pages` already arrives expanded (see plan_if_ready) and the pool is
-        # presented as its 128-token sub-page view.
+        # request's real table width, not the whole pool).  Decode without KV splitting produces
+        # one work tile per request, so the schedule does not depend on the lengths; the values are
+        # refreshed every step by the caller.  Plans are always built on kernel pages (128 tokens)
+        # and the pool is presented as its 128-token sub-page view.
         sub = _sub_pages(block_size)
         pool = _pool_sub_view(key_cache, sub)
         dummy_lens = torch.ones(bucket, dtype=torch.int32, device=self.device)
@@ -266,7 +343,7 @@ class TileInferDecodeAttention:
             page_size=KERNEL_PAGE_SIZE,
         )
         plan = cls._attn.plan_from_page_table(
-            torch.zeros((bucket, max_pages), dtype=torch.int32, device=self.device),
+            torch.zeros((bucket, width), dtype=torch.int32, device=self.device),
             dummy_lens,
             qo_lens=torch.ones(bucket, dtype=torch.int32, device=self.device),
             page_size=KERNEL_PAGE_SIZE,
@@ -278,18 +355,31 @@ class TileInferDecodeAttention:
             kv_tile_pages=self.kv_tile_pages,
             k_cache=pool,
             # Only the *shape* is read (`finalize_plan` asserts K/V match); a full
-            # `empty_like(key_cache)` duplicate of the V pool is ~0.8 GiB here and OOMs whenever the
-            # KV cache already fills the budget.
+            # `empty_like(key_cache)` duplicate of the V pool is ~0.8 GiB here and OOMs whenever
+            # the KV cache already fills the budget.
             v_cache=pool,
         )
-        self._q_pad[(self._config_key, bucket)] = torch.zeros(
-            (bucket, self.num_heads, 1, self.head_size), dtype=self.dtype, device=self.device
+        state = plan.backend_state
+        # Engine-side staging (plan-owned, refreshed every step with device-side copies only):
+        # the expanded sub-page table, the (constant) dense indptr and the padded lens vector.
+        # Padding rows stay at table=0 / len=1 forever: a valid page id and a valid length, so
+        # the kernel's softmax cannot divide by zero and the padded outputs are never read.
+        state["table_buf"] = torch.zeros((bucket, width), dtype=torch.int32, device=self.device)
+        state["lens_buf"] = torch.ones(bucket, dtype=torch.int32, device=self.device)
+        state["table_width"] = width
+        state["kv_indptr_buf"].copy_(
+            torch.arange(0, bucket + 1, dtype=torch.int32, device=self.device) * width
         )
+        if cls._marker is None:
+            # In-service probe: bumped once per kernel launch inside run().  Under ACLGraph the
+            # increment is *captured into the graph*, so it also counts replays — the number grows
+            # while the engine serves decode steps even though no Python runs (B5c).
+            cls._marker = torch.zeros(1, dtype=torch.int64, device=self.device)
         self._plans[key] = plan
         logger.info(
-            "TileInfer plan READY: bucket=%d max_pages=%d block_size=%d -> %s",
+            "TileInfer plan READY: bucket=%d table_width=%d block_size=%d -> %s",
             bucket,
-            max_pages,
+            width,
             block_size,
             plan.summary(),
         )
@@ -309,47 +399,81 @@ class TileInferDecodeAttention:
     ) -> torch.Tensor:
         """One decode step: ``query`` is ``[num_reqs, num_heads, head_size]`` (the layout vLLM-Ascend
         passes here), writes into ``output`` with the same layout."""
-        from tileinfer.metadata import pad_batch, ragged_from_page_table_device
-
+        cls = TileInferDecodeAttention
+        capturing = torch.npu.is_current_stream_capturing()
         num_reqs = int(seq_lens.numel())
         bucket = _bucket_for(num_reqs)
-        plan = self.plan_if_ready(bucket, int(block_tables.shape[1]), block_size, key_cache)
-        if plan is None:
-            return None  # still compiling (or it failed): let the caller take the FIA path
-
-        # Engine pages -> kernel pages: expand the page table to 128-token sub-page ids and view
-        # the pools the same way (zero-copy, see KERNEL_PAGE_SIZE).  For block_size == 128 both are
-        # identity, so the non-hybrid path is untouched.
         sub = _sub_pages(block_size)
-        table = _expand_page_table(block_tables[:num_reqs], sub)
-        meta = ragged_from_page_table_device(
-            table, seq_lens[:num_reqs], KERNEL_PAGE_SIZE, device=self.device
+        width = int(block_tables.shape[1]) * sub
+        pool_eff = int(key_cache.shape[0])
+        key = self._plan_key(bucket, width, block_size, pool_eff)
+        plan = cls._plans.get(key)
+        if plan is None:
+            if capturing:
+                # Inside a capture we must not build, not allocate and not raise: let FIA serve
+                # this step.  (prewarm() during the pre-capture warmup makes this path a no-op.)
+                cls._stats["fallbacks"] += 1
+                return None
+            self.prewarm(width, block_size, key_cache)
+            plan = cls._plans.get(key)
+            if plan is None:
+                cls._stats["fallbacks"] += 1
+                return None
+
+        state = plan.backend_state
+        # Engine pages -> kernel pages: expand the page table to 128-token sub-page ids (zero-copy;
+        # identity for block_size == 128) and stage everything into plan-owned buffers.  Every op
+        # below is shape-static and device-side, so the whole step is capturable.
+        table_exp = _expand_page_table(block_tables[:num_reqs], sub)
+        table_buf: torch.Tensor = state["table_buf"]
+        table_buf[:num_reqs].copy_(table_exp)
+        lens_buf: torch.Tensor = state["lens_buf"]
+        lens_buf[:num_reqs].copy_(seq_lens[:num_reqs].to(torch.int32))
+        # last-page-len from the padded lens, in place: ((lens - 1) % page) + 1
+        lpl = state["last_page_len_buf"]
+        torch.sub(lens_buf, 1, out=lpl)
+        lpl.remainder_(KERNEL_PAGE_SIZE)
+        lpl.add_(1)
+        # Dense page-index layout: request b's pages are ``kv_indices[b*width : b*width + pages_b]``
+        # (row-major, contiguous), indptr is the constant ``arange(bucket+1) * width`` — padding
+        # columns hold stale page ids that indptr masks out, so no masked_select (which would
+        # force a device sync) is needed anywhere.
+        idx_flat = table_buf.view(-1)
+        idx_buf: torch.Tensor = state["kv_indices_buf"]
+        idx_buf[: idx_flat.numel()].copy_(idx_flat)
+
+        # Stage the padded query.  vLLM hands us ``[num_tokens, num_heads, head_size]`` on this
+        # stack (verified); the kernel wants ``[bucket, num_kv_heads * BR, head_size]`` with the
+        # GQA group zero-padded to BR rows.  Head order is already ``kv_head * group + i``.
+        from tileinfer.kernels.attention.paged_decode_ascend950 import padded_rows
+
+        br = padded_rows(self.group_size)
+        q_pad: torch.Tensor = state["q_pad"]
+        q_pad.view(bucket, self.num_kv_heads, br, self.head_size)[:, :, : self.group_size].copy_(
+            query[:num_reqs]
+            .to(self.dtype)
+            .reshape(num_reqs, self.num_kv_heads, self.group_size, self.head_size)
         )
-        if bucket != num_reqs:
-            meta = pad_batch(meta, bucket, KERNEL_PAGE_SIZE)
-        k_view = _pool_sub_view(key_cache, sub)
-        v_view = _pool_sub_view(value_cache, sub)
 
-        q = self._q_pad[(self._config_key, bucket)]
-        # vLLM hands us `[num_tokens, num_heads, head_size]` on this stack (verified), while the
-        # kernel wants `[num_reqs, num_heads, 1, head_size]`.  `reshape` (not `view`) also tolerates
-        # the `[num_tokens, num_heads * head_size]` layout other builds use, and a non-contiguous
-        # slice.
-        q[:num_reqs] = query[:num_reqs].reshape(num_reqs, self.num_heads, 1, self.head_size).to(self.dtype)
-
-        out = TileInferDecodeAttention._attn.run(
-            q,
-            k_view,
-            v_view,
+        TileInferDecodeAttention._attn.run(
+            q_pad,
+            _pool_sub_view(key_cache, sub),
+            _pool_sub_view(value_cache, sub),
             plan=plan,
-            kv_indptr=meta.kv_indptr,
-            kv_indices=meta.kv_indices,
-            kv_last_page_len=meta.kv_last_page_len,
+            kv_indptr=state["kv_indptr_buf"],
+            kv_indices=idx_buf,
+            kv_last_page_len=lpl,
         )
-        # Mirror vLLM's own `output` layout instead of assuming a flat `[num_reqs, heads*head_size]`:
-        # on this stack `output` is `[num_tokens, num_heads, head_size]`, so reshaping to a flat width
-        # raised "expanded size (128) must match the existing size (1536)".
-        output[:num_reqs] = out[:num_reqs].reshape(output[:num_reqs].shape).to(output.dtype)
+        cls._stats["capture_calls" if capturing else "eager_calls"] += 1
+        if cls._marker is not None:
+            cls._marker += 1
+
+        # Copy the live rows back with the engine's ``output`` layout
+        # (``[num_tokens, num_heads, head_size]`` on this stack).
+        result4 = state["out_pad"].view(bucket, self.num_kv_heads, br, self.head_size)
+        output[:num_reqs].view(num_reqs, self.num_kv_heads, self.group_size, self.head_size).copy_(
+            result4[:num_reqs, :, : self.group_size]
+        )
         return output
 
 
@@ -426,6 +550,12 @@ def _build_classes():
 
         def _decode(self, block_size: int) -> Optional[TileInferDecodeAttention]:
             if self._tileinfer is None:
+                import os
+
+                try:
+                    max_num_reqs = int(self.vllm_config.scheduler_config.max_num_seqs)
+                except Exception:  # noqa: BLE001 - fall back to the largest bucket
+                    max_num_reqs = 0
                 self._tileinfer = TileInferDecodeAttention(
                     num_heads=self.num_heads,
                     num_kv_heads=self.num_kv_heads,
@@ -435,7 +565,9 @@ def _build_classes():
                     # Split-KV (`kv_tile_pages > 0`) was unreachable from the engine before: the ctor
                     # defaulted to 0 and nothing ever passed it.  It is still opt-in (the kernel also
                     # refuses split plans without TILEINFER_ALLOW_SPLIT_KV=1, see KI-1).
-                    kv_tile_pages=int(__import__("os").environ.get("TILEINFER_KV_TILE_PAGES", 0)),
+                    kv_tile_pages=int(os.environ.get("TILEINFER_KV_TILE_PAGES", 0)),
+                    # Prewarm builds one plan per bucket up to this, before graph capture.
+                    max_num_reqs=int(max_num_reqs or 0),
                 )
             return self._tileinfer if self._tileinfer.supported(block_size) else None
 
@@ -457,6 +589,9 @@ def _build_classes():
             if self._tileinfer_failed or self.key_cache is None:
                 return super().forward_impl(query, key, value, kv_cache, attn_metadata, output)
 
+            if not ops_enabled("decode"):
+                return super().forward_impl(query, key, value, kv_cache, attn_metadata, output)
+
             if attn_metadata.attn_state != AscendAttentionState.DecodeOnly:
                 return super().forward_impl(query, key, value, kv_cache, attn_metadata, output)
 
@@ -467,12 +602,22 @@ def _build_classes():
 
             try:
                 num_reqs = int(attn_metadata.seq_lens.numel())
+                # Device-resident lengths only: the host-side `seq_lens` cannot be copied inside
+                # an ACLGraph capture (aclrtMemcpy is rejected while the stream is capturing),
+                # and replay would never refresh a plan-owned buffer from a host tensor.  The
+                # common metadata's device seq_lens lives in vLLM's fixed-address graph input
+                # buffer, so a D2D copy from it is capturable and replays correctly.  (The
+                # `seq_lens_device` field is added to vllm-ascend's AscendMetadata by this
+                # project - see .agent_loop/state/DECISIONS.md D17 for the exact patch.)
+                device_lens = getattr(attn_metadata, "seq_lens_device", None)
+                if device_lens is None:
+                    device_lens = attn_metadata.seq_lens
                 out = impl.run(
                     query=query[:num_reqs],
                     key_cache=self.key_cache,
                     value_cache=self.value_cache,
                     block_tables=attn_metadata.block_tables[:num_reqs],
-                    seq_lens=attn_metadata.seq_lens[:num_reqs],
+                    seq_lens=device_lens[:num_reqs],
                     block_size=block_size,
                     output=output,
                 )
@@ -565,6 +710,62 @@ def _build_classes_into_module() -> None:
     TileInferBackend, TileInferImpl = _build_classes()
 
 
+_METRICS_INTERVAL_S = 1.0
+
+
+def start_metrics_dumper() -> bool:
+    """Serve the "is TileInfer actually serving" probe (BACKLOG B5c).
+
+    When ``TILEINFER_METRICS_PATH`` is set, a daemon thread atomically writes one JSON line every
+    second: plan READY count, kernel-call counters (``capture_calls`` inside a graph capture,
+    ``eager_calls`` outside), FIA-fallback count, the ``kernel_markers`` device counter and the
+    exception latch.  ``kernel_markers`` is bumped by a device-side add *inside* run() — under
+    ACLGraph that increment is captured into the graph, so it counts replays too: it grows while
+    the engine decodes even though no Python runs.  A benchmark asserts on this file *before*
+    trusting any number: ready_plans >= 1, fallbacks == 0 and, in graph mode, capture_calls > 0.
+    """
+    import json
+    import os
+    import time
+
+    path = os.environ.get("TILEINFER_METRICS_PATH")
+    if not path:
+        return False
+
+    def _loop() -> None:
+        while True:
+            try:
+                cls = TileInferDecodeAttention
+                stats = dict(getattr(cls, "_stats", {}))
+                stats["ready_plans"] = len(getattr(cls, "_plans", {}))
+                marker = getattr(cls, "_marker", None)
+                stats["kernel_markers"] = int(marker.item()) if marker is not None else -1
+                stats["ts"] = time.time()
+                # Only a process that actually hosts TileInfer state (the EngineCore) may write:
+                # the API server imports the plugin too, and its empty view would keep overwriting
+                # the real numbers.  Empty processes stay silent instead.
+                if (
+                    stats["ready_plans"] == 0
+                    and stats["capture_calls"] == 0
+                    and stats["eager_calls"] == 0
+                    and stats["fallbacks"] == 0
+                    and stats["kernel_markers"] < 0
+                ):
+                    time.sleep(_METRICS_INTERVAL_S)
+                    continue
+                tmp = f"{path}.tmp"
+                with open(tmp, "w", encoding="utf-8") as handle:
+                    json.dump(stats, handle)
+                os.replace(tmp, path)
+            except Exception:  # noqa: BLE001 - metrics must never break serving
+                pass
+            time.sleep(_METRICS_INTERVAL_S)
+
+    threading.Thread(target=_loop, daemon=True, name="tileinfer-metrics").start()
+    logger.info("TileInfer serving probe -> %s", path)
+    return True
+
+
 _INSTALLED = False
 
 
@@ -609,6 +810,7 @@ def install(raise_on_failure: bool = True) -> bool:
                 "did not take effect (another plugin registered after us?)"
             )
         _INSTALLED = True
+        start_metrics_dumper()
         logger.info(
             "TileInfer registered as the CUSTOM attention backend (decode accelerated, "
             "prefill falls back to vLLM-Ascend)"
