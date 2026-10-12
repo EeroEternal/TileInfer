@@ -19,3 +19,6 @@ bench_out/
 # local scratch and user-local toolchains (never part of the repo)
 .work/
 .cann*/
+
+# agent loop driver and all its runtime artifacts (user-local, never part of the repo)
+.agent_loop/
