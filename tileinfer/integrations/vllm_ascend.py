@@ -44,6 +44,8 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 
 import torch
 
+from ..utils import quantize_capacity
+
 logger = logging.getLogger("tileinfer.vllm_ascend")
 
 #: Batch sizes the kernel is compiled for.  Serving batch sizes cluster well below these ceilings,
@@ -81,13 +83,30 @@ class TileInferDecodeAttention:
         self.device = device
         self.dtype = dtype
         self.kv_tile_pages = kv_tile_pages
-        self._attn = None
-        self._plans: Dict[Tuple[int, int, int, int], Any] = {}
-        self._q_pad: Dict[int, torch.Tensor] = {}
         self._warned = False
-        self._lock = threading.Lock()
-        self._building: set = set()
-        self._failed: set = set()
+
+        # The plan cache, its in-flight/failed sets, the padded-query buffers and the engine-facing
+        # `BatchAttention` belong to the *configuration*, not to the layer: vLLM instantiates one of
+        # these per layer (28 for this model), and building a plan per layer multiplied a once-only
+        # cost by the layer count -- the first request then spent its window compiling plans and
+        # falling back to FIA.  Share them on the class, keyed by the configuration below.
+        cls = TileInferDecodeAttention
+        if not hasattr(cls, "_plans"):
+            cls._plans: Dict[Any, Any] = {}
+            cls._q_pad: Dict[Any, torch.Tensor] = {}
+            cls._building: set = set()
+            cls._failed: set = set()
+            cls._lock = threading.Lock()
+            cls._attn = None
+        self._config_key = (
+            num_heads,
+            num_kv_heads,
+            head_size,
+            round(float(scale), 6),
+            str(device),
+            str(dtype),
+            int(kv_tile_pages),
+        )
 
     # ------------------------------------------------------------------ availability
 
@@ -121,7 +140,18 @@ class TileInferDecodeAttention:
         a **background thread** and this step (and every step until it finishes) falls back to the
         Ascend FIA path.  Serving is never interrupted by a compile; the kernel just appears.
         """
-        key = (bucket, max_pages, block_size, int(key_cache.shape[0]))
+        # The plan is shaped by the pool it must cover, not by the request's *current* block-table
+        # width: keying on the exact `max_pages` made a brand-new plan -- and a full TileLang compile
+        # inside the serving process -- appear every time the block table grew by one page, so most
+        # steps fell back to FIA while the compile starved the engine.  Round the width up to a power
+        # of two so one plan covers a whole run (and the plan's workspace stays bounded: the dummy
+        # page table sizes it, so using the whole pool would OOM).
+        max_pages_eff = quantize_capacity(max_pages)
+        # Quantize the pool for the *key* as well: the pool is derived from free memory at profiling
+        # time, so it differs from run to run (observed 5822 / 10674 / 11585 / 11586).  Left raw, every
+        # run would be a cache miss and pay a fresh ~70 s compile inside the serving process.
+        pool_eff = quantize_capacity(int(key_cache.shape[0]))
+        key = (self._config_key, bucket, max_pages_eff, block_size, pool_eff)
         plan = self._plans.get(key)
         if plan is not None or key in self._failed:
             return plan
@@ -132,15 +162,15 @@ class TileInferDecodeAttention:
             self._building.add(key)
 
         logger.info(
-            "TileInfer: compiling the decode kernel for bucket=%d max_pages=%d block_size=%d pool=%d "
+            "TileInfer: compiling the decode kernel for bucket=%d pages<=%d block_size=%d pool=%d "
             "pages in the background; serving through FIA until it is ready",
             bucket,
-            max_pages,
+            max_pages_eff,
             block_size,
-            int(key_cache.shape[0]),
+            pool_eff,
         )
         threading.Thread(
-            target=self._compile_plan, args=(key, bucket, max_pages, block_size, key_cache), daemon=True
+            target=self._compile_plan, args=(key, bucket, max_pages_eff, block_size, key_cache), daemon=True
         ).start()
         return None
 
@@ -161,12 +191,14 @@ class TileInferDecodeAttention:
         from tileinfer.metadata import RaggedMetadata
 
         _diag("build_plan")
-        if self._attn is None:
-            self._attn = BatchAttention(backend="tilelang-ascend950", device=self.device, dtype=self.dtype)
+        cls = TileInferDecodeAttention
+        if cls._attn is None:
+            cls._attn = BatchAttention(backend="tilelang-ascend950", device=self.device, dtype=self.dtype)
 
-        # A *dummy* page table: only its shape matters.  Decode without KV splitting produces one
-        # work tile per request, so the schedule does not depend on the lengths; the values are
-        # refreshed every step by the caller.
+        # A *dummy* page table: only its shape matters (it sizes the plan's workspace, so it is the
+        # rounded-up width from plan_if_ready, not the whole pool).  Decode without KV splitting
+        # produces one work tile per request, so the schedule does not depend on the lengths; the
+        # values are refreshed every step by the caller.
         dummy_lens = torch.ones(bucket, dtype=torch.int32, device=self.device)
         dummy = RaggedMetadata(
             kv_indptr=torch.arange(0, bucket + 1, dtype=torch.int32, device=self.device),
@@ -174,7 +206,7 @@ class TileInferDecodeAttention:
             kv_last_page_len=torch.ones(bucket, dtype=torch.int32, device=self.device),
             page_size=block_size,
         )
-        plan = self._attn.plan_from_page_table(
+        plan = cls._attn.plan_from_page_table(
             torch.zeros((bucket, max_pages), dtype=torch.int32, device=self.device),
             dummy_lens,
             qo_lens=torch.ones(bucket, dtype=torch.int32, device=self.device),
@@ -186,9 +218,12 @@ class TileInferDecodeAttention:
             causal=False,
             kv_tile_pages=self.kv_tile_pages,
             k_cache=key_cache,
-            v_cache=torch.empty_like(key_cache),
+            # Only the *shape* is read (`finalize_plan` asserts K/V match); a full
+            # `empty_like(key_cache)` duplicate of the V pool is ~0.8 GiB here and OOMs whenever the
+            # KV cache already fills the budget.
+            v_cache=key_cache,
         )
-        self._q_pad[bucket] = torch.zeros(
+        self._q_pad[(self._config_key, bucket)] = torch.zeros(
             (bucket, self.num_heads, 1, self.head_size), dtype=self.dtype, device=self.device
         )
         self._plans[key] = plan
@@ -229,14 +264,14 @@ class TileInferDecodeAttention:
         if bucket != num_reqs:
             meta = pad_batch(meta, bucket, block_size)
 
-        q = self._q_pad[bucket]
+        q = self._q_pad[(self._config_key, bucket)]
         # vLLM hands us `[num_tokens, num_heads, head_size]` on this stack (verified), while the
         # kernel wants `[num_reqs, num_heads, 1, head_size]`.  `reshape` (not `view`) also tolerates
         # the `[num_tokens, num_heads * head_size]` layout other builds use, and a non-contiguous
         # slice.
         q[:num_reqs] = query[:num_reqs].reshape(num_reqs, self.num_heads, 1, self.head_size).to(self.dtype)
 
-        out = self._attn.run(
+        out = TileInferDecodeAttention._attn.run(
             q,
             key_cache,
             value_cache,

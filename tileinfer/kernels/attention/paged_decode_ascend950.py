@@ -32,6 +32,8 @@ import torch
 import tilelang
 import tilelang.ascend.language as T
 
+from ...utils import quantize_capacity
+
 __all__ = [
     "paged_decode_ascend950",
     "paged_decode_split",
@@ -476,7 +478,14 @@ def build_split_kernel(**spec):
 
 
 def build_decode_kernel(**spec):
-    """Compile (and cache) the kernel for one shape combination."""
+    """Compile (and cache) the kernel for one shape combination.
+
+    ``num_pages_cap`` is quantized here, at the one entry point every caller uses (the engine, the
+    prewarm script, the tests), so the cache key never follows the exact runtime pool size -- otherwise
+    a prewarm for one pool misses the engine's key and the serving process pays a fresh ~70 s compile.
+    """
+    if "num_pages_cap" in spec:
+        spec["num_pages_cap"] = quantize_capacity(spec["num_pages_cap"])
     key = tuple(sorted(spec.items()))
     kernel = _KERNEL_CACHE.get(key)
     if kernel is None:
@@ -662,7 +671,9 @@ def paged_prefill_ascend950(
 
 
 def build_prefill_kernel(**spec):
-    """Compile (and cache) the prefill kernel."""
+    """Compile (and cache) the prefill kernel.  See `build_decode_kernel` re: `num_pages_cap`."""
+    if "num_pages_cap" in spec:
+        spec["num_pages_cap"] = quantize_capacity(spec["num_pages_cap"])
     key = ("prefill",) + tuple(sorted(spec.items()))
     kernel = _KERNEL_CACHE.get(key)
     if kernel is None:
@@ -726,7 +737,7 @@ def forward_split(
         group=group,
         dim=dim,
         page_size=page_size,
-        num_pages_cap=int(k_cache.shape[0]),
+        num_pages_cap=quantize_capacity(k_cache.shape[0]),
         num_tiles=num_tiles,
         max_splits=max_splits,
         dtype=dtype,
@@ -746,7 +757,7 @@ def forward_split(
         last_page_len = kv_last_page_len
     else:
         indices = meta.kv_indices.to(torch.int32)
-        cap = int(k_cache.shape[0])
+        cap = quantize_capacity(k_cache.shape[0])
         if indices.numel() < cap:
             indices = torch.cat([indices, indices.new_zeros(cap - indices.numel())])
         indptr = meta.kv_indptr.to(torch.int32)
@@ -876,7 +887,7 @@ def forward_prefill(
         group=group,
         dim=dim,
         page_size=page_size,
-        num_pages_cap=cap,
+        num_pages_cap=quantize_capacity(cap),
         num_tiles=num_tiles,
         block_q=br,
         dtype=dtype,
@@ -969,7 +980,7 @@ def forward(
         group=group,
         dim=dim,
         page_size=page_size,
-        num_pages_cap=int(k_cache.shape[0]),
+        num_pages_cap=quantize_capacity(k_cache.shape[0]),
         dtype=dtype,
     )
 
@@ -990,7 +1001,7 @@ def forward(
         last_page_len = kv_last_page_len
     else:
         indices = meta.kv_indices.to(torch.int32)
-        cap = int(k_cache.shape[0])
+        cap = quantize_capacity(k_cache.shape[0])
         if indices.numel() < cap:
             indices = torch.cat([indices, indices.new_zeros(cap - indices.numel())])
         indptr = meta.kv_indptr.to(torch.int32)

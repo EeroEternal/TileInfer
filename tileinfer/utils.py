@@ -18,9 +18,24 @@ __all__ = [
     "default_dtype",
     "synchronize",
     "have_tilelang",
+    "quantize_capacity",
 ]
 
 DeviceLike = Union[str, torch.device, None]
+
+
+def quantize_capacity(n: int) -> int:
+    """Round a *runtime* capacity up to a stable power of two.
+
+    Capacities like the KV pool size or a request's block-table width are derived from free memory and
+    from the sequence length, so they differ from run to run and grow while a sequence is decoded.  A
+    kernel or plan compiled for an exact capacity is therefore recompiled whenever the number moves by
+    one -- and that compile runs inside the serving process, where it starves the engine (see
+    `docs/known-issues.md`).  Every capacity that reaches a compile key goes through here, so one
+    build covers a whole family of runs.
+    """
+    n = int(n)
+    return 1 if n <= 1 else 1 << (n - 1).bit_length()
 
 
 def is_npu_available() -> bool:

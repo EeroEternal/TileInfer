@@ -27,6 +27,11 @@ def main() -> int:
     ap.add_argument("--page-size", type=int, default=128)
     ap.add_argument("--num-pages-cap", type=int, required=True, help="the server's KV pool, in pages")
     ap.add_argument("--buckets", type=int, nargs="+", default=[1, 2, 4], help="batch sizes to compile")
+    ap.add_argument(
+        "--dtype",
+        default="bfloat16",
+        help="the tensor dtype the engine will use; part of the compile key, so it must match",
+    )
     args = ap.parse_args()
 
     import os
@@ -41,6 +46,7 @@ def main() -> int:
             dim=args.dim,
             page_size=args.page_size,
             num_pages_cap=args.num_pages_cap,
+            dtype=args.dtype,
         )
         print(f"bucket={batch} compiled in {time.time() - t0:.0f}s", flush=True)
     print("pre-warm done")
