@@ -130,7 +130,7 @@ def scenario_single(base, model, label, prompt, max_tokens, runs):
         "ttft_ms_p50": pct(ttfts, 50), "ttft_ms_p99": pct(ttfts, 99),
         "tpot_ms_p50": pct(tpots, 50), "tpot_ms_p99": pct(tpots, 99),
         "itl_ms_p50": pct(itls, 50), "itl_ms_p99": pct(itls, 99),
-        "out_toks_median": med_ms(tputs),
+        "out_toks_median": round(statistics.median(tputs), 2),
     }
     print(json.dumps(out, ensure_ascii=False), flush=True)
     return out
@@ -157,7 +157,8 @@ def scenario_conc(base, model, conc, max_tokens, runs):
             itls += r["itls"]
         time.sleep(1)
     agg.update({
-        "out_toks_p50": med_ms(tputs), "req_toks_p50": med_ms(rputs),
+        "out_toks_p50": round(statistics.median(tputs), 2),
+        "req_toks_p50": round(statistics.median(rputs), 2),
         "ttft_ms_p50": pct(ttfts, 50), "ttft_ms_p99": pct(ttfts, 99),
         "tpot_ms_p50": pct(tpots, 50), "tpot_ms_p99": pct(tpots, 99),
         "itl_ms_p50": pct(itls, 50), "itl_ms_p99": pct(itls, 99),
