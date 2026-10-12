@@ -200,3 +200,55 @@ def test_graph_capture_replay_data_updates():
     exp2 = _reference(table_g, lens_g, q_g, kc, vc)
     diff2 = (out_g.cpu().float() - exp2).abs().max().item()
     assert diff2 < TOL, f"replay-2 mismatch: max|diff|={diff2}"
+
+
+def test_step_guard_two_layers_one_step():
+    """D23 步守卫:同一 step_obj 的第二次 run()(第二层)跳过刷新仍正确;新 step_obj 强制刷新。
+
+    引擎语义:一步内 vLLM 把同一 attn_metadata 交给全部 full-attn 层,刷新链只跑一次;
+    这里钉死两层行为——第二层必须命中守卫(跳过刷新)且输出仍与参考一致,否则就是
+    UnboundLocalError 类回归(D23 首版实锤过:守卫跳过分支漏绑 idx_buf → 进程级熔断)。
+    """
+    device = torch.device("npu", 0)
+    torch.manual_seed(19)
+    TileInferDecodeAttention._step_guard = ()
+    impl = _make_impl(device)
+    kc = torch.randn(ENGINE_POOL_PAGES, ENGINE_BLOCK, KVH, DIM, dtype=DTYPE, device=device)
+    vc = torch.randn_like(kc)
+    impl.prewarm(width=TABLE_WIDTH * SUB, block_size=ENGINE_BLOCK, key_cache=kc)
+
+    lens = torch.tensor([300, 129], dtype=torch.int32, device=device)
+    table = torch.randint(0, ENGINE_POOL_PAGES, (2, TABLE_WIDTH), dtype=torch.int32, device=device)
+    out1 = torch.empty(2, NUM_HEADS, DIM, dtype=DTYPE, device=device)
+    out2 = torch.empty_like(out1)
+    step = object()
+    common = dict(
+        key_cache=kc, value_cache=vc, block_tables=table, seq_lens=lens,
+        block_size=ENGINE_BLOCK, step_obj=step,
+    )
+    q1 = torch.randn(2, NUM_HEADS, DIM, dtype=DTYPE, device=device) * 0.2
+    q2 = torch.randn(2, NUM_HEADS, DIM, dtype=DTYPE, device=device) * 0.2
+    got1 = impl.run(query=q1, output=out1, **common)
+    got2 = impl.run(query=q2, output=out2, **common)  # 第二层:守卫命中,跳过刷新
+    torch.npu.synchronize()
+    assert got1 is not None and got2 is not None, "fell back (plan missing)"
+    exp1 = _reference(table, lens, q1, kc, vc)
+    exp2 = _reference(table, lens, q2, kc, vc)
+    d1 = (got1.cpu().float() - exp1).abs().max().item()
+    d2 = (got2.cpu().float() - exp2).abs().max().item()
+    assert d1 < TOL, f"layer-1 mismatch: max|diff|={d1}"
+    assert d2 < TOL, f"layer-2 (guard-hit, no refresh) mismatch: max|diff|={d2}"
+
+    # 新的一步:换数据 + 新 step 对象 → 必须重新刷新(旧守卫不得吞掉新页表)
+    table2 = torch.randint(0, ENGINE_POOL_PAGES, (2, TABLE_WIDTH), dtype=torch.int32, device=device)
+    lens2 = torch.tensor([77, 256], dtype=torch.int32, device=device)
+    q3 = torch.randn(2, NUM_HEADS, DIM, dtype=DTYPE, device=device) * 0.2
+    out3 = torch.empty_like(out1)
+    got3 = impl.run(
+        query=q3, key_cache=kc, value_cache=vc, block_tables=table2, seq_lens=lens2,
+        block_size=ENGINE_BLOCK, output=out3, step_obj=object(),
+    )
+    torch.npu.synchronize()
+    exp3 = _reference(table2, lens2, q3, kc, vc)
+    d3 = (got3.cpu().float() - exp3).abs().max().item()
+    assert d3 < TOL, f"next-step mismatch (stale guard?): max|diff|={d3}"

@@ -250,3 +250,42 @@ The proper fix - worth ~2x on prefill - is to restructure the kernel into explic
 `T.Vector(vector=2) as sid:` regions and mask with `sid * ROWS + r`.  That is a bigger change (it also
 moves the `dual_copy`s into the vector region) and it needs device iteration, so it is a standalone
 task rather than a footnote to this one.
+
+## KI-4 — offline `LLM()` and serve(HTTP) numbers are not comparable (diagnosed, by design)
+
+**Status:** diagnosed · **Impact:** measurement methodology, not a product bug.
+
+### Symptom
+
+The same decode workload (batch 1 x 128 tokens, enforce-eager, same server flags) measures
+~136.7 ms/step through the offline `LLM()` API but ~45.9 ms/step (TPOT) through a `vllm serve`
+HTTP benchmark — the *offline* number is 3x **worse**, which is the opposite of the usual
+intuition that a benchmark harness should be leaner than a full server (EVIDENCE E14;
+`.agent_loop/run/b3_ti_b1.log` vs the eager matrix in `PERFORMANCE_REPORT.md` §3).
+
+### Attribution
+
+1. **EngineCore process topology.** `vllm serve` runs the EngineCore in a dedicated subprocess:
+   scheduler, sampler-side CPU work, detokenization and HTTP streaming overlap the engine's
+   dispatch loop across processes. The offline `LLM()` (with `VLLM_ENABLE_V1_MULTIPROCESSING=0`,
+   which is what in-process profiling probes need) runs everything in **one GIL**: the engine
+   loop's Python (sampling prep, detokenization, stream assembly) serializes against every
+   `aten::`/CANN op dispatch, inflating wall time per step.
+2. **What is actually comparable:** component-level attribution inside `execute_model`.
+   Clean in-process timers (perf_counter, no profiler — profiler instrumentation inflates
+   in-region timings by ~2x, see EVIDENCE E12) give: FIA `execute_model` 42.2 ms/step at
+   batch 4, TileInfer 97.0 ms/step at batch 1 (of which the TileInfer kernel-call path is
+   ~4.4 ms x 10 full-attn layers after the per-step refresh dedup, D23/E13). Everything
+   outside `execute_model` is engine-loop/GIL territory and differs by topology.
+3. **Graph mode dissolves most of the gap:** replay executes the captured kernels without
+   per-step Python, so host-path differences (TileInfer's included) mostly vanish — which is
+   why the production A/B (graph mode) is the authoritative comparison.
+
+### Rules that came out of it
+
+1. Performance verdicts are **serve-based only** (the A/B harness); offline `LLM()` numbers
+   are for component attribution and must never be compared 1:1 with serve TPOT/TTFT.
+2. In-process timers must be taken **outside** `torch.profiler` regions; use the profiler
+   only for op-mix structure (E12).
+3. When probing the offline engine, keep `VLLM_ENABLE_V1_MULTIPROCESSING=0` in mind: it is
+   required for monkeypatch instrumentation but changes the very overhead being measured.

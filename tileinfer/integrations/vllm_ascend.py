@@ -367,6 +367,15 @@ class TileInferDecodeAttention:
     _lock = threading.Lock()
     _attn = None
     _marker = None
+    # Per-step metadata-refresh dedup (B3): every full-attention layer calls run() once per
+    # decode step with the *same* page table / seq_lens, so the refresh chain would run
+    # ~10x redundantly (E12: ~0.4ms per small NPU eager op on this stack).  Keying on the
+    # identity of the step's attn_metadata object (a fresh AscendMetadata is built by
+    # vllm-ascend's builder every step, capture included) makes the refresh run exactly
+    # once per step - the plan-owned buffers it writes are shared by all layers.  A strong
+    # reference to the object is kept so its id cannot be recycled while it is the guard.
+    _step_guard: tuple = ()
+    _step_obj: Any = None
     _stats: Dict[str, int] = {
         "capture_calls": 0,
         "eager_calls": 0,
@@ -632,9 +641,15 @@ class TileInferDecodeAttention:
         seq_lens: torch.Tensor,
         block_size: int,
         output: torch.Tensor,
+        step_obj: Any = None,
     ) -> torch.Tensor:
         """One decode step: ``query`` is ``[num_reqs, num_heads, head_size]`` (the layout vLLM-Ascend
-        passes here), writes into ``output`` with the same layout."""
+        passes here), writes into ``output`` with the same layout.
+
+        ``step_obj`` is the step's attention-metadata object (vLLM passes the same instance to
+        every layer of a step and builds a fresh one per step); when provided, the shared
+        metadata-refresh chain runs only for the first layer of the step (B3 dedup).
+        """
         cls = TileInferDecodeAttention
         capturing = torch.npu.is_current_stream_capturing()
         num_reqs = int(seq_lens.numel())
@@ -657,40 +672,58 @@ class TileInferDecodeAttention:
                 return None
 
         state = plan.backend_state
+        # Buffers the kernel call needs regardless of whether this layer performed the
+        # step's refresh (plan-owned, stable addresses).
+        lpl = state["last_page_len_buf"]
+        idx_buf: torch.Tensor = state["kv_indices_buf"]
         # Engine pages -> kernel pages: expand the page table to 128-token sub-page ids (zero-copy;
         # identity for block_size == 128) and stage everything into plan-owned buffers.  Every op
         # below is shape-static and device-side, so the whole step is capturable.
-        table_exp = _expand_page_table(block_tables[:num_reqs], sub)
-        table_buf: torch.Tensor = state["table_buf"]
-        table_buf[:num_reqs].copy_(table_exp)
-        # Zero the padding rows' columns so a padding row (pages=1 from its stale len=1) can only
-        # ever reach page 0 — never a leftover id from some earlier longer batch.
-        table_buf[num_reqs:].zero_()
-        lens_buf: torch.Tensor = state["lens_buf"]
-        lens_buf[:num_reqs].copy_(seq_lens[:num_reqs].to(torch.int32))
-        # last-page-len from the padded lens, in place: ((lens - 1) % page) + 1
-        lpl = state["last_page_len_buf"]
-        torch.sub(lens_buf, 1, out=lpl)
-        lpl.remainder_(KERNEL_PAGE_SIZE)
-        lpl.add_(1)
-        # Rebuild the ragged triple on the device (H4 fix): fixed shapes, in-place, capturable.
-        # pages_b = ceil(lens_b / 128); kv_indptr = exclusive cumsum; request b's pages end up at
-        # ``kv_indices[indptr[b] : indptr[b] + pages_b]`` — exactly the span the kernel derives
-        # from indptr diffs.  Invalid columns are parked in the trash slot, outside every span.
-        pages: torch.Tensor = state["pages_buf"]
-        torch.add(lens_buf, KERNEL_PAGE_SIZE - 1, out=pages)
-        pages.floor_divide_(KERNEL_PAGE_SIZE)
-        indptr: torch.Tensor = state["kv_indptr_buf"]
-        torch.cumsum(pages, dim=0, out=indptr[1:])
-        j: torch.Tensor = state["j_buf"]
-        torch.lt(j.unsqueeze(0), pages.unsqueeze(1), out=state["valid_buf"])
-        torch.ge(j.unsqueeze(0), pages.unsqueeze(1), out=state["invalid_buf"])
-        torch.add(indptr[:-1].unsqueeze(1), j.unsqueeze(0), out=state["dst32_buf"])
-        dst64: torch.Tensor = state["dst64_buf"]
-        dst64.copy_(state["dst32_buf"])
-        dst64.masked_fill_(state["invalid_buf"], state["trash_slot"])
-        idx_buf: torch.Tensor = state["kv_indices_buf"]
-        idx_buf.scatter_(0, dst64.view(-1), table_buf.view(-1))
+        step_id = id(step_obj) if step_obj is not None else None
+        if step_id is None or (step_id, key) != cls._step_guard:
+            # First layer of this step (or a library-level caller without step identity):
+            # refresh the shared metadata.  Layers 2..N skip - the values are identical.
+            if step_id is not None:
+                cls._step_guard = (step_id, key)
+                cls._step_obj = step_obj  # strong ref: keeps the id unique while it guards
+            cls._stats["refreshes"] = cls._stats.get("refreshes", 0) + 1
+            if cls._stats["refreshes"] <= 12:
+                logger.info(
+                    "TileInfer step refresh #%d: metadata id=%s key_bucket=%d",
+                    cls._stats["refreshes"],
+                    step_id,
+                    bucket,
+                )
+            table_exp = _expand_page_table(block_tables[:num_reqs], sub)
+            table_buf: torch.Tensor = state["table_buf"]
+            table_buf[:num_reqs].copy_(table_exp)
+            # Zero the padding rows' columns so a padding row (pages=1 from its stale len=1) can
+            # only ever reach page 0 - never a leftover id from some earlier longer batch.
+            table_buf[num_reqs:].zero_()
+            lens_buf: torch.Tensor = state["lens_buf"]
+            lens_buf[:num_reqs].copy_(seq_lens[:num_reqs].to(torch.int32))
+            # last-page-len from the padded lens, in place: ((lens - 1) % page) + 1
+            torch.sub(lens_buf, 1, out=lpl)
+            lpl.remainder_(KERNEL_PAGE_SIZE)
+            lpl.add_(1)
+            # Rebuild the ragged triple on the device (H4 fix): fixed shapes, in-place, capturable.
+            # pages_b = ceil(lens_b / 128); kv_indptr = exclusive cumsum; request b's pages end up
+            # at ``kv_indices[indptr[b] : indptr[b] + pages_b]`` - exactly the span the kernel
+            # derives from indptr diffs.  Invalid columns are parked in the trash slot, outside
+            # every span.
+            pages: torch.Tensor = state["pages_buf"]
+            torch.add(lens_buf, KERNEL_PAGE_SIZE - 1, out=pages)
+            pages.floor_divide_(KERNEL_PAGE_SIZE)
+            indptr: torch.Tensor = state["kv_indptr_buf"]
+            torch.cumsum(pages, dim=0, out=indptr[1:])
+            j: torch.Tensor = state["j_buf"]
+            torch.lt(j.unsqueeze(0), pages.unsqueeze(1), out=state["valid_buf"])
+            torch.ge(j.unsqueeze(0), pages.unsqueeze(1), out=state["invalid_buf"])
+            torch.add(indptr[:-1].unsqueeze(1), j.unsqueeze(0), out=state["dst32_buf"])
+            dst64: torch.Tensor = state["dst64_buf"]
+            dst64.copy_(state["dst32_buf"])
+            dst64.masked_fill_(state["invalid_buf"], state["trash_slot"])
+            idx_buf.scatter_(0, dst64.view(-1), table_buf.view(-1))
 
         # Stage the padded query.  vLLM hands us ``[num_tokens, num_heads, head_size]`` on this
         # stack (verified); the kernel wants ``[bucket, num_kv_heads * BR, head_size]`` with the
@@ -886,6 +919,9 @@ def _build_classes():
                     seq_lens=device_lens[:num_reqs],
                     block_size=block_size,
                     output=output,
+                    # Step identity for the refresh-once-per-step dedup (B3): vLLM hands the
+                    # same metadata instance to every attention layer of a step.
+                    step_obj=attn_metadata,
                 )
                 if out is None:  # kernel not compiled yet - keep serving through FIA
                     return super().forward_impl(query, key, value, kv_cache, attn_metadata, output)

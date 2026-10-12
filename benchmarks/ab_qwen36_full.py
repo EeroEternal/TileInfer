@@ -175,6 +175,40 @@ def top_logprobs(base, model):
     return [(t["token"], round(t["logprob"], 4)) for t in (items[0].get("top_logprobs") or [])] if items else []
 
 
+def wait_ready(base: str, model: str) -> None:
+    for _ in range(240):
+        try:
+            post(base + "/v1/chat/completions",
+                 {"model": model, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1},
+                 timeout=30)
+            return
+        except Exception:
+            time.sleep(5)
+    raise SystemExit("server not ready")
+
+
+def probe_assertions(probe_path: str, phase: str) -> dict:
+    """在役探针断言(B5c/任务书第 1c 项):A/B 数字有效性前提。
+
+    before: ready_plans>=1 且 capture_calls>0(图模式已进图);快照 fallbacks/markers。
+    after:  测量窗口 fallbacks 增量必须为 0,markers 必须增长(内核真实服役)。
+    """
+    import os
+
+    if not probe_path or not os.path.exists(probe_path):
+        return {}
+    with open(probe_path) as f:
+        m = json.load(f)
+    if phase == "before":
+        assert m.get("ready_plans", 0) >= 1, f"probe: 没有 READY plan: {m}"
+        assert m.get("capture_calls", 0) > 0, f"probe: capture_calls=0,TileInfer 未进图: {m}"
+        assert not m.get("exceptions", 0), f"probe: 异常熔断已触发: {m}"
+        print(f"[probe-before] {m}", flush=True)
+    else:
+        print(f"[probe-after] {m}", flush=True)
+    return m
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8321)
@@ -183,22 +217,17 @@ def main():
     ap.add_argument("--outdir", required=True)
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--conc", type=int, nargs="+", default=[4, 16, 32])
+    ap.add_argument("--warmup", type=int, default=1,
+                    help="每场景先做 N 次不计入统计的预热(双侧同参,公平)")
+    ap.add_argument("--probe", default="",
+                    help="TileInfer 在役探针 JSON 路径(TILEINFER_METRICS_PATH);空=FIA 侧跳过")
     args = ap.parse_args()
 
     import os
     os.makedirs(args.outdir, exist_ok=True)
     base = f"http://127.0.0.1:{args.port}"
 
-    for _ in range(240):
-        try:
-            post(base + "/v1/chat/completions",
-                 {"model": args.model, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1},
-                 timeout=30)
-            break
-        except Exception:
-            time.sleep(5)
-    else:
-        raise SystemExit("server not ready")
+    wait_ready(base, args.model)
 
     p8k, p16k = make_long_prompt(8000), make_long_prompt(16000)
     report = {"label": args.label, "model": args.model, "port": args.port,
@@ -208,14 +237,38 @@ def main():
 
     report["top5_logprobs"] = top_logprobs(base, args.model)
 
-    report["scenarios"].append(scenario_single(base, args.model, "ttft_short_1tok", SHORT_PROMPT, 1, args.runs + 2))
-    report["scenarios"].append(scenario_single(base, args.model, "decode_512tok", SHORT_PROMPT, 512, args.runs))
-    report["scenarios"].append(scenario_single(base, args.model, "decode_128tok", SHORT_PROMPT, 128, args.runs))
-    report["scenarios"].append(scenario_single(base, args.model, "long8k_128tok", p8k, 128, args.runs))
-    report["scenarios"].append(scenario_single(base, args.model, "long16k_128tok", p16k, 128, args.runs))
-    report["scenarios"].append(scenario_single(base, args.model, "ttft_long16k_1tok", p16k, 1, args.runs))
+    probe_before = probe_assertions(args.probe, "before")
+
+    scenarios = [
+        ("ttft_short_1tok", SHORT_PROMPT, 1),
+        ("decode_128tok", SHORT_PROMPT, 128),
+        ("decode_512tok", SHORT_PROMPT, 512),
+        ("long8k_128tok", p8k, 128),
+        ("long16k_128tok", p16k, 128),
+        ("ttft_long16k_1tok", p16k, 1),
+    ]
+    if args.warmup:
+        print(f"[warmup] 每场景预热 {args.warmup} 次(不计入统计)", flush=True)
+        for _, prompt, mt in scenarios:
+            for _ in range(args.warmup):
+                gen_stream(base, args.model, prompt, mt)
+        for c in args.conc:
+            scenario_conc(base, args.model, c, 128, 1)  # 并发场景预热走 runs=1 输出被丢弃
+        report["warmup_runs"] = args.warmup
+
+    for label, prompt, mt in scenarios:
+        report["scenarios"].append(scenario_single(base, args.model, label, prompt, mt, args.runs))
     for c in args.conc:
         report["scenarios"].append(scenario_conc(base, args.model, c, 128, args.runs))
+
+    if probe_before:
+        probe_after = probe_assertions(args.probe, "after")
+        assert probe_after.get("fallbacks", -1) == probe_before.get("fallbacks", -2), \
+            "probe: 测量窗口出现 FIA 回退,A/B 数字无效"
+        assert probe_after.get("kernel_markers", 0) > probe_before.get("kernel_markers", 0), \
+            "probe: 测量窗口 marker 未增长,TileInfer 未服役,数字无效"
+        report["probe_before"] = probe_before
+        report["probe_after"] = probe_after
 
     out = os.path.join(args.outdir, f"ab_full_{args.label}.json")
     with open(out, "w") as f:
