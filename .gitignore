@@ -15,3 +15,7 @@ bench_out/
 *.json
 !docs/**/*.json
 .env
+
+# local scratch and user-local toolchains (never part of the repo)
+.work/
+.cann*/
