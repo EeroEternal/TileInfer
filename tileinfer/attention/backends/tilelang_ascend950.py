@@ -23,7 +23,6 @@ import torch
 
 from ...metadata import AttentionMode
 from ...plan import AttentionPlan
-from ...utils import quantize_capacity
 from .base import AttentionBackend, register_backend
 
 __all__ = ["TileLangAscend950Backend"]
@@ -111,7 +110,7 @@ class TileLangAscend950Backend(AttentionBackend):
             plan.gqa_group_size,
             plan.head_dim,
             plan.page_size,
-            quantize_capacity(int(k_cache.shape[0])),
+            int(k_cache.shape[0]),
         )
         if state.get("spec_key") == spec_key:
             return plan
@@ -174,7 +173,7 @@ class TileLangAscend950Backend(AttentionBackend):
             # own copies, so a kernel can never write into a caller's tensor, and the addresses
             # stay stable across steps (which is what graph capture wants).  This mirrors the
             # fork backend's `_refresh_metadata`.
-            cap = quantize_capacity(int(k_cache.shape[0]))
+            cap = int(k_cache.shape[0])
             state["page_cap"] = cap
             state["kv_indptr_buf"] = torch.empty(plan.batch_size + 1, dtype=torch.int32, device=plan.device)
             state["kv_indices_buf"] = torch.zeros(cap, dtype=torch.int32, device=plan.device)
@@ -189,7 +188,7 @@ class TileLangAscend950Backend(AttentionBackend):
                 group=plan.gqa_group_size,
                 dim=plan.head_dim,
                 page_size=plan.page_size,
-                num_pages_cap=quantize_capacity(int(k_cache.shape[0])),
+                num_pages_cap=int(k_cache.shape[0]),
                 dtype=_TILELANG_DTYPE[plan.dtype],
             )
         return plan

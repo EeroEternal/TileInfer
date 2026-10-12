@@ -117,8 +117,10 @@ class TileInferDecodeAttention:
     def supported(self, block_size: int) -> bool:
         """Whether the kernel can handle this configuration at all."""
         reasons = []
-        if self.head_size != 128:
-            reasons.append(f"head_size={self.head_size} (the Ascend 950 path is tuned for 128)")
+        if self.head_size not in (128, 256):
+            reasons.append(
+                f"head_size={self.head_size} (the Ascend 950 path is tuned for 128 and 256)"
+            )
         if block_size < 16:
             reasons.append(f"block_size={block_size} (the paged kernel needs >= 16)")
         if self.group_size < 2:
@@ -146,11 +148,12 @@ class TileInferDecodeAttention:
         # steps fell back to FIA while the compile starved the engine.  Round the width up to a power
         # of two so one plan covers a whole run (and the plan's workspace stays bounded: the dummy
         # page table sizes it, so using the whole pool would OOM).
+        # `max_pages` (the request's block-table width) is rounded up because it moves *within* a run
+        # and the plan is sized by a dummy table, not by storage.  The *pool* is deliberately left
+        # exact: the kernel declares the K/V cache as `(pool, page_size, kv_heads, dim)` and the FFI
+        # view requires the storage to actually cover it, so a rounded-up pool overruns the tensor.
         max_pages_eff = quantize_capacity(max_pages)
-        # Quantize the pool for the *key* as well: the pool is derived from free memory at profiling
-        # time, so it differs from run to run (observed 5822 / 10674 / 11585 / 11586).  Left raw, every
-        # run would be a cache miss and pay a fresh ~70 s compile inside the serving process.
-        pool_eff = quantize_capacity(int(key_cache.shape[0]))
+        pool_eff = int(key_cache.shape[0])
         key = (self._config_key, bucket, max_pages_eff, block_size, pool_eff)
         plan = self._plans.get(key)
         if plan is not None or key in self._failed:
@@ -366,6 +369,10 @@ def _build_classes():
                     head_size=self.head_size,
                     scale=self.scale,
                     device=self.key_cache.device,
+                    # Split-KV (`kv_tile_pages > 0`) was unreachable from the engine before: the ctor
+                    # defaulted to 0 and nothing ever passed it.  It is still opt-in (the kernel also
+                    # refuses split plans without TILEINFER_ALLOW_SPLIT_KV=1, see KI-1).
+                    kv_tile_pages=int(__import__("os").environ.get("TILEINFER_KV_TILE_PAGES", 0)),
                 )
             return self._tileinfer if self._tileinfer.supported(block_size) else None
 

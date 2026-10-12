@@ -32,8 +32,6 @@ import torch
 import tilelang
 import tilelang.ascend.language as T
 
-from ...utils import quantize_capacity
-
 __all__ = [
     "paged_decode_ascend950",
     "paged_decode_split",
@@ -83,7 +81,7 @@ def paged_decode_ascend950(
     num_blocks = batch * kv_heads
 
     assert BR % 2 == 0, "dual_copy splits the M dimension across the two AIVs, so group must be even"
-    assert dim == 128, "the Ascend 950 attention path is tuned for head_dim == 128"
+    assert dim in (128, 256), "the Ascend 950 attention path is tuned for head_dim 128 or 256"
     assert page_size % 2 == 0
 
     @T.prim_func
@@ -236,7 +234,7 @@ def paged_decode_split(
     num_slots = batch * max_splits
 
     assert BR % 2 == 0 and group % 2 == 0 and group <= BR
-    assert dim == 128
+    assert dim in (128, 256), "the Ascend 950 attention path is tuned for head_dim 128 or 256"
     assert page_size % 2 == 0
 
     @T.prim_func
@@ -480,12 +478,10 @@ def build_split_kernel(**spec):
 def build_decode_kernel(**spec):
     """Compile (and cache) the kernel for one shape combination.
 
-    ``num_pages_cap`` is quantized here, at the one entry point every caller uses (the engine, the
-    prewarm script, the tests), so the cache key never follows the exact runtime pool size -- otherwise
-    a prewarm for one pool misses the engine's key and the serving process pays a fresh ~70 s compile.
+    ``num_pages_cap`` is the *real* pool size, deliberately not rounded: the kernel declares the
+    K/V cache as ``(num_pages_cap, page_size, kv_heads, dim)``, and the storage must actually cover
+    it (see `pool_view`), so a rounded-up cap makes the FFI view overrun the tensor.
     """
-    if "num_pages_cap" in spec:
-        spec["num_pages_cap"] = quantize_capacity(spec["num_pages_cap"])
     key = tuple(sorted(spec.items()))
     kernel = _KERNEL_CACHE.get(key)
     if kernel is None:
@@ -544,7 +540,7 @@ def paged_prefill_ascend950(
 
     assert BR % 32 == 0, "the ND->NZ copy template wants ROWS = BR // 2 to be a multiple of 16"
     assert BR <= 128, "one L0C tile holds BR x BC floats; keep block_q <= 128 at page_size 128"
-    assert dim == 128
+    assert dim in (128, 256), "the Ascend 950 attention path is tuned for head_dim 128 or 256"
     assert page_size % 2 == 0
 
     @T.prim_func
@@ -672,8 +668,6 @@ def paged_prefill_ascend950(
 
 def build_prefill_kernel(**spec):
     """Compile (and cache) the prefill kernel.  See `build_decode_kernel` re: `num_pages_cap`."""
-    if "num_pages_cap" in spec:
-        spec["num_pages_cap"] = quantize_capacity(spec["num_pages_cap"])
     key = ("prefill",) + tuple(sorted(spec.items()))
     kernel = _KERNEL_CACHE.get(key)
     if kernel is None:
@@ -737,7 +731,7 @@ def forward_split(
         group=group,
         dim=dim,
         page_size=page_size,
-        num_pages_cap=quantize_capacity(k_cache.shape[0]),
+        num_pages_cap=int(k_cache.shape[0]),
         num_tiles=num_tiles,
         max_splits=max_splits,
         dtype=dtype,
@@ -757,7 +751,7 @@ def forward_split(
         last_page_len = kv_last_page_len
     else:
         indices = meta.kv_indices.to(torch.int32)
-        cap = quantize_capacity(k_cache.shape[0])
+        cap = int(k_cache.shape[0])
         if indices.numel() < cap:
             indices = torch.cat([indices, indices.new_zeros(cap - indices.numel())])
         indptr = meta.kv_indptr.to(torch.int32)
@@ -781,8 +775,8 @@ def forward_split(
     _hook("before split")
     split(
         q_pad,
-        k_cache.reshape(-1, page_size, kv_heads, dim),
-        v_cache.reshape(-1, page_size, kv_heads, dim),
+        pool_view(k_cache, int(k_cache.shape[0])),
+        pool_view(v_cache, int(v_cache.shape[0])),
         indptr,
         indices,
         last_page_len,
@@ -887,15 +881,15 @@ def forward_prefill(
         group=group,
         dim=dim,
         page_size=page_size,
-        num_pages_cap=quantize_capacity(cap),
+        num_pages_cap=cap,
         num_tiles=num_tiles,
         block_q=br,
         dtype=dtype,
     )
     kernel(
         q_packed,
-        k_cache.reshape(-1, page_size, kv_heads, dim),
-        v_cache.reshape(-1, page_size, kv_heads, dim),
+        pool_view(k_cache, cap),
+        pool_view(v_cache, cap),
         meta.kv_indptr.to(torch.int32),
         indices,
         meta.kv_last_page_len.to(torch.int32),
@@ -939,6 +933,26 @@ _TORCH_TO_TILELANG_DTYPE = {
 }
 
 
+def pool_view(k_cache: torch.Tensor, cap: int) -> torch.Tensor:
+    """Present the KV pool with the kernel's declared page capacity, without copying.
+
+    Kernels are compiled for a quantized capacity ``cap >= pool`` so that one compiled artifact
+    serves every pool size in its bucket (see :func:`build_decode_kernel`).  The FFI binder
+    asserts that the runtime tensor's page count equals the declared one, and padding the pool
+    itself is not an option -- the engine writes new KV into it every step.  Pages beyond the
+    real pool are never dereferenced (every access is bounded by ``kv_indptr``/``kv_indices``,
+    whose buffer *is* padded to ``cap``), so a zero-copy capacity view is exact.
+
+    ``cap < pool`` would silently hide live pages and is a caller bug.
+    """
+    pool = int(k_cache.shape[0])
+    if pool == cap:
+        return k_cache.reshape(-1, *k_cache.shape[1:])
+    assert pool < cap, f"pool grew past the kernel's compiled capacity ({pool} > {cap})"
+    flat = k_cache if k_cache.is_contiguous() else k_cache.contiguous()
+    return flat.as_strided((cap, *flat.shape[1:]), flat.stride())
+
+
 def forward(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -980,7 +994,7 @@ def forward(
         group=group,
         dim=dim,
         page_size=page_size,
-        num_pages_cap=quantize_capacity(k_cache.shape[0]),
+        num_pages_cap=int(k_cache.shape[0]),
         dtype=dtype,
     )
 
@@ -988,8 +1002,8 @@ def forward(
     q_pad = q.new_zeros((batch, kv_heads * br, dim))
     q_pad.view(batch, kv_heads, br, dim)[:, :, :group] = q[:, :, 0, :].view(batch, kv_heads, group, dim)
 
-    k_flat = k_cache.reshape(-1, page_size, kv_heads, dim)
-    v_flat = v_cache.reshape(-1, page_size, kv_heads, dim)
+    k_flat = pool_view(k_cache, int(k_cache.shape[0]))
+    v_flat = pool_view(v_cache, int(v_cache.shape[0]))
 
     # The kernel is compiled for the whole pool (`k_cache.shape[0]`), while one step usually
     # references fewer pages.  The ABI wants the declared length, and the unused tail is never
@@ -1001,7 +1015,7 @@ def forward(
         last_page_len = kv_last_page_len
     else:
         indices = meta.kv_indices.to(torch.int32)
-        cap = quantize_capacity(k_cache.shape[0])
+        cap = int(k_cache.shape[0])
         if indices.numel() < cap:
             indices = torch.cat([indices, indices.new_zeros(cap - indices.numel())])
         indptr = meta.kv_indptr.to(torch.int32)
