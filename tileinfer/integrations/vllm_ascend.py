@@ -213,7 +213,8 @@ class TileInferDecodeAttention:
         block_size: int,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        """One decode step: ``query`` is ``[num_reqs, num_heads * head_size]``, writes into ``output``."""
+        """One decode step: ``query`` is ``[num_reqs, num_heads, head_size]`` (the layout vLLM-Ascend
+        passes here), writes into ``output`` with the same layout."""
         from tileinfer.metadata import pad_batch, ragged_from_page_table_device
 
         num_reqs = int(seq_lens.numel())
@@ -229,7 +230,11 @@ class TileInferDecodeAttention:
             meta = pad_batch(meta, bucket, block_size)
 
         q = self._q_pad[bucket]
-        q[:num_reqs] = query[:num_reqs].view(num_reqs, self.num_heads, 1, self.head_size).to(self.dtype)
+        # vLLM hands us `[num_tokens, num_heads, head_size]` on this stack (verified), while the
+        # kernel wants `[num_reqs, num_heads, 1, head_size]`.  `reshape` (not `view`) also tolerates
+        # the `[num_tokens, num_heads * head_size]` layout other builds use, and a non-contiguous
+        # slice.
+        q[:num_reqs] = query[:num_reqs].reshape(num_reqs, self.num_heads, 1, self.head_size).to(self.dtype)
 
         out = self._attn.run(
             q,
@@ -240,9 +245,10 @@ class TileInferDecodeAttention:
             kv_indices=meta.kv_indices,
             kv_last_page_len=meta.kv_last_page_len,
         )
-        output[:num_reqs] = out[:num_reqs].reshape(num_reqs, self.num_heads * self.head_size).to(
-            output.dtype
-        )
+        # Mirror vLLM's own `output` layout instead of assuming a flat `[num_reqs, heads*head_size]`:
+        # on this stack `output` is `[num_tokens, num_heads, head_size]`, so reshaping to a flat width
+        # raised "expanded size (128) must match the existing size (1536)".
+        output[:num_reqs] = out[:num_reqs].reshape(output[:num_reqs].shape).to(output.dtype)
         return output
 
 
