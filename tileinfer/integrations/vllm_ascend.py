@@ -52,6 +52,50 @@ logger = logging.getLogger("tileinfer.vllm_ascend")
 #: so the padding waste is small compared to recompiling.
 BATCH_BUCKETS: Tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128, 256)
 
+#: The TileLang kernels are compiled for 128-token pages: the page is the kernel's N tile (``BC``),
+#: so a page of 2048 tokens cannot fit the 64 KB L0 buffers.  Hybrid models (Qwen3.5/3.6 with GDN
+#: layers) force a much larger engine block size — vLLM-Ascend aligns the attention page with the
+#: mamba state page (e.g. 2048 tokens).  A ``block_size = k * 128`` page is *k consecutive
+#: 128-token sub-pages* in memory, so the pool is presented as a zero-copy view with 128-token
+#: pages and the engine's page table is expanded to sub-page ids (``page * k + i``).  Kernel shapes
+#: then stay within capacity and no KV copy happens; vLLM's block-size validation accepts this
+#: because the framework block size only needs to be a *multiple* of the kernel's requirement.
+KERNEL_PAGE_SIZE = 128
+
+
+def _sub_pages(block_size: int) -> int:
+    """How many 128-token sub-pages one engine page holds (>= 1; 1 = no transformation)."""
+    if block_size % KERNEL_PAGE_SIZE != 0:
+        raise ValueError(
+            f"block_size={block_size} is not a multiple of {KERNEL_PAGE_SIZE}; "
+            "the TileInfer kernel cannot tile it"
+        )
+    return max(1, block_size // KERNEL_PAGE_SIZE)
+
+
+def _expand_page_table(block_tables: torch.Tensor, sub: int) -> torch.Tensor:
+    """Expand a dense table of ``block_size``-token pages into 128-token sub-page ids.
+
+    Column ``j * sub + i`` of the result holds ``table[j] * sub + i``: sub-page ``i`` of engine
+    page ``table[j]``.  Unused columns expand to sub-pages of whatever stale id they hold — they
+    are masked out by ``ragged_from_page_table_device`` (``cols < pages_per_seq``), so their
+    contents never matter.
+    """
+    if sub == 1:
+        return block_tables
+    scaled = block_tables.to(torch.int32) * sub
+    expanded = scaled.repeat_interleave(sub, dim=1)
+    offsets = torch.arange(sub, dtype=torch.int32, device=block_tables.device)
+    return expanded + offsets.repeat(scaled.shape[1])
+
+
+def _pool_sub_view(pool: torch.Tensor, sub: int) -> torch.Tensor:
+    """View a pool of ``block_size``-token NHD pages as ``sub``-times more 128-token pages."""
+    if sub == 1:
+        return pool
+    nb, block, heads, dim = pool.shape
+    return pool.reshape(nb * (block // KERNEL_PAGE_SIZE), KERNEL_PAGE_SIZE, heads, dim)
+
 
 def _bucket_for(num_reqs: int) -> int:
     for bucket in BATCH_BUCKETS:
@@ -123,6 +167,11 @@ class TileInferDecodeAttention:
             )
         if block_size < 16:
             reasons.append(f"block_size={block_size} (the paged kernel needs >= 16)")
+        elif block_size % KERNEL_PAGE_SIZE != 0:
+            reasons.append(
+                f"block_size={block_size} (the kernel tiles 128-token pages; "
+                "the engine page must be a multiple)"
+            )
         if self.group_size < 2:
             reasons.append(f"group={self.group_size} (MHA needs the reference path)")
         if reasons:
@@ -152,7 +201,10 @@ class TileInferDecodeAttention:
         # and the plan is sized by a dummy table, not by storage.  The *pool* is deliberately left
         # exact: the kernel declares the K/V cache as `(pool, page_size, kv_heads, dim)` and the FFI
         # view requires the storage to actually cover it, so a rounded-up pool overruns the tensor.
-        max_pages_eff = quantize_capacity(max_pages)
+        # Widths are counted in *kernel* pages (128 tokens): a hybrid model's 2048-token page is 16
+        # of them (see KERNEL_PAGE_SIZE), and the plan's schedule must cover the expanded table.
+        sub = _sub_pages(block_size)
+        max_pages_eff = quantize_capacity(max_pages * sub)
         pool_eff = int(key_cache.shape[0])
         key = (self._config_key, bucket, max_pages_eff, block_size, pool_eff)
         plan = self._plans.get(key)
@@ -201,30 +253,34 @@ class TileInferDecodeAttention:
         # A *dummy* page table: only its shape matters (it sizes the plan's workspace, so it is the
         # rounded-up width from plan_if_ready, not the whole pool).  Decode without KV splitting
         # produces one work tile per request, so the schedule does not depend on the lengths; the
-        # values are refreshed every step by the caller.
+        # values are refreshed every step by the caller.  Plans are always built on kernel pages
+        # (128 tokens) — `max_pages` already arrives expanded (see plan_if_ready) and the pool is
+        # presented as its 128-token sub-page view.
+        sub = _sub_pages(block_size)
+        pool = _pool_sub_view(key_cache, sub)
         dummy_lens = torch.ones(bucket, dtype=torch.int32, device=self.device)
         dummy = RaggedMetadata(
             kv_indptr=torch.arange(0, bucket + 1, dtype=torch.int32, device=self.device),
             kv_indices=torch.zeros(bucket, dtype=torch.int32, device=self.device),
             kv_last_page_len=torch.ones(bucket, dtype=torch.int32, device=self.device),
-            page_size=block_size,
+            page_size=KERNEL_PAGE_SIZE,
         )
         plan = cls._attn.plan_from_page_table(
             torch.zeros((bucket, max_pages), dtype=torch.int32, device=self.device),
             dummy_lens,
             qo_lens=torch.ones(bucket, dtype=torch.int32, device=self.device),
-            page_size=block_size,
+            page_size=KERNEL_PAGE_SIZE,
             num_qo_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
             head_dim=self.head_size,
             sm_scale=self.scale,
             causal=False,
             kv_tile_pages=self.kv_tile_pages,
-            k_cache=key_cache,
+            k_cache=pool,
             # Only the *shape* is read (`finalize_plan` asserts K/V match); a full
             # `empty_like(key_cache)` duplicate of the V pool is ~0.8 GiB here and OOMs whenever the
             # KV cache already fills the budget.
-            v_cache=key_cache,
+            v_cache=pool,
         )
         self._q_pad[(self._config_key, bucket)] = torch.zeros(
             (bucket, self.num_heads, 1, self.head_size), dtype=self.dtype, device=self.device
@@ -261,11 +317,18 @@ class TileInferDecodeAttention:
         if plan is None:
             return None  # still compiling (or it failed): let the caller take the FIA path
 
+        # Engine pages -> kernel pages: expand the page table to 128-token sub-page ids and view
+        # the pools the same way (zero-copy, see KERNEL_PAGE_SIZE).  For block_size == 128 both are
+        # identity, so the non-hybrid path is untouched.
+        sub = _sub_pages(block_size)
+        table = _expand_page_table(block_tables[:num_reqs], sub)
         meta = ragged_from_page_table_device(
-            block_tables[:num_reqs], seq_lens[:num_reqs], block_size, device=self.device
+            table, seq_lens[:num_reqs], KERNEL_PAGE_SIZE, device=self.device
         )
         if bucket != num_reqs:
-            meta = pad_batch(meta, bucket, block_size)
+            meta = pad_batch(meta, bucket, KERNEL_PAGE_SIZE)
+        k_view = _pool_sub_view(key_cache, sub)
+        v_view = _pool_sub_view(value_cache, sub)
 
         q = self._q_pad[(self._config_key, bucket)]
         # vLLM hands us `[num_tokens, num_heads, head_size]` on this stack (verified), while the
@@ -276,8 +339,8 @@ class TileInferDecodeAttention:
 
         out = TileInferDecodeAttention._attn.run(
             q,
-            key_cache,
-            value_cache,
+            k_view,
+            v_view,
             plan=plan,
             kv_indptr=meta.kv_indptr,
             kv_indices=meta.kv_indices,

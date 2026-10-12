@@ -103,18 +103,30 @@ def paged_decode_ascend950(
             v_l1 = T.alloc_l1((D, BC), dtype)  # V stored transposed, as in the upstream FA
             p_l1 = T.alloc_l1((BR, BC), dtype)
 
-            qk_a = T.alloc_l0a((BR, D), dtype)
-            qk_b = T.alloc_l0b((BC, D), dtype)
+            # D-split: head_dim 256 exceeds the 64 KB L0A/L0B capacity with single GEMMs (Z3
+            # scheduling refuses 98304/131072 B), so both products are split along D into D2=128
+            # halves: QK^T accumulates two GEMMs into one accumulator, P@V keeps two accumulators.
+            # For dim <= 128 every `if D > D2` branch is compile-time dead and the buffers below
+            # are exactly the pre-split ones.
+            D2 = min(D, 128)
+            qk_a = T.alloc_l0a((BR, D2), dtype)
+            qk_b = T.alloc_l0b((BC, D2), dtype)
             pv_a = T.alloc_l0a((BR, BC), dtype)
-            pv_b = T.alloc_l0b((D, BC), dtype)
+            pv_b = T.alloc_l0b((D2, BC), dtype)
             qk_acc = T.alloc_l0c((BR, BC), accum)
-            pv_acc = T.alloc_l0c((BR, D), accum)
+            pv_acc0 = T.alloc_l0c((BR, D2), accum)
+            if D > D2:
+                pv_acc1 = T.alloc_l0c((BR, D2), accum)
 
             s_ub = T.alloc_shared((ROWS, BC), accum)
             p_ub = T.alloc_shared((ROWS, BC), dtype)
-            o_ub = T.alloc_shared((ROWS, D), accum)
-            o_tmp_ub = T.alloc_shared((ROWS, D), accum)
-            out_ub = T.alloc_shared((ROWS, D), dtype)
+            o_ub0 = T.alloc_shared((ROWS, D2), accum)
+            o_tmp0 = T.alloc_shared((ROWS, D2), accum)
+            out_ub0 = T.alloc_shared((ROWS, D2), dtype)
+            if D > D2:
+                o_ub1 = T.alloc_shared((ROWS, D2), accum)
+                o_tmp1 = T.alloc_shared((ROWS, D2), accum)
+                out_ub1 = T.alloc_shared((ROWS, D2), dtype)
             m_ub = T.alloc_shared((ROWS,), accum)
             l_ub = T.alloc_shared((ROWS,), accum)
 
@@ -123,16 +135,22 @@ def paged_decode_ascend950(
             T.copy(Q[b, bh * BR : (bh + 1) * BR, 0:D], q_l1)
             T.fill(m_ub, T.float32(-1e30))
             T.fill(l_ub, T.float32(0))
-            T.fill(o_ub, T.float32(0))
+            T.fill(o_ub0, T.float32(0))
+            if D > D2:
+                T.fill(o_ub1, T.float32(0))
 
             for p in T.serial(num_pages):
                 pid = kv_indices[kv_indptr[b] + p]
 
                 # ---- scores = Q @ K^T, then cube -> UB ----
                 T.copy(KCache[pid, 0:BC, bh, 0:D], k_l1)
-                T.copy(q_l1[0:BR, 0:D], qk_a)
-                T.copy(k_l1[0:BC, 0:D], qk_b)
+                T.copy(q_l1[0:BR, 0:D2], qk_a)
+                T.copy(k_l1[0:BC, 0:D2], qk_b)
                 T.gemm(qk_a, qk_b, qk_acc, transpose_B=True, clear_accum=True)
+                if D > D2:
+                    T.copy(q_l1[0:BR, D2:D], qk_a)
+                    T.copy(k_l1[0:BC, D2:D], qk_b)
+                    T.gemm(qk_a, qk_b, qk_acc, transpose_B=True)
                 T.dual_copy(qk_acc, s_ub)
 
                 # ---- online softmax (SIMT) ----
@@ -169,8 +187,11 @@ def paged_decode_ascend950(
 
                     for r in T.Parallel(ROWS):
                         l_ub[r] = l_ub[r] * alpha[r] + partial[r]
-                    for r, d in T.Parallel(ROWS, D):
-                        o_ub[r, d] = o_ub[r, d] * alpha[r]
+                    for r, d in T.Parallel(ROWS, D2):
+                        o_ub0[r, d] = o_ub0[r, d] * alpha[r]
+                    if D > D2:
+                        for r, d in T.Parallel(ROWS, D2):
+                            o_ub1[r, d] = o_ub1[r, d] * alpha[r]
                     for r, c in T.Parallel(ROWS, BC):
                         p_ub[r, c] = T.Cast(dtype, s_frag[r, c])
 
@@ -178,18 +199,31 @@ def paged_decode_ascend950(
                 T.dual_copy(p_ub[0:ROWS, 0:BC], p_l1[0:BR, 0:BC])
                 T.copy(VCache[pid, 0:BC, bh, 0:D], v_l1[0:D, 0:BC], transpose=True)
                 T.copy(p_l1[0:BR, 0:BC], pv_a)
-                T.copy(v_l1[0:D, 0:BC], pv_b)
-                T.gemm(pv_a, pv_b, pv_acc, transpose_B=True, clear_accum=True)
-                T.dual_copy(pv_acc, o_tmp_ub)
+                T.copy(v_l1[0:D2, 0:BC], pv_b)
+                T.gemm(pv_a, pv_b, pv_acc0, transpose_B=True, clear_accum=True)
+                if D > D2:
+                    T.copy(v_l1[D2:D, 0:BC], pv_b)
+                    T.gemm(pv_a, pv_b, pv_acc1, transpose_B=True, clear_accum=True)
+                T.dual_copy(pv_acc0, o_tmp0)
+                if D > D2:
+                    T.dual_copy(pv_acc1, o_tmp1)
                 with T.SimtVF(threads=threads):
-                    for r, d in T.Parallel(ROWS, D):
-                        o_ub[r, d] = o_ub[r, d] + o_tmp_ub[r, d]
+                    for r, d in T.Parallel(ROWS, D2):
+                        o_ub0[r, d] = o_ub0[r, d] + o_tmp0[r, d]
+                    if D > D2:
+                        for r, d in T.Parallel(ROWS, D2):
+                            o_ub1[r, d] = o_ub1[r, d] + o_tmp1[r, d]
 
             # ---- normalise and store ----
             with T.SimtVF(threads=threads):
-                for r, d in T.Parallel(ROWS, D):
-                    out_ub[r, d] = T.Cast(dtype, o_ub[r, d] / l_ub[r])
-            T.dual_copy(out_ub[0:ROWS, 0:D], Out[b, bh * BR : (bh + 1) * BR, 0:D])
+                for r, d in T.Parallel(ROWS, D2):
+                    out_ub0[r, d] = T.Cast(dtype, o_ub0[r, d] / l_ub[r])
+                if D > D2:
+                    for r, d in T.Parallel(ROWS, D2):
+                        out_ub1[r, d] = T.Cast(dtype, o_ub1[r, d] / l_ub[r])
+            T.dual_copy(out_ub0[0:ROWS, 0:D2], Out[b, bh * BR : (bh + 1) * BR, 0:D2])
+            if D > D2:
+                T.dual_copy(out_ub1[0:ROWS, 0:D2], Out[b, bh * BR : (bh + 1) * BR, D2:D])
 
     return main
 
@@ -266,18 +300,26 @@ def paged_decode_split(
             v_l1 = T.alloc_l1((D, BC), dtype)
             p_l1 = T.alloc_l1((BR, BC), dtype)
 
-            qk_a = T.alloc_l0a((BR, D), dtype)
-            qk_b = T.alloc_l0b((BC, D), dtype)
+            # D-split, see paged_decode_ascend950: keeps L0A/L0B within capacity for dim=256.
+            D2 = min(D, 128)
+            qk_a = T.alloc_l0a((BR, D2), dtype)
+            qk_b = T.alloc_l0b((BC, D2), dtype)
             pv_a = T.alloc_l0a((BR, BC), dtype)
-            pv_b = T.alloc_l0b((D, BC), dtype)
+            pv_b = T.alloc_l0b((D2, BC), dtype)
             qk_acc = T.alloc_l0c((BR, BC), accum)
-            pv_acc = T.alloc_l0c((BR, D), accum)
+            pv_acc0 = T.alloc_l0c((BR, D2), accum)
+            if D > D2:
+                pv_acc1 = T.alloc_l0c((BR, D2), accum)
 
             s_ub = T.alloc_shared((ROWS, BC), accum)
             p_ub = T.alloc_shared((ROWS, BC), dtype)
-            o_ub = T.alloc_shared((ROWS, D), accum)
-            o_tmp_ub = T.alloc_shared((ROWS, D), accum)
-            out_ub = T.alloc_shared((ROWS, D), dtype)
+            o_ub0 = T.alloc_shared((ROWS, D2), accum)
+            o_tmp0 = T.alloc_shared((ROWS, D2), accum)
+            out_ub0 = T.alloc_shared((ROWS, D2), dtype)
+            if D > D2:
+                o_ub1 = T.alloc_shared((ROWS, D2), accum)
+                o_tmp1 = T.alloc_shared((ROWS, D2), accum)
+                out_ub1 = T.alloc_shared((ROWS, D2), dtype)
             lse_ub = T.alloc_shared((ROWS,), accum)
             m_ub = T.alloc_shared((ROWS,), accum)
             l_ub = T.alloc_shared((ROWS,), accum)
@@ -285,15 +327,21 @@ def paged_decode_split(
             T.copy(Q[b, bh * BR : (bh + 1) * BR, 0:D], q_l1)
             T.fill(m_ub, T.float32(-1e30))
             T.fill(l_ub, T.float32(0))
-            T.fill(o_ub, T.float32(0))
+            T.fill(o_ub0, T.float32(0))
+            if D > D2:
+                T.fill(o_ub1, T.float32(0))
 
             for p in T.serial(plen):
                 pid = kv_indices[kv_indptr[b] + start + p]
 
                 T.copy(KCache[pid, 0:BC, bh, 0:D], k_l1)
-                T.copy(q_l1[0:BR, 0:D], qk_a)
-                T.copy(k_l1[0:BC, 0:D], qk_b)
+                T.copy(q_l1[0:BR, 0:D2], qk_a)
+                T.copy(k_l1[0:BC, 0:D2], qk_b)
                 T.gemm(qk_a, qk_b, qk_acc, transpose_B=True, clear_accum=True)
+                if D > D2:
+                    T.copy(q_l1[0:BR, D2:D], qk_a)
+                    T.copy(k_l1[0:BC, D2:D], qk_b)
+                    T.gemm(qk_a, qk_b, qk_acc, transpose_B=True)
                 T.dual_copy(qk_acc, s_ub)
 
                 # only the request's *last* page can be partially filled, wherever the split puts it
@@ -326,30 +374,47 @@ def paged_decode_split(
 
                     for r in T.Parallel(ROWS):
                         l_ub[r] = l_ub[r] * alpha[r] + partial[r]
-                    for r, d in T.Parallel(ROWS, D):
-                        o_ub[r, d] = o_ub[r, d] * alpha[r]
+                    for r, d in T.Parallel(ROWS, D2):
+                        o_ub0[r, d] = o_ub0[r, d] * alpha[r]
+                    if D > D2:
+                        for r, d in T.Parallel(ROWS, D2):
+                            o_ub1[r, d] = o_ub1[r, d] * alpha[r]
                     for r, c in T.Parallel(ROWS, BC):
                         p_ub[r, c] = T.Cast(dtype, s_frag[r, c])
 
                 T.dual_copy(p_ub[0:ROWS, 0:BC], p_l1[0:BR, 0:BC])
                 T.copy(VCache[pid, 0:BC, bh, 0:D], v_l1[0:D, 0:BC], transpose=True)
                 T.copy(p_l1[0:BR, 0:BC], pv_a)
-                T.copy(v_l1[0:D, 0:BC], pv_b)
-                T.gemm(pv_a, pv_b, pv_acc, transpose_B=True, clear_accum=True)
-                T.dual_copy(pv_acc, o_tmp_ub)
+                T.copy(v_l1[0:D2, 0:BC], pv_b)
+                T.gemm(pv_a, pv_b, pv_acc0, transpose_B=True, clear_accum=True)
+                if D > D2:
+                    T.copy(v_l1[D2:D, 0:BC], pv_b)
+                    T.gemm(pv_a, pv_b, pv_acc1, transpose_B=True, clear_accum=True)
+                T.dual_copy(pv_acc0, o_tmp0)
+                if D > D2:
+                    T.dual_copy(pv_acc1, o_tmp1)
                 with T.SimtVF(threads=threads):
-                    for r, d in T.Parallel(ROWS, D):
-                        o_ub[r, d] = o_ub[r, d] + o_tmp_ub[r, d]
+                    for r, d in T.Parallel(ROWS, D2):
+                        o_ub0[r, d] = o_ub0[r, d] + o_tmp0[r, d]
+                    if D > D2:
+                        for r, d in T.Parallel(ROWS, D2):
+                            o_ub1[r, d] = o_ub1[r, d] + o_tmp1[r, d]
 
             with T.SimtVF(threads=threads):
-                for r, d in T.Parallel(ROWS, D):
-                    out_ub[r, d] = T.Cast(dtype, o_ub[r, d] / l_ub[r])
+                for r, d in T.Parallel(ROWS, D2):
+                    out_ub0[r, d] = T.Cast(dtype, o_ub0[r, d] / l_ub[r])
+                if D > D2:
+                    for r, d in T.Parallel(ROWS, D2):
+                        out_ub1[r, d] = T.Cast(dtype, o_ub1[r, d] / l_ub[r])
                 for r in T.Parallel(ROWS):
                     lse_ub[r] = m_ub[r] + T.log(l_ub[r])
 
-            T.dual_copy(out_ub[0:ROWS, 0:D], PartOut[slot * kv_heads + bh, 0:BR, 0:D])
+            T.dual_copy(out_ub0[0:ROWS, 0:D2], PartOut[slot * kv_heads + bh, 0:BR, 0:D2])
+            if D > D2:
+                T.dual_copy(out_ub1[0:ROWS, 0:D2], PartOut[slot * kv_heads + bh, 0:BR, D2:D])
             T.dual_copy(
-                lse_ub[0:ROWS], PartLse[(slot * kv_heads + bh) * BR : (slot * kv_heads + bh + 1) * BR]
+                lse_ub[0:ROWS],
+                PartLse[(slot * kv_heads + bh) * BR : (slot * kv_heads + bh + 1) * BR],
             )
 
     return main
@@ -572,18 +637,26 @@ def paged_prefill_ascend950(
             v_l1 = T.alloc_l1((D, BC), dtype)
             p_l1 = T.alloc_l1((BR, BC), dtype)
 
-            qk_a = T.alloc_l0a((BR, D), dtype)
-            qk_b = T.alloc_l0b((BC, D), dtype)
+            # D-split, see paged_decode_ascend950: keeps L0A/L0B within capacity for dim=256.
+            D2 = min(D, 128)
+            qk_a = T.alloc_l0a((BR, D2), dtype)
+            qk_b = T.alloc_l0b((BC, D2), dtype)
             pv_a = T.alloc_l0a((BR, BC), dtype)
-            pv_b = T.alloc_l0b((D, BC), dtype)
+            pv_b = T.alloc_l0b((D2, BC), dtype)
             qk_acc = T.alloc_l0c((BR, BC), accum)
-            pv_acc = T.alloc_l0c((BR, D), accum)
+            pv_acc0 = T.alloc_l0c((BR, D2), accum)
+            if D > D2:
+                pv_acc1 = T.alloc_l0c((BR, D2), accum)
 
             s_ub = T.alloc_shared((ROWS, BC), accum)
             p_ub = T.alloc_shared((ROWS, BC), dtype)
-            o_ub = T.alloc_shared((ROWS, D), accum)
-            o_tmp_ub = T.alloc_shared((ROWS, D), accum)
-            out_ub = T.alloc_shared((ROWS, D), dtype)
+            o_ub0 = T.alloc_shared((ROWS, D2), accum)
+            o_tmp0 = T.alloc_shared((ROWS, D2), accum)
+            out_ub0 = T.alloc_shared((ROWS, D2), dtype)
+            if D > D2:
+                o_ub1 = T.alloc_shared((ROWS, D2), accum)
+                o_tmp1 = T.alloc_shared((ROWS, D2), accum)
+                out_ub1 = T.alloc_shared((ROWS, D2), dtype)
             m_ub = T.alloc_shared((ROWS,), accum)
             l_ub = T.alloc_shared((ROWS,), accum)
             # Per-row causal threshold for *this AIV's* half of the M tile.  `dual_copy` splits it
@@ -595,15 +668,21 @@ def paged_prefill_ascend950(
             T.dual_copy(RowThr[tile * BR : (tile + 1) * BR], thr_ub)
             T.fill(m_ub, T.float32(-1e30))
             T.fill(l_ub, T.float32(0))
-            T.fill(o_ub, T.float32(0))
+            T.fill(o_ub0, T.float32(0))
+            if D > D2:
+                T.fill(o_ub1, T.float32(0))
 
             for p in T.serial(req_pages):
                 pid = kv_indices[kv_indptr[b] + p]
 
                 T.copy(KCache[pid, 0:BC, bh, 0:D], k_l1)
-                T.copy(q_l1[0:BR, 0:D], qk_a)
-                T.copy(k_l1[0:BC, 0:D], qk_b)
+                T.copy(q_l1[0:BR, 0:D2], qk_a)
+                T.copy(k_l1[0:BC, 0:D2], qk_b)
                 T.gemm(qk_a, qk_b, qk_acc, transpose_B=True, clear_accum=True)
+                if D > D2:
+                    T.copy(q_l1[0:BR, D2:D], qk_a)
+                    T.copy(k_l1[0:BC, D2:D], qk_b)
+                    T.gemm(qk_a, qk_b, qk_acc, transpose_B=True)
                 T.dual_copy(qk_acc, s_ub)
 
                 limit = T.if_then_else(p + 1 < req_pages, BC, kv_last_page_len[b])
@@ -642,26 +721,42 @@ def paged_prefill_ascend950(
 
                     for r in T.Parallel(ROWS):
                         l_ub[r] = l_ub[r] * alpha[r] + partial[r]
-                    for r, d in T.Parallel(ROWS, D):
-                        o_ub[r, d] = o_ub[r, d] * alpha[r]
+                    for r, d in T.Parallel(ROWS, D2):
+                        o_ub0[r, d] = o_ub0[r, d] * alpha[r]
+                    if D > D2:
+                        for r, d in T.Parallel(ROWS, D2):
+                            o_ub1[r, d] = o_ub1[r, d] * alpha[r]
                     for r, c in T.Parallel(ROWS, BC):
                         p_ub[r, c] = T.Cast(dtype, s_frag[r, c])
 
                 T.dual_copy(p_ub[0:ROWS, 0:BC], p_l1[0:BR, 0:BC])
                 T.copy(VCache[pid, 0:BC, bh, 0:D], v_l1[0:D, 0:BC], transpose=True)
                 T.copy(p_l1[0:BR, 0:BC], pv_a)
-                T.copy(v_l1[0:D, 0:BC], pv_b)
-                T.gemm(pv_a, pv_b, pv_acc, transpose_B=True, clear_accum=True)
-                T.dual_copy(pv_acc, o_tmp_ub)
+                T.copy(v_l1[0:D2, 0:BC], pv_b)
+                T.gemm(pv_a, pv_b, pv_acc0, transpose_B=True, clear_accum=True)
+                if D > D2:
+                    T.copy(v_l1[D2:D, 0:BC], pv_b)
+                    T.gemm(pv_a, pv_b, pv_acc1, transpose_B=True, clear_accum=True)
+                T.dual_copy(pv_acc0, o_tmp0)
+                if D > D2:
+                    T.dual_copy(pv_acc1, o_tmp1)
                 with T.SimtVF(threads=threads):
-                    for r, d in T.Parallel(ROWS, D):
-                        o_ub[r, d] = o_ub[r, d] + o_tmp_ub[r, d]
+                    for r, d in T.Parallel(ROWS, D2):
+                        o_ub0[r, d] = o_ub0[r, d] + o_tmp0[r, d]
+                    if D > D2:
+                        for r, d in T.Parallel(ROWS, D2):
+                            o_ub1[r, d] = o_ub1[r, d] + o_tmp1[r, d]
 
             with T.SimtVF(threads=threads):
-                for r, d in T.Parallel(ROWS, D):
-                    out_ub[r, d] = T.Cast(dtype, o_ub[r, d] / l_ub[r])
+                for r, d in T.Parallel(ROWS, D2):
+                    out_ub0[r, d] = T.Cast(dtype, o_ub0[r, d] / l_ub[r])
+                if D > D2:
+                    for r, d in T.Parallel(ROWS, D2):
+                        out_ub1[r, d] = T.Cast(dtype, o_ub1[r, d] / l_ub[r])
 
-            T.dual_copy(out_ub[0:ROWS, 0:D], OutPacked[bx, 0:BR, 0:D])
+            T.dual_copy(out_ub0[0:ROWS, 0:D2], OutPacked[bx, 0:BR, 0:D2])
+            if D > D2:
+                T.dual_copy(out_ub1[0:ROWS, 0:D2], OutPacked[bx, 0:BR, D2:D])
 
     return main
 
