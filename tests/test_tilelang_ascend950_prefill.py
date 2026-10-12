@@ -117,14 +117,17 @@ def _case(batch, kv_heads, group, page_size, dim, kv_lens, qo_lens, seed=0):
 
 
 @pytest.mark.parametrize(
-    "batch,kv_heads,group,kv_lens,qo_lens,label",
+    "batch,kv_heads,group,kv_lens,qo_lens,label,dim",
     [
-        (1, 2, 8, [128], [128], "prefill, one full page, causal"),
-        (1, 2, 8, [132], [4], "append: 4 new tokens over 128 cached"),
-        (1, 2, 8, [300], [100], "append with a partial tail page"),
-        (2, 2, 8, [256, 128], [256, 8], "two ragged requests"),
+        (1, 2, 8, [128], [128], "prefill, one full page, causal", 128),
+        (1, 2, 8, [132], [4], "append: 4 new tokens over 128 cached", 128),
+        (1, 2, 8, [300], [100], "append with a partial tail page", 128),
+        (2, 2, 8, [256, 128], [256, 8], "two ragged requests", 128),
+        # head_dim 256 (Qwen3.5/3.6 full-attention layers), incl. a non-power-of-two pool
+        (1, 2, 8, [128], [128], "d256 prefill, one full page, causal", 256),
+        (1, 2, 8, [300], [100], "d256 append with a partial tail page", 256),
     ],
 )
-def test_paged_prefill_matches_reference(batch, kv_heads, group, kv_lens, qo_lens, label):
-    diff = _case(batch, kv_heads, group, 128, 128, kv_lens, qo_lens)
+def test_paged_prefill_matches_reference(batch, kv_heads, group, kv_lens, qo_lens, label, dim):
+    diff = _case(batch, kv_heads, group, 128, dim, kv_lens, qo_lens)
     assert diff < TOL, f"{label}: max abs diff {diff:.4f} exceeds {TOL}"

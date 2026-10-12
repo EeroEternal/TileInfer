@@ -129,20 +129,28 @@ def _case(batch, kv_heads, group, page_size, dim, kv_lens, seed=0, kv_tile_pages
 
 
 @pytest.mark.parametrize(
-    "batch,kv_heads,group,kv_lens,label,kv_tile_pages",
+    "batch,kv_heads,group,kv_lens,label,kv_tile_pages,dim",
     [
-        (1, 2, 8, [128], "one full page", 0),
-        (1, 2, 8, [200], "partial tail page", 0),
-        (1, 2, 8, [1], "single token", 0),
-        (2, 2, 8, [128, 256], "ragged batch", 0),
-        (1, 1, 32, [256], "group == M tile", 0),
+        (1, 2, 8, [128], "one full page", 0, 128),
+        (1, 2, 8, [200], "partial tail page", 0, 128),
+        (1, 2, 8, [1], "single token", 0, 128),
+        (2, 2, 8, [128, 256], "ragged batch", 0, 128),
+        (1, 1, 32, [256], "group == M tile", 0, 128),
         # split-KV: 32 pages -> 4 tiles, the tail lands in the last split
-        (1, 2, 8, [4000], "split-KV, 4 tiles", 8),
+        (1, 2, 8, [4000], "split-KV, 4 tiles", 8, 128),
         # split-KV across several ragged requests (different split counts per request)
-        (2, 2, 8, [4096, 1024], "split-KV, ragged", 8),
+        (2, 2, 8, [4096, 1024], "split-KV, ragged", 8, 128),
+        # head_dim 256 (Qwen3.5/3.6 full-attention layers): non-power-of-two pool on purpose,
+        # it is the regression case for the kernel's quantized page-capacity binding
+        (1, 2, 8, [128], "d256 one full page", 0, 256),
+        (1, 2, 8, [200], "d256 partial tail page", 0, 256),
+        (2, 2, 8, [128, 256], "d256 ragged batch", 0, 256),
+        (1, 1, 32, [256], "d256 group == M tile", 0, 256),
+        # d256 + non-power-of-two pool (3 pages, kernel compiled for 4) - ABI binding regression
+        (2, 2, 8, [130, 300], "d256 ragged, odd pool", 0, 256),
     ],
 )
-def test_paged_decode_matches_reference(batch, kv_heads, group, kv_lens, label, kv_tile_pages):
-    got, expected = _case(batch, kv_heads, group, 128, 128, kv_lens, kv_tile_pages=kv_tile_pages)
+def test_paged_decode_matches_reference(batch, kv_heads, group, kv_lens, label, kv_tile_pages, dim):
+    got, expected = _case(batch, kv_heads, group, 128, dim, kv_lens, kv_tile_pages=kv_tile_pages)
     diff = (got - expected).abs().max().item()
     assert diff < TOL, f"{label}: max abs diff {diff:.4f} exceeds {TOL}"

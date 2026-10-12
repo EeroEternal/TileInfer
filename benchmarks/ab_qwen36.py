@@ -169,21 +169,21 @@ def main():
     # 1) 数值对照:首 token top-5 logprobs(每次运行都记,取第一次做 A/B 对照)
     report["top5_logprobs"] = top_logprobs(base, args.model)
 
-    # 2) 单流:TTFT(max_tokens=1)与 128-token 生成(TPOT 分布),3 次取中位数
-    ttfts, tpots_all, tputs = [], [], []
+    # 2) 单流:TTFT(max_tokens=1)与 128-token 生成(TPOT 取实测 decode 墙钟/token),3 次取中位数
+    ttfts, tpot_runs, tputs = [], [], []
     for r in range(args.runs):
         m = gen_once(base, args.model, 1, stream=False)
         ttfts.append(m["ttft"] * 1000)
         g = gen_once(base, args.model, 128, stream=True)
-        tpots_all.extend(g.get("tpots", []))
         decode_wall = g["gen_wall"] - g["ttft"]
+        tpot_runs.append(decode_wall / max(1, g["tokens"] - 1) * 1000)
         tputs.append((g["tokens"] - 1) / decode_wall if decode_wall > 0 else 0.0)
         time.sleep(1)
     report["single_stream"] = {
         "ttft_ms_median": round(statistics.median(ttfts), 1),
         "ttft_ms_all": [round(x, 1) for x in ttfts],
-        "tpot_ms_p50": round(percentile(tpots_all, 50), 2),
-        "tpot_ms_p99": round(percentile(tpots_all, 99), 2),
+        "tpot_ms_median": round(statistics.median(tpot_runs), 2),
+        "tpot_ms_all": [round(x, 2) for x in tpot_runs],
         "tokps_median": round(statistics.median(tputs), 2),
     }
 
