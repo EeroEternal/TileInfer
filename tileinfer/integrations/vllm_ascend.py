@@ -361,15 +361,37 @@ class TileInferDecodeAttention:
         )
         state = plan.backend_state
         # Engine-side staging (plan-owned, refreshed every step with device-side copies only):
-        # the expanded sub-page table, the (constant) dense indptr and the padded lens vector.
-        # Padding rows stay at table=0 / len=1 forever: a valid page id and a valid length, so
-        # the kernel's softmax cannot divide by zero and the padded outputs are never read.
+        # the expanded sub-page table and the padded lens vector.  Padding rows stay at
+        # table=0 / len=1: a valid page id and a valid length, so the kernel's softmax cannot
+        # divide by zero and the padded outputs are never read.
         state["table_buf"] = torch.zeros((bucket, width), dtype=torch.int32, device=self.device)
         state["lens_buf"] = torch.ones(bucket, dtype=torch.int32, device=self.device)
         state["table_width"] = width
-        state["kv_indptr_buf"].copy_(
-            torch.arange(0, bucket + 1, dtype=torch.int32, device=self.device) * width
-        )
+        # The ragged triple is rebuilt on the device every step (H4): pages_b = ceil(lens_b/128),
+        # kv_indptr = exclusive cumsum, and the row-major table columns are *compacted* into
+        # kv_indices with a fixed-shape scatter.  The kernel derives pages_b from indptr diffs,
+        # so an invalid (stale) table column must not be reachable through the indptr span — an
+        # earlier revision used the dense indptr ``arange(bucket+1)*width`` instead, which made
+        # every row attend over ``width`` pages including stale ids and produced garbage output.
+        # All helpers below are fixed-shape plan-owned buffers: the per-step rebuild is pure
+        # in-place device work (no allocation, no host sync), so it captures into ACLGraph.
+        state["pages_buf"] = torch.empty(bucket, dtype=torch.int32, device=self.device)
+        state["j_buf"] = torch.arange(width, dtype=torch.int32, device=self.device)
+        state["valid_buf"] = torch.empty((bucket, width), dtype=torch.bool, device=self.device)
+        state["invalid_buf"] = torch.empty((bucket, width), dtype=torch.bool, device=self.device)
+        state["dst32_buf"] = torch.empty((bucket, width), dtype=torch.int32, device=self.device)
+        state["dst64_buf"] = torch.empty((bucket, width), dtype=torch.int64, device=self.device)
+        # kv_indices is pool-sized (the kernel's declared page cap); ``sum(pages_b)`` is at most
+        # ``bucket*width``, far below the pool size, so the last slot is never covered by any
+        # row's indptr span and serves as the scatter's trash destination for invalid columns.
+        trash = int(state["kv_indices_buf"].numel()) - 1
+        if bucket * width >= trash:
+            raise ValueError(
+                f"KV pool ({trash + 1} pages) smaller than the staging table "
+                f"({bucket}x{width}); the ragged compaction has nowhere to park invalid columns"
+            )
+        state["trash_slot"] = trash
+        state["kv_indptr_buf"].zero_()
         if cls._marker is None:
             # In-service probe: bumped once per kernel launch inside run().  Under ACLGraph the
             # increment is *captured into the graph*, so it also counts replays — the number grows
@@ -427,6 +449,9 @@ class TileInferDecodeAttention:
         table_exp = _expand_page_table(block_tables[:num_reqs], sub)
         table_buf: torch.Tensor = state["table_buf"]
         table_buf[:num_reqs].copy_(table_exp)
+        # Zero the padding rows' columns so a padding row (pages=1 from its stale len=1) can only
+        # ever reach page 0 — never a leftover id from some earlier longer batch.
+        table_buf[num_reqs:].zero_()
         lens_buf: torch.Tensor = state["lens_buf"]
         lens_buf[:num_reqs].copy_(seq_lens[:num_reqs].to(torch.int32))
         # last-page-len from the padded lens, in place: ((lens - 1) % page) + 1
@@ -434,13 +459,24 @@ class TileInferDecodeAttention:
         torch.sub(lens_buf, 1, out=lpl)
         lpl.remainder_(KERNEL_PAGE_SIZE)
         lpl.add_(1)
-        # Dense page-index layout: request b's pages are ``kv_indices[b*width : b*width + pages_b]``
-        # (row-major, contiguous), indptr is the constant ``arange(bucket+1) * width`` — padding
-        # columns hold stale page ids that indptr masks out, so no masked_select (which would
-        # force a device sync) is needed anywhere.
-        idx_flat = table_buf.view(-1)
+        # Rebuild the ragged triple on the device (H4 fix): fixed shapes, in-place, capturable.
+        # pages_b = ceil(lens_b / 128); kv_indptr = exclusive cumsum; request b's pages end up at
+        # ``kv_indices[indptr[b] : indptr[b] + pages_b]`` — exactly the span the kernel derives
+        # from indptr diffs.  Invalid columns are parked in the trash slot, outside every span.
+        pages: torch.Tensor = state["pages_buf"]
+        torch.add(lens_buf, KERNEL_PAGE_SIZE - 1, out=pages)
+        pages.floor_divide_(KERNEL_PAGE_SIZE)
+        indptr: torch.Tensor = state["kv_indptr_buf"]
+        torch.cumsum(pages, dim=0, out=indptr[1:])
+        j: torch.Tensor = state["j_buf"]
+        torch.lt(j.unsqueeze(0), pages.unsqueeze(1), out=state["valid_buf"])
+        torch.ge(j.unsqueeze(0), pages.unsqueeze(1), out=state["invalid_buf"])
+        torch.add(indptr[:-1].unsqueeze(1), j.unsqueeze(0), out=state["dst32_buf"])
+        dst64: torch.Tensor = state["dst64_buf"]
+        dst64.copy_(state["dst32_buf"])
+        dst64.masked_fill_(state["invalid_buf"], state["trash_slot"])
         idx_buf: torch.Tensor = state["kv_indices_buf"]
-        idx_buf[: idx_flat.numel()].copy_(idx_flat)
+        idx_buf.scatter_(0, dst64.view(-1), table_buf.view(-1))
 
         # Stage the padded query.  vLLM hands us ``[num_tokens, num_heads, head_size]`` on this
         # stack (verified); the kernel wants ``[bucket, num_kv_heads * BR, head_size]`` with the
