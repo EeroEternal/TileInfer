@@ -1220,9 +1220,11 @@ def install_gdn_chunk_wu() -> bool:
             a_kkt = _kkt(k=k, beta=beta, g_cumsum=g64, cu_seqlens=cu_seqlens,
                          chunk_indices=chunk_indices_bt, output_dtype=torch.float32)
             # ---- 中段:融合内核(solve_tril + recompute_w_u)----
-            # 服务端 cu_seqlens 为 int32(引擎 metadata),内核签名要求 int64 → 统一转换
+            # 服务端 cu_seqlens / meta.chunk_indices_chunk64 均为 int32(引擎 metadata),
+            # 内核签名要求 int64 → 统一转换;triton 链首两核保持原 dtype(与原实现一致)
             cu64 = cu_seqlens.to(torch.int64)
-            w, u = gdn_chunk_wu(a_kkt, k, v, beta, g64, cu64, ci64)
+            ci64_64 = ci64.to(torch.int64) if ci64.dtype != torch.int64 else ci64
+            w, u = gdn_chunk_wu(a_kkt, k, v, beta, g64, cu64, ci64_64)
             cls_stats["gdn_wu_calls"] = cls_stats.get("gdn_wu_calls", 0) + 1
 
             # ---- 链尾:与原实现一致(AscendC staging + fwd_h + fwd_o)----

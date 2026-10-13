@@ -198,6 +198,46 @@ def test_chain_parity_fused_vs_original_t128():
 
 @pytest.mark.npu
 @pytest.mark.skipif(not (is_npu_available() and _HAVE_VLLM_ASCEND), reason="requires Ascend NPU")
+def test_serving_contract_int32_meta():
+    """在役契约(E27/D34):引擎 metadata 的 cu_seqlens 与 prebuilt_meta.chunk_indices_chunk64
+    均为 int32,分派必须完成到内核 int64 签名的转换(首轮 A/B 100% fallback 的根因)。"""
+    _init_once()
+    import os
+
+    from tileinfer.integrations.vllm_ascend import (
+        TileInferDecodeAttention,
+        _build_gdn_chunk_meta,
+        install_gdn_chunk_wu,
+    )
+
+    assert install_gdn_chunk_wu()
+    old = os.environ.get("TILEINFER_OPS")
+    os.environ["TILEINFER_OPS"] = "decode,prefill,moe,gdnwu"
+    try:
+        q, k, v, beta, gating, cu32, h0 = _make(128, seed=6, cu_dtype=torch.int32)
+        meta = _build_gdn_chunk_meta(tuple(cu32.to(torch.int64).tolist()), cu32.device, HV)
+        meta.chunk_indices_chunk64 = meta.chunk_indices_chunk64.to(torch.int32)
+        import vllm_ascend.ops.triton.fla.chunk as chunk_mod
+        from vllm.config import VllmConfig
+        from vllm.forward_context import set_forward_context
+
+        stats = TileInferDecodeAttention._stats
+        calls = stats.get("gdn_wu_calls", 0)
+        with set_forward_context(None, vllm_config=VllmConfig()):
+            g64, o, _, fs, w, _, _ = chunk_mod.chunk_gated_delta_rule_fwd(
+                q, k, v, gating, beta, D**-0.5, h0, True, cu_seqlens=cu32, prebuilt_meta=meta,
+            )
+        assert stats["gdn_wu_calls"] == calls + 1, "int32 meta 契约下必须正常走融合核"
+        assert torch.isfinite(o).all()
+    finally:
+        if old is None:
+            os.environ.pop("TILEINFER_OPS", None)
+        else:
+            os.environ["TILEINFER_OPS"] = old
+
+
+@pytest.mark.npu
+@pytest.mark.skipif(not (is_npu_available() and _HAVE_VLLM_ASCEND), reason="requires Ascend NPU")
 def test_threshold_env_override():
     """TILEINFER_GDNWU_MAX_TOKENS 覆盖:调到 256 后 T=256 也走融合核(阈值可运维调整)。"""
     _init_once()
