@@ -40,6 +40,41 @@ chunk-wu 未接入(opt-in 机制就绪)——即对比的是"TileInfer decode+pr
 解读:短上下文与并发(≤512 输入、≤32 并发)双源一致 TI≈FIA;长上下文 2-6x 为结构性
 (KI-1 split-KV 未启用 + D22 prefill 编译窗 + chunked prefill KV 重扫),属阶段三 L1-L3 范围。
 
+## P1/H10 短/长上下文长度自适应分流(gdnwu 融合核,引擎同侧 A/B,2026-10-14)
+
+**方案**:prefill 总 token 数 T ≤ 阈值(缺省 128,微基准交叉点 E26)走 `gdn_chunk_wu` 融合核,
+超阈值回退原 chunk 链;`TILEINFER_OPS` 显式含 `gdnwu` 才安装(opt-in,默认路径零改动),
+`TILEINFER_GDNWU_MAX_TOKENS` 可覆盖阈值。机制经五轮在役探针验证零异常
+(gdn_wu_calls/long_skips/fallbacks 语义全部符合设计,如健康成对轮 900/2040/0)。
+
+**验收数字(健康成对,环境对齐判据:双侧 decode 同代码,8K TPOT 比值 1.0000;
+wuoff=原链 vs wuon=融合核,背靠背)**:
+
+| 场景 | wuoff | wuon | wuon/wuoff |
+|---|---|---|---|
+| 1tok(33 in)TTFT | 110.6 ms | 109.4 ms | 0.989 |
+| 128tok(33 in)TTFT / TPOT | 108.2 / 9.26 | 109.1 / 9.28 | 1.008 / 1.002 |
+| 512tok TTFT / TPOT | 108.6 / 9.55 | 108.6 / 9.56 | 1.000 / 1.001 |
+| 8K TTFT / TPOT | 1487.6 / 17.16 | 1474.9 / 17.16 | 0.991 / 1.000 |
+| 16K TTFT / TPOT | 3870.6 / 25.19 | 3868.8 / 25.20 | 1.000 / 1.000 |
+| 并发 4/16/32 TTFT | 232.8/315.9/461.2 | 226.3/307.0/455.6 | 0.972/0.972/0.988 |
+
+**目标形状补测(138-token prefill 进融合核,`TILEINFER_GDNWU_MAX_TOKENS=192`;同轮内用
+原链场景做暖机漂移内校正)**:138tok 融合核 0.926 vs 同轮 522tok 原链 0.926 → 校正后
+**收益 = 1.00x(零)**。微基准预期(E24:T128 省 ~6ms/步≈6%)未在引擎端到端兑现。
+
+**结论**:①长上下文零劣化 proven(全部 |Δ|≤1.5%);②短上下文引擎级收益 ≈0(健康成对
+−1.1%~+0.8%;目标形状校正后 1.00x),未达 ≥5% 验收判据——微基准收益 ≠ 引擎收益
+(与 M-MoE E19/gating E21 同型教训,在役 A/B 为最终裁决);③处置:**不默认接入**,机制/
+内核/测试保留为 opt-in(`TILEINFER_OPS=...,gdnwu`),交用户裁决是否重启(路线=E24 判读 3
+平方链全 cube 化)。VERDICT: TEMPORARY_PASS。
+
+方法注记:①健康判定看门狗(`.agent_loop/run/run_gdnwu_ab_health.sh`)以环境对齐比值
+(8K TPOT |Δ|≤3%)+ 机制探针前提自动产出成对数据;②背靠背冷启动 TTFT 探针存在暖机漂移
+(后跑侧长 prefill 快 8-18%),成对结论必须同轮内校验;③早期"健康带"判据(8K TTFT<700ms)
+系误判——drift 轮 462ms 实为 prefill_fallbacks=980(全回退 FIA)的病态数字,TI 接管稳态即
+~1700ms(E30 修正)。
+
 Reproduce with:
 
 ```bash
