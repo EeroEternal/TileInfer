@@ -108,6 +108,21 @@ caller-buffer alignment, KV pool size, stream ordering, the shapes themselves, b
 harness' reference, the reference-vs-kernel ordering, and an exact mirror of the harness' case
 construction — all refuted, each with a probe in `benchmarks/probes/`.
 
+### 运行形态评估与状态审计(2026-10-13,阶段 3 P5)
+
+- **O4 · eager 残余内核调用路径 —— skip(部署形态评估)**:TileInfer 服役形态 = vLLM-Ascend
+  **图模式在役**(全部历史 A/B serve 探针 `capture_calls=40>0`、`fallbacks=0`、6 plan READY;
+  ab 基准在采数前即断言这些前提)。图捕获把 decode 步内核编入 ACLGraph,replay 期不执行任何
+  Python/主机路径,残余的 TI eager 主机调用路径(~4.4ms×10 层,D23 瘦身后,B3/E13)只在回退窗口
+  (首见形状编译窗/显式回退)或 `--enforce-eager` 部署下执行——在役数字从未受其影响。结论:
+  图模式部署下无收益可图,skip;若未来以 eager 模式部署,优化方向与 P4 的 FFI 主机批处理同向,
+  不另行立项。
+- **O7 · 状态文件 commit hash 引用审计 —— 无漂移,无需校正**:对 `docs/*.md` 与
+  `.agent_loop/state/*.md` 中全部 16 个 commit hash 引用(79a9ea5×6、4370b5c×5、8fe3a26×4、
+  7e1308f×3、13fffc4×2 及 86d926f/d72f31f/e76089e/49e7a11/49e6140/17260c4/bf016fb/339f4f2 各 1)
+  逐一 `git cat-file -e` 核对:全部可达,且引用处的主题描述与实际 commit message 一致;文档中
+  其余 7-9 位数字串均为 PID(2580095/3965161 等)非 hash。未发现历史重写漂移,无需改写。
+
 ---
 
 ## 3. What is left

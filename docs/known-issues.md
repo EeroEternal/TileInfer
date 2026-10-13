@@ -291,3 +291,28 @@ intuition that a benchmark harness should be leaner than a full server (EVIDENCE
    only for op-mix structure (E12).
 3. When probing the offline engine, keep `VLLM_ENABLE_V1_MULTIPROCESSING=0` in mind: it is
    required for monkeypatch instrumentation but changes the very overhead being measured.
+
+## KI-5 — CANN teardown double-free after loading `vllm_ascend_C` (diagnosed, mitigated; upstream)
+
+**Status:** diagnosed 2026-10-13 (O6 排查) · **Impact:** 进程退出路径 only,零运行期影响。
+
+### Symptom
+
+任何 Python 进程在载入 `vllm_ascend_C`(`TORCH_LIBRARY` 的 `_C_ascend` .so)后于解释器
+终结期退出时,CANN runtime teardown 触发 double-free abort(exit code 134)。最小复证:
+`python -c "import <该 .so>"` 直接 134。serve 进程从未暴露,因为编排脚本以 SIGTERM kill
+收尾,引擎进程不经历 Python 终结期 teardown;只有 pytest 这类正常退出通道会踩中
+(iter-018 前设备套件数值绿但退出码被 abort 污染)。
+
+### Root cause / attribution
+
+`_C_ascend` 的静态析构序与 CANN runtime 的进程级 teardown 顺序冲突,属上游
+(vllm_ascend 构建产物 / CANN)缺陷,与 TileInfer 代码无关(证据:D14、E27 最小复证;
+同源现象早在阶段一即观察为"仅 teardown 打印,不影响服务")。
+
+### Mitigation(已落地,业务测试基础设施)
+
+`tests/conftest.py` 在 `pytest_unconfigure` 注册 atexit 钩子:汇总输出写完后以
+`os._exit(exitstatus)` 硬退出,跳过解释器终结期析构——pytest 真实退出码保住,abort 消失。
+CPU 套件与不载该 .so 的设备套件零影响。裸进程场景(手动 python -i 载 vllm 后退出)仍会
+踩中,属上游修复范畴;若上游修复,可移除该钩子复验。
