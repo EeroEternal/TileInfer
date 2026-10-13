@@ -23,3 +23,11 @@ bench_out/
 # agent loop driver and all its runtime artifacts (user-local, never part of the repo)
 .agent_loop/
 export_only_prof_dir/
+
+# NPU/CANN runtime dumps and profiler output (agent-loop process artifacts, never commit)
+extra-info/
+export_only_prof_dir/
+*_prof_dir/
+profiling/
+exception_info.*
+*.o
