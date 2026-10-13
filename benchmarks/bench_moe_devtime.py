@@ -48,11 +48,20 @@ results = {}
 scenarios = [
     ("decode_b32", 32, "0"), ("prefill_400", 400, "0"),
 ]
+DECODER = json.JSONDecoder()
+
+def load_trace(path):
+    """Tolerate trailing garbage after the first JSON document."""
+    with open(path) as f:
+        return DECODER.raw_decode(f.read())[0]
+
 for name, tokens, skewed in scenarios:
     for which in ("base", "ti"):
         code = SCRIPT
         out_dir = f"/tmp/opencode/moeprof_{name}_{which}"
         os.makedirs(out_dir, exist_ok=True)
+        for stale in glob.glob(f"/tmp/moedt_{name}_{which}.json*"):
+            os.remove(stale)
         r = subprocess.run(
             ["/home/userlist/zxs/TileInfer/.venv/bin/python", "-c", code, name, str(tokens), skewed, which],
             capture_output=True, text=True, cwd=out_dir,
@@ -61,7 +70,7 @@ for name, tokens, skewed in scenarios:
         tp = f"/tmp/moedt_{name}_{which}.json"
         per_step = {}
         if os.path.exists(tp):
-            tr = json.load(open(tp))
+            tr = load_trace(tp)
             events = tr if isinstance(tr, list) else tr.get("traceEvents", [])
             agg = {}
             for e in events:

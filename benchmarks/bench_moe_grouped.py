@@ -59,13 +59,15 @@ def prepare_ours(x, topk_ids, dev):
     lay = build_slot_layout(topk_ids, BM, num_experts=E)
     rows_slots = lay["num_tiles"] * BM
     x_slots = gather_slots(expanded, lay["sorted_ids"], lay["num_expanded"]).contiguous()
+    # P4 final-round knobs (E36): larger W nd2nz ops + fully contiguous down
+    # reads; best-of-sweep (1.065x vs BN/BK=128 defaults, still 0.81x vs aclnn).
     k1 = build_gate_up_kernel(
         num_tiles_max=lay["num_tiles"], rows_slots=rows_slots, num_experts=E,
-        inter=I, hidden=H, block_m=BM,
+        inter=I, hidden=H, block_m=BM, block_n=256,
     )
     k2 = build_down_kernel(
         num_tiles_max=lay["num_tiles"], rows_slots=rows_slots, num_experts=E,
-        inter=I, hidden=H, block_m=BM,
+        inter=I, hidden=H, block_m=BM, block_n=64, block_k=512,
     )
     y = torch.empty((rows_slots, I), dtype=torch.bfloat16, device=dev)
     out = torch.empty((rows_slots, H), dtype=torch.bfloat16, device=dev)

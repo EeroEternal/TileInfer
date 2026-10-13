@@ -111,6 +111,51 @@ Reproduce with:
 bash .agent_loop/run/probe_p3_prefill_warm.sh
 ```
 
+## P4 M-MoE 一轮重试(最终轮):结构性瓶颈定位,FINAL TEMPORARY 关闭(2026-10-14)
+
+**背景**:M-MoE 融合内核 E19 收口于 0.86x 设备时间(TEMPORARY);本轮为契约内的最终重试,
+攻击面=块调度合并 / FFI 主机批处理 / E 权重预 NZ 布局,门槛 ≥1.0x aclnn(设备时间)才接入。
+
+**干净环境基线复现(E35)**:E19 的 chrome-trace 绝对值系当期环境干扰虚高 ~15x(E15 期),
+当日干净环境重测——decode_b32:TI 793µs/步 vs aclnn 链 603µs/步(**0.76x**);prefill_400:
+1277.7 vs 1002.8µs(**0.78x**);墙钟 geomean 0.898x(与 E19 的 0.891x 一致,比值口径稳定)。
+
+**结构定位(E36)**:
+1. 流水无关:K 主循环 T.Pipelined 双缓冲(去守卫+哨兵 tile 重构后确认真流水化,内核源码
+   比对)对设备时间零影响(gate_up 474.1 vs 475µs)——串行延迟链不是瓶颈。
+2. 带宽记账:TI 读权重 ~955MB/步@793µs≈1.2TB/s;aclnn 同权重 @603µs≈1.62TB/s。差距在
+   GM→L1 **nd2nz 格式转换吞吐**(~50GB/s/核):W traffic 每步固定不可压缩(每 (tile,nt)
+   单元必读一次专家权重切片)。
+3. 预 NZ 直载在内核层不可表达:tilelang 的 `T.copy` GM→L1/UB 恒定发射 nd2nz;NZ 标注
+   (`make_ascend_compact_nz_layout`)仅支持 UB 内 vsstb SIMD 逐行散转(更慢);L0B 64KB
+   容量封顶 W-op 几何(Z3 调度器实证)。追平 aclnn 需要「权重以免转换形态进入 MTE」=
+   **vLLM 集成层预 NZ 权重布局**(内核签名之外),超出本轮内核重试范围。
+4. 旋钮扫(7 配置,数值全零差):最优 spec = gate_up `block_n=256` + down
+   `block_n=64, block_k=512`(down 单 K 迭代、W2 128KB 全连续读)。
+5. 其余攻击面评估:块调度=persistent 28 核+空块早退已在役(E19),守卫移除实验证明调度
+   开销非因子;FFI 主机批处理=今日主机仅 ~23µs/步(wall 0.816 vs device 0.793ms)且图模式
+   replay 无主机路径,不改变设备时间门槛。
+
+**最终数字(E36b,最优 spec 已固化进 benchmarks/bench_moe_grouped.py)**:
+
+| 口径 | 场景 | aclnn 链 | TileLang 融合 | 比值 |
+|---|---|---|---|---|
+| 设备时间(µs/步,chrome trace) | decode_b32 | 602.1 | **740.9** | **0.813x** |
+| 设备时间(µs/步) | prefill_400 | 1002.5 | **1191.2** | **0.842x** |
+| 墙钟 geomean(7 场景) | — | — | — | **0.974x**(b1 1.654 / b4 1.160 / b16 0.843 / b32 0.859 / p128 0.851 / p400 0.850 / skew 0.829) |
+
+**判定**:设备时间门槛 ≥1.0x 未达(内核内部优化空间实测 ~6%,缺口 ~19-24% 为结构性的)→
+按预设契约**不接入,M-MoE FINAL TEMPORARY 关闭,此后不再重试,交用户裁决**。重启路线=
+集成层预 NZ 权重布局(权重加载时一次转 NZ,内核免 nd2nz)+ 本轮 bench 已固化的最优 spec。
+
+Reproduce with:
+
+```bash
+source .agent_loop/run/env.sh
+.venv/bin/python benchmarks/bench_moe_grouped.py --out .agent_loop/run/p4_final_wall.json
+.venv/bin/python benchmarks/bench_moe_devtime.py   # 设备时间口径(门槛判据)
+```
+
 
 Reproduce with:
 
