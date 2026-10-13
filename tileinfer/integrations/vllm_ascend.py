@@ -39,6 +39,7 @@ Three serving realities this file has to deal with
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from typing import Any, Dict, Optional, Sequence, Tuple
 
@@ -381,6 +382,7 @@ class TileInferDecodeAttention:
         "eager_calls": 0,
         "fallbacks": 0,
         "exceptions": 0,
+        "gdn_gating_calls": 0,
     }
 
     def __init__(
@@ -1048,6 +1050,50 @@ def _build_classes_into_module() -> None:
     TileInferBackend, TileInferImpl = _build_classes()
 
 
+_GDN_GATING_INSTALLED = False
+
+
+def install_gdn_gating() -> bool:
+    """Take over vLLM-Ascend's GDN gating (BACKLOG M-GDN, ``TILEINFER_OPS=gdn``).
+
+    On A5 the in-service path is ``vllm_ascend.device.device_op.A5DeviceAdaptor.
+    fused_gdn_gating`` — a triton patch whose single kernel costs ~2.6 ms of device time
+    per prefill call at T=128 (E20: 78 ms = 11% of the prefill step) for what is an
+    elementwise ``(T, H)`` softplus/sigmoid.  We replace it with the torch-composed
+    implementation in :mod:`tileinfer.kernels.gdn` (numerically identical to the triton
+    kernel, capture-safe fixed-shape ops).  The dispatch honours ``ops_enabled("gdn")``
+    at every call, so flipping ``TILEINFER_OPS`` takes the original back without a code
+    change, and each invocation bumps the serving-probe ``gdn_gating_calls`` counter.
+    """
+    global _GDN_GATING_INSTALLED
+    if _GDN_GATING_INSTALLED:
+        return True
+    from vllm_ascend.device import device_op as _device_op
+
+    from tileinfer.kernels.gdn import fused_gdn_gating as _gdn_impl
+
+    adaptor = _device_op.A5DeviceAdaptor
+    if getattr(adaptor, "_tileinfer_gdn_installed", False):
+        _GDN_GATING_INSTALLED = True
+        return True
+
+    cls_stats = TileInferDecodeAttention._stats
+
+    def _fused_gdn_gating(A_log, a, b, dt_bias):
+        if ops_enabled("gdn"):
+            g, beta = _gdn_impl(A_log, a, b, dt_bias)
+            cls_stats["gdn_gating_calls"] = cls_stats.get("gdn_gating_calls", 0) + 1
+            return g, beta
+        return _original(A_log, a, b, dt_bias)
+
+    _original = adaptor.fused_gdn_gating
+    adaptor.fused_gdn_gating = staticmethod(_fused_gdn_gating)
+    adaptor._tileinfer_gdn_installed = True
+    _GDN_GATING_INSTALLED = True
+    logger.info("TileInfer GDN gating dispatch installed (TILEINFER_OPS governs per call)")
+    return True
+
+
 _METRICS_INTERVAL_S = 1.0
 
 
@@ -1149,6 +1195,20 @@ def install(raise_on_failure: bool = True) -> bool:
             )
         _INSTALLED = True
         start_metrics_dumper()
+        # GDN gating 接管为**显式 opt-in**(E21/D29:引擎内 A/B 无收益、TTFT +2~9%,不进默认
+        # 路径;TILEINFER_OPS 显式含 gdn 时才安装)。decode/prefill/moe 维持缺省全开。
+        _spec = (os.environ.get("TILEINFER_OPS") or "").strip().lower()
+        _parts = {s.strip() for s in _spec.split(",") if s.strip()}
+        if "gdn" in _parts:
+            try:
+                install_gdn_gating()
+            except Exception as exc:  # noqa: BLE001 - GDN takeover must not break the attention slot
+                logger.warning("TileInfer GDN gating dispatch not installed: %s", exc)
+        else:
+            logger.info(
+                "TileInfer GDN gating takeover left off (TILEINFER_OPS does not list gdn; "
+                "evidence E21: no engine-level gain, kept as explicit opt-in)"
+            )
         logger.info(
             "TileInfer registered as the CUSTOM attention backend (decode accelerated, "
             "prefill falls back to vLLM-Ascend)"
