@@ -147,6 +147,41 @@ def _bucket_for(num_reqs: int) -> int:
 PREFILL_MAX_TILES = int(__import__("os").environ.get("TILEINFER_PREFILL_MAX_TILES", "4096"))
 
 
+def _next_pow2(n: int) -> int:
+    """Smallest power of two ``>= n`` (P3 canonical tile quantization; 1 stays 1)."""
+    return 1 if n <= 1 else 1 << (n - 1).bit_length()
+
+
+def _pad_tile_schedule(schedule, num_tiles: int, trash_seq: int):
+    """Pad a :class:`TileSchedule` to ``num_tiles`` entries with dead tiles (P3).
+
+    A dead tile has ``q_len == 0`` (the pack/unpack loops skip it, every ``RowThr`` row is -1)
+    and points at the *trash row* — a batch-padding request with zero KV pages, so the kernel's
+    page loop runs zero iterations for it.  Pure tensor ops on the schedule's device.
+    """
+    t = schedule.num_tiles
+    if num_tiles <= t:
+        return schedule
+    pad = num_tiles - t
+
+    def _pad(tensor: torch.Tensor, fill: int) -> torch.Tensor:
+        extra = torch.full((pad,), fill, dtype=torch.int32, device=tensor.device)
+        return torch.cat([tensor.to(torch.int32), extra]).contiguous()
+
+    from tileinfer.plan import TileSchedule
+
+    return TileSchedule(
+        seq_ids=_pad(schedule.seq_ids, trash_seq),
+        q_offsets=_pad(schedule.q_offsets, 0),
+        q_lens=_pad(schedule.q_lens, 0),
+        kv_page_starts=_pad(schedule.kv_page_starts, 0),
+        kv_page_lens=_pad(schedule.kv_page_lens, 0),
+        split_ids=_pad(schedule.split_ids, 0),
+        split_counts=_pad(schedule.split_counts, 1),
+        balanced=schedule.balanced,
+    )
+
+
 class PrefillShapeManager:
     """Lazy background compiler for the prefill kernel's shape variants (BACKLOG B1)."""
 
@@ -173,6 +208,25 @@ class PrefillShapeManager:
         logger.info("TileInfer: compiling prefill kernel for shape %s in the background", spec)
         threading.Thread(target=cls._compile, args=(spec,), daemon=True).start()
         return False
+
+    @classmethod
+    def prewarm_sync(cls, spec: tuple) -> bool:
+        """Synchronously compile ``spec`` (P3 prewarm); True when it is (now) ready.
+
+        Used from ``prewarm()`` — startup, off the serving path — to build the canonical variant
+        ladder before any traffic.  Skips specs that are ready, already building (a lazy compile
+        from a startup dummy step may be in flight) or beyond the variant cap.
+        """
+        if spec in cls._ready:
+            return True
+        with cls._lock:
+            if spec in cls._building:
+                return False
+            if len(cls._ready) >= cls._cap:
+                return False
+            cls._building.add(spec)
+        cls._compile(spec)
+        return spec in cls._ready
 
     @classmethod
     def _compile(cls, spec: tuple) -> None:
@@ -234,6 +288,7 @@ def prefill_step(
     num_kv_heads: int,
     head_size: int,
     scale: float,
+    batch_cap: int = 0,
 ) -> bool:
     """One prefill/append step through the TileLang prefill kernel (BACKLOG B1).
 
@@ -291,15 +346,27 @@ def prefill_step(
     if dtype_name is None:
         _refuse("dtype", str(query.dtype), "bfloat16/float16")
         return False
+    if num_reqs > BATCH_BUCKETS[-1]:
+        _refuse("batch over largest bucket", num_reqs, BATCH_BUCKETS[-1])
+        return False
     pool_pages = int(_pool_sub_view(key_cache, sub).shape[0])
+    # P3 canonical variant quantization: the compiled shape is not the step's exact
+    # ``(batch, num_tiles)`` but ``(_bucket_for(batch_cap) + 1 trash rows, next pow2 tiles)``.
+    # The trash row owns zero pages (padded tiles pointing at it run zero KV iterations) and
+    # padded tiles carry q_len == 0 (fully masked, output unread), so the padding is invisible
+    # semantically — and ``prewarm()`` can enumerate the whole canonical ladder (≤ 32 variants),
+    # which is what removes the ~110 s first-seen lazy compile from serving.
+    cap = int(batch_cap) if batch_cap and batch_cap >= num_reqs else num_reqs
+    kernel_batch = _bucket_for(cap) + 1
+    kernel_tiles = _next_pow2(max_tiles)
     spec = (
-        num_reqs,
+        kernel_batch,
         num_kv_heads,
         group,
         head_size,
         KERNEL_PAGE_SIZE,
         pool_pages,
-        max_tiles,
+        kernel_tiles,
         128,
         dtype_name,
     )
@@ -312,6 +379,8 @@ def prefill_step(
         block_q=128,
         load_balance=False,
     )
+    if kernel_tiles != schedule.num_tiles:
+        schedule = _pad_tile_schedule(schedule, kernel_tiles, kernel_batch - 1)
     qo_dev = torch.tensor(qo_host, dtype=torch.int32, device=device)
     from tileinfer.kernels.attention.paged_decode_ascend950 import forward_prefill
 
@@ -324,6 +393,7 @@ def prefill_step(
         qo_dev,
         group=group,
         block_q=128,
+        kernel_batch=kernel_batch,
     )
     # Unpack [batch, H, max_qo, D] -> [num_tokens, H, D] with the engine's layout.
     offset = 0
@@ -398,6 +468,7 @@ class TileInferDecodeAttention:
         dtype: torch.dtype = torch.bfloat16,
         kv_tile_pages: int = 0,
         max_num_reqs: int = 0,
+        max_num_batched_tokens: int = 0,
     ) -> None:
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
@@ -407,6 +478,7 @@ class TileInferDecodeAttention:
         self.dtype = dtype
         self.kv_tile_pages = kv_tile_pages
         self.max_num_reqs = max_num_reqs or 0
+        self.max_num_batched_tokens = max_num_batched_tokens or 0
         self._warned = False
 
         self._config_key = (
@@ -501,6 +573,63 @@ class TileInferDecodeAttention:
                 limit,
                 width,
             )
+        built_prefill = self.prewarm_prefill(block_size, key_cache)
+        cls._stats["prefill_variants"] = len(PrefillShapeManager._ready)
+        if built_prefill >= 0:
+            logger.info(
+                "TileInfer: prefill variant ladder prewarm finished (%d newly compiled, "
+                "%d ready, cap %d)",
+                built_prefill,
+                len(PrefillShapeManager._ready),
+                PrefillShapeManager._cap,
+            )
+
+    def prewarm_prefill(self, block_size: int, key_cache: torch.Tensor) -> int:
+        """Synchronously compile the canonical prefill variant ladder (P3).
+
+        The canonical variant of a step is ``(bucket(max_num_reqs) + 1 trash rows,
+        next-pow2 tiles)``; the tile ladder top comes from the scheduler token budget
+        (``max_num_batched_tokens``, which bounds every prefill/chunk step's tile count), so the
+        ladder covers *every* prefill shape the engine can schedule — a first-seen prompt length
+        is served by a ready variant instead of triggering the ~110 s lazy compile (D22).  The
+        ladder is |log2(top)| + 1 entries, far below the variant cap.  Returns how many variants
+        were newly compiled here (0 when all were ready/covered elsewhere; -1 when the
+        configuration is unknown and prewarm was skipped).
+        """
+        limit = int(self.max_num_reqs) if self.max_num_reqs else BATCH_BUCKETS[-1]
+        group = self.group_size
+        # A mixed step carries up to ``budget`` tokens: a chunk of ``budget - n`` prefill tokens
+        # (group rows each → /128 per tile) plus ``n`` one-row decode appends (one tile each).
+        budget = int(self.max_num_batched_tokens) or 8192
+        tiles_top = _next_pow2(-(-budget * group // 128) + limit)
+        tiles_top = min(tiles_top, PREFILL_MAX_TILES)
+        kernel_batch = _bucket_for(limit) + 1
+        pool_pages = int(_pool_sub_view(key_cache, _sub_pages(block_size)).shape[0])
+        return self._prewarm_prefill_ladder(kernel_batch, tiles_top, pool_pages)
+
+    def _prewarm_prefill_ladder(self, kernel_batch: int, tiles_top: int, pool_pages) -> int:
+        dtype_name = _TORCH_DTYPE_NAME.get(self.dtype)
+        if dtype_name is None:
+            return -1
+        built = 0
+        tiles = 1
+        while tiles <= tiles_top:
+            spec = (
+                kernel_batch,
+                self.num_kv_heads,
+                self.group_size,
+                self.head_size,
+                KERNEL_PAGE_SIZE,
+                pool_pages,
+                tiles,
+                128,
+                dtype_name,
+            )
+            if spec not in PrefillShapeManager._ready:
+                if PrefillShapeManager.prewarm_sync(spec):
+                    built += 1
+            tiles *= 2
+        return built
 
     def plan_if_ready(self, bucket: int, max_pages: int, block_size: int, key_cache: torch.Tensor):
         """Return the plan for this shape, or ``None`` while it is being compiled.
@@ -842,8 +971,12 @@ def _build_classes():
 
                 try:
                     max_num_reqs = int(self.vllm_config.scheduler_config.max_num_seqs)
+                    # P3: token budget of one prefill/chunk step — bounds the prefill variant
+                    # ladder's tile top (see prewarm_prefill).
+                    max_batched = int(self.vllm_config.scheduler_config.max_num_batched_tokens)
                 except Exception:  # noqa: BLE001 - fall back to the largest bucket
                     max_num_reqs = 0
+                    max_batched = 0
                 self._tileinfer = TileInferDecodeAttention(
                     num_heads=self.num_heads,
                     num_kv_heads=self.num_kv_heads,
@@ -856,6 +989,7 @@ def _build_classes():
                     kv_tile_pages=int(os.environ.get("TILEINFER_KV_TILE_PAGES", 0)),
                     # Prewarm builds one plan per bucket up to this, before graph capture.
                     max_num_reqs=int(max_num_reqs or 0),
+                    max_num_batched_tokens=int(max_batched or 0),
                 )
             return self._tileinfer if self._tileinfer.supported(block_size) else None
 
@@ -947,6 +1081,12 @@ def _build_classes():
                 device_lens = getattr(attn_metadata, "seq_lens_device", None)
                 if device_lens is None:
                     device_lens = attn_metadata.seq_lens
+                # P3: the batch half of the canonical variant must be prewarm-stable, so it is
+                # derived from the scheduler's max_num_seqs (the same number prewarm uses).
+                try:
+                    batch_cap = int(self.vllm_config.scheduler_config.max_num_seqs)
+                except Exception:  # noqa: BLE001 - library callers without a config
+                    batch_cap = 0
                 served = prefill_step(
                     query=query,
                     key_cache=self.key_cache,
@@ -960,6 +1100,7 @@ def _build_classes():
                     num_kv_heads=self.num_kv_heads,
                     head_size=self.head_size,
                     scale=self.scale,
+                    batch_cap=batch_cap,
                 )
                 if not served:
                     TileInferDecodeAttention._stats["prefill_fallbacks"] = (

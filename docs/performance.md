@@ -75,6 +75,43 @@ wuoff=原链 vs wuon=融合核,背靠背)**:
 系误判——drift 轮 462ms 实为 prefill_fallbacks=980(全回退 FIA)的病态数字,TI 接管稳态即
 ~1700ms(E30 修正)。
 
+## P3 prefill 预热覆盖:canonical 变体量化 + ladder 预热(2026-10-14)
+
+**问题**:prefill 内核按 `(batch, kv_heads, group, dim, page, pool_pages, num_tiles, block_q,
+dtype)` 编译变体,真实流量形状空间近连续(任意 prompt 长度×任意并发),首见形状惰性编译
+~110s(D22)形成 TTFT 编译窗,是图模式 A/B 长上下文 2-6x 落差的结构性成因之一。
+
+**方案(D39)**:变体量化归一——批维 padding 到 `bucket(max_num_seqs)+1` 行(末行为 trash 行:
+0 页、整页 last_page_len→kv_len=0;padding tile 指向它→内核页循环零迭代、输出不读);
+tile 维向上量化到 2 的幂(padding tile `q_len=0`:打包/解包跳过、RowThr=-1 全掩码)。
+canonical 变体 = `(B, 2^⌈log2 t⌉)`,prewarm 按 token 预算(`max_num_batched_tokens`)推导
+ladder:顶 = `next_pow2(ceil(B·group/128)+max_reqs)` 与 `PREFILL_MAX_TILES` 取小 →
+变体数 = log2(top)+1 ≈ 11 ≤ 上限 32,覆盖引擎可调度的**全部** prefill 形状。
+
+**验收数字(E34/E34b)**:
+
+| 项 | 数字 | 判据 |
+|---|---|---|
+| 设备测试(量化路径数值 vs reference_attention,TOL 3e-2) | 4/4 绿(非 2 幂 t=19→32、批 1→5 trash 行、append、decode 行混批) | 通过 |
+| ladder 预热后任意 ladder 内形状可用性 | qo∈{1,17,97,257,397,512} 全部即时 usable | 通过 |
+| 首见形状首步(API 级,qo=397) | **0.008s** | <5s ✓ |
+| 引擎首发首见形状 ~700/~1500/~2600 tok TTFT | **1.43 / 2.59 / 1.54 s** | <5s ✓ |
+| 引擎在役探针 | prefill_calls=30(3 请求×10 层,首发即接管)、prefill_fallbacks=0、prefill_exceptions=0 | 通过 |
+| decode 侧不受影响 | fallbacks=0、capture_calls=40、ready_plans=6、markers 增长、exceptions=0 | 通过 |
+
+**成本注记**:预热单价 ~109s/变体(与 D22 惰性编译同价)× ladder ≈11 → 冷启动一次性
+~16-20min(实测 ladder 9 新编译 16min;T=512/1024 由启动 dummy 的后台编译并行完成),
+磁盘缓存持久化后热启 0.2s;量化 waste ≤2x tile 数但 padding tile 指零页行,实际零 KV
+计算;超 ladder 形状(配置变更)仍走惰性编译回退,行为同 D22。VERDICT: PASS。
+
+Reproduce with:
+
+```bash
+.venv/bin/python -m pytest tests/test_vllm_ascend_prefill_prewarm.py -q -s
+bash .agent_loop/run/probe_p3_prefill_warm.sh
+```
+
+
 Reproduce with:
 
 ```bash

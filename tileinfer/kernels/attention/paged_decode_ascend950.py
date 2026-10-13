@@ -913,13 +913,21 @@ def forward_prefill(
     block_q: int = 128,
     dtype: str | None = None,
     out: torch.Tensor | None = None,
+    kernel_batch: int | None = None,
 ) -> torch.Tensor:
     """Run paged prefill / append: packs ``Q`` into the kernel's tile layout, unpacks the result.
 
     ``q``         ``[batch, kv_heads * group, max_qo_len, dim]``; rows past ``qo_lens[b]`` are ignored
     ``schedule``  from :func:`tileinfer.plan.plan_query_tiles` over the *flattened* row counts
-                  ``qo_lens * group`` — a tile's rows are contiguous in ``(q_pos, head)`` order
+                  ``qo_lens * group`` — a tile's rows are contiguous in ``(q_pos, head)`` order;
+                  may be *padded* past the live tiles (P3): padded tiles carry ``q_len == 0`` and
+                  ``seq_ids`` pointing at a trash row, and are skipped by the pack/unpack loops
     ``qo_lens``   ``[batch]``, used for the append offset (``kv_len - qo_len``)
+    ``kernel_batch``
+                  compile/call the kernel for a *padded* batch (P3 canonical-variant quantization):
+                  ``kv_indptr``/``kv_last_page_len``/``causal_shift`` grow by trash rows (0 pages,
+                  never referenced by a live tile) so one compiled variant serves every real batch
+                  up to the bucket.  ``None`` = use ``q.shape[0]`` (exact batch, the old behaviour).
 
     Two host-side steps, both plain tensor ops: the kernel wants rows ordered ``(q_pos, head)``
     inside one KV head (the caller's tensor is ``(head, q_pos)``), and tiles are addressed per
@@ -946,8 +954,12 @@ def forward_prefill(
 
     q_packed = torch.zeros((num_tiles * kv_heads, br, dim), dtype=q.dtype, device=q.device)
     out_packed = torch.empty_like(q_packed)
-    for tile in range(num_tiles):
-        b = int(schedule.seq_ids[tile].item())
+    seq_ids_host = schedule.seq_ids.to(torch.int64)
+    # P3 padded tiles (q_len == 0, seq_id -> trash row) carry no query rows: skip them here and
+    # in the unpack loop below.  Everything the kernel sees stays shape-static.
+    live = schedule.q_lens.to(torch.int64) > 0
+    for tile in torch.nonzero(live).flatten().tolist():
+        b = int(seq_ids_host[tile].item())
         q_off = int(schedule.q_offsets[tile].item())
         rows = int(schedule.q_lens[tile].item())
         for bh in range(kv_heads):
@@ -957,9 +969,35 @@ def forward_prefill(
     cap = int(k_cache.shape[0])
     if indices.numel() < cap:
         indices = torch.cat([indices, indices.new_zeros(cap - indices.numel())])
+    # P3 canonical-variant batch padding: grow the per-request metadata to ``kernel_batch`` rows
+    # with trash rows (0 pages, last_page_len = a full page so the derived kv_len is exactly 0).
+    # A padded tile references only the trash row, whose page loop runs zero iterations.
+    kb = batch if kernel_batch is None else int(kernel_batch)
+    if kb < batch:
+        raise ValueError(f"kernel_batch={kb} is smaller than the real batch={batch}")
+    if kb > batch:
+        pad = kb - batch
+        indptr = torch.cat(
+            [meta.kv_indptr.to(torch.int32), meta.kv_indptr[-1:].to(torch.int32).expand(pad)]
+        ).contiguous()
+        lpl = torch.cat(
+            [
+                meta.kv_last_page_len.to(torch.int32),
+                torch.full((pad,), page_size, dtype=torch.int32, device=q.device),
+            ]
+        ).contiguous()
+    else:
+        indptr = meta.kv_indptr.to(torch.int32)
+        lpl = meta.kv_last_page_len.to(torch.int32)
     # causal shift per request: kv_len - qo_len.  Zero for a plain prefill, > 0 for append /
-    # chunked prefill, which is what makes row 0 of a chunk see the cached prefix.
-    causal_shift = (meta.kv_lens.to(torch.int32) - qo_lens.to(torch.int32)).contiguous()
+    # chunked prefill, which is what makes row 0 of a chunk see the cached prefix.  Derived from
+    # the *padded* indptr/lpl so it covers the trash rows too (their kv_len is exactly 0).
+    qo_lens = qo_lens.to(torch.int32)
+    if qo_lens.numel() < kb:
+        qo_lens = torch.cat([qo_lens, qo_lens.new_zeros(kb - qo_lens.numel())])
+    pages = indptr[1:] - indptr[:-1]
+    kv_lens = ((pages - 1) * page_size + lpl).to(torch.int32)
+    causal_shift = (kv_lens - qo_lens).contiguous()
 
     # Per-row causal threshold, one entry per (tile, M row).  Global row ``q_off + r`` carries query
     # position ``(q_off + r) // group`` and may attend to ``kv_pos <= q_pos + shift``; rows past the
@@ -976,7 +1014,7 @@ def forward_prefill(
         row_thr = torch.where(ar < rows64, thr, torch.full_like(thr, -1)).reshape(-1).to(torch.int32)
 
     kernel = build_prefill_kernel(
-        batch=batch,
+        batch=kb,
         kv_heads=kv_heads,
         group=group,
         dim=dim,
@@ -990,9 +1028,9 @@ def forward_prefill(
         q_packed,
         pool_view(k_cache, cap),
         pool_view(v_cache, cap),
-        meta.kv_indptr.to(torch.int32),
+        indptr,
         indices,
-        meta.kv_last_page_len.to(torch.int32),
+        lpl,
         schedule.seq_ids.to(torch.int32),
         schedule.q_offsets.to(torch.int32),
         schedule.q_lens.to(torch.int32),
@@ -1002,8 +1040,8 @@ def forward_prefill(
     )
 
     out_flat = torch.zeros_like(q_flat)
-    for tile in range(num_tiles):
-        b = int(schedule.seq_ids[tile].item())
+    for tile in torch.nonzero(live).flatten().tolist():
+        b = int(seq_ids_host[tile].item())
         q_off = int(schedule.q_offsets[tile].item())
         rows = int(schedule.q_lens[tile].item())
         for bh in range(kv_heads):
