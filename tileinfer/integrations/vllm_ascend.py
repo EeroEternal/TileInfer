@@ -76,7 +76,8 @@ def _sub_pages(block_size: int) -> int:
 #: individual takeovers; unset or empty means *all on*.  One flip + server restart (a restart is
 #: seconds, not the recompile a config change would be) takes a suspicious op out of the chain
 #: without touching the others — the fallback for every disabled op is the stock FIA path.
-_OPS_ALL = {"decode", "prefill", "gdn", "moe"}
+#: ``gdnwu`` 是 chunk 链中段融合核(H10/阶段 3 P1)的独立开关,与 ``gdn`` 解耦做同侧 A/B 归因。
+_OPS_ALL = {"decode", "prefill", "gdn", "gdnwu", "moe"}
 
 
 def ops_enabled(op: str) -> bool:
@@ -1098,16 +1099,76 @@ def install_gdn_gating() -> bool:
 
 _GDN_WU_INSTALLED = False
 
+#: 长度自适应分流阈值(P1/H11):prefill 总 token 数 ≤ 阈值才走融合核,否则回退原 triton 链。
+#: E26/E26b 微基准(在役形状 HK16/HV32/D128,npu Event 预热后中位):T=128 融合 0.527ms vs
+#: 基线 0.724ms(0.73x,唯一融合占优区间);T=256 起反向(1.22x/2.40x@512/4.41x@1024/14.4x@8192,
+#: 机理=E24 的标量 Neumann/合并积链随 chunk 数线性劣化,基线近常数的启动主导)。交叉点严格
+#: 落在 (128, 256) 区间,保守取上界 128。可用 ``TILEINFER_GDNWU_MAX_TOKENS`` 覆盖。
+_GDN_WU_MAX_TOKENS_DEFAULT = 128
+
+
+def _gdnwu_max_tokens() -> int:
+    """Length-adaptive dispatch threshold for the chunk-wu fused kernel (P1/H11)."""
+    raw = os.environ.get("TILEINFER_GDNWU_MAX_TOKENS")
+    if raw is None or not raw.strip():
+        return _GDN_WU_MAX_TOKENS_DEFAULT
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning("invalid TILEINFER_GDNWU_MAX_TOKENS=%r, using %d", raw,
+                       _GDN_WU_MAX_TOKENS_DEFAULT)
+        return _GDN_WU_MAX_TOKENS_DEFAULT
+
+
+def _build_gdn_chunk_meta(cu_seqlens_host, device, hv_heads: int) -> "object":
+    """库级/测试路径的 prebuilt_meta 现场构建(serving 恒由在役 builder 提供)。
+
+    字段与 ``vllm_ascend.ops.gdn_attn_builder._build_non_spec_chunked_prefill_metadata``
+    同构:chunk 64 / large block 1216 / cumsum 块 = next_pow2(2^18 // (HV·64))——最后一项
+    必须与 ``chunk_local_cumsum`` 内部按同一公式推导的 OPTIM_BLOCK_SIZE 一致,否则 grid 数
+    与 128-token 块寻址错位会直接设备越界(507015)。cu_seqlens.tolist() 的宿主同步仅发生
+    在这条非在役路径。没有它,回退原链在 meta=None 时 fwd_o 会 507015 设备崩溃(E22 坑位:
+    在役恒带 host tuple,None 分支从未被在役走过)。
+    """
+    import triton
+    from vllm_ascend.ops.gdn_attn_builder import GDNChunkedPrefillMetadata
+    from vllm_ascend.ops.triton.fla.utils import (
+        prepare_chunk_indices,
+        prepare_chunk_offsets,
+        prepare_final_chunk_indices,
+        prepare_update_chunk_offsets,
+    )
+
+    cu_cpu = torch.tensor([int(x) for x in cu_seqlens_host], dtype=torch.int64)
+    ci = prepare_chunk_indices(cu_cpu, 64)
+    cumsum_block = triton.next_power_of_2((2**18) // (max(1, hv_heads) * 64))
+    return GDNChunkedPrefillMetadata(
+        cu_seqlens_host=tuple(int(x) for x in cu_seqlens_host),
+        chunk_indices_chunk64_host=tuple(ci.to(torch.int64).reshape(-1).tolist()),
+        chunk_indices_chunk64=ci.to(device, non_blocking=True),
+        chunk_offsets_chunk64=prepare_chunk_offsets(cu_cpu, 64).to(device, non_blocking=True),
+        update_chunk_offsets_chunk64=prepare_update_chunk_offsets(cu_cpu, 64).to(device, non_blocking=True),
+        final_chunk_indices_chunk64=prepare_final_chunk_indices(cu_cpu, 64).to(device, non_blocking=True),
+        chunk_indices_large_block=prepare_chunk_indices(cu_cpu, 1216).to(device, non_blocking=True),
+        block_indices_cumsum=prepare_chunk_indices(cu_cpu, cumsum_block).to(device, non_blocking=True),
+        num_decodes=0,
+    )
+
 
 def install_gdn_chunk_wu() -> bool:
-    """接管 vLLM-Ascend GDN prefill chunk 链的中段两核(BACKLOG M-GDN 9c,H10)。
+    """接管 vLLM-Ascend GDN prefill chunk 链的中段两核(BACKLOG M-GDN 9c,H10;阶段 3 P1)。
 
     在役链(E20/E22):cumsum → kkt → **solve_tril + recompute_w_u**(四核 triton 中的两大
-    单核,稳态合计 0.73ms/层@T=128,30 层=22ms/步)→ AscendC fwd_h → fwd_o。本钩子把
-    ``chunk_gated_delta_rule_fwd`` 替换为 TileInfer 版本:中段换成 tileinfer 的融合内核
-    ``gdn_chunk_wu``(块逆 + 乘 k/v 一步完成),链首尾(cumsum/kkt/fwd_h/fwd_o 与 AscendC
-    staging)保持原实现不变。PCP(world_size>1)与 cu_seqlens=None(死代码路径,见 E22)
-    时回退原实现;``TILEINFER_OPS`` 每步读取 ``gdnwu`` 项,秒级回退;计数入在役探针。
+    单核)→ AscendC fwd_h → fwd_o。本钩子把 ``chunk_gated_delta_rule_fwd`` 替换为 TileInfer
+    版本:中段换成 tileinfer 的融合内核 ``gdn_chunk_wu``(块逆 + 乘 k/v 一步完成),链首尾
+    (cumsum/kkt/fwd_h/fwd_o 与 AscendC staging)保持原实现不变。
+
+    **长度自适应分流(P1/H11,E26/E26b)**:仅当 prefill 总 token 数 ``q.shape[1]`` ≤ 阈值
+    (缺省 128,``TILEINFER_GDNWU_MAX_TOKENS`` 可覆盖)才走融合核——该区间是微基准扫描中
+    融合唯一占优的形状带;更长上下文(E26:T256 起 1.22x、T8192 14.4x)回退原 triton 链,
+    保证长上下文零劣化。判定只读宿主侧 shape,零设备同步,图捕获安全。PCP(world_size>1)
+    与 cu_seqlens=None(死代码路径,见 E22)时回退原实现;``TILEINFER_OPS`` 每步读取
+    ``gdnwu`` 项,秒级回退;计数(gdn_wu_calls/gdn_wu_long_skips/gdn_wu_fallbacks)入在役探针。
     """
     global _GDN_WU_INSTALLED
     if _GDN_WU_INSTALLED:
@@ -1128,24 +1189,40 @@ def install_gdn_chunk_wu() -> bool:
 
     def _ti_chunk_gated_delta_rule_fwd(q, k, v, g, beta, scale, initial_state, output_final_state,
                                         cu_seqlens=None, prebuilt_meta=None):
-        if not ops_enabled("gdnwu") or cu_seqlens is None or get_pcp_group().world_size > 1:
+        # 长度自适应分流(P1/H11):短上下文走融合核,长上下文回退原链(E26/E26b 阈值依据)。
+        # q 为 varlen 布局 [1, T_total, H, D],shape 读取纯宿主侧、零同步。
+        # 库级/测试调用(serving 恒带在役 builder 的 prebuilt_meta)现场补一份同构 meta:
+        # 原链在 meta=None 时 fwd_o 会 507015 设备崩溃(E22 坑位),构建仅发生在宿主同步
+        # 一次的库级路径上,在役路径不受影响。
+        enabled = ops_enabled("gdnwu")
+        if enabled and cu_seqlens is not None and prebuilt_meta is None:
+            prebuilt_meta = _build_gdn_chunk_meta(
+                tuple(int(x) for x in cu_seqlens.to(torch.int64).tolist()),
+                cu_seqlens.device, g.shape[2])
+        if (not enabled) or cu_seqlens is None or get_pcp_group().world_size > 1 \
+                or q.shape[1] > _gdnwu_max_tokens():
+            if enabled and cu_seqlens is not None and get_pcp_group().world_size <= 1:
+                # 开关开着但形状超阈值:计一次"长度分流跳过"(在役探针可见分流真的发生)
+                cls_stats["gdn_wu_long_skips"] = cls_stats.get("gdn_wu_long_skips", 0) + 1
             return _original_fwd(q, k, v, g, beta, scale, initial_state, output_final_state,
                                  cu_seqlens=cu_seqlens, prebuilt_meta=prebuilt_meta)
         try:
             meta = prebuilt_meta
-            block_indices_cumsum = None if meta is None else meta.block_indices_cumsum
-            cu_seqlens_host = None if meta is None else meta.cu_seqlens_host
-            ci64 = None if meta is None else meta.chunk_indices_chunk64
-            ci_host = None if meta is None else meta.chunk_indices_chunk64_host
-            chunk_indices_large_block = None if meta is None else meta.chunk_indices_large_block
-            chunk_indices_bt = None if meta is None else meta.chunk_indices_chunk64
+            block_indices_cumsum = meta.block_indices_cumsum
+            cu_seqlens_host = meta.cu_seqlens_host
+            ci64 = meta.chunk_indices_chunk64
+            ci_host = meta.chunk_indices_chunk64_host
+            chunk_indices_large_block = meta.chunk_indices_large_block
+            chunk_indices_bt = meta.chunk_indices_chunk64
 
             # ---- 链首:与原实现一致 ----
             g64 = _cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens, block_indices=block_indices_cumsum)
             a_kkt = _kkt(k=k, beta=beta, g_cumsum=g64, cu_seqlens=cu_seqlens,
                          chunk_indices=chunk_indices_bt, output_dtype=torch.float32)
             # ---- 中段:融合内核(solve_tril + recompute_w_u)----
-            w, u = gdn_chunk_wu(a_kkt, k, v, beta, g64, cu_seqlens, ci64)
+            # 服务端 cu_seqlens 为 int32(引擎 metadata),内核签名要求 int64 → 统一转换
+            cu64 = cu_seqlens.to(torch.int64)
+            w, u = gdn_chunk_wu(a_kkt, k, v, beta, g64, cu64, ci64)
             cls_stats["gdn_wu_calls"] = cls_stats.get("gdn_wu_calls", 0) + 1
 
             # ---- 链尾:与原实现一致(AscendC staging + fwd_h + fwd_o)----
@@ -1155,7 +1232,6 @@ def install_gdn_chunk_wu() -> bool:
             g_ascendc = g64.transpose(1, 2).contiguous()
             q_ascendc = q.to(torch.bfloat16).transpose(1, 2).contiguous()
 
-            cu64 = cu_seqlens.to(torch.int64)
             if cu_seqlens_host is None:
                 cu_seqlens_host = tuple(cu64.tolist())
             if ci_host is None:

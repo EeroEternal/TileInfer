@@ -76,6 +76,34 @@ _bootstrap_ascend_env()
 import pytest
 import torch
 
+#: 测试进程内真实加载过 vllm_ascend_C(TORCH_LIBRARY ``_C_ascend``)的标记。
+#: 该 .so 载入后,解释器终结期的 CANN teardown 会 double-free(D14 同源的已知
+#: 上游缺陷,serve 进程被 kill 收尾所以从未暴露),把 pytest 的真实退出码变成
+#: SIGABRT(134)。pytest_unconfigure(全部输出已写完)时按状态码硬退出跳过
+#: 终结期析构;未加载该 .so 的运行(CPU 套件、其余设备套件)完全不受影响。
+_CUSTOM_OPS_STATE = {"vllm_ascend_C": False}
+
+
+def mark_vllm_ascend_C_loaded() -> None:
+    """由真实执行 ``import vllm_ascend.vllm_ascend_C`` 的设备用例调用(见 dispatch 测试)。"""
+    _CUSTOM_OPS_STATE["vllm_ascend_C"] = True
+
+
+def pytest_unconfigure(config: pytest.Config) -> None:
+    if _CUSTOM_OPS_STATE["vllm_ascend_C"]:
+        import atexit
+        import os as _os
+        import sys as _sys
+
+        def _hard_exit_skip_cann_teardown() -> None:
+            # 此时 pytest 汇总已写完;os._exit 跳过解释器终结期的 CANN teardown
+            # (double-free,D14 同源上游缺陷),保住真实退出码。
+            _sys.stdout.flush()
+            _sys.stderr.flush()
+            _os._exit(int(getattr(config, "exitstatus", 0)))
+
+        atexit.register(_hard_exit_skip_cann_teardown)
+
 
 @pytest.fixture
 def cpu() -> torch.device:
