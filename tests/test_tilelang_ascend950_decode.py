@@ -140,6 +140,11 @@ def _case(batch, kv_heads, group, page_size, dim, kv_lens, seed=0, kv_tile_pages
         (1, 2, 8, [4000], "split-KV, 4 tiles", 8, 128),
         # split-KV across several ragged requests (different split counts per request)
         (2, 2, 8, [4096, 1024], "split-KV, ragged", 8, 128),
+        # split-KV with the *serving* GQA config (32 qo / 8 kv heads -> group 4): this is the
+        # KI-1 regression case - the merge kernel's GM staging used to fault with a vector-core
+        # exception for group 4 (sub-32-byte PartLse row) while group 8 passed
+        (1, 8, 4, [4096], "split-KV, serving group 4", 16, 128),
+        (2, 8, 4, [4096, 512], "split-KV, group 4 ragged", 16, 128),
         # head_dim 256 (Qwen3.5/3.6 full-attention layers): non-power-of-two pool on purpose,
         # it is the regression case for the kernel's quantized page-capacity binding
         (1, 2, 8, [128], "d256 one full page", 0, 256),

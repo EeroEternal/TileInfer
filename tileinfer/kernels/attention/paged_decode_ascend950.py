@@ -444,6 +444,16 @@ def paged_decode_merge(
     ``lse = -1e30``, so ``exp(-1e30 - lse_all)`` is 0 and the max/sum reductions ignore them.  The
     split axis is *unrolled in Python* (``max_splits`` is a compile-time constant), which keeps the
     per-split GM→UB staging static and the arithmetic race-free.
+
+    The GM→UB staging copies whole **BR** lse rows, never bare ``group`` rows (KI-1 root cause):
+    the copy engine faults with a vector-core exception on sub-32-byte descriptors, and with the
+    serving GQA group of 4 a ``PartLse`` row is only 16 bytes (``group=8`` happened to be exactly
+    one 32 B sector, which is why every early probe - all built with group 8 - passed).  ``BR`` is
+    the slot stride of ``PartLse``, so the extra rows are real memory: finite values for slots the
+    split kernel wrote (padding rows of a real slot carry ``-inf``, which the reductions below
+    never read) and the pre-filled ``-inf`` of unused slots.  The ``PartOut`` copy keeps ``group``
+    rows: each row is 256 B and rows scale with ``max_splits``, so padding it to ``BR`` would
+    overflow UB at the long-context split counts (32 splits × 32 rows × dim).
     """
     BR = padded_rows(group)
     accum = "float32"
@@ -461,7 +471,7 @@ def paged_decode_merge(
             b = bx // kv_heads
             bh = bx % kv_heads
 
-            lse_g = T.alloc_shared((max_splits, group), accum)
+            lse_g = T.alloc_shared((max_splits, BR), accum)
             out_g = T.alloc_shared((max_splits, group, dim), dtype)
             w_g = T.alloc_shared((max_splits, group), accum)
             acc_g = T.alloc_shared((group, dim), accum)
@@ -473,7 +483,7 @@ def paged_decode_merge(
 
             for s in T.serial(max_splits):
                 base = (b * max_splits + s) * kv_heads + bh
-                T.copy(PartLse[base * BR : base * BR + group], lse_g[s, 0:group])
+                T.copy(PartLse[base * BR : (base + 1) * BR], lse_g[s, 0:BR])
                 T.copy(PartOut[base, 0:group, 0:dim], out_g[s, 0:group, 0:dim])
 
             with T.SimtVF(threads=threads):

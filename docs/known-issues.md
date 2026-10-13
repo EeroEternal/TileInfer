@@ -102,119 +102,77 @@ time and again inside `_build_plan()`.  That distinguishes "imported but unregis
 imported" and points at the line to fix.  Meanwhile the plugin falls back to FIA, which is why the
 integration is still opt-in.
 
-## KI-1 — split-KV wedges the device when several shapes share one process (open)
+## KI-1 — split-KV wedged the device: merge-kernel staging fault for group 4 (RESOLVED 2026-10-14)
 
-**Status:** open(2026-10-13:诊断与启用列入**阶段三 L1/L3,当前延后待授权**;期间 split-KV 保持
-opt-in,长上下文 8K/16K 图模式数字受此主导,见 PERFORMANCE_REPORT §5)·
-**Affected:** `tilelang-ascend950` with `kv_tile_pages > 0` ·
-**Default:** the backend **refuses** split plans unless `TILEINFER_ALLOW_SPLIT_KV=1`.
+**Status:** resolved · **Root cause:** the merge kernel staged `PartLse` GM→UB at *group* granularity;
+with the serving GQA config (32 qo / 8 kv heads → group 4) that is a 16-byte descriptor, and the
+copy engine rejects sub-32-byte descriptors with `ACL_ERROR_RT_VECTOR_CORE_EXCEPTION` (507035).
+**Fix:** stage the lse row at the slot stride `BR` (one line + docstring; the `PartOut` staging
+stays at group granularity - its rows are 256 B). ·
+**Affected:** `tilelang-ascend950` with `kv_tile_pages > 0` and group 4 (group 8 was always fine) ·
+**Default:** the backend still **refuses** split plans unless `TILEINFER_ALLOW_SPLIT_KV=1` (policy,
+not a workaround - see below).
 
-### Symptom
+### Symptom (historical)
 
-Running the serving sweep (`benchmarks/bench_attention.py --preset serving --kv-tile-pages 16`,
-seven shapes in one process) dies on the third shape:
+The serving sweep (`benchmarks/bench_attention.py --preset serving --kv-tile-pages 16`) died on the
+third shape - the first one whose plan splits:
 
 ```
 b64/kv512   -> ok          b16/kv4096 -> ACL_ERROR_RT_VECTOR_CORE_EXCEPTION (507035)
 b32/kv2048  -> ok          b8/kv8192  -> every later op fails (device wedged)
 ```
 
-The exception is reported *asynchronously*: it surfaces in whatever torch op runs next
-(`aclnnInplaceNormal`, then a host copy), not at the launch that faulted.  After it, the device
-rejects everything, so the sweep cannot continue.
+The exception surfaced asynchronously, in whatever torch op ran next, which (with the misleading
+"several shapes in one process" framing) sent the investigation towards allocator layout and process
+state.
 
-### What is ruled out
+### Root cause (found 2026-10-14, evidence E37)
 
-* **The shape itself.**  `b16/kv4096` with `kv_tile_pages=16` (2 splits) run alone produces
-  `max|diff| = 4e-4` against the CPU reference, and **20 consecutive launches of that same plan in
-  one process are all clean**.
-* **The arithmetic.**  All seven device tests pass, including split schedules (single request with
-  4 splits, and a ragged 2-request batch with different split counts).
-* **The harness' reference.**  The first sweep ran the reference on the NPU and failed the same way;
-  moving the reference to the CPU (which is also what the probes do) did not change it.
-* **A stale kernel cache.**  `tilelang`'s cache key is a SHA-256 of the generated function binary,
-  so a shape cannot silently reuse another shape's kernel.  (The ABI check would also catch a
-  size mismatch, as it did once with `kv_indices`.)
+Launch-level canary instrumentation (per-launch sync + full pointer dumps, `.agent_loop/run/p6/`)
+attributed the fault to the **merge kernel's very first launch**; the split kernel completed cleanly.
+Then the "multi-shape process" framing collapsed:
 
-### Why we are not shipping it enabled anyway
+1. a *single-shape* fresh process (`b16/kv4096` only, split+merge) faults identically - no history,
+   no reuse, no other kernel;
+2. a minimal merge-only probe with **identical addresses and sizes** passes for group 8 and faults
+   for group 4 - only the `group` constant differs;
+3. the merge kernel copies `PartLse[base*BR : base*BR + group]` - 8 fp32 = 32 B for group 8
+   (exactly one sector, fine) but 4 fp32 = **16 B for group 4** (sub-sector → fault).
 
-A vector-core exception is not a wrong number: it wedges the device for the rest of the process, so
-any engine that hit it would take the whole serving process down.  Until it is understood, split-KV
-is opt-in, and the documented way to get the 3x is to run it per shape (or in a fresh process).
+Every earlier "clean" experiment had used group-8 probe configs (`kv_heads=2, group=8`, as do the
+device tests to this day) - the serving group-4 merge had never been launched in isolation.  That is
+why "20 consecutive launches clean" and the three-shape mirror probe never saw it, and why the bug
+looked like exotic process state.
 
-### Retracted: the vLLM EngineCore fault was not ours
+### Fix
 
-An earlier revision of this file claimed a second reproducer - the first decode inside a vLLM
-EngineCore faulting with the same 507035.  That is **withdrawn**: the same server, same model, same
-request with TileInfer switched off (`TILEINFER_DISABLE=1`, so the stock Ascend FIA path) crashes
-identically.  The model in that experiment was a hand-made tiny Qwen2 (2 layers, vocab 1024, random
-weights) built to get `head_dim=128` on a box that has none; something in that configuration faults on
-this stack regardless of the attention backend, and it is not our bug.
+`paged_decode_merge` now stages the lse row at the full slot stride `BR` (32 fp32 = 128 B); the
+padding rows are real memory (the slot stride of `PartLse` *is* `BR`, so the copy never leaves the
+tensor) and are never read by the reductions.  `PartOut` staging keeps group granularity: each row
+is 256 B and a BR-padded `out_g` would overflow UB at the long-context split counts (32 splits ×
+32 rows × dim = 256 KB).  Device tests now cover split-KV with group 4 (`split-KV, serving group 4`,
+`split-KV, group 4 ragged`).
 
-What *is* verified in vLLM is in [`integration-vllm-ascend.md`](integration-vllm-ascend.md): the
-backend registers, is selected, is entered for decode-only batches, and declines configurations its
-kernel cannot serve (Qwen2.5-0.5B's `head_size=64`) with a logged reason before falling back to FIA.
+### Verification (all green, E37 / .agent_loop/run/p6/chain.out)
 
-Three more hypotheses for KI-1 were tested and **refuted** while chasing this, and each one is a
-result worth keeping:
+* merge-only: group ∈ {4, 8} × max_splits 2, and group 4 × max_splits 32 (UB pressure) - SYNC OK;
+* backend path, single shape `b16/kv4096`: 20 consecutive launches clean;
+* `--preset repro` (b64/b32/b16-split): all three rows ok, split maxerr 4.86e-04;
+* `--preset serving` full sweep with `--kv-tile-pages 16`: all seven shapes, no wedge.
 
-| Hypothesis | Experiment | Result |
-|---|---|---|
-| caller buffers unaligned | slice every input out of a bigger allocation at 2 B / 16 B / 128 B / 512 B offsets | clean at every offset |
-| pool larger than 2 GiB overflows 32-bit addressing | compile and run against pools of 0.5 / 2.4 / 7.3 GiB | clean at every size |
-| the kernel ignores the caller's NPU stream | write the page on a non-default stream, launch immediately, ask which content it saw | saw the new content: ordering respected |
+### Why split-KV stays opt-in
 
-So KI-1 remains what it was: the split path, several shapes in one process, no reproducer outside the
-sweep.
+The fault is fixed, but the 2026-10-13 decision stands on its own merits: per-shape kernel burns
+~70 s of compile on first sight, and the engine rollout (P8) needs per-shape prewarm before the flag
+flips.  Enabling is now an engineering decision, not a safety one.
 
-### Reproducer, and what has been ruled out (updated)
+### Retracted earlier claims (kept for the record)
 
-```bash
-source <CANN 9.3.x>/set_env.sh
-export TILEINFER_ALLOW_SPLIT_KV=1
-python benchmarks/bench_attention.py --preset repro --backend tilelang-ascend950 \
-       --dtype bf16 --kv-tile-pages 16
-# b64/kv512   -> ok
-# b32/kv2048  -> ok
-# b16/kv4096  -> ACL_ERROR_RT_VECTOR_CORE_EXCEPTION (reported by the next torch op)
-```
-
-`--preset repro` is exactly the three-shape prefix that fails, and it is kept in the harness for
-this purpose.
-
-Ruled out, each by running the reproducer above with one thing changed:
-
-| Hypothesis | Experiment | Result |
-|---|---|---|
-| the harness' NPU reference | `--no-check` | still faults |
-| repeated launches / benchmark loop | `--warmup 0 --iters 1` | still faults |
-| a stale disk-cached kernel | `TILELANG_CLEAR_CACHE=1` (forces a recompile) | still faults |
-| a stale in-memory kernel | code read: the cache key is a SHA-256 of the compiled function, not its name | impossible |
-| the shape itself | `b16/kv4096 kv_tile_pages=16` alone, and 20 consecutive launches of one plan | clean |
-| "unsplit kernel first, then split" | a probe running that pair in both orders | clean |
-| the exact case construction | a probe mirroring `make_case_tensors` (same `randn`, `shuffle_pages=True`, `qo_indptr`, three launches with per-launch sync) for the same three shapes | **clean** |
-
-The last row is the interesting one: an exact mirror of the *cases* passes, so the trigger is not the
-shapes, the arguments or the page table but some **process state the harness has and the probe does
-not** (allocation history/layout is the obvious candidate - it is what made an earlier guard-tensor
-experiment "prove" a layout-dependent overrun in PM-1 as well).  A device debugger, or
-`ASCEND_LAUNCH_BLOCKING=1` plus per-launch attribution, is the way in.
-
-Because a device fault takes the process with it, split-KV stays opt-in meanwhile.
-
-### Next steps
-
-1. Run the reproducer under `ASCEND_LAUNCH_BLOCKING=1` so the fault is attributed to the launch that
-   causes it rather than to the next op; that alone should say whether it is the split kernel or the
-   merge kernel.
-2. Instrument the harness path to dump the device pointers and shapes of every tensor handed to the
-   kernels, and diff that against the probe run that passes - if a *layout* difference is the trigger,
-   the addresses will show it (e.g. a buffer landing next to an unmapped page).
-3. Try the harness with the plan buffers allocated through a different allocator path (e.g. one extra
-   dummy allocation between them) to test the layout sensitivity directly.
-4. Ask upstream with the reproducer: a `T.SimtVF` + `dual_copy` kernel that faults only in some
-   allocation layouts is worth their attention regardless of whose bug it is.
-
+* "the vLLM EngineCore fault" - withdrawn even before this resolution: the same server crashes
+  identically with TileInfer off (hand-made tiny Qwen2 config fault regardless of backend).
+* allocator layout / process state hypotheses (H14): disproven by the single-shape and merge-only
+  reproductions above.
 
 ## PM-2 — multi-tile prefill was off by a row offset (resolved)
 
