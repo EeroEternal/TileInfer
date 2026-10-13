@@ -196,11 +196,14 @@ TILELANG_CACHE_DIR=/tmp/tl_cache_vllm python scripts/prewarm-tileinfer-kernels.p
     --kv-heads 2 --group 6 --dim 128 --page-size 128 --num-pages-cap 9425 --buckets 1 2 4
 ```
 
-The kernel key includes the KV pool capacity (it is part of the buffer ABI: `kv_indices` is padded to
-it), so pre-warming needs the capacity the server will use.  It is deterministic for a fixed model,
-`--gpu-memory-utilization` and `--max-model-len`, and the plugin logs it (`pool=9425 pages`); vLLM also
-prints the KV cache size at startup.  After a pre-warm the server's own compile is a cache hit and the
-first decode step is served without a stall, with no fallback to FIA.
+The kernel key includes the KV pool's *declared* capacity: `declared_pool_cap` rounds the real
+pool up to a power of two (or an exact `TILEINFER_POOL_CAP` pin) and the kernel declares K/V at
+that extent while `pool_view` re-binds the pool's own storage to it (`Tensor.set_`; `as_strided`
+would reject the oversized shape).  Pages outside `kv_indptr`/`kv_indices` spans are never
+dereferenced, so the view is exact and the exact pool size is out of the kernel/plan/pre-warm
+keys — vLLM's snapshot-derived pool (9425 pages in one run, 9899 in the next) no longer
+invalidates a pre-warm (L2, 2026-10-14).  After a pre-warm the server's own compile is a cache
+hit and the first decode step is served without a stall, with no fallback to FIA.
 
 Two consequences worth remembering:
 

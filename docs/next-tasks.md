@@ -191,11 +191,17 @@ MoE grouped GEMM, sampling.  Each starts as a new kernel module plus a reference
 *First step*: `ASCEND_LAUNCH_BLOCKING=1` 下最小碎片 sweep(`benchmarks/probes/ki1_pool_size.py` 模板)。
 *Done when*: 可上游提交的复现器 + 根因 + 多形状进程设备测试绿。
 
-### L2 · 池无关内核 ABI
+### L2 · 池无关内核 ABI —— ✅ DONE(2026-10-14)
 
 *What*: KV 池指针移出内核签名(plan 携带),使预烧免精确池匹配——vLLM 池页数不可复现是预烧失效
 的已知根因(status.md §5.2)。**内核签名变更,落地后必须重跑引擎内回归与预烧链路**。
 *Done when*: 预烧 key 与池解耦,引擎内 prewarm→READY 全绿。
+*Result*: `declared_pool_cap`(pow2 上取整/`TILEINFER_POOL_CAP` 钉死)进入内核 K/V 首维、
+kv_indices 槽与 plan key;池以 `Tensor.set_` 容量视图零拷贝呈现(as_strided 拒超界形状,
+extent=1 占位被否证——拷贝描述符对 size-1 维忽略动态 pid)。全量回归 EXIT=0(125 dots,含
+cap>pool 设备绑定用例);probe_b5 引擎探针 PASS(6 plan + 9 prefill 变体 READY,
+capture_calls=40、fallbacks=0);跨进程漂移池(9425→9899/9600)预烧命中同一产物(10s vs
+83s 首编)。证据 E38;一次性成本=键变更冷启动重编译 ~25min(已付)。
 
 ### L3 · split-KV 真正启用
 

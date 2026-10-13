@@ -115,13 +115,19 @@ class TileLangAscend950Backend(AttentionBackend):
             )
 
         state = plan.backend_state
+        from ...kernels.attention.paged_decode_ascend950 import declared_pool_cap
+
+        # L2 pool-agnostic ABI: the kernel (and its key) is compiled for the *declared*
+        # capacity, which covers but does not equal the real pool — so a plan survives the
+        # run-to-run pool drift of the engine's memory snapshot.
+        pool_cap = declared_pool_cap(int(k_cache.shape[0]))
         spec_key = (
             plan.batch_size,
             plan.num_kv_heads,
             plan.gqa_group_size,
             plan.head_dim,
             plan.page_size,
-            int(k_cache.shape[0]),
+            pool_cap,
         )
         if state.get("spec_key") == spec_key:
             return plan
@@ -184,7 +190,7 @@ class TileLangAscend950Backend(AttentionBackend):
             # own copies, so a kernel can never write into a caller's tensor, and the addresses
             # stay stable across steps (which is what graph capture wants).  This mirrors the
             # fork backend's `_refresh_metadata`.
-            cap = int(k_cache.shape[0])
+            cap = pool_cap
             state["page_cap"] = cap
             state["kv_indptr_buf"] = torch.empty(plan.batch_size + 1, dtype=torch.int32, device=plan.device)
             state["kv_indices_buf"] = torch.zeros(cap, dtype=torch.int32, device=plan.device)
@@ -199,7 +205,7 @@ class TileLangAscend950Backend(AttentionBackend):
                 group=plan.gqa_group_size,
                 dim=plan.head_dim,
                 page_size=plan.page_size,
-                num_pages_cap=int(k_cache.shape[0]),
+                num_pages_cap=pool_cap,
                 dtype=_TILELANG_DTYPE[plan.dtype],
                 out_manual=True,
             )
@@ -213,7 +219,7 @@ class TileLangAscend950Backend(AttentionBackend):
             state["out_pad"] = torch.empty(
                 (plan.batch_size, kv_heads * br, plan.head_dim), dtype=plan.dtype, device=plan.device
             )
-            cap = int(k_cache.shape[0])
+            cap = pool_cap
             state["page_cap"] = cap
             state["kv_indptr_buf"] = torch.empty(
                 (plan.batch_size + 1,), dtype=torch.int32, device=plan.device
@@ -295,8 +301,8 @@ class TileLangAscend950Backend(AttentionBackend):
             ].copy_(q.reshape(batch, kv_heads, plan.gqa_group_size, plan.head_dim))
         state["kernel"](
             state["q_pad"],
-            pool_view(k_cache, int(k_cache.shape[0])),
-            pool_view(v_cache, int(v_cache.shape[0])),
+            pool_view(k_cache, state["page_cap"]),
+            pool_view(v_cache, state["page_cap"]),
             state["kv_indptr_buf"],
             state["kv_indices_buf"],
             state["last_page_len_buf"],

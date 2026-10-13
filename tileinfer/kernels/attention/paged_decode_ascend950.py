@@ -27,6 +27,7 @@ strings that can no longer resolve the enclosing function's locals.
 """
 
 import math
+import os
 
 import torch
 import tilelang
@@ -43,6 +44,7 @@ __all__ = [
     "build_merge_kernel",
     "build_tile_slots",
     "padded_rows",
+    "declared_pool_cap",
     "forward",
     "forward_split",
     "forward_prefill",
@@ -61,13 +63,22 @@ def paged_decode_ascend950(
 ):
     """Build the paged decode attention ``T.prim_func``.
 
+    ``num_pages_cap`` is the *declared* capacity (:func:`declared_pool_cap`): it sizes the
+    ``kv_indices`` ABI slot and the K/V page extents, but never equals the real pool — the
+    caller presents the pool through :func:`pool_view` and no page outside the real pool is
+    ever dereferenced.
+
     Layouts (chosen to match what serving engines already allocate, see ``docs/architecture.md``):
 
     ``Q``        ``[batch, kv_heads * BR, dim]`` — **padded**: query head ``kv_head * group + i``
                  belongs to KV head ``kv_head``, and rows ``group..BR-1`` of each KV head must be
                  zero (the caller pads and slices).
     ``Out``      same padded shape; only the first ``group`` rows of each KV head are meaningful.
-    ``KCache`` / ``VCache``  ``[num_pages, page_size, kv_heads, dim]`` (NHD).
+    ``KCache`` / ``VCache``  ``[num_pages_cap, page_size, kv_heads, dim]`` (NHD) — declared at
+                 the *declared* capacity (:func:`declared_pool_cap`), which covers but does not
+                 equal the real pool (L2 pool-agnostic ABI).  The caller presents the pool
+                 through :func:`pool_view`; pages beyond the real pool are never dereferenced
+                 (every access is bounded by ``kv_indptr``/``kv_indices``).
     ``kv_indptr`` / ``kv_indices`` / ``kv_last_page_len``  the engine-agnostic page list.
     """
     # M of the QK^T GEMM.  Padded so that the per-AIV row count is a multiple of 16: the ND->NZ
@@ -258,6 +269,9 @@ def paged_decode_split(
     Parallelism: the grid is ``num_tiles * kv_heads`` instead of ``batch * kv_heads``, so a single
     long request can occupy every core instead of eight of them (the 51 GB/s case in
     ``docs/performance.md`` measures 153 GB/s with 16 splits).
+
+    Like the plain kernel, ``KCache``/``VCache`` are declared at the declared capacity, not the
+    real pool (L2 pool-agnostic ABI, see :func:`paged_decode_ascend950`).
     """
     BR = padded_rows(group)
     BC = page_size
@@ -536,7 +550,13 @@ def build_merge_kernel(**spec):
 _KERNEL_CACHE: dict = {}
 
 def build_split_kernel(**spec):
-    """Compile (and cache) a split-KV decode kernel."""
+    """Compile (and cache) a split-KV decode kernel.
+
+    The pool capacity is quantized to the ABI's declared value (see :func:`declared_pool_cap`),
+    so the cache key does not depend on the real pool size.
+    """
+    if spec.get("num_pages_cap") is not None:
+        spec["num_pages_cap"] = declared_pool_cap(spec["num_pages_cap"])
     key = ("split",) + tuple(sorted(spec.items()))
     kernel = _KERNEL_CACHE.get(key)
     if kernel is None:
@@ -553,15 +573,21 @@ def build_split_kernel(**spec):
 def build_decode_kernel(**spec):
     """Compile (and cache) the kernel for one shape combination.
 
-    ``num_pages_cap`` is the *real* pool size, deliberately not rounded: the kernel declares the
-    K/V cache as ``(num_pages_cap, page_size, kv_heads, dim)``, and the storage must actually cover
-    it (see `pool_view`), so a rounded-up cap makes the FFI view overrun the tensor.
+    ``num_pages_cap`` is quantized to the ABI's *declared* capacity (see
+    :func:`declared_pool_cap`) before it enters the cache key: the kernel declares the K/V cache
+    at that extent, and the caller presents the real pool through :func:`pool_view` (a zero-copy
+    capacity view re-binding the pool's own storage).  Pages beyond the real pool are never
+    dereferenced — every access is bounded by ``kv_indptr``/``kv_indices`` — so one artifact
+    serves every pool in the declared-capacity bucket, which decouples the kernel key from
+    vLLM's snapshot-derived pool size.
 
     ``out_manual=True`` compiles the same kernel with ``out_idx=[]`` so the caller hands in the
     output tensor (``Out`` becomes the 7th positional argument).  That is what serving wants: the
     output buffer is owned by the plan and reused every step, so a captured step never allocates.
     """
     out_manual = bool(spec.pop("out_manual", False))
+    if spec.get("num_pages_cap") is not None:
+        spec["num_pages_cap"] = declared_pool_cap(spec["num_pages_cap"])
     key = ("decode", "manual" if out_manual else "auto") + tuple(sorted(spec.items()))
     kernel = _KERNEL_CACHE.get(key)
     if kernel is None:
@@ -610,6 +636,9 @@ def paged_prefill_ascend950(
     into ``RowThr`` (rows past the live count get -1), and the kernel ``dual_copy``s that 1-D array
     exactly like ``s_ub`` -- so each AIV half receives its own half of the thresholds and the mask is
     correct on both.  Callers may use the full ``block_q`` tile; there is no tile-size restriction.
+
+    Like the decode kernels, ``KCache``/``VCache`` are declared at the declared capacity, not
+    the real pool (L2 pool-agnostic ABI, see :func:`paged_decode_ascend950`).
     """
     BR = block_q
     BC = page_size
@@ -777,7 +806,10 @@ def paged_prefill_ascend950(
 
 
 def build_prefill_kernel(**spec):
-    """Compile (and cache) the prefill kernel.  See `build_decode_kernel` re: `num_pages_cap`."""
+    """Compile (and cache) the prefill kernel.  See `build_decode_kernel` re: `num_pages_cap`
+    (quantized to the ABI's declared capacity, so the key is pool-agnostic)."""
+    if spec.get("num_pages_cap") is not None:
+        spec["num_pages_cap"] = declared_pool_cap(spec["num_pages_cap"])
     key = ("prefill",) + tuple(sorted(spec.items()))
     kernel = _KERNEL_CACHE.get(key)
     if kernel is None:
@@ -834,6 +866,9 @@ def forward_split(
     br = padded_rows(group)
     num_tiles = schedule.num_tiles
     dtype = dtype or _TORCH_TO_TILELANG_DTYPE[q.dtype]
+    # Declared ABI capacity (covers the real pool; see declared_pool_cap): sizes the split
+    # kernel's kv_indices slot and its K/V page extents (the pools are capacity views).
+    cap = declared_pool_cap(int(k_cache.shape[0]))
 
     split = build_split_kernel(
         batch=batch,
@@ -841,7 +876,7 @@ def forward_split(
         group=group,
         dim=dim,
         page_size=page_size,
-        num_pages_cap=int(k_cache.shape[0]),
+        num_pages_cap=cap,
         num_tiles=num_tiles,
         max_splits=max_splits,
         dtype=dtype,
@@ -861,7 +896,6 @@ def forward_split(
         last_page_len = kv_last_page_len
     else:
         indices = meta.kv_indices.to(torch.int32)
-        cap = int(k_cache.shape[0])
         if indices.numel() < cap:
             indices = torch.cat([indices, indices.new_zeros(cap - indices.numel())])
         indptr = meta.kv_indptr.to(torch.int32)
@@ -885,8 +919,8 @@ def forward_split(
     _hook("before split")
     split(
         q_pad,
-        pool_view(k_cache, int(k_cache.shape[0])),
-        pool_view(v_cache, int(v_cache.shape[0])),
+        pool_view(k_cache, cap),
+        pool_view(v_cache, cap),
         indptr,
         indices,
         last_page_len,
@@ -976,7 +1010,9 @@ def forward_prefill(
             q_packed[tile * kv_heads + bh, :rows] = q_flat[b, bh, q_off : q_off + rows]
 
     indices = meta.kv_indices.to(torch.int32)
-    cap = int(k_cache.shape[0])
+    # Declared ABI capacity (covers the real pool; see declared_pool_cap): kv_indices padding,
+    # the compiled variant and the pool views all use it, so the kernel key is pool-agnostic.
+    cap = declared_pool_cap(int(k_cache.shape[0]))
     if indices.numel() < cap:
         indices = torch.cat([indices, indices.new_zeros(cap - indices.numel())])
     # P3 canonical-variant batch padding: grow the per-request metadata to ``kernel_batch`` rows
@@ -1081,18 +1117,58 @@ _TORCH_TO_TILELANG_DTYPE = {
 }
 
 
+def declared_pool_cap(pool_pages: int) -> int:
+    """The kernel ABI's *declared* page capacity for a real KV pool (L2, pool-agnostic ABI).
+
+    Pages outside ``kv_indptr``/``kv_indices`` spans are never dereferenced, so the declared
+    capacity of ``KCache``/``VCache``/``kv_indices`` only has to *cover* the real pool — its
+    exact value is free.  Rounding up to a power of two (or pinning it with
+    ``TILEINFER_POOL_CAP``) removes the pool size from the kernel/plan/pre-warm keys: vLLM
+    derives the pool from a memory snapshot, so it drifts run to run (9425 vs 9899 pages) and
+    used to silently invalidate an out-of-process pre-warm.  ``cap >= pool`` always holds; the
+    caller presents the pool through :func:`pool_view`, which is a zero-copy capacity view.
+    """
+    pool_pages = int(pool_pages)
+    pinned = os.environ.get("TILEINFER_POOL_CAP", "").strip()
+    if pinned:
+        cap = int(pinned)
+        if cap < pool_pages:
+            raise ValueError(
+                f"TILEINFER_POOL_CAP={cap} is below the real pool ({pool_pages} pages); "
+                "the declared capacity must cover every live page"
+            )
+        return cap
+    return 1 if pool_pages <= 1 else 1 << (pool_pages - 1).bit_length()
+
+
 def pool_view(k_cache: torch.Tensor, cap: int) -> torch.Tensor:
     """Present the KV pool with the kernel's declared page capacity, without copying.
 
-    Kernels are compiled for a quantized capacity ``cap >= pool`` so that one compiled artifact
-    serves every pool size in its bucket (see :func:`build_decode_kernel`).  The FFI binder
-    asserts that the runtime tensor's page count equals the declared one, and padding the pool
-    itself is not an option -- the engine writes new KV into it every step.  Pages beyond the
-    real pool are never dereferenced (every access is bounded by ``kv_indptr``/``kv_indices``,
-    whose buffer *is* padded to ``cap``), so a zero-copy capacity view is exact.
+    L2 ABI: kernels are compiled for the *declared* capacity (see :func:`declared_pool_cap`),
+    which covers but does not equal the real pool, so one compiled artifact serves every pool in
+    its bucket and the pool size stays out of the kernel/plan/pre-warm keys.  The FFI binder
+    wants a runtime tensor of the declared shape, and ``as_strided`` refuses to create a view
+    whose shape exceeds the storage — but ``Tensor.set_`` does not validate, so the capacity view
+    is built by re-binding the pool's own storage at the declared extent (same base pointer, same
+    strides, contiguous).  Pages beyond the real pool are never dereferenced: every access is
+    bounded by ``kv_indptr``/``kv_indices`` (the page-table compaction parks invalid columns in a
+    trash slot and the spans only ever name real pages), and the pool *must not* be padded — the
+    engine writes new KV into it every step.
 
-    ``cap < pool`` would silently hide live pages and is a caller bug.
+    ``cap < pool`` would silently hide live pages and is a caller bug (asserted).
     """
+    pool = int(k_cache.shape[0])
+    if pool == cap:
+        return k_cache.reshape(-1, *k_cache.shape[1:])
+    if pool > cap:
+        raise ValueError(
+            f"pool grew past the kernel's compiled capacity ({pool} > {cap}); "
+            "the declared capacity must cover every live page"
+        )
+    flat = k_cache if k_cache.is_contiguous() else k_cache.contiguous()
+    view = torch.empty(0, dtype=flat.dtype, device=flat.device)
+    view.set_(flat.untyped_storage(), 0, (cap, *flat.shape[1:]), flat.stride())
+    return view
     pool = int(k_cache.shape[0])
     if pool == cap:
         return k_cache.reshape(-1, *k_cache.shape[1:])
@@ -1136,13 +1212,16 @@ def forward(
     # Derive the kernel dtype from the tensors: a wrapper that silently disagrees with its inputs
     # is a debugging session nobody wants.
     dtype = dtype or _TORCH_TO_TILELANG_DTYPE[q.dtype]
+    # Declared ABI capacity (covers the real pool; see declared_pool_cap): sizes the kv_indices
+    # slot the kernel reads page ids from and the K/V page extents (capacity views).
+    cap = declared_pool_cap(int(k_cache.shape[0]))
     kernel = build_decode_kernel(
         batch=batch,
         kv_heads=kv_heads,
         group=group,
         dim=dim,
         page_size=page_size,
-        num_pages_cap=int(k_cache.shape[0]),
+        num_pages_cap=cap,
         dtype=dtype,
     )
 
@@ -1150,12 +1229,13 @@ def forward(
     q_pad = q.new_zeros((batch, kv_heads * br, dim))
     q_pad.view(batch, kv_heads, br, dim)[:, :, :group] = q[:, :, 0, :].view(batch, kv_heads, group, dim)
 
-    k_flat = pool_view(k_cache, int(k_cache.shape[0]))
-    v_flat = pool_view(v_cache, int(v_cache.shape[0]))
+    k_flat = pool_view(k_cache, cap)
+    v_flat = pool_view(v_cache, cap)
 
-    # The kernel is compiled for the whole pool (`k_cache.shape[0]`), while one step usually
-    # references fewer pages.  The ABI wants the declared length, and the unused tail is never
-    # dereferenced (every access is bounded by kv_indptr), so pad rather than recompile.
+    # The kernel is compiled for the declared capacity, which covers but does not equal the
+    # real pool, while one step usually references a handful of pages still.  The ABI wants the
+    # declared length, and the unused tail is never dereferenced (every access is bounded by
+    # kv_indptr), so pad rather than recompile.
     # Prefer the plan-owned metadata buffers (stable addresses, caller tensors untouched).
     if kv_indices is not None:
         indices = kv_indices
@@ -1163,7 +1243,6 @@ def forward(
         last_page_len = kv_last_page_len
     else:
         indices = meta.kv_indices.to(torch.int32)
-        cap = int(k_cache.shape[0])
         if indices.numel() < cap:
             indices = torch.cat([indices, indices.new_zeros(cap - indices.numel())])
         indptr = meta.kv_indptr.to(torch.int32)

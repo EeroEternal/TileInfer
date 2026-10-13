@@ -322,6 +322,7 @@ def prefill_step(
 
     from tileinfer.metadata import ragged_from_page_table_device
     from tileinfer.plan import plan_query_tiles
+    from tileinfer.kernels.attention.paged_decode_ascend950 import declared_pool_cap
 
     device = query.device
     sub = _sub_pages(block_size)
@@ -349,7 +350,7 @@ def prefill_step(
     if num_reqs > BATCH_BUCKETS[-1]:
         _refuse("batch over largest bucket", num_reqs, BATCH_BUCKETS[-1])
         return False
-    pool_pages = int(_pool_sub_view(key_cache, sub).shape[0])
+    pool_pages = declared_pool_cap(int(_pool_sub_view(key_cache, sub).shape[0]))
     # P3 canonical variant quantization: the compiled shape is not the step's exact
     # ``(batch, num_tiles)`` but ``(_bucket_for(batch_cap) + 1 trash rows, next pow2 tiles)``.
     # The trash row owns zero pages (padded tiles pointing at it run zero KV iterations) and
@@ -522,14 +523,18 @@ class TileInferDecodeAttention:
 
     # ------------------------------------------------------------------ plan cache
 
-    def _plan_key(self, bucket: int, width: int, block_size: int, pool_pages: int) -> tuple:
+    def _plan_key(self, bucket: int, width: int, block_size: int, pool_cap: int) -> tuple:
         """Plan cache key.
 
         ``width`` is the request's *actual* block-table width in kernel pages (a constant buffer
         width in vLLM: ``ceil(max_model_len / engine_block)`` sub-pages), so one plan covers a
         whole run and the plan-owned staging buffers can be sized to it exactly.
+
+        ``pool_cap`` is the kernel ABI's *declared* capacity (:func:`declared_pool_cap`), not the
+        exact pool: vLLM derives the pool from a memory snapshot that drifts run to run, and an
+        exact-pool key silently invalidated out-of-process pre-warm (L2).
         """
-        return (self._config_key, bucket, width, block_size, pool_pages)
+        return (self._config_key, bucket, width, block_size, pool_cap)
 
     def prewarm(self, width: int, block_size: int, key_cache: torch.Tensor) -> None:
         """Synchronously build a plan for *every* bucket up to ``max_num_reqs``.
@@ -541,8 +546,10 @@ class TileInferDecodeAttention:
         ``width`` counts kernel pages (engine table width × sub-pages).  Plans are built on
         kernel pages (see KERNEL_PAGE_SIZE) and the pool is presented as its 128-token view.
         """
+        from tileinfer.kernels.attention.paged_decode_ascend950 import declared_pool_cap
+
         cls = TileInferDecodeAttention
-        pool_eff = int(key_cache.shape[0])
+        pool_eff = declared_pool_cap(int(key_cache.shape[0]))
         # ``max_num_reqs`` comes from the impl's vLLM config; when it is unavailable build every
         # bucket anyway (compiles hit the TileLang disk cache, so the cost is one-time).
         limit = int(self.max_num_reqs) if self.max_num_reqs else BATCH_BUCKETS[-1]
@@ -604,7 +611,10 @@ class TileInferDecodeAttention:
         tiles_top = _next_pow2(-(-budget * group // 128) + limit)
         tiles_top = min(tiles_top, PREFILL_MAX_TILES)
         kernel_batch = _bucket_for(limit) + 1
-        pool_pages = int(_pool_sub_view(key_cache, _sub_pages(block_size)).shape[0])
+        from tileinfer.kernels.attention.paged_decode_ascend950 import declared_pool_cap
+
+        sub_view = _pool_sub_view(key_cache, _sub_pages(block_size))
+        pool_pages = declared_pool_cap(int(sub_view.shape[0]))
         return self._prewarm_prefill_ladder(kernel_batch, tiles_top, pool_pages)
 
     def _prewarm_prefill_ladder(self, kernel_batch: int, tiles_top: int, pool_pages) -> int:
@@ -640,7 +650,9 @@ class TileInferDecodeAttention:
         """
         sub = _sub_pages(block_size)
         width = max_pages * sub
-        pool_eff = int(key_cache.shape[0])
+        from tileinfer.kernels.attention.paged_decode_ascend950 import declared_pool_cap
+
+        pool_eff = declared_pool_cap(int(key_cache.shape[0]))
         key = self._plan_key(bucket, width, block_size, pool_eff)
         plan = self._plans.get(key)
         if plan is not None or key in self._failed:
@@ -652,8 +664,8 @@ class TileInferDecodeAttention:
             self._building.add(key)
 
         logger.info(
-            "TileInfer: compiling the decode kernel for bucket=%d pages<=%d block_size=%d pool=%d "
-            "pages in the background; serving through FIA until it is ready",
+            "TileInfer: compiling the decode kernel for bucket=%d pages<=%d block_size=%d "
+            "declared_pool_cap=%d pages in the background; serving through FIA until it is ready",
             bucket,
             width,
             block_size,
@@ -790,7 +802,9 @@ class TileInferDecodeAttention:
         bucket = _bucket_for(num_reqs)
         sub = _sub_pages(block_size)
         width = int(block_tables.shape[1]) * sub
-        pool_eff = int(key_cache.shape[0])
+        from tileinfer.kernels.attention.paged_decode_ascend950 import declared_pool_cap
+
+        pool_eff = declared_pool_cap(int(key_cache.shape[0]))
         key = self._plan_key(bucket, width, block_size, pool_eff)
         plan = cls._plans.get(key)
         if plan is None:

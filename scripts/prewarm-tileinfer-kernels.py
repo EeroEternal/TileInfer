@@ -6,8 +6,12 @@ a serving process therefore blocks that process - in vLLM it stops the EngineCor
 looks like the engine hanging.  Compiling here (a separate process, before the server is launched)
 populates `TILELANG_CACHE_DIR`; the server's own compile call then hits the cache and returns at once.
 
-The kernel key includes the KV pool capacity, so pass the capacity the server will use.  The pool size
-is printed by vLLM-Ascend at startup ("GPU KV cache size"), or it can be read from a previous run's log.
+The kernel is compiled for the ABI's *declared* pool capacity, which is quantized up from the
+value you pass (next power of two; or pin it exactly with ``TILEINFER_POOL_CAP``).  This is
+deliberate (L2 pool-agnostic ABI): the server's pool comes from a vLLM memory snapshot and
+drifts run to run (9425 vs 9899 pages), so pre-warm only needs to land in the same capacity
+bucket as the server -- pass either run's pool size, or pin ``TILEINFER_POOL_CAP`` to the same
+value on both sides for an exact match.
 
     TILELANG_CACHE_DIR=/tmp/tl_cache_vllm \\
         python scripts/prewarm-tileinfer-kernels.py \\
@@ -25,7 +29,13 @@ def main() -> int:
     ap.add_argument("--group", type=int, required=True, help="query heads per KV head")
     ap.add_argument("--dim", type=int, default=128, help="head dimension")
     ap.add_argument("--page-size", type=int, default=128)
-    ap.add_argument("--num-pages-cap", type=int, required=True, help="the server's KV pool, in pages")
+    ap.add_argument(
+        "--num-pages-cap",
+        type=int,
+        required=True,
+        help="the server's KV pool, in pages (quantized up to the ABI's declared capacity; "
+        "any pool size in the same bucket produces the same kernel)",
+    )
     ap.add_argument("--buckets", type=int, nargs="+", default=[1, 2, 4], help="batch sizes to compile")
     ap.add_argument(
         "--dtype",

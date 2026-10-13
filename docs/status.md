@@ -185,7 +185,12 @@ Environment variables that change behaviour: `TILEINFER_ALLOW_SPLIT_KV=1` (enabl
    served. Pre-warm out of process. This looked like the *machine* hanging for several rounds.
 2. **The KV pool is not reproducible.** vLLM derives it from a memory snapshot (9425 pages in one run,
    9899 in the next), which silently invalidates a pre-warm and pushes compilation back inside the
-   engine. Pin it with `--num-gpu-blocks-override`.
+   engine. ~~Pin it with `--num-gpu-blocks-override`.~~ **Resolved (2026-10-14, L2 pool-agnostic
+   ABI)**: kernels/plan keys now use a *declared* capacity (`declared_pool_cap`: power-of-two
+   ceiling of the real pool, or an exact `TILEINFER_POOL_CAP` pin) and the pool is presented as a
+   zero-copy capacity view (`Tensor.set_`), so drifted pools land in the same bucket and a
+   pre-warm compiled for one pool size is reused by the next run as-is (9425→9899/9600 cross-process
+   cache hits measured).
 3. **A bare `wait` in bash waits for the server too.** Three "engine hangs" were my harness waiting on
    the server process launched with `&`, with the engine idle the whole time (`Running: 0`).
 4. **Registry initialisation races in real engines.** vLLM builds one backend per attention layer and

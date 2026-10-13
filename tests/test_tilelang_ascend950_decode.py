@@ -159,3 +159,82 @@ def test_paged_decode_matches_reference(batch, kv_heads, group, kv_lens, label, 
     got, expected = _case(batch, kv_heads, group, 128, dim, kv_lens, kv_tile_pages=kv_tile_pages)
     diff = (got - expected).abs().max().item()
     assert diff < TOL, f"{label}: max abs diff {diff:.4f} exceeds {TOL}"
+
+
+# -------------------------------------------------------------------------------------------
+# L2: pool-agnostic kernel ABI — the declared capacity is quantized, so kernel/plan/pre-warm
+# keys never contain vLLM's snapshot-derived pool size, and a kernel compiled for a declared
+# cap larger than the real pool stays numerically exact (pages beyond the pool are never
+# dereferenced; the pool is presented through the zero-copy ``pool_view``).
+# -------------------------------------------------------------------------------------------
+
+
+def test_declared_pool_cap_semantics(monkeypatch):
+    from tileinfer.kernels.attention.paged_decode_ascend950 import declared_pool_cap
+
+    assert declared_pool_cap(1) == 1
+    assert declared_pool_cap(2) == 2
+    assert declared_pool_cap(3) == 4
+    assert declared_pool_cap(30) == 32
+    # the two snapshot-derived pool sizes actually observed on the reference box: same bucket
+    assert declared_pool_cap(9425) == declared_pool_cap(9899) == 16384
+    for pool in (1, 2, 3, 17, 100, 8192, 8193, 9425, 9899):
+        cap = declared_pool_cap(pool)
+        assert cap >= pool and cap & (cap - 1) == 0, pool
+    # an explicit pin wins; going below the real pool is a hard error
+    monkeypatch.setenv("TILEINFER_POOL_CAP", "64")
+    assert declared_pool_cap(50) == 64
+    with pytest.raises(ValueError):
+        declared_pool_cap(65)
+
+
+def test_pool_view_capacity_view():
+    from tileinfer.kernels.attention.paged_decode_ascend950 import declared_pool_cap, pool_view
+
+    pool = torch.randn(3, 128, 2, 8)
+    cap = declared_pool_cap(3)
+    view = pool_view(pool, cap)
+    # capacity view: declared extent, same storage/strides, real pages untouched
+    assert view.shape == (cap, 128, 2, 8)
+    assert view.data_ptr() == pool.data_ptr()
+    assert view.is_contiguous()
+    assert torch.equal(view[:3], pool)
+    assert pool_view(pool, 3).shape == (3, 128, 2, 8)
+    with pytest.raises(ValueError):
+        pool_view(pool, 2)  # declared capacity below the real pool is a caller bug
+
+
+@pytest.mark.parametrize(
+    "builder,extra",
+    [
+        ("build_decode_kernel", {}),
+        ("build_split_kernel", {"num_tiles": 4, "max_splits": 2}),
+        ("build_prefill_kernel", {"num_tiles": 4}),
+    ],
+)
+def test_kernel_cache_keys_ignore_exact_pool_size(monkeypatch, builder, extra):
+    """Two snapshot-drifted pool sizes must compile one artifact (same declared cap)."""
+    import tileinfer.kernels.attention.paged_decode_ascend950 as K
+
+    def _fake_compile(fn, **kwargs):
+        return object()
+
+    monkeypatch.setattr(K.tilelang, "compile", _fake_compile)
+    common = dict(batch=7, kv_heads=2, group=4, dim=128, page_size=128, dtype="bfloat16", **extra)
+    before = len(K._KERNEL_CACHE)
+    getattr(K, builder)(**common, num_pages_cap=9425)
+    getattr(K, builder)(**common, num_pages_cap=9899)
+    # one entry only: the second size hit the first one's cache slot
+    assert len(K._KERNEL_CACHE) == before + 1
+    if builder == "build_decode_kernel":
+        getattr(K, builder)(**common, num_pages_cap=9425, out_manual=True)
+        assert len(K._KERNEL_CACHE) == before + 2  # manual-out is a distinct artifact
+
+
+@pytest.mark.parametrize("kv_tile_pages", [0, 8])
+def test_declared_cap_beyond_pool_is_exact(monkeypatch, kv_tile_pages):
+    """Device binding regression: a 5-page pool served by kernels compiled for cap=64."""
+    monkeypatch.setenv("TILEINFER_POOL_CAP", "64")
+    got, expected = _case(2, 2, 8, 128, 128, [130, 300], kv_tile_pages=kv_tile_pages)
+    diff = (got - expected).abs().max().item()
+    assert diff < TOL, f"declared-cap binding (kv_tile_pages={kv_tile_pages}): {diff:.4f} > {TOL}"
