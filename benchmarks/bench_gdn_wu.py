@@ -26,6 +26,9 @@ from vllm.config import VllmConfig, set_current_vllm_config  # noqa: E402
 from vllm.distributed import init_distributed_environment, initialize_model_parallel  # noqa: E402
 
 init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://")
+from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton  # noqa: E402
+
+init_device_properties_triton()
 
 results = {}
 

@@ -18,7 +18,8 @@ w/u 对 fp64 oracle TOL 3e-2(同现有内核)。三角形保证有效行输出�
 * persistent 28 核,任务列表 = NT×HV(NT = varlen 64-token 块数,exact-shape 变体);
 * 双 AIV 各持 32 行 band(rows_ub 由 dual_copy(arange) 隐式给基址,SPMD 无 AIV id);
 * 两 AIV 冗余计算全 64x64 逆,用 rows_ub[0]//32 选择只落本 band 到 m_bf;
-* 16x16 小乘 = T.alloc_reducer + 3D T.Parallel(S,S,S)(ascend 方言无标量累加器);
+* 16x16 小乘 = shared(UB) 累加器 + serial 内积循环(probe4 验证模式;reducer 在 serial
+  循环/多分配点场景会触发多 epoch 或空二进制,见 E23);
 * gemm:w = M@kb、u = M@vb(kb/vb 由 dual_copy 按行带拼成全 64 行,transpose_B=False)。
 
 本模块不得使用 ``from __future__ import annotations``(同 attention 内核约束)。
@@ -91,7 +92,7 @@ def gdn_chunk_wu_ascend950(
             x42 = T.alloc_shared((S, S), "float32")
             x43 = T.alloc_shared((S, S), "float32")
             p1 = T.alloc_shared((S, S), "float32")
-            p2 = T.alloc_shared((S, S), "float32")
+            tmp = T.alloc_shared((4 * S, S), "float32")  # Neumann 步积
             # ---- L1 / L0 ----
             m_l1 = T.alloc_l1((BT, BT), dtype)
             kb_l1 = T.alloc_l1((BT, D), dtype)
@@ -127,147 +128,124 @@ def gdn_chunk_wu_ascend950(
                                 a_full[r, c] = T.if_then_else(ok, A[row, c], T.float32(0))
 
                         # ---- 2. 四个对角 16x16 块逆:拼成 [64,16] 一次算 ----
-                        # X ← X + X@B,B = -A 子块(严格下三角),15 步精确
+                        # X ← I + X@B,B = -A 子块(严格下三角),15 步精确:
+                        # (I-B)^-1 = Σ B^k,定点式 X = I + X·B;注意 X ← X + X·B 是
+                        # 二项式 (I+B)^n,数值错误(E23 调试实证,禁用)。
+                        # shared UB 累加器 + serial 内积(probe4 验证模式,E23)
                         with T.SimtVF(threads=threads):
                             for r, c in T.Parallel(4 * S, S):
                                 xa_all[r, c] = T.if_then_else(r % S == c, T.float32(1), T.float32(0))
                             for st in T.serial(NEUMANN_STEPS):
-                                red = T.alloc_reducer((4 * S, S), "float32", op="sum")
-                                frag = T.alloc_fragment((4 * S, S), "float32")
-                                T.reducer_init(red)
-                                for r, c, kk in T.Parallel(4 * S, S, S):
-                                    T.reducer_update(
-                                        red[r, c],
-                                        xa_all[r, kk]
-                                        * T.if_then_else(
-                                            kk > c, -a_full[(r // S) * S + kk, c], T.float32(0)
-                                        ),
-                                    )
-                                T.finalize_reducer(red, frag)
                                 for r, c in T.Parallel(4 * S, S):
-                                    xa_all[r, c] = xa_all[r, c] + frag[r, c]
+                                    tmp[r, c] = T.float32(0)
+                                for r, c in T.Parallel(4 * S, S):
+                                    for kk in T.serial(S):
+                                        tmp[r, c] = tmp[r, c] + xa_all[r, kk] * T.if_then_else(
+                                            kk > c,
+                                            -a_full[(r // S) * S + kk, (r // S) * S + c],
+                                            T.float32(0),
+                                        )
+                                for r, c in T.Parallel(4 * S, S):
+                                    xa_all[r, c] = T.if_then_else(
+                                        r % S == c, T.float32(1), T.float32(0)
+                                    ) + tmp[r, c]
 
-                        # ---- 3. 块合并积(全部 fp32 16x16 小乘)----
+                        # ---- 3. 块合并积(全部 fp32 16x16 小乘,shared UB 累加)----
+                        # 前代换(i>j):X_ij = -M_ii·(Σ_{i<k<j} A_ik·X_kj + A_ij·M_jj)
                         # X21 = -M22·A21·M11;X31 = -M33(A31·M11 + A32·X21);
-                        # X32 = -M33·A32·M22;X41 = -M44(A41·M11 + A42·X21);
-                        # X42 = -M44·A42·M22;X43 = -M44·A43·M33
+                        # X32 = -M33·A32·M22;X41 = -M44(A41·M11 + A42·X21 + A43·X31);
+                        # X42 = -M44(A42·M22 + A43·X32);X43 = -M44·A43·M33
                         # 行块基址:M11=xa_all[0], M22=[S], M33=[2S], M44=[3S];
-                        #          A21/A31/A32 行基址 = 16/32/48,A43 列基址 = 32
+                        #          A21/A31/A32/A41/A42/A43 行基址 = 16/32/32/48/48/48,
+                        #          A32/A42/A43 列基址 = 16/16/32
                         with T.SimtVF(threads=threads):
-                            # p1 = M22·A21(每个积独立 reducer 分配:单 epoch 契约)
-                            red = T.alloc_reducer((S, S), "float32", op="sum")
-                            frag = T.alloc_fragment((S, S), "float32")
-                            T.reducer_init(red)
-                            for r, c, kk in T.Parallel(S, S, S):
-                                T.reducer_update(red[r, c], xa_all[S + r, kk] * a_full[S + kk, c])
-                            T.finalize_reducer(red, p1)
-                            # X21 = -(p1·M11)
-                            red = T.alloc_reducer((S, S), "float32", op="sum")
-                            frag = T.alloc_fragment((S, S), "float32")
-                            T.reducer_init(red)
-                            for r, c, kk in T.Parallel(S, S, S):
-                                T.reducer_update(red[r, c], p1[r, kk] * xa_all[kk, c])
-                            T.finalize_reducer(red, frag)
+                            # X21 = -(M22·A21)·M11
                             for r, c in T.Parallel(S, S):
-                                x21[r, c] = -frag[r, c]
-                            # p1 = A31·M11
-                            red = T.alloc_reducer((S, S), "float32", op="sum")
-                            frag = T.alloc_fragment((S, S), "float32")
-                            T.reducer_init(red)
-                            for r, c, kk in T.Parallel(S, S, S):
-                                T.reducer_update(red[r, c], a_full[2 * S + r, kk] * xa_all[kk, c])
-                            T.finalize_reducer(red, p1)
-                            # p2 = A32·X21
-                            red = T.alloc_reducer((S, S), "float32", op="sum")
-                            frag = T.alloc_fragment((S, S), "float32")
-                            T.reducer_init(red)
-                            for r, c, kk in T.Parallel(S, S, S):
-                                T.reducer_update(red[r, c], a_full[2 * S + r, kk] * x21[kk, c])
-                            T.finalize_reducer(red, p2)
-                            # X31 = -M33·(p1+p2)
+                                p1[r, c] = T.float32(0)
                             for r, c in T.Parallel(S, S):
-                                p1[r, c] = p1[r, c] + p2[r, c]
-                            red = T.alloc_reducer((S, S), "float32", op="sum")
-                            frag = T.alloc_fragment((S, S), "float32")
-                            T.reducer_init(red)
-                            for r, c, kk in T.Parallel(S, S, S):
-                                T.reducer_update(red[r, c], p1[r, kk] * xa_all[2 * S + kk, c])
-                            T.finalize_reducer(red, frag)
+                                for kk in T.serial(S):
+                                    p1[r, c] = p1[r, c] + xa_all[S + r, kk] * a_full[S + kk, c]
                             for r, c in T.Parallel(S, S):
-                                x31[r, c] = -frag[r, c]
-                            # X32 = -M33·A32·M22
-                            red = T.alloc_reducer((S, S), "float32", op="sum")
-                            frag = T.alloc_fragment((S, S), "float32")
-                            T.reducer_init(red)
-                            for r, c, kk in T.Parallel(S, S, S):
-                                T.reducer_update(red[r, c], a_full[2 * S + r, kk] * xa_all[S + kk, c])
-                            T.finalize_reducer(red, p1)
-                            red = T.alloc_reducer((S, S), "float32", op="sum")
-                            frag = T.alloc_fragment((S, S), "float32")
-                            T.reducer_init(red)
-                            for r, c, kk in T.Parallel(S, S, S):
-                                T.reducer_update(red[r, c], xa_all[2 * S + r, kk] * p1[kk, c])
-                            T.finalize_reducer(red, frag)
+                                x21[r, c] = T.float32(0)
                             for r, c in T.Parallel(S, S):
-                                x32[r, c] = -frag[r, c]
-                            # X41 = -M44(A41·M11 + A42·X21)
-                            red = T.alloc_reducer((S, S), "float32", op="sum")
-                            frag = T.alloc_fragment((S, S), "float32")
-                            T.reducer_init(red)
-                            for r, c, kk in T.Parallel(S, S, S):
-                                T.reducer_update(red[r, c], a_full[3 * S + r, kk] * xa_all[kk, c])
-                            T.finalize_reducer(red, p1)
-                            red = T.alloc_reducer((S, S), "float32", op="sum")
-                            frag = T.alloc_fragment((S, S), "float32")
-                            T.reducer_init(red)
-                            for r, c, kk in T.Parallel(S, S, S):
-                                T.reducer_update(red[r, c], a_full[3 * S + r, kk] * x21[kk, c])
-                            T.finalize_reducer(red, p2)
+                                for kk in T.serial(S):
+                                    x21[r, c] = x21[r, c] - p1[r, kk] * xa_all[kk, c]
+                            # X31 = -M33·(A31·M11 + A32·X21)(P3^-1 在左)
                             for r, c in T.Parallel(S, S):
-                                p1[r, c] = p1[r, c] + p2[r, c]
-                            red = T.alloc_reducer((S, S), "float32", op="sum")
-                            frag = T.alloc_fragment((S, S), "float32")
-                            T.reducer_init(red)
-                            for r, c, kk in T.Parallel(S, S, S):
-                                T.reducer_update(red[r, c], xa_all[3 * S + r, kk] * p1[kk, c])
-                            T.finalize_reducer(red, frag)
+                                p1[r, c] = T.float32(0)
                             for r, c in T.Parallel(S, S):
-                                x41[r, c] = -frag[r, c]
-                            # X42 = -M44·A42·M22
-                            red = T.alloc_reducer((S, S), "float32", op="sum")
-                            frag = T.alloc_fragment((S, S), "float32")
-                            T.reducer_init(red)
-                            for r, c, kk in T.Parallel(S, S, S):
-                                T.reducer_update(red[r, c], a_full[3 * S + r, kk] * xa_all[S + kk, c])
-                            T.finalize_reducer(red, p1)
-                            red = T.alloc_reducer((S, S), "float32", op="sum")
-                            frag = T.alloc_fragment((S, S), "float32")
-                            T.reducer_init(red)
-                            for r, c, kk in T.Parallel(S, S, S):
-                                T.reducer_update(red[r, c], xa_all[3 * S + r, kk] * p1[kk, c])
-                            T.finalize_reducer(red, frag)
+                                for kk in T.serial(S):
+                                    p1[r, c] = (
+                                        p1[r, c]
+                                        + a_full[2 * S + r, kk] * xa_all[kk, c]
+                                        + a_full[2 * S + r, S + kk] * x21[kk, c]
+                                    )
                             for r, c in T.Parallel(S, S):
-                                x42[r, c] = -frag[r, c]
+                                x31[r, c] = T.float32(0)
+                            for r, c in T.Parallel(S, S):
+                                for kk in T.serial(S):
+                                    x31[r, c] = x31[r, c] - xa_all[2 * S + r, kk] * p1[kk, c]
+                            # X32 = -M33·A32·M22(A32 = 行 32-47、列 16-31)
+                            for r, c in T.Parallel(S, S):
+                                p1[r, c] = T.float32(0)
+                            for r, c in T.Parallel(S, S):
+                                for kk in T.serial(S):
+                                    p1[r, c] = p1[r, c] + a_full[2 * S + r, S + kk] * xa_all[S + kk, c]
+                            for r, c in T.Parallel(S, S):
+                                x32[r, c] = T.float32(0)
+                            for r, c in T.Parallel(S, S):
+                                for kk in T.serial(S):
+                                    x32[r, c] = x32[r, c] - xa_all[2 * S + r, kk] * p1[kk, c]
+                            # X41 = -M44·(A41·M11 + A42·X21 + A43·X31)
+                            for r, c in T.Parallel(S, S):
+                                p1[r, c] = T.float32(0)
+                            for r, c in T.Parallel(S, S):
+                                for kk in T.serial(S):
+                                    p1[r, c] = (
+                                        p1[r, c]
+                                        + a_full[3 * S + r, kk] * xa_all[kk, c]
+                                        + a_full[3 * S + r, S + kk] * x21[kk, c]
+                                        + a_full[3 * S + r, 2 * S + kk] * x31[kk, c]
+                                    )
+                            for r, c in T.Parallel(S, S):
+                                x41[r, c] = T.float32(0)
+                            for r, c in T.Parallel(S, S):
+                                for kk in T.serial(S):
+                                    x41[r, c] = x41[r, c] - xa_all[3 * S + r, kk] * p1[kk, c]
+                            # X42 = -M44·(A42·M22 + A43·X32)
+                            for r, c in T.Parallel(S, S):
+                                p1[r, c] = T.float32(0)
+                            for r, c in T.Parallel(S, S):
+                                for kk in T.serial(S):
+                                    p1[r, c] = (
+                                        p1[r, c]
+                                        + a_full[3 * S + r, S + kk] * xa_all[S + kk, c]
+                                        + a_full[3 * S + r, 2 * S + kk] * x32[kk, c]
+                                    )
+                            for r, c in T.Parallel(S, S):
+                                x42[r, c] = T.float32(0)
+                            for r, c in T.Parallel(S, S):
+                                for kk in T.serial(S):
+                                    x42[r, c] = x42[r, c] - xa_all[3 * S + r, kk] * p1[kk, c]
                             # X43 = -M44·A43·M33
-                            red = T.alloc_reducer((S, S), "float32", op="sum")
-                            frag = T.alloc_fragment((S, S), "float32")
-                            T.reducer_init(red)
-                            for r, c, kk in T.Parallel(S, S, S):
-                                T.reducer_update(red[r, c], xa_all[3 * S + r, kk] * a_full[3 * S + kk, 2 * S + c])
-                            T.finalize_reducer(red, p1)
-                            red = T.alloc_reducer((S, S), "float32", op="sum")
-                            frag = T.alloc_fragment((S, S), "float32")
-                            T.reducer_init(red)
-                            for r, c, kk in T.Parallel(S, S, S):
-                                T.reducer_update(red[r, c], p1[r, kk] * xa_all[2 * S + kk, c])
-                            T.finalize_reducer(red, frag)
                             for r, c in T.Parallel(S, S):
-                                x43[r, c] = -frag[r, c]
+                                p1[r, c] = T.float32(0)
+                            for r, c in T.Parallel(S, S):
+                                for kk in T.serial(S):
+                                    p1[r, c] = p1[r, c] + a_full[3 * S + r, 2 * S + kk] * xa_all[2 * S + kk, c]
+                            for r, c in T.Parallel(S, S):
+                                x43[r, c] = T.float32(0)
+                            for r, c in T.Parallel(S, S):
+                                for kk in T.serial(S):
+                                    x43[r, c] = x43[r, c] - xa_all[3 * S + r, kk] * p1[kk, c]
 
                         # ---- 4. 组装 M 两个半带(blk_top = M 行 0..31,blk_bot = 行 32..63)----
-                        T.fill(blk_top, T.float32(0))
-                        T.fill(blk_bot, T.float32(0))
+                        # 注意:T.fill 不得出现在 If/Then 条件区内(SimtVF 外),否则 codegen
+                        # 静默产出空二进制(E23 微二分实证);清零并入 SimtVF Parallel。
                         with T.SimtVF(threads=threads):
+                            for j, c in T.Parallel(hb, BT):
+                                blk_top[j, c] = T.float32(0)
+                                blk_bot[j, c] = T.float32(0)
                             for r, c in T.Parallel(S, S):
                                 blk_top[r, c] = xa_all[r, c]
                             for r, c in T.Parallel(S, S):
