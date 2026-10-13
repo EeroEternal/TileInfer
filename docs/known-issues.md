@@ -104,7 +104,9 @@ integration is still opt-in.
 
 ## KI-1 — split-KV wedges the device when several shapes share one process (open)
 
-**Status:** open · **Affected:** `tilelang-ascend950` with `kv_tile_pages > 0` ·
+**Status:** open(2026-10-13:诊断与启用列入**阶段三 L1/L3,当前延后待授权**;期间 split-KV 保持
+opt-in,长上下文 8K/16K 图模式数字受此主导,见 PERFORMANCE_REPORT §5)·
+**Affected:** `tilelang-ascend950` with `kv_tile_pages > 0` ·
 **Default:** the backend **refuses** split plans unless `TILEINFER_ALLOW_SPLIT_KV=1`.
 
 ### Symptom

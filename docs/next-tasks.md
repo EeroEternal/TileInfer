@@ -6,20 +6,21 @@ A working list, ordered by value ÷ cost.  Each entry says **what**, **why**, th
 or a command, not a plan) and **done when**.  Everything here is grounded in what the repo already
 contains; nothing is speculative.
 
-## Where the project stands
+## Where the project stands(2026-10-13 刷新)
 
 | | state |
 |---|---|
-| Decode kernel (paged, GQA, NHD, tail masking) | ✅ validated on device, ~1e-3 vs the fp32 oracle |
-| Split-KV kernel + device merge kernel | ✅ written and validated (3.0x at b1/32k–64k), **opt-in** because of KI-1 |
-| Prefill / append kernel (causal, ragged, paged) | ✅ validated (incl. the append causal offset), tiles planned at `block_q // 2` — half the M tile is wasted (PM-2) |
-| Plan / scheduler / metadata / workspaces | ✅ implemented, 37 CPU tests |
-| vLLM-Ascend integration | 🟡 **reaches the kernel**: the EngineCore builds the plan and serves decode through TileLang, first-step logprobs match FIA to 4 decimals.  No performance numbers yet |
-| Performance baseline (decode, unsplit) | ✅ 138–147 GB/s at wide shapes, 51 GB/s at batch 1 (the reason split-KV exists) |
+| Decode kernel (paged, GQA, NHD, tail masking, **head_dim 128+256**) | ✅ validated on device(d256 经 dsplit-v2,24/24 绿)|
+| Split-KV kernel + device merge kernel | ✅ written and validated (3.0x at b1/32k–64k), **opt-in** because of KI-1(启用=阶段三 L3,延后) |
+| Prefill / append kernel (causal, ragged, paged) | ✅ validated + **已接线进引擎**(B1,prefill_calls=949 实证) |
+| Plan / scheduler / metadata / workspaces | ✅ implemented, CPU 套件全绿 |
+| vLLM-Ascend integration | ✅ **Qwen3.6-35B-A3B 图模式真实在役**:6 plan READY、capture_calls=40、fallbacks=0、logprobs 逐位一致;双源 A/B 数字落盘(PERFORMANCE_REPORT §5) |
+| Performance baseline (decode, unsplit) | ✅ 138–147 GB/s at wide shapes, 51 GB/s at batch 1(启用 split-KV 可 3x,受 KI-1 门禁) |
+| 融合算子层(M-MoE / M-GDN) | ⏸ **收口**:M-MoE TEMPORARY(0.86x 交决策)、M-GDN 9a/9b 关闭、gating disproven(opt-in)、9c chunk-wu TEMPORARY(0.718x 未过门槛)——详见 [`status.md`](status.md) §0 |
 | Device CI | ⏳ none yet |
 
 Open bugs and post-mortems live in [`known-issues.md`](known-issues.md) (KI-1 split-path instability,
-PM-1/PM-2 resolved) and the environment traps in [`architecture.md`](architecture.md).
+KI-4 离线/serve 口径,PM-1/PM-2 resolved) and the environment traps in [`architecture.md`](architecture.md).
 
 ---
 
@@ -50,16 +51,13 @@ have is from a run with 27 compiles failing in the background, so it measures a 
 TileInfer and for the stock FIA path.  Add a batch-2/4 case (concurrent `curl`s) and an `npu-smi` line
 next to each measurement so contention is visible in the numbers.
 
-*Status*: done for short contexts - see the table in `docs/performance.md` (ours within ~6 % of FIA
-single-stream, ~30 % behind at batch 4).  What remains: a long-context run (`--max-model-len` beyond 8k)
-where the split-KV path is what should show up, and a repeat on a settled kernel.
-*Done when*: a table with TTFT-proxy, tokens/s and (if possible) a decode-step latency for both
-backends on the same prompts, with the fallback counter at zero for the TileInfer rows, and the
-`docs/performance.md` section updated.  Also: explain why the earlier baseline run died
-(`TILEINFER_VLLM=1` was still set while `TILEINFER_DISABLE=1`, so the "baseline" had the plugin
-active — already fixed in the harness, worth re-verifying).
+*Status*: **done(2026-10-13,图模式双源)** — 自研 9 场景×3 + 官方 bench 27 case 全落盘,在役探针
+通过为前提。结论:短上下文+并发 TI≈FIA(比值 0.91-1.09);长上下文 8K/16K 落后 2-6x(结构性:
+KI-1 split-KV 未启用 + prefill 编译窗,属阶段三)。数字与口径:`.agent_loop/PERFORMANCE_REPORT.md`
+§5 与 [`performance.md`](performance.md)。环境退化期按双侧比值口径(TEMPORARY),绝对值待环境
+恢复后建议重跑一次。
 
-### T3 · KI-1: the split path faults the device with several shapes in one process
+### T3 · KI-1: the split path faults the device with several shapes in one process(**阶段三 L1,延后待授权**)
 
 *Why*: the 2.8–3.0x on long-context decode is gated behind `TILEINFER_ALLOW_SPLIT_KV=1` because a
 device fault takes the whole serving process with it.
@@ -118,7 +116,7 @@ the pre-warm can be derived from the server config instead of copied from a log.
 
 *Done when*: a served model reaches "zero compiles after start-up" and the docs say how.
 
-### T7 · Split-KV by default
+### T7 · Split-KV by default(**= 阶段三 L3,延后**;依赖 T3/L1 与 L2 池无关 ABI)
 
 *Why*: it is the main performance feature for the shape serving actually sees (single long request).
 
@@ -127,38 +125,26 @@ multi-shape process.
 
 ---
 
-## P2 — engine integration
+## P2 — engine integration(核心项已完成)
 
-### T8 · vLLM-Ascend: the prefill path and the compatibility surface
+### T8 · vLLM-Ascend: the prefill path and the compatibility surface ✅(**done,B1/B6,2026-10-13**)
 
-*Why*: TileInfer currently serves **decode only**; prefill, chunked prefill and speculative decoding
-fall through to vLLM-Ascend.  That is a fine first policy but it should be a *chosen* one.
+*Done*: prefill_step 统一 PrefillNoCache/PrefillCacheHit/ChunkedPrefill 为 append 语义(K/V 经
+reshape_and_cache 入池);惰性后台编译+变体上限 32+blocks 上限(D22);`TILEINFER_OPS=decode,prefill,gdn,gdnwu,moe`
+算子粒度开关(每步读取,秒级回退,B6);设备测试 3/3 + 引擎内 probe PASS(prefill_calls=18/949)。
 
-*First step*: dispatch on `attn_metadata.attn_state` (`DecodeOnly` → TileInfer, the rest → FIA) and
-record the policy in `docs/integration-vllm-ascend.md`; then try the prefill kernel behind an env flag
-once T4 has landed.
+### T9 · ACLGraph capture verification ✅(**done,B5,2026-10-13**)
 
-*Done when*: the policy is explicit, the SupportedConfig paths are exercised by a real model run
-(Llama/Qwen), and the fallback is covered by a test or a documented checklist item.
+*Done*: 图模式 Qwen3.6 真实在役——plan 预构建提前到 warmup(B5a)、捕获态优雅回退(B5b)、
+在役探针(capture_calls/markers/fallbacks,B5c)、稠密→ragged 设备侧重建修复图模式 NaN(B5d/D21);
+设备测试 tests/test_vllm_ascend_graph_stage.py 3/3;图模式端到端生成正常文本 + top-5 logprobs 与
+FIA 逐位一致。
 
-### T9 · ACLGraph capture verification
+### T10 · FIA baseline inside the benchmark harness ✅(**done**)
 
-*Why*: the whole plan/run split exists so that captured graphs contain no allocation, no compile and
-no host sync — but that has never been tested with `--enforce-eager` off.
-
-*First step*: run the same prompt with and without ACLGraph (`cudagraph_mode`), compare the outputs and
-the log for unexpected allocations/compiles inside capture.
-
-*Done when*: eager and captured runs agree (within fp16 tolerance) and the logs show no compile during
-capture.
-
-### T10 · FIA baseline inside the benchmark harness
-
-*Why*: "we are fast" needs the CANN operator as the yardstick, not torch.
-
-*First step*: finish `run_fia` in `benchmarks/bench_attention.py` for the CANN FIA signature used by
-this stack (`torch_npu.npu_fused_infer_attention_score` / the vLLM-Ascend call), and print it next to
-the TileInfer rows.
+*Done*: 基线 = vllm-ascend 原生 FIA 算子路径(同 serve 脚本 `TILEINFER` 开关翻转);自研
+`benchmarks/ab_qwen36_full.py`(预热+3 次中位+在役探针断言)与官方 `vllm bench serve` 双源产出;
+官方客户端三连坑已修(D25:本地路径+served-model-name+chat endpoint+离线)。
 
 ---
 
@@ -190,6 +176,32 @@ runner with an Ascend card becomes available — a workflow that runs them.
 MLA (DeepSeek-V3/V4), cascade / shared prefix, sparse attention, FP8/FP4 KV, fp16 (`head_dim != 128`),
 MoE grouped GEMM, sampling.  Each starts as a new kernel module plus a reference implementation in
 `tileinfer/testing/`, mirroring how decode and prefill were built.
+
+**进展(2026-10-13)**:MoE grouped GEMM 与 GDN 线性注意力已按 TEMPORARY/关闭收口
+(`tileinfer/kernels/{moe,gdn}/` 保留,opt-in 机制就绪);FP8/量化 KV、cascade/前缀缓存、投机解码、
+采样融合、RMSNorm 小算子、autotune 框架等已裁决移除(BACKLOG「已裁决移除」节),勿再实现。
+
+---
+
+## P-DEF — 阶段三长上下文包(⏸ 明确延后,待用户授权后按 L1→L2→L3 序开工)
+
+### L1 · KI-1 诊断(split-KV 多形状同进程 wedge)
+
+*What*: 定位 split-KV 内核多形状同进程 507015/507035 wedge 的根因(8 个假设已排除,探针齐全)。
+*First step*: `ASCEND_LAUNCH_BLOCKING=1` 下最小碎片 sweep(`benchmarks/probes/ki1_pool_size.py` 模板)。
+*Done when*: 可上游提交的复现器 + 根因 + 多形状进程设备测试绿。
+
+### L2 · 池无关内核 ABI
+
+*What*: KV 池指针移出内核签名(plan 携带),使预烧免精确池匹配——vLLM 池页数不可复现是预烧失效
+的已知根因(status.md §5.2)。**内核签名变更,落地后必须重跑引擎内回归与预烧链路**。
+*Done when*: 预烧 key 与池解耦,引擎内 prewarm→READY 全绿。
+
+### L3 · split-KV 真正启用
+
+*What*: 按 shape 预烧(≈140s/shape)+ `TILEINFER_ALLOW_SPLIT_KV` 默认化 + 长上下文(≥8K)引擎内
+A/B,兑现 standalone 已证的 2.8x。依赖 L1/L2。
+*Done when*: 图模式 serve 下 8K/16K 单流 TTFT/吞吐对比 FIA 落盘且无回退。
 
 ---
 

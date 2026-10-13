@@ -4,6 +4,42 @@ Numbers from the reference machine (single `Ascend950PR_9579`, CANN 9.3.0, offic
 `tilelang==0.1.15`, bf16).  Nothing here is a promise — it is a baseline with the methodology and
 the known limits written down, so the next person can tell an improvement from a regression.
 
+> **2026-10-13(权威数字)**:当前主力场景 **Qwen3.6-35B-A3B**(混合 GDN + d256 full-attn)图模式
+> 双源 A/B 见下方「图模式双源全指标」节;完整流程、逐场景 P50/P99 与原始 JSON 索引在
+> `.agent_loop/PERFORMANCE_REPORT.md`(第 5 节,TEMPORARY_PASS 比值口径)。本文件其余章节为
+> Qwen2.5-1.5B/d128 时代的库级基线,方法论仍有效,绝对值不可与 Qwen3.6 数字混读。
+
+## 图模式双源全指标(Qwen3.6-35B-A3B,自研源+官方源,TI/FIA 比值)
+
+**口径注记(读数前必读)**:①测量期存在外部全盘扫描干扰(E15/H6,禁 kill 的他人进程),图模式
+每步主机路径整体退化(~130ms 量级),**绝对值失真,以下均为双侧同条件 TI/FIA 比值**(TEMPORARY
+口径,环境恢复后应按正常口径重跑);②split-KV 关闭(KI-1)、M-MoE 未接入(0.86x)、gdn gating/
+chunk-wu 未接入(opt-in 机制就绪)——即对比的是"TileInfer decode+prefill 接管 vs FIA 全原生",
+比值不含上述未启用项的贡献;③比值 = TileInfer/FIA,吞吐类 <1 为落后、TTFT/TPOT 类 >1 为落后;
+④在役探针通过是数字有效前提(6 plan READY、capture_calls=40、fallbacks=0、markers 随 replay
+增长、logprobs 逐位一致)。
+
+自研源(中位;场景 1tok/128tok/512tok/8K/16K/并发 4/16/32):
+
+| 场景 | 指标 | FIA | TileInfer | TI/FIA |
+|---|---|---|---|---|
+| 单 token(33 in) | TTFT ms | 563.4 | 628.9 | 1.12 |
+| 128 tok 生成 | TPOT ms | 130.8 | 137.9 | 1.05 |
+| 128 tok 生成 | 吞吐 tok/s | 7.64 | 7.25 | 0.95 |
+| 512 tok 生成 | TPOT ms | 131.0 | 142.5 | 1.09 |
+| 8K in+128 gen | TTFT / TPOT | 5470 / 136.7 | 15917 / 269.2 | **2.91 / 1.97** |
+| 16K in+128 gen | TTFT / TPOT | 11298 / 142.9 | 46910 / 402.4 | **4.15 / 2.82** |
+| 16K 纯 prefill | TTFT ms | 11298 | 46863 | **4.15** |
+| 并发 4 / 16 / 32 | 吞吐 tok/s | 24.21 / 78.69 / 126.55 | 23.01 / 72.69 / 115.33 | 0.95 / 0.92 / 0.91 |
+
+官方源(vllm bench serve,9 场景×3 中位;输出 tok/s、请求 req/s、TTFT/TPOT/ITL P50/P99 完整表
+见 PERFORMANCE_REPORT §5.4 与 §8 终版汇总)关键行:1tok TTFT P50 1.05;128/512tok 吞吐
+0.94-0.95、TPOT P50 1.06;并发 4/16/32 吞吐 0.96/0.95/0.94;8K 吞吐 **0.33**/TTFT P50 **4.04**;
+16K 吞吐 **0.21**/TTFT P50 **5.76**。
+
+解读:短上下文与并发(≤512 输入、≤32 并发)双源一致 TI≈FIA;长上下文 2-6x 为结构性
+(KI-1 split-KV 未启用 + D22 prefill 编译窗 + chunked prefill KV 重扫),属阶段三 L1-L3 范围。
+
 Reproduce with:
 
 ```bash

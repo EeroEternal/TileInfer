@@ -5,7 +5,11 @@
 > The concrete, ordered task list lives in [`next-tasks.md`](next-tasks.md); this document is the
 > phased plan it serves.
 
-Status legend: ✅ done · 🟡 in progress · ⏳ not started
+Status legend: ✅ done · 🟡 in progress · ⏳ not started · ⏸ deferred(延后待授权)
+
+> 2026-10-13 刷新:阶段一(attention 内核 + 引擎集成 + 图模式双源 A/B)全部完成;
+> 阶段二融合算子层(M-MoE / M-GDN)已按 TEMPORARY/关闭收口(见 [`status.md`](status.md) §0);
+> 阶段三(长上下文包)⏸ 延后。当前权威数字:`.agent_loop/PERFORMANCE_REPORT.md`。
 
 ## Phase 0 — environment and baseline ✅
 
@@ -19,7 +23,7 @@ Status legend: ✅ done · 🟡 in progress · ⏳ not started
 | Micro-benchmark harness with correctness checking and FIA hook | ✅ |
 | Test suite runnable on CPU, NPU tests auto-skip | ✅ |
 
-## Phase 1 — minimal attention 🟡
+## Phase 1 — minimal attention ✅(2026-10-13 收口:Qwen3.6-35B-A3B 图模式在役,短上下文 TI≈FIA)
 
 | Item | Status |
 |---|---|
@@ -42,29 +46,41 @@ Status legend: ✅ done · 🟡 in progress · ⏳ not started
 Exit criteria: decode matches the reference on device for the full shape grid; prefill matches for
 causal and append; published numbers against FIA on the same shapes.
 
-## Phase 2 — engine integration ⏳
+## Phase 2 — engine integration ✅(Qwen3.6 图模式在役 + 双源 A/B;融合算子层收口结论如下)
 
 | Item | Status |
 |---|---|
-| vLLM-Ascend `TILEINFER` backend (metadata builder + impl) | ⏳ sketch in `examples/` |
-| End-to-end Qwen/Llama serving, eager mode | ⏳ |
-| ACLGraph capture/replay parity (eager vs graph, bit-exact tolerance) | ⏳ |
-| Prefill fallback strategy while the prefill kernel lands | ⏳ |
+| vLLM-Ascend TileInfer backend(metadata builder + impl + 算子开关) | ✅ `TILEINFER_VLLM=1` 插件接管 decode+prefill;`TILEINFER_OPS` 粒度开关(B6) |
+| End-to-end Qwen3.6-35B-A3B serving(85B 权重,混合 GDN+d256) | ✅ eager 与图模式均端到端可用 |
+| ACLGraph capture/replay parity | ✅ B5:6 plan READY、capture_calls=40、fallbacks=0、NaN 修复、logprobs 逐位一致 |
+| Prefill fallback strategy | ✅ B1:prefill_step 统一接管,惰性编译+变体上限(D22),prefill_calls=949 实证 |
+| 图模式双源 A/B(自研 9 场景 + 官方 bench 27 case) | ✅ PERFORMANCE_REPORT §5:短上下文比值 0.91-1.09;长上下文 2-6x(结构性,KI-1+编译窗) |
+| M-MoE grouped GEMM 融合算子 | ⏸ **TEMPORARY**:设备时间 0.86x vs aclnn(3 轮优化轨迹 0.691→0.869→0.968x 墙钟),按 1.0x 契约不接入,交用户决策(E19/H7) |
+| M-GDN 线性注意力算子(9a/9b/9c/gating) | ⏸ **收口**:9a/9b 按证据关闭(decode 侧无收益,E20);gating 替换 disproven(引擎 A/B 无收益,显式 opt-in 保留,E21/D29);9c chunk 链融合内核数值 6/6 绿但微基准 0.718x@T128/14.28x@T8192 未过 ×0.6 门槛,不接入(E23/E24/D31) |
 
-Exit criteria: `--attention-backend TILEINFER` serves a model with output equal to the FIA path
-within fp16 tolerance, and TTFT/TPOT within 5% of FIA on standard shapes.
+Exit criteria: `--attention-backend TILEINFER`(插件等价机制)serves a model with output equal to the
+FIA path within fp16 tolerance ✅,and TTFT/TPOT within 5% of FIA on standard shapes ✅(短上下文;
+长上下文受 KI-1 门禁,属 Phase 3)。
 
-## Phase 3 — optimisation and extension ⏳
+## Phase 3 — long-context package(solid-KV/长上下文)⏸ deferred(阶段二完成后待授权)
 
 | Item | Status |
 |---|---|
-| Load-balanced split-KV wired through the kernel (not just the plan) | ⏳ |
+| **L1** KI-1 诊断(split-KV 多形状同进程 wedge,复现:`benchmarks/bench_attention.py --preset serving --kv-tile-pages 16`) | ⏸ deferred |
+| **L2** 池无关内核 ABI(池移出内核签名,预烧免精确池匹配;签名变更需重跑引擎内回归与预烧) | ⏸ deferred(L1 前置/伴生) |
+| **L3** split-KV 真正启用(按 shape 预烧 ≈140s/shape + 长上下文 ≥8K 对比数据,兑现 2.8x) | ⏸ deferred(依赖 L1/L2) |
+
+## Phase 4 — optimisation and extension ⏳(未立项;MoE/GDN 已按 TEMPORARY 收口交决策)
+
+| Item | Status |
+|---|---|
+| Load-balanced split-KV wired through the kernel (not just the plan) | ⏳(并入 Phase 3 L3) |
 | MLA (DeepSeek-V3/V4), sparse attention (`tile-ai` sparse FA examples as reference) | ⏳ |
-| Low-precision paths (FP8/FP4 KV, int8 quantised decode) | ⏳ |
-| Cascade / shared-prefix attention, sliding window, attention sink | ⏳ |
-| Grouped GEMM / MoE expert kernels, sampling | ⏳ |
+| Low-precision paths (FP8/FP4 KV, int8 quantised decode) | ⏳(已裁决移除:FP8/量化 KV 不做,见 BACKLOG) |
+| Cascade / shared-prefix attention, sliding window, attention sink | ⏳(已裁决移除:cascade/前缀缓存不做) |
+| Grouped GEMM / MoE expert kernels, sampling | ⏸ MoE 已 TEMPORARY(0.86x,E19/H7);sampling 已裁决移除 |
 
-## Phase 4 — ecosystem ⏳
+## Phase 5 — ecosystem ⏳
 
 | Item | Status |
 |---|---|
