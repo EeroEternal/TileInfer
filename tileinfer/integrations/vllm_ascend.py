@@ -383,6 +383,8 @@ class TileInferDecodeAttention:
         "fallbacks": 0,
         "exceptions": 0,
         "gdn_gating_calls": 0,
+        "gdn_wu_calls": 0,
+        "gdn_wu_fallbacks": 0,
     }
 
     def __init__(
@@ -1094,6 +1096,113 @@ def install_gdn_gating() -> bool:
     return True
 
 
+_GDN_WU_INSTALLED = False
+
+
+def install_gdn_chunk_wu() -> bool:
+    """接管 vLLM-Ascend GDN prefill chunk 链的中段两核(BACKLOG M-GDN 9c,H10)。
+
+    在役链(E20/E22):cumsum → kkt → **solve_tril + recompute_w_u**(四核 triton 中的两大
+    单核,稳态合计 0.73ms/层@T=128,30 层=22ms/步)→ AscendC fwd_h → fwd_o。本钩子把
+    ``chunk_gated_delta_rule_fwd`` 替换为 TileInfer 版本:中段换成 tileinfer 的融合内核
+    ``gdn_chunk_wu``(块逆 + 乘 k/v 一步完成),链首尾(cumsum/kkt/fwd_h/fwd_o 与 AscendC
+    staging)保持原实现不变。PCP(world_size>1)与 cu_seqlens=None(死代码路径,见 E22)
+    时回退原实现;``TILEINFER_OPS`` 每步读取 ``gdnwu`` 项,秒级回退;计数入在役探针。
+    """
+    global _GDN_WU_INSTALLED
+    if _GDN_WU_INSTALLED:
+        return True
+    import vllm_ascend.ops.triton.fla.chunk as _chunk_mod
+    from vllm.distributed import get_pcp_group
+
+    from tileinfer.kernels.gdn.chunk_wu_ascend950 import gdn_chunk_wu
+
+    if getattr(_chunk_mod, "_tileinfer_gdn_wu_installed", False):
+        _GDN_WU_INSTALLED = True
+        return True
+
+    cls_stats = TileInferDecodeAttention._stats
+    _original_fwd = _chunk_mod.chunk_gated_delta_rule_fwd
+    _cumsum = _chunk_mod.chunk_local_cumsum
+    _kkt = _chunk_mod.chunk_scaled_dot_kkt_fwd
+
+    def _ti_chunk_gated_delta_rule_fwd(q, k, v, g, beta, scale, initial_state, output_final_state,
+                                        cu_seqlens=None, prebuilt_meta=None):
+        if not ops_enabled("gdnwu") or cu_seqlens is None or get_pcp_group().world_size > 1:
+            return _original_fwd(q, k, v, g, beta, scale, initial_state, output_final_state,
+                                 cu_seqlens=cu_seqlens, prebuilt_meta=prebuilt_meta)
+        try:
+            meta = prebuilt_meta
+            block_indices_cumsum = None if meta is None else meta.block_indices_cumsum
+            cu_seqlens_host = None if meta is None else meta.cu_seqlens_host
+            ci64 = None if meta is None else meta.chunk_indices_chunk64
+            ci_host = None if meta is None else meta.chunk_indices_chunk64_host
+            chunk_indices_large_block = None if meta is None else meta.chunk_indices_large_block
+            chunk_indices_bt = None if meta is None else meta.chunk_indices_chunk64
+
+            # ---- 链首:与原实现一致 ----
+            g64 = _cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens, block_indices=block_indices_cumsum)
+            a_kkt = _kkt(k=k, beta=beta, g_cumsum=g64, cu_seqlens=cu_seqlens,
+                         chunk_indices=chunk_indices_bt, output_dtype=torch.float32)
+            # ---- 中段:融合内核(solve_tril + recompute_w_u)----
+            w, u = gdn_chunk_wu(a_kkt, k, v, beta, g64, cu_seqlens, ci64)
+            cls_stats["gdn_wu_calls"] = cls_stats.get("gdn_wu_calls", 0) + 1
+
+            # ---- 链尾:与原实现一致(AscendC staging + fwd_h + fwd_o)----
+            k_ascendc = k.to(torch.bfloat16).transpose(1, 2).contiguous()
+            w_ascendc = w.to(torch.bfloat16).transpose(1, 2).contiguous()
+            u_ascendc = u.to(torch.bfloat16).transpose(1, 2).contiguous()
+            g_ascendc = g64.transpose(1, 2).contiguous()
+            q_ascendc = q.to(torch.bfloat16).transpose(1, 2).contiguous()
+
+            cu64 = cu_seqlens.to(torch.int64)
+            if cu_seqlens_host is None:
+                cu_seqlens_host = tuple(cu64.tolist())
+            if ci_host is None:
+                ci_host = tuple(ci64.flatten().tolist())
+            from vllm_ascend.ops.gdn_attn_builder import _compact_empty_segments
+
+            cu_seqlens_kern, initial_state_kern, keep_meta = _compact_empty_segments(
+                cu_seqlens_host, initial_state,
+                device=initial_state.device if initial_state is not None else None,
+            )
+            h, v_new, final_state = torch.ops._C_ascend.chunk_gated_delta_rule_fwd_h(
+                k_ascendc, w_ascendc, u_ascendc, g=g_ascendc, gk=None,
+                initial_state=initial_state_kern, output_final_state=True, chunk_size=64,
+                save_new_value=True, cu_seqlens=cu_seqlens_kern, chunk_indices=ci_host,
+                use_exp2=False, transpose_state_layout=False,
+            )
+            if keep_meta is not None:
+                _fs_full = initial_state.clone()
+                _fs_full[keep_meta] = final_state
+                final_state = _fs_full
+
+            o_ascendc = torch.ops._C_ascend.chunk_fwd_o(
+                q_ascendc, k_ascendc, v_new, h, scale, g=g_ascendc, g_gamma=None,
+                cu_seqlens=cu_seqlens_host, chunk_indices=ci_host, chunk_size=64,
+                transpose_state_layout=False,
+            )
+            o = o_ascendc.to(torch.bfloat16).transpose(1, 2).contiguous()
+            v_new = v_new.to(torch.bfloat16).transpose(1, 2).contiguous()
+            h = h.to(torch.bfloat16).transpose(1, 2).contiguous()
+            from vllm.model_executor.layers.fla.ops.utils import SUPPRESS_LEVEL
+
+            if SUPPRESS_LEVEL < 3:
+                return g64, o, None, final_state, None, None, None
+            return g64, o, None, final_state, w, h, v_new
+        except Exception as exc:  # noqa: BLE001 - 接管失败不得打断推理(与 B5b 同语义)
+            cls_stats["gdn_wu_fallbacks"] = cls_stats.get("gdn_wu_fallbacks", 0) + 1
+            logger.warning("TileInfer gdn_chunk_wu fallback to vllm-ascend chain: %s", exc)
+            return _original_fwd(q, k, v, g, beta, scale, initial_state, output_final_state,
+                                 cu_seqlens=cu_seqlens, prebuilt_meta=prebuilt_meta)
+
+    _chunk_mod.chunk_gated_delta_rule_fwd = _ti_chunk_gated_delta_rule_fwd
+    _chunk_mod._tileinfer_gdn_wu_installed = True
+    _GDN_WU_INSTALLED = True
+    logger.info("TileInfer GDN chunk wu dispatch installed (TILEINFER_OPS governs per call)")
+    return True
+
+
 _METRICS_INTERVAL_S = 1.0
 
 
@@ -1209,6 +1318,14 @@ def install(raise_on_failure: bool = True) -> bool:
                 "TileInfer GDN gating takeover left off (TILEINFER_OPS does not list gdn; "
                 "evidence E21: no engine-level gain, kept as explicit opt-in)"
             )
+        if "gdnwu" in _parts:
+            # chunk 链中段融合(H10)单独开关,便于与 gating 解耦做同侧 A/B 归因
+            try:
+                install_gdn_chunk_wu()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("TileInfer GDN chunk wu dispatch not installed: %s", exc)
+        else:
+            logger.info("TileInfer GDN chunk wu takeover left off (TILEINFER_OPS does not list gdnwu)")
         logger.info(
             "TileInfer registered as the CUSTOM attention backend (decode accelerated, "
             "prefill falls back to vLLM-Ascend)"
