@@ -277,6 +277,57 @@ source <CANN 9.3.x>/set_env.sh
 python benchmarks/bench_attention.py --preset serving --backend tilelang-ascend950 --dtype bf16
 ```
 
+## H17/E-B 收口:weight_nz_mode=2 不可用 + dense NZ 零收益(2026-10-14,iter-037)
+
+**结论:官方「集成层预 NZ」路线在 Qwen3.6 + vllm-ascend 0.23.0 上 disproven,不再投入**;
+dense GEMM(E-B,设备占比 17.3%)首次评估随之收口 = 零收益。
+
+1. **dense 微基准**(E42):aclnn linear ND vs NZ 权重,`qkv M=512 K=2048 N=6144`
+   ratio 0.988/0.995、`o_proj M=512 K=4096 N=2048` ratio 0.999/1.002,maxdiff=0(逐位一致)
+   ——aclnn 算子无内核内 nd2nz 惩罚,E36 的 nd2nz ~50GB/s 是 TI 自研 TileLang 内核
+   GM→L1 路径特性。
+2. **引擎级裁决**(E43):`--additional-config '{"weight_nz_mode": 2}'` 启动即 abort——
+   `vllm_ascend/ops/linear.py:98 maybe_trans_nz → npu_format_cast(ACL_FORMAT_FRACTAL_NZ)`
+   报 `aclnnNpuFormatCastCalculateSizeAndFormat, error code 161002`(稠密权重形状不被算子
+   支持;与 E42 的 npu_grouped_matmul bf16 组合受限同源)。零代码官方开关不可用。
+   nz0 背靠背对照与 P0 基线全场景偏差 ≤6.5%(环境无漂移)。
+3. **路线意义重定位**:NZ 权重唯一剩余价值 = TI 自研 MoE 内核的 pre-NZ 直载输入
+   (E-A 重启候选;P4 节的重启路线在基线侧无兑现可能,自研内核侧另需设备验证)。
+
+Reproduce with:
+
+```bash
+bash .agent_loop/run/h17_nz_ab.sh          # nz0/nz2 背靠背 5 场景(nz2 预期启动 abort)
+.venv/bin/python .agent_loop/run/e42_nz_gemm_probe.py   # dense ND/NZ 微基准
+```
+
+## W1-C8 病态 2×2 隔离:归因 TI prefill 路径(2026-10-14,iter-037,E44)
+
+P0 基线暴露的「长上下文×并发」引擎级病态(16K C8 吞吐 0.121x/TTFT 8.4x/TPOT 8.4x)
+经 `TILEINFER_OPS` 域隔离(16K C8 权威口径单景,on 侧配置=split opt-in):
+
+| 配置 | TTFT p50 (ms) | TPOT p50 (ms) | 吞吐 (tok/s) |
+|---|---|---|---|
+| off(FIA 全部) | 1720 | 69.9 | 95.0 |
+| on(TI 全接管) | 14450 | 589.3 | 11.5 |
+| **probeA `TILEINFER_OPS=decode`**(TI split-KV decode + FIA prefill) | **1573(健康)** | 84.5 | 80.4 |
+| **probeB `TILEINFER_OPS=prefill`**(TI prefill + FIA decode) | **19198(病态)** | 537.3 | 11.8 |
+
+- 病态 100% 随 TI **prefill** 接管域走;decode/split 侧无责(probeA 探针全绿:
+  capture_calls=40/ready_plans=6/fallbacks=0;剩余 ~15% 吞吐差=已知 W2 并发税)。
+- probeB 的 TPOT 537ms(FIA decode)≈ on 侧 589ms → decode 慢是被同引擎混合步的
+  TI prefill 慢步摊派,非 decode 自身问题;E41 候选③(图切换)/④(batched tokens
+  交互)出局,剩余候选=①多行 chunk 形状的内核执行开销 vs prefill_step 逐层主机
+  准备链(q_pad ~553MB/层/步、每层 2 次主机同步、plan 重建;C8 短 chunk×多行放大)。
+- 下一步(H18,已登记):profiler 逐内核+主机段分解(16K C8 负载)→ 修复
+  (跨层元数据共享或内核调度)→ 门槛:16K/8K C8 TTFT/TPOT 收窄至 ≤2x、短场景 |Δ|<3%。
+
+Reproduce with:
+
+```bash
+PROBES=A bash .agent_loop/run/w1iso_probe.sh   # 或 B;单景 16384x128_c8
+```
+
 ## Prefill KV 重扫截断(prefill kernel KV-rescan truncation,2026-10-14)
 
 **问题**:prefill 内核每个 query tile 都循环该请求的**全部** KV pages(`for p in T.serial(req_pages)`),
