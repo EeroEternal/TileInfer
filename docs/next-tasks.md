@@ -6,12 +6,12 @@ A working list, ordered by value ÷ cost.  Each entry says **what**, **why**, th
 or a command, not a plan) and **done when**.  Everything here is grounded in what the repo already
 contains; nothing is speculative.
 
-## Where the project stands(2026-10-13 刷新)
+## Where the project stands(2026-10-14 刷新)
 
 | | state |
 |---|---|
 | Decode kernel (paged, GQA, NHD, tail masking, **head_dim 128+256**) | ✅ validated on device(d256 经 dsplit-v2,24/24 绿)|
-| Split-KV kernel + device merge kernel | ✅ written and validated (3.0x at b1/32k–64k), **opt-in** because of KI-1(启用=阶段三 L3,延后) |
+| Split-KV kernel + device merge kernel | ✅ validated (3.0x at b1/32k–64k) **and enabled in the engine**(P8):KI-1 已修(P6)+ 池无关 ABI(P7);opt-in 服务长上下文,8K TPOT 1.41x / 16K 2.04x |
 | Prefill / append kernel (causal, ragged, paged) | ✅ validated + **已接线进引擎**(B1,prefill_calls=949 实证) |
 | Plan / scheduler / metadata / workspaces | ✅ implemented, CPU 套件全绿 |
 | vLLM-Ascend integration | ✅ **Qwen3.6-35B-A3B 图模式真实在役**:6 plan READY、capture_calls=40、fallbacks=0、logprobs 逐位一致;双源 A/B 数字落盘(PERFORMANCE_REPORT §5) |
@@ -19,8 +19,8 @@ contains; nothing is speculative.
 | 融合算子层(M-MoE / M-GDN) | ⏸ **收口**:M-MoE TEMPORARY(0.86x 交决策)、M-GDN 9a/9b 关闭、gating disproven(opt-in)、9c chunk-wu TEMPORARY(0.718x 未过门槛)——详见 [`status.md`](status.md) §0 |
 | Device CI | ⏳ none yet |
 
-Open bugs and post-mortems live in [`known-issues.md`](known-issues.md) (KI-1 split-path instability,
-KI-4 离线/serve 口径,PM-1/PM-2 resolved) and the environment traps in [`architecture.md`](architecture.md).
+Open bugs and post-mortems live in [`known-issues.md`](known-issues.md) (KI-1 **resolved 2026-10-14**,
+KI-2 resolved, KI-4 离线/serve 口径,KI-5 上游 teardown,PM-1/PM-2 resolved) and the environment traps in [`architecture.md`](architecture.md).
 
 ---
 
