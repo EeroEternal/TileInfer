@@ -1084,6 +1084,403 @@ def paged_prefill_split_ascend950(
     return main
 
 
+def paged_prefill_split_head_ascend950(
+    batch: int,
+    kv_heads: int,
+    group: int,
+    dim: int,
+    page_size: int,
+    num_pages_cap: int,
+    num_tiles: int,
+    max_splits: int,
+    block_q: int = 128,
+    dtype: str = "bfloat16",
+    threads: int = 128,
+):
+    """Head-split prefill: the **fully-visible** page chunks of a q-block (H20).
+
+    Arithmetic is identical to :func:`paged_prefill_split_ascend950` minus the per-row causal
+    predicate: the scheduler only ever gives a head tile pages entirely before every row's
+    causal frontier (``frontier_page_splits``), so the mask reduces to the scalar tail check
+    ``c < limit`` and the kernel takes **no ``RowThr`` input at all**.  That is the point: the
+    E48 forensics pinned the tilelang failure on the SimtVF per-row ``thr_ub`` predicate under
+    multi-block launches, and every kernel here without per-row predicates (decode, decode
+    split, plain prefill) is multi-block-clean.  The epilogue writes the same normalised
+    partial + LSE slots, so the merge is unchanged.
+    """
+    BR = block_q
+    BC = page_size
+    D = dim
+    ROWS = BR // 2
+    accum = "float32"
+    scale = 1.0 / math.sqrt(dim)
+    num_slots = batch * max_splits
+
+    assert BR % 32 == 0
+    assert BR <= 128
+    assert dim in (128, 256)
+    assert page_size % 2 == 0
+
+    @T.prim_func
+    def main(
+        QPacked: T.Tensor((num_tiles * kv_heads, BR, dim), dtype),
+        KCache: T.Tensor((num_pages_cap, page_size, kv_heads, dim), dtype),
+        VCache: T.Tensor((num_pages_cap, page_size, kv_heads, dim), dtype),
+        kv_indptr: T.Tensor((batch + 1,), "int32"),
+        kv_indices: T.Tensor((num_pages_cap,), "int32"),
+        kv_last_page_len: T.Tensor((batch,), "int32"),
+        seq_ids: T.Tensor((num_tiles,), "int32"),
+        tile_rows: T.Tensor((num_tiles,), "int32"),
+        kv_page_starts: T.Tensor((num_tiles,), "int32"),
+        TilePageLens: T.Tensor((num_tiles,), "int32"),
+        tile_slots: T.Tensor((num_tiles,), "int32"),
+        PartOut: T.Tensor((num_slots * kv_heads, BR, dim), dtype),
+        PartLse: T.Tensor((num_slots * kv_heads * BR,), accum),
+    ):
+        with T.Kernel(num_tiles * kv_heads) as bx:
+            tile = bx // kv_heads
+            bh = bx % kv_heads
+            b = seq_ids[tile]
+            start = kv_page_starts[tile]
+            req_pages = kv_indptr[b + 1] - kv_indptr[b]
+            # Head tiles may include the request's last page only when the frontier split is
+            # absent (P_vis == pages); keep the same truncation contract as the split kernel.
+            plen = TilePageLens[tile]
+            eff = req_pages - start
+            eff = T.if_then_else(eff < 0, 0, eff)
+            plen = T.if_then_else(plen < eff, plen, eff)
+            plen = T.if_then_else(plen < 0, 0, plen)
+            slot = tile_slots[tile]
+
+            q_l1 = T.alloc_l1((BR, D), dtype)
+            k_l1 = T.alloc_l1((BC, D), dtype)
+            v_l1 = T.alloc_l1((D, BC), dtype)
+            p_l1 = T.alloc_l1((BR, BC), dtype)
+
+            D2 = min(D, 128)
+            qk_a = T.alloc_l0a((BR, D2), dtype)
+            qk_b = T.alloc_l0b((BC, D2), dtype)
+            pv_a = T.alloc_l0a((BR, BC), dtype)
+            pv_b = T.alloc_l0b((D2, BC), dtype)
+            qk_acc = T.alloc_l0c((BR, BC), accum)
+            pv_acc0 = T.alloc_l0c((BR, D2), accum)
+            if D > D2:
+                pv_acc1 = T.alloc_l0c((BR, D2), accum)
+
+            s_ub = T.alloc_shared((ROWS, BC), accum)
+            p_ub = T.alloc_shared((ROWS, BC), dtype)
+            o_ub0 = T.alloc_shared((ROWS, D2), accum)
+            o_tmp0 = T.alloc_shared((ROWS, D2), accum)
+            out_ub0 = T.alloc_shared((ROWS, D2), dtype)
+            if D > D2:
+                o_ub1 = T.alloc_shared((ROWS, D2), accum)
+                o_tmp1 = T.alloc_shared((ROWS, D2), accum)
+                out_ub1 = T.alloc_shared((ROWS, D2), dtype)
+            m_ub = T.alloc_shared((ROWS,), accum)
+            l_ub = T.alloc_shared((ROWS,), accum)
+
+            T.copy(QPacked[bx, 0:BR, 0:D], q_l1)
+            T.fill(m_ub, T.float32(-1e30))
+            T.fill(l_ub, T.float32(0))
+            T.fill(o_ub0, T.float32(0))
+            if D > D2:
+                T.fill(o_ub1, T.float32(0))
+            for p in T.serial(plen):
+                pid = kv_indices[kv_indptr[b] + start + p]
+
+                T.copy(KCache[pid, 0:BC, bh, 0:D], k_l1)
+                T.copy(q_l1[0:BR, 0:D2], qk_a)
+                T.copy(k_l1[0:BC, 0:D2], qk_b)
+                T.gemm(qk_a, qk_b, qk_acc, transpose_B=True, clear_accum=True)
+                if D > D2:
+                    T.copy(q_l1[0:BR, D2:D], qk_a)
+                    T.copy(k_l1[0:BC, D2:D], qk_b)
+                    T.gemm(qk_a, qk_b, qk_acc, transpose_B=True)
+                T.dual_copy(qk_acc, s_ub)
+
+                limit = T.if_then_else(start + p + 1 < req_pages, BC, kv_last_page_len[b])
+                with T.SimtVF(threads=threads):
+                    s_frag = T.alloc_fragment((ROWS, BC), accum)
+                    # Scalar tail mask only — deliberately no per-row predicate (H20/E48).
+                    for r, c in T.Parallel(ROWS, BC):
+                        s_frag[r, c] = T.if_then_else(
+                            c < limit, s_ub[r, c] * T.float32(scale), T.float32(-1e30)
+                        )
+                    row_max = T.alloc_reducer((ROWS,), accum, op="max")
+                    T.reducer_init(row_max)
+                    for r, c in T.Parallel(ROWS, BC):
+                        T.reducer_update(row_max[r], s_frag[r, c])
+                    new_m = T.alloc_fragment((ROWS,), accum)
+                    T.finalize_reducer(row_max, new_m)
+
+                    alpha = T.alloc_fragment((ROWS,), accum)
+                    for r in T.Parallel(ROWS):
+                        alpha[r] = T.exp(m_ub[r] - T.max(m_ub[r], new_m[r]))
+                        m_ub[r] = T.max(m_ub[r], new_m[r])
+
+                    row_sum = T.alloc_reducer((ROWS,), accum, op="sum")
+                    T.reducer_init(row_sum)
+                    for r, c in T.Parallel(ROWS, BC):
+                        s_frag[r, c] = T.exp(s_frag[r, c] - m_ub[r])
+                        T.reducer_update(row_sum[r], s_frag[r, c])
+                    partial = T.alloc_fragment((ROWS,), accum)
+                    T.finalize_reducer(row_sum, partial)
+
+                    for r in T.Parallel(ROWS):
+                        l_ub[r] = l_ub[r] * alpha[r] + partial[r]
+                    for r, d in T.Parallel(ROWS, D2):
+                        o_ub0[r, d] = o_ub0[r, d] * alpha[r]
+                    if D > D2:
+                        for r, d in T.Parallel(ROWS, D2):
+                            o_ub1[r, d] = o_ub1[r, d] * alpha[r]
+                    for r, c in T.Parallel(ROWS, BC):
+                        p_ub[r, c] = T.Cast(dtype, s_frag[r, c])
+
+                T.dual_copy(p_ub[0:ROWS, 0:BC], p_l1[0:BR, 0:BC])
+                T.copy(VCache[pid, 0:BC, bh, 0:D], v_l1[0:D, 0:BC], transpose=True)
+                T.copy(p_l1[0:BR, 0:BC], pv_a)
+                T.copy(v_l1[0:D2, 0:BC], pv_b)
+                T.gemm(pv_a, pv_b, pv_acc0, transpose_B=True, clear_accum=True)
+                if D > D2:
+                    T.copy(v_l1[D2:D, 0:BC], pv_b)
+                    T.gemm(pv_a, pv_b, pv_acc1, transpose_B=True, clear_accum=True)
+                T.dual_copy(pv_acc0, o_tmp0)
+                if D > D2:
+                    T.dual_copy(pv_acc1, o_tmp1)
+                with T.SimtVF(threads=threads):
+                    for r, d in T.Parallel(ROWS, D2):
+                        o_ub0[r, d] = o_ub0[r, d] + o_tmp0[r, d]
+                    if D > D2:
+                        for r, d in T.Parallel(ROWS, D2):
+                            o_ub1[r, d] = o_ub1[r, d] + o_tmp1[r, d]
+
+            with T.SimtVF(threads=threads):
+                # l_safe: an emptied tile carries l=0 -> (out=0, lse=-1e30 + log(1)), the
+                # merge's zero-weight filler (same contract as the decode split kernel).
+                for r, d in T.Parallel(ROWS, D2):
+                    l_safe = T.if_then_else(l_ub[r] > 0, l_ub[r], T.float32(1))
+                    out_ub0[r, d] = T.Cast(dtype, o_ub0[r, d] / l_safe)
+                if D > D2:
+                    for r, d in T.Parallel(ROWS, D2):
+                        l_safe = T.if_then_else(l_ub[r] > 0, l_ub[r], T.float32(1))
+                        out_ub1[r, d] = T.Cast(dtype, o_ub1[r, d] / l_safe)
+                for r in T.Parallel(ROWS):
+                    l_safe = T.if_then_else(l_ub[r] > 0, l_ub[r], T.float32(1))
+                    m_ub[r] = m_ub[r] + T.log(l_safe)
+
+            T.dual_copy(out_ub0[0:ROWS, 0:D2], PartOut[slot * kv_heads + bh, 0:BR, 0:D2])
+            if D > D2:
+                T.dual_copy(out_ub1[0:ROWS, 0:D2], PartOut[slot * kv_heads + bh, 0:BR, D2:D])
+            T.dual_copy(
+                m_ub[0:ROWS],
+                PartLse[(slot * kv_heads + bh) * BR : (slot * kv_heads + bh + 1) * BR],
+            )
+
+    return main
+
+
+def paged_prefill_split_frontier_ascend950(
+    batch: int,
+    kv_heads: int,
+    group: int,
+    dim: int,
+    page_size: int,
+    num_pages_cap: int,
+    num_tiles: int,
+    max_splits: int,
+    block_q: int = 128,
+    dtype: str = "bfloat16",
+    threads: int = 128,
+):
+    """Frontier-split prefill: the causal-frontier page chunk, plain-kernel mask form (H20).
+
+    The exact :func:`paged_prefill_ascend950` body — including the multi-block-verified
+    compound ``and`` predicate over ``RowThr`` (0a99edd) — with three deltas taken from the
+    split kernel: the tile starts at ``kv_page_starts[tile]`` instead of page 0, ``plen`` is
+    clamped to the pages that actually exist, and the epilogue writes the normalised partial
+    plus LSE into the dense slot layout (instead of a final output), so the unchanged merge
+    combines it with the head splits' partials.  The scheduler gives each q-block exactly one
+    frontier tile covering ``[P_vis, pages)``; every page it visits may be partially masked
+    for some rows, which the ``RowThr`` predicate handles (this is the plain kernel's
+    multi-block-tested path, unlike the split kernel's — E48).
+    """
+    BR = block_q
+    BC = page_size
+    D = dim
+    ROWS = BR // 2
+    accum = "float32"
+    scale = 1.0 / math.sqrt(dim)
+    num_slots = batch * max_splits
+
+    assert BR % 32 == 0
+    assert BR <= 128
+    assert dim in (128, 256)
+    assert page_size % 2 == 0
+
+    @T.prim_func
+    def main(
+        QPacked: T.Tensor((num_tiles * kv_heads, BR, dim), dtype),
+        KCache: T.Tensor((num_pages_cap, page_size, kv_heads, dim), dtype),
+        VCache: T.Tensor((num_pages_cap, page_size, kv_heads, dim), dtype),
+        kv_indptr: T.Tensor((batch + 1,), "int32"),
+        kv_indices: T.Tensor((num_pages_cap,), "int32"),
+        kv_last_page_len: T.Tensor((batch,), "int32"),
+        seq_ids: T.Tensor((num_tiles,), "int32"),
+        tile_rows: T.Tensor((num_tiles,), "int32"),
+        kv_page_starts: T.Tensor((num_tiles,), "int32"),
+        causal_shift: T.Tensor((batch,), "int32"),
+        RowThr: T.Tensor((num_tiles * BR,), "int32"),
+        TilePageLens: T.Tensor((num_tiles,), "int32"),
+        tile_slots: T.Tensor((num_tiles,), "int32"),
+        PartOut: T.Tensor((num_slots * kv_heads, BR, dim), dtype),
+        PartLse: T.Tensor((num_slots * kv_heads * BR,), accum),
+    ):
+        with T.Kernel(num_tiles * kv_heads) as bx:
+            tile = bx // kv_heads
+            bh = bx % kv_heads
+            b = seq_ids[tile]
+            start = kv_page_starts[tile]
+            req_pages = kv_indptr[b + 1] - kv_indptr[b]
+            plen = TilePageLens[tile]
+            eff = req_pages - start
+            eff = T.if_then_else(eff < 0, 0, eff)
+            plen = T.if_then_else(plen < eff, plen, eff)
+            plen = T.if_then_else(plen < 0, 0, plen)
+            slot = tile_slots[tile]
+
+            q_l1 = T.alloc_l1((BR, D), dtype)
+            k_l1 = T.alloc_l1((BC, D), dtype)
+            v_l1 = T.alloc_l1((D, BC), dtype)
+            p_l1 = T.alloc_l1((BR, BC), dtype)
+
+            D2 = min(D, 128)
+            qk_a = T.alloc_l0a((BR, D2), dtype)
+            qk_b = T.alloc_l0b((BC, D2), dtype)
+            pv_a = T.alloc_l0a((BR, BC), dtype)
+            pv_b = T.alloc_l0b((D2, BC), dtype)
+            qk_acc = T.alloc_l0c((BR, BC), accum)
+            pv_acc0 = T.alloc_l0c((BR, D2), accum)
+            if D > D2:
+                pv_acc1 = T.alloc_l0c((BR, D2), accum)
+
+            s_ub = T.alloc_shared((ROWS, BC), accum)
+            p_ub = T.alloc_shared((ROWS, BC), dtype)
+            o_ub0 = T.alloc_shared((ROWS, D2), accum)
+            o_tmp0 = T.alloc_shared((ROWS, D2), accum)
+            out_ub0 = T.alloc_shared((ROWS, D2), dtype)
+            if D > D2:
+                o_ub1 = T.alloc_shared((ROWS, D2), accum)
+                o_tmp1 = T.alloc_shared((ROWS, D2), accum)
+                out_ub1 = T.alloc_shared((ROWS, D2), dtype)
+            m_ub = T.alloc_shared((ROWS,), accum)
+            l_ub = T.alloc_shared((ROWS,), accum)
+            # Per-row causal threshold for this AIV's half of the M tile (dual_copy splits it
+            # exactly like s_ub, see paged_prefill_ascend950).
+            thr_ub = T.alloc_shared((ROWS,), "int32")
+
+            T.copy(QPacked[bx, 0:BR, 0:D], q_l1)
+            T.dual_copy(RowThr[tile * BR : (tile + 1) * BR], thr_ub)
+            T.fill(m_ub, T.float32(-1e30))
+            T.fill(l_ub, T.float32(0))
+            T.fill(o_ub0, T.float32(0))
+            if D > D2:
+                T.fill(o_ub1, T.float32(0))
+            for p in T.serial(plen):
+                pid = kv_indices[kv_indptr[b] + start + p]
+
+                T.copy(KCache[pid, 0:BC, bh, 0:D], k_l1)
+                T.copy(q_l1[0:BR, 0:D2], qk_a)
+                T.copy(k_l1[0:BC, 0:D2], qk_b)
+                T.gemm(qk_a, qk_b, qk_acc, transpose_B=True, clear_accum=True)
+                if D > D2:
+                    T.copy(q_l1[0:BR, D2:D], qk_a)
+                    T.copy(k_l1[0:BC, D2:D], qk_b)
+                    T.gemm(qk_a, qk_b, qk_acc, transpose_B=True)
+                T.dual_copy(qk_acc, s_ub)
+
+                limit = T.if_then_else(start + p + 1 < req_pages, BC, kv_last_page_len[b])
+                with T.SimtVF(threads=threads):
+                    s_frag = T.alloc_fragment((ROWS, BC), accum)
+                    # The plain kernel's multi-block-verified compound predicate (0a99edd),
+                    # with the split's global-position kv_pos.
+                    for r, c in T.Parallel(ROWS, BC):
+                        kv_pos = (start + p) * BC + c
+                        s_frag[r, c] = T.if_then_else(
+                            (c < limit) and (kv_pos <= thr_ub[r]),
+                            s_ub[r, c] * T.float32(scale),
+                            T.float32(-1e30),
+                        )
+                    row_max = T.alloc_reducer((ROWS,), accum, op="max")
+                    T.reducer_init(row_max)
+                    for r, c in T.Parallel(ROWS, BC):
+                        T.reducer_update(row_max[r], s_frag[r, c])
+                    new_m = T.alloc_fragment((ROWS,), accum)
+                    T.finalize_reducer(row_max, new_m)
+
+                    alpha = T.alloc_fragment((ROWS,), accum)
+                    for r in T.Parallel(ROWS):
+                        alpha[r] = T.exp(m_ub[r] - T.max(m_ub[r], new_m[r]))
+                        m_ub[r] = T.max(m_ub[r], new_m[r])
+
+                    row_sum = T.alloc_reducer((ROWS,), accum, op="sum")
+                    T.reducer_init(row_sum)
+                    for r, c in T.Parallel(ROWS, BC):
+                        s_frag[r, c] = T.exp(s_frag[r, c] - m_ub[r])
+                        T.reducer_update(row_sum[r], s_frag[r, c])
+                    partial = T.alloc_fragment((ROWS,), accum)
+                    T.finalize_reducer(row_sum, partial)
+
+                    for r in T.Parallel(ROWS):
+                        l_ub[r] = l_ub[r] * alpha[r] + partial[r]
+                    for r, d in T.Parallel(ROWS, D2):
+                        o_ub0[r, d] = o_ub0[r, d] * alpha[r]
+                    if D > D2:
+                        for r, d in T.Parallel(ROWS, D2):
+                            o_ub1[r, d] = o_ub1[r, d] * alpha[r]
+                    for r, c in T.Parallel(ROWS, BC):
+                        p_ub[r, c] = T.Cast(dtype, s_frag[r, c])
+
+                T.dual_copy(p_ub[0:ROWS, 0:BC], p_l1[0:BR, 0:BC])
+                T.copy(VCache[pid, 0:BC, bh, 0:D], v_l1[0:D, 0:BC], transpose=True)
+                T.copy(p_l1[0:BR, 0:BC], pv_a)
+                T.copy(v_l1[0:D2, 0:BC], pv_b)
+                T.gemm(pv_a, pv_b, pv_acc0, transpose_B=True, clear_accum=True)
+                if D > D2:
+                    T.copy(v_l1[D2:D, 0:BC], pv_b)
+                    T.gemm(pv_a, pv_b, pv_acc1, transpose_B=True, clear_accum=True)
+                T.dual_copy(pv_acc0, o_tmp0)
+                if D > D2:
+                    T.dual_copy(pv_acc1, o_tmp1)
+                with T.SimtVF(threads=threads):
+                    for r, d in T.Parallel(ROWS, D2):
+                        o_ub0[r, d] = o_ub0[r, d] + o_tmp0[r, d]
+                    if D > D2:
+                        for r, d in T.Parallel(ROWS, D2):
+                            o_ub1[r, d] = o_ub1[r, d] + o_tmp1[r, d]
+
+            with T.SimtVF(threads=threads):
+                for r, d in T.Parallel(ROWS, D2):
+                    l_safe = T.if_then_else(l_ub[r] > 0, l_ub[r], T.float32(1))
+                    out_ub0[r, d] = T.Cast(dtype, o_ub0[r, d] / l_safe)
+                if D > D2:
+                    for r, d in T.Parallel(ROWS, D2):
+                        l_safe = T.if_then_else(l_ub[r] > 0, l_ub[r], T.float32(1))
+                        out_ub1[r, d] = T.Cast(dtype, o_ub1[r, d] / l_safe)
+                for r in T.Parallel(ROWS):
+                    l_safe = T.if_then_else(l_ub[r] > 0, l_ub[r], T.float32(1))
+                    m_ub[r] = m_ub[r] + T.log(l_safe)
+
+            T.dual_copy(out_ub0[0:ROWS, 0:D2], PartOut[slot * kv_heads + bh, 0:BR, 0:D2])
+            if D > D2:
+                T.dual_copy(out_ub1[0:ROWS, 0:D2], PartOut[slot * kv_heads + bh, 0:BR, D2:D])
+            T.dual_copy(
+                m_ub[0:ROWS],
+                PartLse[(slot * kv_heads + bh) * BR : (slot * kv_heads + bh + 1) * BR],
+            )
+
+    return main
+
+
 def build_prefill_split_kernel(**spec):
     """Compile (and cache) the split-KV prefill kernel (H19).  See `build_prefill_kernel`
     re: `num_pages_cap` (quantized to the ABI's declared capacity, key stays pool-agnostic)."""
@@ -1094,6 +1491,40 @@ def build_prefill_split_kernel(**spec):
     if kernel is None:
         kernel = tilelang.compile(
             paged_prefill_split_ascend950(**spec),
+            out_idx=[],
+            pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
+        )
+        _KERNEL_CACHE[key] = kernel
+    return kernel
+
+
+def build_prefill_split_head_kernel(**spec):
+    """Compile (and cache) the head-split prefill kernel (H20).  Same capacity/key contract
+    as :func:`build_prefill_split_kernel`."""
+    if spec.get("num_pages_cap") is not None:
+        spec["num_pages_cap"] = declared_pool_cap(spec["num_pages_cap"])
+    key = ("prefill_split_head",) + tuple(sorted(spec.items()))
+    kernel = _KERNEL_CACHE.get(key)
+    if kernel is None:
+        kernel = tilelang.compile(
+            paged_prefill_split_head_ascend950(**spec),
+            out_idx=[],
+            pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
+        )
+        _KERNEL_CACHE[key] = kernel
+    return kernel
+
+
+def build_prefill_split_frontier_kernel(**spec):
+    """Compile (and cache) the frontier-split prefill kernel (H20).  Same capacity/key
+    contract as :func:`build_prefill_split_kernel`."""
+    if spec.get("num_pages_cap") is not None:
+        spec["num_pages_cap"] = declared_pool_cap(spec["num_pages_cap"])
+    key = ("prefill_split_frontier",) + tuple(sorted(spec.items()))
+    kernel = _KERNEL_CACHE.get(key)
+    if kernel is None:
+        kernel = tilelang.compile(
+            paged_prefill_split_frontier_ascend950(**spec),
             out_idx=[],
             pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
         )
@@ -1437,71 +1868,37 @@ def plan_prefill_split_ctx(
     indices,
     device,
 ):
-    """Build the split-prefill step context entirely on the host (H19, zero device syncs).
+    """Build the split-prefill step context entirely on the host (H19/H20, zero device syncs).
 
-    Mirrors :func:`tileinfer.plan.plan_query_tiles_from_host`'s tile enumeration *exactly*
-    (same request order, same ``range(0, q_rows, block_q)`` q-blocks, same
-    ``range(0, pages, kv_tile_pages)`` splits — the two must never drift) and derives every
-    layer-independent structure a split prefill step needs, once per step:
+    Tile enumeration is the H20 two-kernel layout: every (request, q-block) is partitioned by
+    :func:`tileinfer.plan.frontier_page_splits` into fully-visible **head splits** (no per-row
+    causal predicate needed — the tilelang SimtVF multi-block mask bug's trigger surface) and
+    one **frontier split** (plain-kernel ``RowThr`` form, multi-block-verified).  All head
+    tiles enumerate first (request/q-block order), then all frontier tiles, so the runner can
+    slice the tile axis in two contiguous halves and launch one kernel per half; the merge
+    reads the dense ``(seq * ms + split)`` slots exactly as before.  Derived per step:
 
-    * ``schedule`` — the (KV-split) :class:`TileSchedule`, padded to ``kernel_tiles`` dead tiles
-      pointing at the trash row ``kernel_batch - 1`` (P3 canonical-variant quantization);
-    * ``row_thr`` / ``tile_page_lens`` / ``causal_shift`` / ``indptr`` / ``lpl`` / ``indices`` —
-      the kernel's mask/truncation/page-table inputs, previously derived per layer from device
-      tensors inside :func:`forward_prefill`, here plain host integers (the caller already holds
-      every length on the host; ``indices`` is the step's page table, padded to the declared
-      capacity here);
+    * ``schedule`` — the :class:`TileSchedule`, padded to ``kernel_tiles`` dead tiles pointing
+      at the trash row ``kernel_batch - 1`` (P3 canonical-variant quantization);
+    * ``row_thr`` — **frontier tiles only** (the head kernel takes no ``RowThr`` input);
+    * ``tile_page_lens`` / ``causal_shift`` / ``indptr`` / ``lpl`` / ``indices`` — the kernels'
+      truncation/page-table inputs (``indices`` padded to the declared capacity here);
     * ``pack_idx`` — flat gather index materialising ``q_packed`` from ``q_flat`` with one
-      ``index_select`` (split tiles of one q-block share the same query rows, so the old
-      per-tile Python pack loop would scale with the split factor);
+      ``index_select`` (head rows first, frontier rows after — matching the tile halves);
     * ``gather_idx`` / ``scatter_idx`` — the merge's slot gather (per q-block × split; missing
       entries point at a dedicated zero-weight trash slot) and the unpack scatter into
       ``out_flat``.
 
-    Split counts may differ per request (ragged pages); ``ms_compile`` is the power-of-two
-    ceiling and the slot layout's ``max_splits`` — unused splits gather the trash slot, which
-    carries ``(out=0, lse=-1e30)`` and merges at exactly zero weight.
-
-    A tile's page loop is cut to its causal frontier exactly like :func:`forward_prefill` does
-    (KV-rescan truncation): ``needed_pages = frontier // page_size + 1`` pages from page 0, so a
-    split tile covering ``[kv_start, kv_start + kv_len)`` scans
-    ``clamp(needed_pages - kv_start, 0, kv_len)`` pages; ranges entirely past the frontier run
-    zero iterations and merge at zero weight.
+    Split counts may differ per q-block (``P_vis`` moves with the block's first row);
+    ``ms_compile`` is the power-of-two ceiling and the slot layout's ``max_splits`` — unused
+    splits gather the trash slot, which carries ``(out=0, lse=-1e30)`` and merges at exactly
+    zero weight.
     """
-    from tileinfer.plan import TileSchedule, plan_query_tiles_from_host
-
-    schedule = plan_query_tiles_from_host(
-        [q * group for q in qo_tokens_host],
-        pages_host,
-        device=device,
-        block_q=block_q,
-        kv_tile_pages=kv_tile_pages,
-        load_balance=False,
-    )
-    if kernel_tiles != schedule.num_tiles:
-        from tileinfer.integrations.vllm_ascend import _pad_tile_schedule
-
-        schedule = _pad_tile_schedule(schedule, kernel_tiles, kernel_batch - 1)
-
-    ms_per_req = (
-        [max(1, -(-pages // kv_tile_pages)) for pages in pages_host]
-        if kv_tile_pages > 0
-        else [1] * len(pages_host)
-    )
-    ms_compile = 1
-    for ms in ms_per_req:
-        while ms_compile < ms:
-            ms_compile *= 2
+    from tileinfer.plan import TileSchedule, frontier_page_splits
 
     BR = block_q
-    kernel_slots = kernel_batch * ms_compile
-    num_qblocks = 0
-    pack: List[int] = []
-    gather: List[int] = []
-    scatter: List[int] = []
-    page_lens_host: List[int] = []
-    thr_host: List[int] = []
-    trash_part = kernel_slots * kv_heads  # flat row of the dedicated trash slot
+    # ---- enumerate the per-(request, q-block) structures once (host ints) ----
+    blocks = []  # (b, q_start, rows, splits, thr_rows)
     for b, qo_tokens in enumerate(qo_tokens_host):
         q_rows = qo_tokens * group
         pages = pages_host[b] if b < len(pages_host) else 0
@@ -1510,55 +1907,124 @@ def plan_prefill_split_ctx(
         lpl = lpl_host[b] if b < len(lpl_host) else page_size
         kv_tokens = (pages - 1) * page_size + lpl if pages > 0 else 0
         shift = kv_tokens - qo_tokens
-        splits = (
-            [(s, min(kv_tile_pages, pages - s)) for s in range(0, pages, kv_tile_pages)]
-            if kv_tile_pages > 0
-            else [(0, pages)]
-        )
         for q_start in range(0, q_rows, BR):
             rows = min(BR, q_rows - q_start)
-            q_pos_last = (q_start + rows - 1) // group
-            needed_pages = (q_pos_last + shift) // page_size + 1
-            # per-row causal thresholds, global KV positions (forward_prefill's RowThr, host
-            # form) — one full BR row set **per tile**, i.e. per split of this q-block
+            if kv_tile_pages > 0:
+                splits = frontier_page_splits(
+                    q_start,
+                    qo_tokens,
+                    pages,
+                    lpl,
+                    group=group,
+                    page_size=page_size,
+                    kv_tile_pages=kv_tile_pages,
+                )
+            else:
+                splits = [(0, pages, True)]
             thr_rows = [((q_start + i) // group + shift) if i < rows else -1 for i in range(BR)]
-            num_qblocks += 1
-            for split_id, (kv_start, kv_len) in enumerate(splits):
-                page_lens_host.append(max(0, min(needed_pages - kv_start, kv_len)))
-                thr_host.extend(thr_rows)
-                for bh in range(kv_heads):
-                    slot = (b * ms_compile + split_id) * kv_heads + bh
-                    gather.append(slot)
-                    for i in range(BR):
-                        # padding rows: point at real memory, masked by thr anyway
-                        pack.append(
-                            (b * kv_heads + bh) * (max_qo_tokens * group)
-                            + (q_start + i if i < rows else 0)
-                        )
-            # unpack scatter: source rows are merged.view(-1, dim), i.e. (g, bh, i)-major with
-            # ``i`` fastest within a head — keep the exact same order.  index_copy_ needs one
-            # index per source row, so padding rows point at out_flat's dedicated zero dummy
-            # row (allocated by the runner, never read: it sits past every live output row).
+            blocks.append((b, q_start, rows, splits, thr_rows))
+    ms_compile = 1
+    for _b, _q, _r, splits, _t in blocks:
+        while ms_compile < len(splits):
+            ms_compile *= 2
+
+    kernel_slots = kernel_batch * ms_compile
+    num_qblocks = 0
+    head_tiles = []  # (b, q_start, rows, kv_start, kv_len, split_id)
+    frontier_tiles = []  # (b, q_start, rows, kv_start, kv_len, split_id, thr_rows)
+    pack_h: List[int] = []
+    pack_f: List[int] = []
+    gather: List[int] = []
+    scatter: List[int] = []
+    trash_part = kernel_slots * kv_heads  # flat row of the dedicated trash slot
+    for b, q_start, rows, splits, thr_rows in blocks:
+        num_qblocks += 1
+        for split_id, (kv_start, kv_len, is_frontier) in enumerate(splits):
+            if is_frontier:
+                frontier_tiles.append((b, q_start, rows, kv_start, kv_len, split_id, thr_rows))
+            else:
+                head_tiles.append((b, q_start, rows, kv_start, kv_len, split_id))
             for bh in range(kv_heads):
+                slot = (b * ms_compile + split_id) * kv_heads + bh
+                gather.append(slot)
+                dst = pack_f if is_frontier else pack_h
                 for i in range(BR):
-                    if i < rows:
-                        scatter.append(
-                            (b * kv_heads + bh) * (max_qo_tokens * group) + q_start + i
-                        )
-                    else:
-                        scatter.append(-1)  # resolved to the dummy row by the runner
-            # splits this q-block does not have (ragged split counts under one power-of-two
-            # ``ms_compile``) gather the trash slot: (out=0, lse=-1e30) merges at zero weight
-            for _s in range(len(splits), ms_compile):
-                for _bh in range(kv_heads):
-                    gather.append(trash_part)
-    # dead (padding) tiles: zero page iterations, thr = -1, pack rows point at real memory
-    dead = schedule.num_tiles - (len(page_lens_host))
+                    dst.append(
+                        (b * kv_heads + bh) * (max_qo_tokens * group)
+                        + (q_start + i if i < rows else 0)
+                    )
+        # unpack scatter: source rows are merged.view(-1, dim), i.e. (g, bh, i)-major with
+        # ``i`` fastest within a head — keep the exact same order.  index_copy_ needs one
+        # index per source row, so padding rows point at out_flat's dedicated zero dummy
+        # row (allocated by the runner, never read: it sits past every live output row).
+        for bh in range(kv_heads):
+            for i in range(BR):
+                if i < rows:
+                    scatter.append(
+                        (b * kv_heads + bh) * (max_qo_tokens * group) + q_start + i
+                    )
+                else:
+                    scatter.append(-1)  # resolved to the dummy row by the runner
+        # splits this q-block does not have (ragged split counts under one power-of-two
+        # ``ms_compile``) gather the trash slot: (out=0, lse=-1e30) merges at zero weight
+        for _s in range(len(splits), ms_compile):
+            for _bh in range(kv_heads):
+                gather.append(trash_part)
+
+    # ---- head-half schedule/pack arrays (live tiles first, then dead padding at the tail
+    # of the frontier half) ----
+    seq_h = [t[0] for t in head_tiles]
+    qoff_h = [t[1] for t in head_tiles]
+    qrows_h = [t[2] for t in head_tiles]
+    kvs_h = [t[3] for t in head_tiles]
+    kvl_h = [t[4] for t in head_tiles]
+    sid_h = [t[5] for t in head_tiles]
+    pack = list(pack_h)
+    num_head_tiles = len(head_tiles)
+    # ---- frontier-half arrays: RowThr lives only here ----
+    seq_f = [t[0] for t in frontier_tiles]
+    qoff_f = [t[1] for t in frontier_tiles]
+    qrows_f = [t[2] for t in frontier_tiles]
+    kvs_f = [t[3] for t in frontier_tiles]
+    kvl_f = [t[4] for t in frontier_tiles]
+    sid_f = [t[5] for t in frontier_tiles]
+    thr_host: List[int] = []
+    page_lens_host: List[int] = [t[4] for t in head_tiles]  # head half first (tile order)
+    for t in frontier_tiles:
+        thr_host.extend(t[6])
+        page_lens_host.append(t[4])
+    pack.extend(pack_f)
+
+    # dead (padding) tiles: zero page iterations, thr = -1, pack rows point at real memory.
+    # They sit at the schedule's tail, i.e. always inside the frontier half.  (The integration
+    # always passes kernel_tiles = next_pow2(live) ≥ live; the max() just keeps the CPU tests'
+    # no-padding calls well-formed.)
+    dead = max(0, kernel_tiles - (num_head_tiles + len(frontier_tiles)))
+    seq_f.extend([kernel_batch - 1] * dead)
+    qoff_f.extend([0] * dead)
+    qrows_f.extend([0] * dead)
+    kvs_f.extend([0] * dead)
+    kvl_f.extend([0] * dead)
+    sid_f.extend([0] * dead)
     for _t in range(dead):
         page_lens_host.append(0)
         thr_host.extend([-1] * BR)
         for _bh in range(kv_heads):
             pack.extend([0] * BR)
+
+    num_tiles_total = num_head_tiles + len(frontier_tiles) + dead
+    schedule = TileSchedule(
+        seq_ids=torch.tensor(seq_h + seq_f, dtype=torch.int32, device=device),
+        q_offsets=torch.tensor(qoff_h + qoff_f, dtype=torch.int32, device=device),
+        q_lens=torch.tensor(qrows_h + qrows_f, dtype=torch.int32, device=device),
+        kv_page_starts=torch.tensor(kvs_h + kvs_f, dtype=torch.int32, device=device),
+        kv_page_lens=torch.tensor(kvl_h + kvl_f, dtype=torch.int32, device=device),
+        split_ids=torch.tensor(sid_h + sid_f, dtype=torch.int32, device=device),
+        # split_counts is unused by the split-prefill runner (slots come from split_ids);
+        # keep it well-formed for the dataclass anyway.
+        split_counts=torch.ones((num_tiles_total,), dtype=torch.int32, device=device),
+        order=torch.arange(num_tiles_total, dtype=torch.int32, device=device),
+    )
 
     # P3 canonical-variant batch padding: trash rows (0 pages, full-page lpl) so the derived
     # kv_len is exactly 0; a padded tile only ever references the trash row.
@@ -1585,6 +2051,8 @@ def plan_prefill_split_ctx(
         "kernel_slots": kernel_slots,
         "num_qblocks": num_qblocks,
         "num_tiles": schedule.num_tiles,
+        "num_head_tiles": num_head_tiles,
+        "num_frontier_tiles": schedule.num_tiles - num_head_tiles,
         "kv_heads": kv_heads,
         "block_q": BR,
         "tile_page_lens": torch.tensor(page_lens_host, dtype=torch.int32, device=device),
@@ -1694,6 +2162,7 @@ def forward_prefill_split(
     num_tiles = ctx["num_tiles"]
     ms = ctx["ms_compile"]
     kernel_slots = ctx["kernel_slots"]
+    num_head_tiles = ctx["num_head_tiles"]
     assert num_qo_heads == kv_heads * group
 
     # [batch, kv_heads, group, q_pos, dim] -> [batch, kv_heads, q_pos * group, dim]
@@ -1716,36 +2185,65 @@ def forward_prefill_split(
     part_out[-kv_heads:].zero_()
     part_lse[-kv_heads * br :].fill_(-1e30)
 
-    kernel = build_prefill_split_kernel(
+    # H20 two-kernel launch: the schedule/pack layout puts every head tile before every
+    # frontier tile, so the two halves slice off the same tensors contiguously.  Both write
+    # the same dense (seq * ms + split) partial slots; the merge is unchanged.
+    head_rows = num_head_tiles * kv_heads
+    frontier_rows = (num_tiles - num_head_tiles) * kv_heads
+    slots = (schedule.seq_ids.to(torch.int32) * ms + schedule.split_ids.to(torch.int32)).contiguous()
+    part_out_view = part_out.narrow(0, 0, kernel_slots * kv_heads)
+    part_lse_view = part_lse.narrow(0, 0, kernel_slots * kv_heads * br)
+    head_spec = dict(
         batch=batch,
         kv_heads=kv_heads,
         group=group,
         dim=dim,
         page_size=page_size,
         num_pages_cap=ctx["cap"],
-        num_tiles=num_tiles,
         max_splits=ms,
         block_q=br,
         dtype=dtype,
     )
-    kernel(
-        q_packed,
-        pool_view(k_cache, ctx["cap"]),
-        pool_view(v_cache, ctx["cap"]),
-        ctx["indptr"],
-        ctx["indices"],
-        ctx["lpl"],
-        schedule.seq_ids.to(torch.int32),
-        schedule.q_offsets.to(torch.int32),
-        schedule.q_lens.to(torch.int32),
-        schedule.kv_page_starts.to(torch.int32),
-        ctx["causal_shift"],
-        ctx["row_thr"],
-        ctx["tile_page_lens"],
-        (schedule.seq_ids.to(torch.int32) * ms + schedule.split_ids.to(torch.int32)).contiguous(),
-        part_out.narrow(0, 0, kernel_slots * kv_heads),
-        part_lse.narrow(0, 0, kernel_slots * kv_heads * br),
-    )
+    if head_rows > 0:
+        k_head = build_prefill_split_head_kernel(num_tiles=num_head_tiles, **head_spec)
+        k_head(
+            q_packed.narrow(0, 0, head_rows),
+            pool_view(k_cache, ctx["cap"]),
+            pool_view(v_cache, ctx["cap"]),
+            ctx["indptr"],
+            ctx["indices"],
+            ctx["lpl"],
+            schedule.seq_ids.to(torch.int32).narrow(0, 0, num_head_tiles),
+            schedule.q_offsets.to(torch.int32).narrow(0, 0, num_head_tiles),
+            schedule.q_lens.to(torch.int32).narrow(0, 0, num_head_tiles),
+            schedule.kv_page_starts.to(torch.int32).narrow(0, 0, num_head_tiles),
+            ctx["tile_page_lens"].narrow(0, 0, num_head_tiles),
+            slots.narrow(0, 0, num_head_tiles),
+            part_out_view,
+            part_lse_view,
+        )
+    if frontier_rows > 0:
+        k_frontier = build_prefill_split_frontier_kernel(
+            num_tiles=num_tiles - num_head_tiles, **head_spec
+        )
+        k_frontier(
+            q_packed.narrow(0, head_rows, frontier_rows),
+            pool_view(k_cache, ctx["cap"]),
+            pool_view(v_cache, ctx["cap"]),
+            ctx["indptr"],
+            ctx["indices"],
+            ctx["lpl"],
+            schedule.seq_ids.to(torch.int32).narrow(0, num_head_tiles, num_tiles - num_head_tiles),
+            schedule.q_offsets.to(torch.int32).narrow(0, num_head_tiles, num_tiles - num_head_tiles),
+            schedule.q_lens.to(torch.int32).narrow(0, num_head_tiles, num_tiles - num_head_tiles),
+            schedule.kv_page_starts.to(torch.int32).narrow(0, num_head_tiles, num_tiles - num_head_tiles),
+            ctx["causal_shift"],
+            ctx["row_thr"],
+            ctx["tile_page_lens"].narrow(0, num_head_tiles, num_tiles - num_head_tiles),
+            slots.narrow(0, num_head_tiles, num_tiles - num_head_tiles),
+            part_out_view,
+            part_lse_view,
+        )
 
     # Merge: log-sum-exp weights over the split axis (see _merge_prefill_partials), then one
     # scatter unpack into the flattened output rows.  The extra dummy row (all zeros, resolved

@@ -250,7 +250,8 @@ class PrefillShapeManager:
         try:
             from tileinfer.kernels.attention.paged_decode_ascend950 import (
                 build_prefill_kernel,
-                build_prefill_split_kernel,
+                build_prefill_split_head_kernel,
+                build_prefill_split_frontier_kernel,
             )
 
             if len(spec) == 9:  # plain prefill variant
@@ -276,7 +277,7 @@ class PrefillShapeManager:
                     block_q=block_q,
                     dtype=dtype_name,
                 )
-            else:  # split-KV prefill variant: the 10th field is ``max_splits`` (H19)
+            else:  # split-KV prefill variant: the 10th field is ``max_splits`` (H19/H20)
                 (
                     batch,
                     kv_heads,
@@ -289,7 +290,23 @@ class PrefillShapeManager:
                     dtype_name,
                     max_splits,
                 ) = spec
-                build_prefill_split_kernel(
+                # H20: the split-prefill step runs two kernels (head = fully-visible chunks,
+                # no per-row predicate; frontier = plain-form mask chunk).  Both share the
+                # spec; the tile axes differ per step, so prewarm builds the padded-size pair
+                # and lazy compiles fill in the exact sizes as traffic demands them.
+                build_prefill_split_head_kernel(
+                    batch=batch,
+                    kv_heads=kv_heads,
+                    group=group,
+                    dim=dim,
+                    page_size=page,
+                    num_pages_cap=pool_pages,
+                    num_tiles=num_tiles,
+                    max_splits=max_splits,
+                    block_q=block_q,
+                    dtype=dtype_name,
+                )
+                build_prefill_split_frontier_kernel(
                     batch=batch,
                     kv_heads=kv_heads,
                     group=group,
@@ -424,7 +441,11 @@ def prefill_step(
         max_splits = 0
         if ktp > 0:
             lpl_host = meta.kv_last_page_len.to(torch.int64).cpu().tolist()
-            splits_per_req = [max(1, -(-p // ktp)) for p in pages_host]
+            # H20 split counts: head chunks of the visible pages + one frontier split — the
+            # +1 keeps this *upper* bound estimate safe (it only sizes the tile budget and
+            # the slot layout's power-of-two ``max_splits``; the ctx computes the real split
+            # counts per q-block).
+            splits_per_req = [max(1, -(-p // ktp) + 1) for p in pages_host]
             split_tiles = sum(
                 ((q * group + 127) // 128) * s for q, s in zip(qo_host, splits_per_req)
             )

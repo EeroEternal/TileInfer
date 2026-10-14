@@ -166,6 +166,47 @@ def plan_query_tiles(
     )
 
 
+def frontier_page_splits(
+    q_start_rows: int,
+    qo_tokens: int,
+    pages: int,
+    lpl: int,
+    *,
+    group: int,
+    page_size: int,
+    kv_tile_pages: int,
+) -> List[Tuple[int, int, bool]]:
+    """H20 split-prefill page partitioning for ONE (request, query-block): the
+    fully-visible head splits plus the frontier split.
+
+    A KV page ``p`` is *fully visible* to the query block when its last token position
+    ``(p + 1) * page_size - 1`` is ``<=`` the **lowest** row's causal threshold
+    ``min_thr = q_start_rows // group + (kv_tokens - qo_tokens)`` — every row of the block
+    then attends to the whole page, so the head kernel needs no per-row causal predicate
+    (which is what sidesteps the tilelang SimtVF multi-block mask bug, E48): head splits tile
+    ``[0, P_vis)`` where ``P_vis = (min_thr + 1) // page_size`` into ``kv_tile_pages``-page
+    chunks; the single **frontier split** covers ``[P_vis, pages)`` (absent when
+    ``P_vis >= pages``) and keeps the plain kernel's per-row ``RowThr`` form
+    (multi-block-verified, 0a99edd).
+
+    Returns ``[(kv_start, kv_len, is_frontier), ...]``; ``kv_len`` is the true page count (the
+    frontier split is *not* frontier-truncated — the RowThr mask does the row-level cutting).
+    """
+    assert kv_tile_pages > 0
+    if qo_tokens <= 0 or pages <= 0:
+        return []
+    kv_tokens = (pages - 1) * page_size + lpl
+    min_thr = q_start_rows // group + (kv_tokens - qo_tokens)
+    p_vis = (min_thr + 1) // page_size
+    p_vis = max(0, min(p_vis, pages))
+    splits: List[Tuple[int, int, bool]] = []
+    for s in range(0, p_vis, kv_tile_pages):
+        splits.append((s, min(kv_tile_pages, p_vis - s), False))
+    if p_vis < pages:
+        splits.append((p_vis, pages - p_vis, True))
+    return splits
+
+
 def plan_query_tiles_from_host(
     qo_lens: List[int],
     page_counts: List[int],

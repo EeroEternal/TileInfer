@@ -1,15 +1,18 @@
-"""Device tests for the split-KV **prefill** kernel (H19).
+"""Device tests for the split-KV **prefill** kernels (H19/H20).
 
-The split kernel must be numerically transparent: every (q-block, split) partial goes through
+The split step must be numerically transparent: every (q-block, split) partial goes through
 the LSE-weighted merge, so the merged output must equal both
 
 * the fp32 torch oracle (:func:`reference_attention`) — the absolute contract, and
 * the *unsplit* prefill kernel on identical inputs — the equivalence contract (same arithmetic,
   different work partition).
 
-Cases cover: plain prefill over many pages, append with a partial tail page, ragged split
-counts in one batch (per-request ``ceil(pages/ktp)`` differing), head_dim 256 in the serving
-configuration (kvh=2, group=8), and the P3 padding paths (batch trash row + pow2 tile padding).
+H20 runs two kernels per step (head = fully-visible page chunks with no per-row predicate,
+frontier = the plain kernel's RowThr form over ``[P_vis, pages)``), launched from the same
+``forward_prefill_split`` public path, so these cases exercise both.  Cases cover: plain
+prefill over many pages (no prefix — pure frontier form), append with a partial tail page
+(mixed head+frontier), ragged split counts in one batch, page-granular splits, head_dim 256
+in the serving configuration (kvh=2, group=8), and the P3 padding paths.
 """
 
 from __future__ import annotations
@@ -31,13 +34,6 @@ pytestmark = [
     pytest.mark.npu,
     pytest.mark.skipif(not is_npu_available(), reason="no Ascend NPU available"),
     pytest.mark.skipif(not _HAVE_ASCEND950, reason="tilelang.ascend (>=0.1.15) not importable"),
-    # H19 现状(iter-039,E48):split 内核在 ≥4 tile 的多块发射下,SimtVF 因果掩码在部分
-    # 块上概率性失效(误差随块数增长;2 tile 完全正确;单 tile 正确;thr_ub 设备端打印内容
-    # 正确)——tilelang 层 codegen 问题,复现与取证链见 .agent_loop/run/h19_debug.py 与
-    # EVIDENCE E48。修复前这些数值用例保持跳过;CPU 侧契约测试见
-    # test_vllm_ascend_prefill_split_ctx.py(7 用例全绿)。
-    pytest.mark.skip(reason="H19 split-prefill: tilelang SimtVF mask mis-lowering on multi-block "
-                            "launches (E48) — enable after the kernel-side fix"),
 ]
 
 DTYPE = torch.bfloat16
