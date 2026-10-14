@@ -146,6 +146,18 @@ def _bucket_for(num_reqs: int) -> int:
 #: 128 ``(q_pos, head)`` rows, so 4096 tiles ≈ a 64K-token chunk at group=8).
 PREFILL_MAX_TILES = int(__import__("os").environ.get("TILEINFER_PREFILL_MAX_TILES", "4096"))
 
+# Per-step metadata dedup for prefill (H18, the B3 step-guard extended to the prefill path):
+# vLLM hands the *same* attention-metadata instance to every full-attention layer of a step and
+# builds a fresh one per step, but everything ``prefill_step`` derives from it (qo lengths, the
+# ragged page-table triple, the tile schedule, the compiled-shape decision) is layer-independent.
+# E45 measured the redundancy at ~10x: per mixed step that was ~180 host-device syncs and a
+# ~5.5 GB q_pad zero-fill just to re-derive identical values — the W1-C8 pathology's prime
+# suspect.  Keyed on the metadata's identity exactly like the decode guard above: the strong
+# reference keeps the guarded id alive, so no *other* live object can ever collide with it.
+_PREFILL_STEP_GUARD: int = 0
+_PREFILL_STEP_OBJ: Any = None  # strong ref: keeps the guarded id unique while it guards
+_PREFILL_STEP_SHARED: dict = {}
+
 
 def _next_pow2(n: int) -> int:
     """Smallest power of two ``>= n`` (P3 canonical tile quantization; 1 stays 1)."""
@@ -289,6 +301,7 @@ def prefill_step(
     head_size: int,
     scale: float,
     batch_cap: int = 0,
+    step_obj: Any = None,
 ) -> bool:
     """One prefill/append step through the TileLang prefill kernel (BACKLOG B1).
 
@@ -300,42 +313,133 @@ def prefill_step(
     prefix) uniformly: the kernel's per-row causal threshold ``q_pos + (kv_len - qo_len)`` makes
     all three the same computation.
 
+    ``step_obj`` is the step's attention-metadata object (vLLM passes the same instance to every
+    layer of a step and builds a fresh one per step); when provided, the shared metadata-build
+    chain (page-table walk, tile schedule, shape decision — everything layer-independent, H18/E45)
+    runs only for the first layer of the step, mirroring the decode path's B3 step-guard.
+
     Returns True when TileInfer served the step; False means "use FIA" (shape not compiled yet
     or structurally unsupported).  Eager-only: must not be called under a graph capture.
     """
+    global _PREFILL_STEP_GUARD, _PREFILL_STEP_OBJ
     num_reqs = int(seq_lens.numel())
     if num_reqs == 0 or num_reqs != int(query_start_loc.numel()) - 1:
         _refuse("req/qsl mismatch", num_reqs, int(query_start_loc.numel()) - 1)
         return False
-    group = max(1, num_heads // num_kv_heads)
-    qo_host = (query_start_loc[1:] - query_start_loc[:-1]).to(torch.int64).cpu().tolist()
-    if sum(qo_host) != int(query.shape[0]):
-        # 常见原因:runner 对 query 做了 token 填充(短批尤甚)。padding 行的输出会被 vLLM
-        # 裁掉,因此只要 sum(qo) <= num_tokens 就可以安全接管,多余行不读不写。
-        if sum(qo_host) > int(query.shape[0]):
-            _refuse("qo sum exceeds tokens", sum(qo_host), int(query.shape[0]))
+
+    step_id = id(step_obj) if step_obj is not None else None
+    shared = _PREFILL_STEP_SHARED if (step_id is not None and step_id == _PREFILL_STEP_GUARD) else None
+    if shared is not None and (
+        shared["num_reqs"] != num_reqs or shared["sum_qo"] != int(query.shape[0])
+    ):
+        shared = None  # belt-and-braces: a guard hit must still describe *this* step
+
+    if shared is None:
+        # First layer of this step (or a library-level caller without step identity):
+        # build the layer-independent payload once.
+        group = max(1, num_heads // num_kv_heads)
+        qo_host = (query_start_loc[1:] - query_start_loc[:-1]).to(torch.int64).cpu().tolist()
+        if sum(qo_host) != int(query.shape[0]):
+            # 常见原因:runner 对 query 做了 token 填充(短批尤甚)。padding 行的输出会被 vLLM
+            # 裁掉,因此只要 sum(qo) <= num_tokens 就可以安全接管,多余行不读不写。
+            if sum(qo_host) > int(query.shape[0]):
+                _refuse("qo sum exceeds tokens", sum(qo_host), int(query.shape[0]))
+                return False
+        max_tiles = sum((q * group + 127) // 128 for q in qo_host)
+        if max_tiles == 0 or max_tiles > PREFILL_MAX_TILES:
+            _refuse("tile bound", max_tiles, PREFILL_MAX_TILES)
             return False
-    max_tiles = sum((q * group + 127) // 128 for q in qo_host)
-    if max_tiles == 0 or max_tiles > PREFILL_MAX_TILES:
-        _refuse("tile bound", max_tiles, PREFILL_MAX_TILES)
-        return False
 
-    from tileinfer.metadata import ragged_from_page_table_device
-    from tileinfer.plan import plan_query_tiles
-    from tileinfer.kernels.attention.paged_decode_ascend950 import declared_pool_cap
+        from tileinfer.metadata import ragged_from_page_table_device
+        from tileinfer.plan import plan_query_tiles_from_host
+        from tileinfer.kernels.attention.paged_decode_ascend950 import declared_pool_cap
 
-    device = query.device
-    sub = _sub_pages(block_size)
-    table_exp = _expand_page_table(block_tables[:num_reqs], sub)
-    # Kernel-page metadata: the same masking the decode path does, but eager (masked_select's
-    # implicit sync is fine outside a capture).
-    meta = ragged_from_page_table_device(table_exp, seq_lens[:num_reqs], KERNEL_PAGE_SIZE)
+        device = query.device
+        sub = _sub_pages(block_size)
+        table_exp = _expand_page_table(block_tables[:num_reqs], sub)
+        # Kernel-page metadata: the same masking the decode path does, but eager (masked_select's
+        # implicit sync is fine outside a capture).
+        meta = ragged_from_page_table_device(table_exp, seq_lens[:num_reqs], KERNEL_PAGE_SIZE)
 
-    max_qo = max(qo_host)
+        dtype_name = _TORCH_DTYPE_NAME.get(query.dtype)
+        if dtype_name is None:
+            _refuse("dtype", str(query.dtype), "bfloat16/float16")
+            return False
+        if num_reqs > BATCH_BUCKETS[-1]:
+            _refuse("batch over largest bucket", num_reqs, BATCH_BUCKETS[-1])
+            return False
+        pool_pages = declared_pool_cap(int(_pool_sub_view(key_cache, sub).shape[0]))
+        # P3 canonical variant quantization: the compiled shape is not the step's exact
+        # ``(batch, num_tiles)`` but ``(_bucket_for(batch_cap) + 1 trash rows, next pow2 tiles)``.
+        # The trash row owns zero pages (padded tiles pointing at it run zero KV iterations) and
+        # padded tiles carry q_len == 0 (fully masked, output unread), so the padding is invisible
+        # semantically — and ``prewarm()`` can enumerate the whole canonical ladder (≤ 32 variants),
+        # which is what removes the ~110 s first-seen lazy compile from serving.
+        cap = int(batch_cap) if batch_cap and batch_cap >= num_reqs else num_reqs
+        kernel_batch = _bucket_for(cap) + 1
+        kernel_tiles = _next_pow2(max_tiles)
+        spec = (
+            kernel_batch,
+            num_kv_heads,
+            group,
+            head_size,
+            KERNEL_PAGE_SIZE,
+            pool_pages,
+            kernel_tiles,
+            128,
+            dtype_name,
+        )
+        if not PrefillShapeManager.usable(spec):
+            return False
+
+        # Host-side page counts for the schedule: one extra tiny D2H, still once per step (was
+        # per layer, and went through plan_query_tiles' per-row ``.item()`` storm on top).
+        pages_host = (meta.kv_indptr[1:] - meta.kv_indptr[:-1]).to(torch.int64).cpu().tolist()
+        schedule = plan_query_tiles_from_host(
+            [q * group for q in qo_host],
+            pages_host,
+            device=device,
+            block_q=128,
+            load_balance=False,
+        )
+        if kernel_tiles != schedule.num_tiles:
+            schedule = _pad_tile_schedule(schedule, kernel_tiles, kernel_batch - 1)
+        qo_dev = torch.tensor(qo_host, dtype=torch.int32, device=device)
+        shared = {
+            "num_reqs": num_reqs,
+            "sum_qo": int(query.shape[0]),
+            "group": group,
+            "qo_host": qo_host,
+            "max_qo": max(qo_host),
+            "kernel_batch": kernel_batch,
+            "meta": meta,
+            "schedule": schedule,
+            "qo_dev": qo_dev,
+        }
+        if step_id is not None:
+            _PREFILL_STEP_GUARD = step_id
+            _PREFILL_STEP_OBJ = step_obj  # strong ref: keeps the id unique while it guards
+            _PREFILL_STEP_SHARED.clear()
+            _PREFILL_STEP_SHARED.update(shared)
+            cls_stats = TileInferDecodeAttention._stats
+            cls_stats["prefill_refreshes"] = cls_stats.get("prefill_refreshes", 0) + 1
+            if cls_stats["prefill_refreshes"] <= 12:
+                logger.info(
+                    "TileInfer prefill step build #%d: metadata id=%s batch=%d tiles=%d",
+                    cls_stats["prefill_refreshes"],
+                    step_id,
+                    kernel_batch,
+                    kernel_tiles,
+                )
+    else:
+        group = shared["group"]
+
+    qo_host = shared["qo_host"]
+    max_qo = shared["max_qo"]
     # [num_tokens, H, D] -> [batch, H, max_qo, D]: one permuted copy per request.  Rows past
     # qo_lens[b] stay zero; the kernel's row thresholds mask them out of the softmax.
     q_pad = torch.zeros(
-        (num_reqs, num_heads, max_qo, head_size), dtype=query.dtype, device=device
+        (num_reqs, num_heads, max_qo, head_size), dtype=query.dtype, device=query.device
     )
     offset = 0
     for b, qo in enumerate(qo_host):
@@ -343,58 +447,18 @@ def prefill_step(
             q_pad[b, :, :qo].copy_(query[offset : offset + qo].permute(1, 0, 2))
         offset += qo
 
-    dtype_name = _TORCH_DTYPE_NAME.get(query.dtype)
-    if dtype_name is None:
-        _refuse("dtype", str(query.dtype), "bfloat16/float16")
-        return False
-    if num_reqs > BATCH_BUCKETS[-1]:
-        _refuse("batch over largest bucket", num_reqs, BATCH_BUCKETS[-1])
-        return False
-    pool_pages = declared_pool_cap(int(_pool_sub_view(key_cache, sub).shape[0]))
-    # P3 canonical variant quantization: the compiled shape is not the step's exact
-    # ``(batch, num_tiles)`` but ``(_bucket_for(batch_cap) + 1 trash rows, next pow2 tiles)``.
-    # The trash row owns zero pages (padded tiles pointing at it run zero KV iterations) and
-    # padded tiles carry q_len == 0 (fully masked, output unread), so the padding is invisible
-    # semantically — and ``prewarm()`` can enumerate the whole canonical ladder (≤ 32 variants),
-    # which is what removes the ~110 s first-seen lazy compile from serving.
-    cap = int(batch_cap) if batch_cap and batch_cap >= num_reqs else num_reqs
-    kernel_batch = _bucket_for(cap) + 1
-    kernel_tiles = _next_pow2(max_tiles)
-    spec = (
-        kernel_batch,
-        num_kv_heads,
-        group,
-        head_size,
-        KERNEL_PAGE_SIZE,
-        pool_pages,
-        kernel_tiles,
-        128,
-        dtype_name,
-    )
-    if not PrefillShapeManager.usable(spec):
-        return False
-
-    schedule = plan_query_tiles(
-        (torch.tensor(qo_host, dtype=torch.int64, device=device) * group),
-        (meta.kv_indptr[1:] - meta.kv_indptr[:-1]).to(torch.int64),
-        block_q=128,
-        load_balance=False,
-    )
-    if kernel_tiles != schedule.num_tiles:
-        schedule = _pad_tile_schedule(schedule, kernel_tiles, kernel_batch - 1)
-    qo_dev = torch.tensor(qo_host, dtype=torch.int32, device=device)
     from tileinfer.kernels.attention.paged_decode_ascend950 import forward_prefill
 
     out4 = forward_prefill(
         q_pad,
-        _pool_sub_view(key_cache, sub),
-        _pool_sub_view(value_cache, sub),
-        meta,
-        schedule,
-        qo_dev,
+        _pool_sub_view(key_cache, _sub_pages(block_size)),
+        _pool_sub_view(value_cache, _sub_pages(block_size)),
+        shared["meta"],
+        shared["schedule"],
+        shared["qo_dev"],
         group=group,
         block_q=128,
-        kernel_batch=kernel_batch,
+        kernel_batch=shared["kernel_batch"],
     )
     # Unpack [batch, H, max_qo, D] -> [num_tokens, H, D] with the engine's layout.
     offset = 0
@@ -1123,6 +1187,7 @@ def _build_classes():
                     head_size=self.head_size,
                     scale=self.scale,
                     batch_cap=batch_cap,
+                    step_obj=attn_metadata,
                 )
                 if not served:
                     TileInferDecodeAttention._stats["prefill_fallbacks"] = (

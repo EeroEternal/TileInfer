@@ -156,6 +156,30 @@ def plan_query_tiles(
     ``kv_tile_pages > 0`` additionally splits each tile along the KV axis (shared-prefix and
     very long context cases), which is what makes cascade/chunked prefill cheap.
     """
+    return plan_query_tiles_from_host(
+        [int(x) for x in qo_lens.to(torch.int64).cpu().tolist()],
+        [int(x) for x in page_counts.to(torch.int64).cpu().tolist()],
+        device=qo_lens.device,
+        block_q=block_q,
+        kv_tile_pages=kv_tile_pages,
+        load_balance=load_balance,
+    )
+
+
+def plan_query_tiles_from_host(
+    qo_lens: List[int],
+    page_counts: List[int],
+    device: Optional[torch.device] = None,
+    block_q: int = 128,
+    kv_tile_pages: int = 0,
+    load_balance: bool = True,
+) -> TileSchedule:
+    """:func:`plan_query_tiles` on host lists: zero ``.item()`` syncs for callers that
+    already hold the lengths on the host (the integration layer's per-step shared build).
+
+    Semantics are identical to the tensor entry point (the original read the tensors row by
+    row via ``.item()`` anyway); ``device`` is where the schedule tensors are allocated.
+    """
     seq_ids: List[int] = []
     q_offsets: List[int] = []
     q_lens: List[int] = []
@@ -164,11 +188,8 @@ def plan_query_tiles(
     split_ids: List[int] = []
     split_counts: List[int] = []
 
-    qo_lens = qo_lens.to(torch.int64)
-    page_counts = page_counts.to(torch.int64)
-    for b in range(qo_lens.numel()):
-        q_len = int(qo_lens[b].item())
-        pages = int(page_counts[b].item())
+    for b, q_len in enumerate(qo_lens):
+        pages = page_counts[b] if b < len(page_counts) else 0
         if q_len <= 0:
             continue
         if kv_tile_pages <= 0:
@@ -188,20 +209,20 @@ def plan_query_tiles(
                 split_counts.append(len(splits))
 
     if not seq_ids:
-        return _empty_schedule(qo_lens.device)
+        return _empty_schedule(device)
 
     schedule = TileSchedule(
-        seq_ids=torch.tensor(seq_ids, dtype=torch.int32, device=qo_lens.device),
-        q_offsets=torch.tensor(q_offsets, dtype=torch.int32, device=qo_lens.device),
-        q_lens=torch.tensor(q_lens, dtype=torch.int32, device=qo_lens.device),
-        kv_page_starts=torch.tensor(kv_starts, dtype=torch.int32, device=qo_lens.device),
-        kv_page_lens=torch.tensor(kv_lens, dtype=torch.int32, device=qo_lens.device),
-        split_ids=torch.tensor(split_ids, dtype=torch.int32, device=qo_lens.device),
-        split_counts=torch.tensor(split_counts, dtype=torch.int32, device=qo_lens.device),
+        seq_ids=torch.tensor(seq_ids, dtype=torch.int32, device=device),
+        q_offsets=torch.tensor(q_offsets, dtype=torch.int32, device=device),
+        q_lens=torch.tensor(q_lens, dtype=torch.int32, device=device),
+        kv_page_starts=torch.tensor(kv_starts, dtype=torch.int32, device=device),
+        kv_page_lens=torch.tensor(kv_lens, dtype=torch.int32, device=device),
+        split_ids=torch.tensor(split_ids, dtype=torch.int32, device=device),
+        split_counts=torch.tensor(split_counts, dtype=torch.int32, device=device),
         balanced=load_balance,
     )
     schedule.order = lpt_order(schedule.work) if load_balance else torch.arange(
-        schedule.num_tiles, dtype=torch.int32, device=qo_lens.device
+        schedule.num_tiles, dtype=torch.int32, device=device
     )
     return schedule
 
