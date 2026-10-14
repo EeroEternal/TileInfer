@@ -43,13 +43,20 @@ import torch
 import tilelang
 import tilelang.ascend.language as T
 
+# D45: pre-NZ weight path -- the UB staging buffer carries the compact-NZ layout so the UB->L1
+# copy lowers to a raw DMA instead of the nd2nz conversion (see benchmarks/probes/moe_prenz_nd2nz.py).
+from tilelang.layout import make_ascend_compact_nz_layout
+from tilelang.language import annotate_layout
+
 __all__ = [
     "moe_gate_up_swiglu",
     "moe_gate_up_swiglu_paired",
     "moe_down",
+    "moe_down_prenz",
     "build_gate_up_kernel",
     "build_gate_up_paired_kernel",
     "build_down_kernel",
+    "build_down_prenz_kernel",
     "pair_gate_up_rows",
 ]
 
@@ -324,6 +331,107 @@ def moe_down(
 
 
 _KERNEL_CACHE: dict = {}
+
+
+def moe_down_prenz(
+    num_tiles_max: int,
+    rows_slots: int,
+    num_experts: int,
+    inter: int,
+    hidden: int,
+    block_m: int = 32,
+    block_n: int = 64,
+    block_k: int = 512,
+    dtype: str = "bfloat16",
+    threads: int = 128,
+):
+    """Down-projection grouped GEMM with a **pre-packed NZ** weight (D45, restart路线).
+
+    Identical arithmetic to :func:`moe_down`, but the weight is read from a compact-NZ packed
+    tensor ``W2nz`` ``[E * NT, block_n, block_k]`` (one NZ tile per (expert, n-tile); see
+    :mod:`tileinfer.kernels.moe.prenz`) through a UB staging buffer annotated with
+    ``make_ascend_compact_nz_layout``.  Per the offline probe (``benchmarks/probes/moe_prenz_nd2nz.py``)
+    this makes the weight path lower to ``asc_copy_gm2ub_align`` + ``asc_copy_ub2l1`` instead of the
+    ``asc_copy_gm2l1_nd2nz`` conversion E36 identified as the structural bottleneck.
+
+    A single K iteration is required (``block_k == inter``) so the packed tile covers the whole
+    reduction axis; the caller packs one ``[block_n, inter]`` NZ tile per (expert, n-tile).
+    """
+    EM = num_tiles_max
+    R = rows_slots
+    E = num_experts
+    I = inter
+    H = hidden
+    BN = block_n
+    BK = block_k
+    ROWS = block_m // 2
+    NT = H // BN
+    total = EM * NT
+    rounds = (total + NUM_CORES - 1) // NUM_CORES
+    assert H % BN == 0 and block_k == I and block_m % 2 == 0, (
+        "pre-NZ down needs block_k == inter (single K iteration) so one packed NZ tile covers K"
+    )
+    # The weight is packed per (expert, n-tile) as a [BN, I] NZ tile, so the leading axis is E*NT.
+    WT = E * NT
+
+    @T.prim_func
+    def main(
+        Y: T.Tensor((R, I), dtype),
+        W2nz: T.Tensor((WT, BN, BK), dtype),
+        ExpertIds: T.Tensor((EM,), "int32"),
+        SortedIds: T.Tensor((R,), "int32"),
+        Out: T.Tensor((R, H), dtype),
+    ):
+        with T.Kernel(NUM_CORES) as bx:
+            w_ub = T.alloc_shared((BN + 1, BK), dtype)  # +1 pad row per the compact-NZ contract
+            a_l1 = T.alloc_l1((block_m, BK), dtype)
+            w_l1 = T.alloc_l1((BN, BK), dtype)
+            ga = T.alloc_l0a((block_m, BK), dtype)
+            gb = T.alloc_l0b((BN, BK), dtype)
+            acc = T.alloc_l0c((block_m, BN), "float32")
+            o_ub = T.alloc_shared((ROWS, BN), "float32")
+            o_cast = T.alloc_shared((ROWS, BN), dtype)
+            annotate_layout({w_ub: make_ascend_compact_nz_layout(w_ub)})
+
+            for it in T.serial(rounds):
+                idx = bx + it * NUM_CORES
+                with T.If(idx < total):
+                    with T.Then():
+                        tile = idx // NT
+                        nt = idx % NT
+                        eid = ExpertIds[tile]
+                        row0 = tile * block_m
+                        active = SortedIds[row0] < R
+                        with T.If(active):
+                            with T.Then():
+                                n0 = nt * BN
+                                T.copy(Y[row0:row0 + block_m, 0:BK], a_l1)
+                                T.copy(W2nz[eid * NT + nt, 0:BN, 0:BK], w_ub[0:BN, 0:BK])
+                                T.copy(w_ub[0:BN, 0:BK], w_l1)
+                                T.copy(a_l1, ga)
+                                T.copy(w_l1, gb)
+                                T.gemm(ga, gb, acc, transpose_B=True, clear_accum=True)
+                                T.dual_copy(acc, o_ub)
+                                with T.SimtVF(threads=threads):
+                                    for r, c in T.Parallel(ROWS, BN):
+                                        o_cast[r, c] = T.Cast(dtype, o_ub[r, c])
+                                T.dual_copy(o_cast[0:ROWS, 0:BN], Out[row0:row0 + block_m, n0:n0 + BN])
+
+    return main
+
+
+def build_down_prenz_kernel(**spec):
+    """Compile (and cache) the pre-NZ down kernel (manual output)."""
+    key = ("down_prenz",) + tuple(sorted(spec.items()))
+    kernel = _KERNEL_CACHE.get(key)
+    if kernel is None:
+        kernel = tilelang.compile(
+            moe_down_prenz(**spec),
+            out_idx=[],
+            pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
+        )
+        _KERNEL_CACHE[key] = kernel
+    return kernel
 
 
 def build_gate_up_kernel(**spec):

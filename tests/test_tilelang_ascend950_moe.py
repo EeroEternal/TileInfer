@@ -178,3 +178,61 @@ def test_end_to_end_vs_full_oracle():
     ref = reference_moe(x, w13, w2, topk_ids, topk_weights)
     diff = (combined - ref).abs().max().item()
     assert diff < 4 * TOL, f"end-to-end mismatch {diff}"
+
+
+def _run_down_prenz(y, w2, topk_ids, block_m=BM, block_n=64):
+    """Down projection through the pre-NZ weight path (D45).
+
+    Pack each expert's ``w2[e]`` ``[H, I]`` into ``NT = H // block_n`` NZ tiles of ``[block_n, I]``
+    (block_k == I), concatenated over (expert, n-tile) -- the layout ``moe_down_prenz`` expects.
+    """
+    from tileinfer.kernels.moe import build_down_prenz_kernel
+    from tileinfer.kernels.moe.prenz import pack_nd_to_compact_nz
+
+    lay = build_slot_layout(topk_ids, block_m, num_experts=w2.shape[0])
+    rows_slots = lay["num_tiles"] * block_m
+    nt = H // block_n
+    # [E, H, I] -> [E, NT, block_n, I] -> packed NZ -> [E*NT, block_n, I]
+    tiles = w2.view(w2.shape[0], nt, block_n, I)
+    packed = pack_nd_to_compact_nz(tiles.reshape(-1, block_n, I)).reshape(w2.shape[0] * nt, block_n, I)
+    kernel = build_down_prenz_kernel(
+        num_tiles_max=lay["num_tiles"],
+        rows_slots=rows_slots,
+        num_experts=w2.shape[0],
+        inter=I,
+        hidden=H,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=I,
+    )
+    out = torch.empty((rows_slots, H), dtype=DTYPE, device=y.device)
+    kernel(y.contiguous(), packed, lay["expert_ids"], lay["sorted_ids"], out)
+    return out, lay
+
+
+@pytest.mark.parametrize("tokens", [4, 32])
+def test_down_prenz_matches_down(tokens):
+    """The pre-NZ down kernel must match the plain ND down kernel bit-for-bit-ish.
+
+    Both compute the same GEMM; the only difference is how the weight reaches L1 (raw DMA vs
+    nd2nz conversion), so the results must agree to bf16 tolerance.
+    """
+    x, w13, w2, topk_ids, _ = _make_case(tokens, E, seed=100 + tokens)
+    y, _ = _run_gate_up(x, w13, topk_ids)
+    out_nd, lay = _run_down(y, w2, topk_ids)
+    out_nz, _ = _run_down_prenz(y, w2, topk_ids)
+    valid = lay["sorted_ids"] < lay["num_expanded"]
+    diff = (out_nd[valid].float() - out_nz[valid].float()).abs().max().item()
+    assert diff < TOL, f"pre-NZ down vs ND down mismatch {diff}"
+
+    # and against the fp32 oracle (the authority on whether the packed layout is correct)
+    expanded = x.unsqueeze(1).expand(-1, TOPK, -1).reshape(-1, H)
+    x_slots = gather_slots(expanded, lay["sorted_ids"], lay["num_expanded"])
+    y_ref = reference_gate_up_swiglu_slots(
+        x_slots, w13, lay["expert_ids"], lay["sorted_ids"], lay["num_expanded"], BM
+    )
+    out_ref = reference_down_slots(
+        y_ref, w2, lay["expert_ids"], lay["sorted_ids"], lay["num_expanded"], BM
+    )
+    diff_oracle = (out_nz[valid].float() - out_ref[valid]).abs().max().item()
+    assert diff_oracle < TOL, f"pre-NZ down vs oracle mismatch {diff_oracle}"
