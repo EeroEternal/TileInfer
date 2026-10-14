@@ -1115,6 +1115,10 @@ def forward_prefill(
         tile_page_lens = torch.where(
             schedule.q_lens.to(torch.int64) > 0, needed, torch.zeros_like(needed)
         ).clamp(min=0).to(torch.int32)
+        if os.environ.get("TILEINFER_PREFILL_NOSCAN_OFF"):
+            # Debug-only: disable the truncation (scan every page) so the pre-truncation baseline can
+            # be reproduced back to back.  Off by default; never set in serving.
+            tile_page_lens = torch.full_like(tile_page_lens, 1 << 30)
 
     kernel = build_prefill_kernel(
         batch=kb,

@@ -176,7 +176,7 @@ flips.  Enabling is now an engineering decision, not a safety one.
 
 ## PM-2 — multi-tile prefill was off by a row offset (resolved)
 
-**Status:** resolved (with a documented cost) · `tilelang-ascend950` prefill path.
+**Status:** resolved (full M tile, no host restriction, 5730b66) · `tilelang-ascend950` prefill path.
 
 ### Symptom
 
@@ -199,17 +199,28 @@ explicit mixed-kernel structure: `with T.Vector(vector=2) as sid:` (documented i
 `tilelang/ascend/language/frame.py`, where `sid = asc_get_sub_block_id()`), which also implies
 wrapping the cube work in `with T.Cube():`.
 
-### Resolution
+### Resolution (full M tile, 5730b66)
 
-For now: **the caller plans its query tiles with `block_q // 2` rows**, so every live row is in the
-first AIV half.  `forward_prefill` enforces it and explains why; the tests cover multi-tile prefill,
-append, a partial tail page and a ragged batch.  The cost is that half of the M tile is padding, i.e.
-~2x the cube work a prefill could need.
+Rather than obtain the AIV index, the **host precomputes each row's causal threshold** ``q_pos +
+shift`` into a ``RowThr`` array (rows past the live count get ``-1``) and the kernel ``dual_copy``s it
+exactly like ``s_ub`` — so each AIV half receives its own half of the thresholds and the mask is
+correct on both halves without the kernel ever needing ``sid``.  The ``block_q // 2`` planning
+restriction and the ``forward_prefill`` guard are **gone**; the full ``block_q`` tile is used end to
+end (``tests/test_tilelang_ascend950_prefill.py`` covers multi-tile prefill, append, a partial tail
+page and a ragged batch at ``block_q == 128``).  The earlier ``block_q // 2`` workaround — half the M
+tile wasted, ~2x the cube work — is no longer in effect.
 
-The proper fix - worth ~2x on prefill - is to restructure the kernel into explicit `T.Cube()` /
-`T.Vector(vector=2) as sid:` regions and mask with `sid * ROWS + r`.  That is a bigger change (it also
-moves the `dual_copy`s into the vector region) and it needs device iteration, so it is a standalone
-task rather than a footnote to this one.
+### Related: KV-rescan truncation (2026-10-14)
+
+The same causal frontier that drives the mask also bounds how many KV pages a tile must read: a tile
+at query position ``q_off`` only needs pages up to ``max(thresholds) = q_pos + shift``.  The prefill
+kernel used to scan the request's **whole** page list per tile (``for p in T.serial(req_pages)``), so
+the trailing masked pages were re-read and re-GEMMed for every tile — an O(tiles × pages) redundancy
+that dominated pure-prefill long-context TTFT.  The kernel now loops ``for p in T.serial(plen)`` with
+``plen`` the host-computed per-tile page count, clamped to the real page count (empty/padding tiles
+run zero iterations).  Skipped pages were masked to ``-1e30`` before ``exp``, so the result is
+bit-for-bit identical; measured **1.14x (8K) / 1.23x (16K) / 1.26x (32K)** on prefill.  See
+[`performance.md`](performance.md#prefill-kv-重扫截断prefill-kernel-kv-rescan-truncation2026-10-14).
 
 ## KI-4 — offline `LLM()` and serve(HTTP) numbers are not comparable (diagnosed, by design)
 

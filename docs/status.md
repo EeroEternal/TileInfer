@@ -98,8 +98,8 @@ details: [`performance.md`](performance.md).
 |---|---|---|
 | **KI-1** split path faults the device (`507035`) when several shapes are compiled and run in one process | keeps split-KV off by default, so long-context decode leaves 2.8x on the table | open; 8 hypotheses refuted (see below); **诊断+启用列入阶段三 L1/L3,当前延后** |
 | **KI-4** 离线 LLM() 与 serve(HTTP) 吞吐不对称(同负载 batch1 离线 136.7ms/步 vs serve eager 45.9ms) | 性能结论口径混淆 | 已定性:EngineCore 进程拓扑+GIL 串行 vs 跨进程重叠(E14);**性能结论一律以 serve 口径为准**(2026-10-13) |
-| **PM-2** the causal mask needs a *global* row index, which a vector region cannot see, so prefill tiles are planned at `block_q // 2` | ~2x wasted M tile in prefill | open, cause understood, fix designed (`T.Cube()` / `T.Vector(2) as sid`) |
-| 长上下文(8K/16K)图模式 TTFT 落后 FIA 2-6x | 长上下文可用性 | 结构性:KI-1(split-KV 未启用)+ D22 prefill 编译窗 + chunked prefill KV 重扫;属阶段三范围 |
+| **PM-2** the causal mask needs a *global* row index, which a vector region cannot see, so prefill tiles were planned at `block_q // 2` | ~2x wasted M tile in prefill | **resolved (5730b66)**: host precomputes each row's causal threshold into `RowThr` and `dual_copy`s it per AIV, so the full `block_q` tile is used; no host restriction |
+| 长上下文(8K/16K)图模式 TTFT 落后 FIA 2-6x | 长上下文可用性 | 已逐项处置:KI-1 修复(P6)+ D22 prefill 编译窗消除(P3)+ chunked prefill KV 重扫截断(prefill 内核级 1.14-1.26x,见 performance.md);引擎级端到端 TTFT 复核待补 |
 | integration 的 prefill/混合步回退 FIA | 设计内降级(不是事故) | prefill 接管已落地(B1,prefill_calls>0 实证);投机解码等仍回退 |
 | `head_size != 128` is declined (e.g. Qwen2.5-0.5B) | that model is served by FIA | deliberate; head_size=256 已支持(Qwen3.6 在役) |
 

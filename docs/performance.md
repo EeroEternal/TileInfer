@@ -45,7 +45,8 @@ chunk-wu 未接入(opt-in 机制就绪)——即对比的是"TileInfer decode+pr
 解读:短上下文与并发(≤512 输入、≤32 并发)双源一致 TI≈FIA;长上下文 2-6x 为测量期结构性
 (KI-1 split-KV 未启用 + D22 prefill 编译窗 + chunked prefill KV 重扫)——阶段三已处置:
 KI-1 修复(P6)+ 首见编译窗消除(P3)+ split-KV opt-in 兑现 decode 侧 1.41x/2.04x(P8);
-纯 prefill 剩余差距(chunked prefill KV 重扫)不在本阶段范围,如实保留。
+纯 prefill 剩余差距中的 **chunked prefill KV 重扫**已消除(见下方「Prefill KV 重扫截断」节,
+prefill 内核级 1.14-1.26x);引擎级端到端 TTFT 复核待补。
 
 ## P1/H10 短/长上下文长度自适应分流(gdnwu 融合核,引擎同侧 A/B,2026-10-14)
 
@@ -210,6 +211,43 @@ Reproduce with:
 ```bash
 source <CANN 9.3.x>/set_env.sh
 python benchmarks/bench_attention.py --preset serving --backend tilelang-ascend950 --dtype bf16
+```
+
+## Prefill KV 重扫截断(prefill kernel KV-rescan truncation,2026-10-14)
+
+**问题**:prefill 内核每个 query tile 都循环该请求的**全部** KV pages(`for p in T.serial(req_pages)`),
+但因果掩码意味着一个 tile 只能看到它的因果前沿(`q_pos + causal_shift`)之前的 KV。长 prompt 下
+后续 tile 的绝大部分页被掩码成 -1e30 却仍被读入、做 QK^T、softmax、PV——即 O(tiles×pages) 的
+**冗余 KV 扫描**,是长上下文纯 prefill TTFT 落后的结构性成因之一。
+
+**方案**:host 侧按 tile 预计算 `TilePageLens = floor(frontier / page_size) + 1`(frontier =
+该 tile 末行 query 位置 + append shift;空/padding tile 为 0),内核页循环改为 `for p in T.serial(plen)`
+并把 `plen` 钳到该请求真实页数。跨页 `limit` 与行阈值 `RowThr` 保持不变——被跳过的尾部页原本就被
+掩码成 -1e30,故数值**逐位等价**(复用了 P8 split 内核的动态截断先例)。
+
+**验收数字**(微基准,单请求,group=8,d128,page=128,median of 10;`benchmarks/bench_prefill_rescan.py`):
+
+| 场景 | 全扫基线 ms | 截断 ms | 加速 | max abs diff vs oracle |
+|---|---|---|---|---|
+| 8K prefill | 178.0 | 156.5 | **1.14x** | 0.0078(两侧相同) |
+| 16K prefill | 553.7 | 449.4 | **1.23x** | 0.0078 |
+| 32K prefill | 1953.8 | 1552.7 | **1.26x** | 0.0156 |
+| chunk 512 over 8K 前缀 | 14.3 | 13.1 | 1.09x | 0.0002 |
+| chunk 2048 over 8K 前缀 | 56.8 | 54.8 | 1.04x | 0.0002 |
+
+截断与全扫的 max abs diff **完全一致**,证明被跳过的页确实只贡献掩码值。收益随上下文变长单调上升
+(纯 prefill 前半 tile 几乎不扫,后段 tile 扫得越来越少);append/chunk(有缓存前缀,每个 tile 都要看
+前缀)收益较小但为正。
+
+**回归**:设备测试 34/34 绿(新增 3 个多 tile 长上下文截断用例:2048/2200-append/4096);CPU 套件 60/60 绿。
+引擎级端到端 TTFT 复核(vLLM serve 长上下文)待补。
+
+Reproduce with:
+
+```bash
+source .agent_loop/run/env.sh
+python benchmarks/bench_prefill_rescan.py                                   # 截断(在役)
+TILEINFER_PREFILL_NOSCAN_OFF=1 python benchmarks/bench_prefill_rescan.py    # 全扫基线
 ```
 
 ## Decode baseline (paged, GQA 32q/8kv, head_dim 128, page 128)
