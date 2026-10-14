@@ -192,7 +192,9 @@ def test_ctx_page_lens_frontier_rule():
 
 
 def test_row_thr_only_on_frontier_tiles():
-    """RowThr exists per frontier tile only; live rows carry q_pos + shift, padding -1."""
+    """RowThr exists per frontier tile only; live rows carry (q_pos + shift − kv_start*128),
+    relativised to the tile's page offset (E50/D52 — keeps the kernel predicate in the plain
+    kernel's `p * BC + c` form); padding rows stay negative."""
     group = 8
     qo, pages, lpl = [300], [9], [96]  # kv = 1120, shift = 820, P_vis in 6..8, 3 splits/qb
     ctx = _build_ctx(qo, pages, lpl, group=group, ktp=4, max_qo=300)
@@ -203,10 +205,12 @@ def test_row_thr_only_on_frontier_tiles():
     shift = 1120 - 300
     q_rows = 300 * group
     blocks = [(qs, min(128, q_rows - qs)) for qs in range(0, q_rows, 128)]
-    for t, (b, q_start, _ks, _kl, _sid) in enumerate(fronts):
+    for t, (b, q_start, ks, _kl, _sid) in enumerate(fronts):
         rows = dict(blocks)[q_start]
         for i in range(128):
-            want = (q_start + i) // group + shift if i < rows else -1
+            want = (
+                ((q_start + i) // group + shift - ks * 128) if i < rows else -1 - ks * 128
+            )
             assert int(thr[t, i]) == want, (t, i)
 
 

@@ -1303,6 +1303,13 @@ def paged_prefill_split_frontier_ascend950(
     frontier tile covering ``[P_vis, pages)``; every page it visits may be partially masked
     for some rows, which the ``RowThr`` predicate handles (this is the plain kernel's
     multi-block-tested path, unlike the split kernel's — E48).
+
+    IR-parity note (E50/D52): the predicate must stay *syntactically identical* to the plain
+    kernel's — ``kv_pos = p * BC + c`` and ``limit = (p + 1 < eff)``.  The tile's page offset
+    enters only through host-side values: ``RowThr`` arrives pre-relativised
+    (``thr − start * BC``, see :func:`plan_prefill_split_ctx`) and ``eff`` is already a kernel
+    scalar.  Carrying ``start`` inside the SimtVF predicate (as the failed H19 kernel did) is
+    exactly the Let-bound-loop-invariant shape that trips the tilelang #3491 vectorizer bug.
     """
     BR = block_q
     BC = page_size
@@ -1398,13 +1405,16 @@ def paged_prefill_split_frontier_ascend950(
                     T.gemm(qk_a, qk_b, qk_acc, transpose_B=True)
                 T.dual_copy(qk_acc, s_ub)
 
-                limit = T.if_then_else(start + p + 1 < req_pages, BC, kv_last_page_len[b])
+                # Syntactic parity with the plain kernel (E50/D52): p is the only loop
+                # variable here; the page offset lives in the relativised RowThr host-side.
+                limit = T.if_then_else(p + 1 < eff, BC, kv_last_page_len[b])
                 with T.SimtVF(threads=threads):
                     s_frag = T.alloc_fragment((ROWS, BC), accum)
-                    # The plain kernel's multi-block-verified compound predicate (0a99edd),
-                    # with the split's global-position kv_pos.
+                    # The plain kernel's multi-block-verified compound predicate (0a99edd):
+                    # thr is pre-relativised by the host (thr − start*BC), so kv_pos keeps
+                    # the plain kernel's p*BC + c form with no GM scalar inside the mask.
                     for r, c in T.Parallel(ROWS, BC):
-                        kv_pos = (start + p) * BC + c
+                        kv_pos = p * BC + c
                         s_frag[r, c] = T.if_then_else(
                             (c < limit) and (kv_pos <= thr_ub[r]),
                             s_ub[r, c] * T.float32(scale),
@@ -1880,7 +1890,9 @@ def plan_prefill_split_ctx(
 
     * ``schedule`` — the :class:`TileSchedule`, padded to ``kernel_tiles`` dead tiles pointing
       at the trash row ``kernel_batch - 1`` (P3 canonical-variant quantization);
-    * ``row_thr`` — **frontier tiles only** (the head kernel takes no ``RowThr`` input);
+    * ``row_thr`` — **frontier tiles only**, relativised to each tile's page offset
+      (``thr − kv_start * page_size``) so the kernel's predicate is syntactically identical
+      to the plain kernel's (the head kernel takes no ``RowThr`` input; E50/D52);
     * ``tile_page_lens`` / ``causal_shift`` / ``indptr`` / ``lpl`` / ``indices`` — the kernels'
       truncation/page-table inputs (``indices`` padded to the declared capacity here);
     * ``pack_idx`` — flat gather index materialising ``q_packed`` from ``q_flat`` with one
@@ -1991,7 +2003,10 @@ def plan_prefill_split_ctx(
     thr_host: List[int] = []
     page_lens_host: List[int] = [t[4] for t in head_tiles]  # head half first (tile order)
     for t in frontier_tiles:
-        thr_host.extend(t[6])
+        # RowThr arrives relativised to the tile's page offset (thr − kv_start*BC): the
+        # frontier kernel's predicate keeps the plain kernel's `p * BC + c` kv_pos form
+        # (syntactic parity, E50/D52).  Padding rows stay negative → fully masked.
+        thr_host.extend(thr - t[3] * page_size for thr in t[6])
         page_lens_host.append(t[4])
     pack.extend(pack_f)
 

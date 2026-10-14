@@ -31,3 +31,4 @@ export_only_prof_dir/
 profiling/
 exception_info.*
 *.o
+.tilelang_cache/
