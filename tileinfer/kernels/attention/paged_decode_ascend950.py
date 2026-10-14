@@ -1410,16 +1410,23 @@ def paged_prefill_split_frontier_ascend950(
                 limit = T.if_then_else(p + 1 < eff, BC, kv_last_page_len[b])
                 with T.SimtVF(threads=threads):
                     s_frag = T.alloc_fragment((ROWS, BC), accum)
-                    # The plain kernel's multi-block-verified compound predicate (0a99edd):
-                    # thr is pre-relativised by the host (thr − start*BC), so kv_pos keeps
-                    # the plain kernel's p*BC + c form with no GM scalar inside the mask.
-                    for r, c in T.Parallel(ROWS, BC):
-                        kv_pos = p * BC + c
-                        s_frag[r, c] = T.if_then_else(
-                            (c < limit) and (kv_pos <= thr_ub[r]),
-                            s_ub[r, c] * T.float32(scale),
-                            T.float32(-1e30),
-                        )
+                    # Scalarized predicate (E54, 3b): the vectorized compound predicate over
+                    # the dual-copied ``thr_ub`` — literally the plain kernel's mask — sent
+                    # the Ascend pass pipeline into a >60 min blowup (E54: head, identical
+                    # minus ``eff``/``start`` scalars, compiles in 2m14s).  The extra let-bound
+                    # scalar chain is exactly tilelang #3492's unfoldable-Lets independence
+                    # analysis domain; computing the mask element-by-element keeps the SimtVF
+                    # region (reducers/exp stay vectorized) but the predicate never reaches
+                    # the vectorizer.  Frontier tiles are ~1 per q-block, so the redundant
+                    # per-lane scalar work is bounded and correctness comes first.
+                    for r in T.serial(ROWS):
+                        for c in T.serial(BC):
+                            kv_pos = p * BC + c
+                            s_frag[r, c] = T.if_then_else(
+                                (c < limit) and (kv_pos <= thr_ub[r]),
+                                s_ub[r, c] * T.float32(scale),
+                                T.float32(-1e30),
+                            )
                     row_max = T.alloc_reducer((ROWS,), accum, op="max")
                     T.reducer_init(row_max)
                     for r, c in T.Parallel(ROWS, BC):
@@ -2229,7 +2236,9 @@ def forward_prefill_split(
             ctx["indices"],
             ctx["lpl"],
             schedule.seq_ids.to(torch.int32).narrow(0, 0, num_head_tiles),
-            schedule.q_offsets.to(torch.int32).narrow(0, 0, num_head_tiles),
+            # H20 head kernel has no q_offsets input (rows are pre-packed host-side); the
+            # 8th slot is ``tile_rows`` (live-row count, unused by the body but kept for
+            # signature parity with the plain kernel) — feed it the per-tile q_lens.
             schedule.q_lens.to(torch.int32).narrow(0, 0, num_head_tiles),
             schedule.kv_page_starts.to(torch.int32).narrow(0, 0, num_head_tiles),
             ctx["tile_page_lens"].narrow(0, 0, num_head_tiles),
@@ -2249,7 +2258,6 @@ def forward_prefill_split(
             ctx["indices"],
             ctx["lpl"],
             schedule.seq_ids.to(torch.int32).narrow(0, num_head_tiles, num_tiles - num_head_tiles),
-            schedule.q_offsets.to(torch.int32).narrow(0, num_head_tiles, num_tiles - num_head_tiles),
             schedule.q_lens.to(torch.int32).narrow(0, num_head_tiles, num_tiles - num_head_tiles),
             schedule.kv_page_starts.to(torch.int32).narrow(0, num_head_tiles, num_tiles - num_head_tiles),
             ctx["causal_shift"],
