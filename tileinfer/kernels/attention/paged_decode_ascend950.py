@@ -679,6 +679,7 @@ def paged_prefill_ascend950(
         tile_rows: T.Tensor((num_tiles,), "int32"),
         causal_shift: T.Tensor((batch,), "int32"),
         RowThr: T.Tensor((num_tiles * BR,), "int32"),
+        TilePageLens: T.Tensor((num_tiles,), "int32"),
         OutPacked: T.Tensor((num_tiles * kv_heads, BR, dim), dtype),
     ):
         with T.Kernel(num_tiles * kv_heads) as bx:
@@ -689,6 +690,16 @@ def paged_prefill_ascend950(
             rows = tile_rows[tile]
             shift = causal_shift[b]
             req_pages = kv_indptr[b + 1] - kv_indptr[b]
+            # KV rescan truncation: the causal mask (RowThr) means this tile can only attend to KV
+            # positions ``<= max(thresholds)``, so scanning the request's *whole* page list would
+            # re-read (and re-GEMM) pages every row masks out.  ``TilePageLens`` is the host-side
+            # count of pages this tile actually needs; clamp it to the real page count so an empty
+            # or padded tile runs zero iterations.  The per-page ``limit`` below is unchanged: a
+            # truncated tile never visits the request's last page, so `p + 1 < req_pages` holds and
+            # its full-page columns stay live (the within-page frontier is still masked by RowThr).
+            plen = TilePageLens[tile]
+            plen = T.if_then_else(plen < req_pages, plen, req_pages)
+            plen = T.if_then_else(plen < 0, 0, plen)
 
             q_l1 = T.alloc_l1((BR, D), dtype)
             k_l1 = T.alloc_l1((BC, D), dtype)
@@ -730,7 +741,7 @@ def paged_prefill_ascend950(
             if D > D2:
                 T.fill(o_ub1, T.float32(0))
 
-            for p in T.serial(req_pages):
+            for p in T.serial(plen):
                 pid = kv_indices[kv_indptr[b] + p]
 
                 T.copy(KCache[pid, 0:BC, bh, 0:D], k_l1)
@@ -1087,6 +1098,24 @@ def forward_prefill(
         thr = ((q_off64 + ar) // group) + shift
         row_thr = torch.where(ar < rows64, thr, torch.full_like(thr, -1)).reshape(-1).to(torch.int32)
 
+    # Per-tile page count (KV-rescan truncation): the tile's causal frontier -- the largest row
+    # threshold, i.e. the last live row's query position plus the append shift -- is the furthest
+    # KV position any of its rows may attend to, so its page loop only needs the pages covering
+    # ``[0, frontier]``.  A padded / empty tile (no live rows) gets 0 and runs zero iterations.
+    # The kernel clamps this to the request's real page count, and the per-page ``limit`` plus the
+    # row thresholds keep the within-page frontier masked, so skipping the trailing pages is
+    # numerically identical to scanning them (they were masked to -1e30 before exp).
+    tile_page_lens = torch.zeros((num_tiles,), dtype=torch.int32, device=q.device)
+    if num_tiles:
+        last_row = schedule.q_offsets.to(torch.int64) + schedule.q_lens.to(torch.int64) - 1
+        frontier = (last_row // group) + causal_shift.to(torch.int64)[
+            schedule.seq_ids.to(torch.int64)
+        ]
+        needed = frontier // page_size + 1
+        tile_page_lens = torch.where(
+            schedule.q_lens.to(torch.int64) > 0, needed, torch.zeros_like(needed)
+        ).clamp(min=0).to(torch.int32)
+
     kernel = build_prefill_kernel(
         batch=kb,
         kv_heads=kv_heads,
@@ -1110,6 +1139,7 @@ def forward_prefill(
         schedule.q_lens.to(torch.int32),
         causal_shift,
         row_thr,
+        tile_page_lens,
         out_packed,
     )
 

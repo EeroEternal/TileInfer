@@ -126,6 +126,12 @@ def _case(batch, kv_heads, group, page_size, dim, kv_lens, qo_lens, seed=0):
         # head_dim 256 (Qwen3.5/3.6 full-attention layers), incl. a non-power-of-two pool
         (1, 2, 8, [128], [128], "d256 prefill, one full page, causal", 256),
         (1, 2, 8, [300], [100], "d256 append with a partial tail page", 256),
+        # KV-rescan truncation: several query tiles over a multi-page KV, so each tile's page loop
+        # is cut to its causal frontier (the trailing masked pages must be skipped without changing
+        # the result).  A whole-prompt prefill and an append (cached prefix) both exercise it.
+        (1, 2, 8, [2048], [2048], "multi-tile prefill, 16 pages, KV-rescan truncation", 128),
+        (1, 2, 8, [2200], [512], "multi-tile append over a 2200-token prefix", 128),
+        (1, 2, 8, [4096], [4096], "multi-tile prefill, 32 pages, deep truncation", 128),
     ],
 )
 def test_paged_prefill_matches_reference(batch, kv_heads, group, kv_lens, qo_lens, label, dim):
