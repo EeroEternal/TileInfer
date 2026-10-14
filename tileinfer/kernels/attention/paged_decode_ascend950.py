@@ -2043,35 +2043,56 @@ def plan_prefill_split_ctx(
     kvl_f = [t[4] for t in frontier_tiles]
     sid_f = [t[5] for t in frontier_tiles]
     slot_f = [t[7] for t in frontier_tiles]
-    thr_host: List[int] = []
-    page_lens_host: List[int] = [t[4] for t in head_tiles]  # head half first (tile order)
+
+    # Dead (padding) tiles: zero page iterations, thr = -1, pack rows point at real memory.
+    # Each half is padded to its own width so the two launch slices have *stable, quantised*
+    # sizes: the integration passes kernel_tiles = next_pow2(live), giving
+    # ``[live head | dead head → kernel_tiles | live frontier | dead frontier → kernel_tiles]``.
+    # The runtime then always launches ``(num_tiles=kernel_tiles, num_slots=kernel_tiles+1)``
+    # for both kernels — exactly the keys the prewarm ladder compiles (the D56-era A/B showed
+    # per-step exact counts racing a data-dependent compile on the serving path).  Dead tiles
+    # write the dedicated trash slot.  The max() keeps the CPU tests' smaller kernel_tiles
+    # well-formed (widths collapse to the live counts).
+    dead_head = max(0, kernel_tiles - num_head_tiles) if num_head_tiles > 0 else 0
+    dead_frontier = max(0, kernel_tiles - len(frontier_tiles)) if frontier_tiles else 0
+    seq_h.extend([kernel_batch - 1] * dead_head)
+    qoff_h.extend([0] * dead_head)
+    qrows_h.extend([0] * dead_head)
+    kvs_h.extend([0] * dead_head)
+    kvl_h.extend([0] * dead_head)
+    sid_h.extend([0] * dead_head)
+    slot_h.extend([kernel_slots] * dead_head)
+    seq_f.extend([kernel_batch - 1] * dead_frontier)
+    qoff_f.extend([0] * dead_frontier)
+    qrows_f.extend([0] * dead_frontier)
+    kvs_f.extend([0] * dead_frontier)
+    kvl_f.extend([0] * dead_frontier)
+    sid_f.extend([0] * dead_frontier)
+    slot_f.extend([kernel_slots] * dead_frontier)
+    head_half = num_head_tiles + dead_head
+    # Per-tile axes follow the schedule order: page_lens/pack are full-schedule (both halves),
+    # row_thr is frontier-half-local (the head kernel takes no RowThr input).
+    page_lens_host = (
+        [t[4] for t in head_tiles]
+        + [0] * dead_head
+        + [t[4] for t in frontier_tiles]
+        + [0] * dead_frontier
+    )
+    thr_host = []
     for t in frontier_tiles:
         # RowThr arrives relativised to the tile's page offset (thr − kv_start*BC): the
         # frontier kernel's predicate keeps the plain kernel's `p * BC + c` kv_pos form
         # (syntactic parity, E50/D52).  Padding rows stay negative → fully masked.
         thr_host.extend(thr - t[3] * page_size for thr in t[6])
-        page_lens_host.append(t[4])
-    pack.extend(pack_f)
+    thr_host += [-1] * (BR * dead_frontier)
+    pack = (
+        list(pack_h)
+        + [0] * (dead_head * BR * kv_heads)
+        + list(pack_f)
+        + [0] * (dead_frontier * BR * kv_heads)
+    )
 
-    # dead (padding) tiles: zero page iterations, thr = -1, pack rows point at real memory.
-    # They sit at the schedule's tail, i.e. always inside the frontier half.  (The integration
-    # always passes kernel_tiles = next_pow2(live) ≥ live; the max() just keeps the CPU tests'
-    # no-padding calls well-formed.)  Their writes go to the dedicated trash slot.
-    dead = max(0, kernel_tiles - (num_head_tiles + len(frontier_tiles)))
-    seq_f.extend([kernel_batch - 1] * dead)
-    qoff_f.extend([0] * dead)
-    qrows_f.extend([0] * dead)
-    kvs_f.extend([0] * dead)
-    kvl_f.extend([0] * dead)
-    sid_f.extend([0] * dead)
-    slot_f.extend([kernel_slots] * dead)
-    for _t in range(dead):
-        page_lens_host.append(0)
-        thr_host.extend([-1] * BR)
-        for _bh in range(kv_heads):
-            pack.extend([0] * BR)
-
-    num_tiles_total = num_head_tiles + len(frontier_tiles) + dead
+    num_tiles_total = head_half + len(frontier_tiles) + dead_frontier
     schedule = TileSchedule(
         seq_ids=torch.tensor(seq_h + seq_f, dtype=torch.int32, device=device),
         q_offsets=torch.tensor(qoff_h + qoff_f, dtype=torch.int32, device=device),
@@ -2116,8 +2137,11 @@ def plan_prefill_split_ctx(
         "tile_slots": torch.tensor(slot_h + slot_f, dtype=torch.int32, device=device),
         "num_qblocks": num_qblocks,
         "num_tiles": schedule.num_tiles,
-        "num_head_tiles": num_head_tiles,
-        "num_frontier_tiles": schedule.num_tiles - num_head_tiles,
+        # Launch slice widths (each half INCLUDING its dead padding): the two kernels are
+        # always built/launched with exactly these tile counts, so the compiled-variant keys
+        # are data-independent (quantised by the caller's kernel_tiles).
+        "num_head_tiles": head_half,
+        "num_frontier_tiles": schedule.num_tiles - head_half,
         "kv_heads": kv_heads,
         "block_q": BR,
         "tile_page_lens": torch.tensor(page_lens_host, dtype=torch.int32, device=device),
@@ -2268,7 +2292,7 @@ def forward_prefill_split(
         dim=dim,
         page_size=page_size,
         num_pages_cap=ctx["cap"],
-        max_splits=ms,
+        max_splits=SPLIT_MS_COMPILE,
         num_slots=kernel_slots + 1,
         block_q=br,
         dtype=dtype,
@@ -2339,6 +2363,13 @@ def padded_rows(group: int) -> int:
     """M-tile size used for a given GQA group (see the padding note in the module docstring)."""
     return max(32, ((group + 31) // 32) * 32)
 
+
+# Fixed compile-time ``max_splits`` for the split-prefill kernels: inert in the kernel body
+# (the explicit ``num_slots`` carries the real capacity — ``max_splits`` only feeds the
+# default), it exists purely to keep the compiled-variant keys data-independent.  Deriving it
+# per step as next_pow2(actual splits) made every first-seen context race a ~2.5 min compile
+# against the serving path (the D56-era engine A/B: 4400/4400 prefill steps fell back to FIA).
+SPLIT_MS_COMPILE = max(1, int(os.environ.get("TILEINFER_PREFILL_SPLIT_MS", "16") or 16))
 
 _TORCH_TO_TILELANG_DTYPE = {
     torch.bfloat16: "bfloat16",

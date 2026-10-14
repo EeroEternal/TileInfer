@@ -363,3 +363,56 @@ def test_dense_tile_slots_unique_per_qblock_split():
                 if v < ctx["kernel_slots"] * 2:
                     used.add(v // 2)
     assert used == set(range(live)), "every live slot must be gathered exactly by its block"
+
+
+def _build_padded_ctx(qo, pages, lpl, ktp, kernel_tiles, max_qo=None, kernel_batch=None):
+    from tileinfer.kernels.attention.paged_decode_ascend950 import plan_prefill_split_ctx
+
+    total_pages = sum(pages)
+    return plan_prefill_split_ctx(
+        list(qo),
+        list(pages),
+        list(lpl),
+        group=8,
+        kv_tile_pages=ktp,
+        kernel_batch=kernel_batch or len(qo),
+        kernel_tiles=kernel_tiles,
+        kv_heads=2,
+        block_q=128,
+        max_qo_tokens=max_qo or max(qo),
+        page_size=128,
+        indices=torch.arange(max(total_pages, 4), dtype=torch.int32),
+        device=torch.device("cpu"),
+    )
+
+
+def test_ctx_padded_halves_quantised_launch():
+    """Each half is dead-padded to kernel_tiles with its trash-slot dead tiles between the
+    halves — the two launch slices are then data-independent keys ``(num_tiles=kernel_tiles,
+    num_slots=kernel_tiles+1)`` (D56: per-step exact counts raced a serving-path compile and
+    fell back 4400/4400 steps to FIA)."""
+    qo, pages, lpl = [300, 40], [9, 16], [96, 128]
+    ktp = 4
+    heads, fronts = _live_tiles(qo, pages, lpl, 8, ktp)
+    live_h, live_f = len(heads), len(fronts)
+    kt = 1 << (live_h + live_f - 1).bit_length()  # next pow2, the integration's kernel_tiles
+    ctx = _build_padded_ctx(qo, pages, lpl, ktp, kt)
+    sched = ctx["schedule"]
+    assert ctx["num_head_tiles"] == kt, "head half padded to kernel_tiles"
+    assert ctx["num_frontier_tiles"] == kt, "frontier half padded to kernel_tiles"
+    assert sched.num_tiles == 2 * kt
+    slots = ctx["tile_slots"].tolist()
+    assert slots[live_h:kt] == [ctx["kernel_slots"]] * (kt - live_h), "dead head → trash"
+    assert slots[kt + live_f :] == [ctx["kernel_slots"]] * (kt - live_f), "dead frontier → trash"
+    # slots are dense by ENUMERATION order but grouped head-half-first in the arrays
+    live_slots = slots[:live_h] + slots[kt : kt + live_f]
+    assert sorted(live_slots) == list(range(live_h + live_f)), "live slots dense 0..live-1"
+    # per-tile axes follow the schedule order; dead tiles carry no pages
+    pl = ctx["tile_page_lens"].tolist()
+    assert pl[live_h:kt] == [0] * (kt - live_h) and pl[kt + live_f :] == [0] * (kt - live_f)
+    assert len(ctx["row_thr"]) == kt * 128, "row_thr stays frontier-local (padded width)"
+    assert len(ctx["pack_idx"]) == sched.num_tiles * 2 * 128
+    # an empty half stays empty (the runner skips its launch entirely)
+    solo = _build_padded_ctx([1], [2], [128], 4, 4, max_qo=1)
+    # kv=2 pages, 1-token query → P_vis=2=pages → head-only
+    assert solo["num_head_tiles"] > 0 and solo["num_frontier_tiles"] == 0

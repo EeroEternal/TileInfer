@@ -441,6 +441,7 @@ def prefill_step(
         ktp = _PREFILL_KV_TILE_PAGES
         split_ctx = None
         max_splits = 0
+        split_ms = 0
         if ktp > 0:
             lpl_host = meta.kv_last_page_len.to(torch.int64).cpu().tolist()
             # H20 split counts: head chunks of the visible pages + one frontier split — the
@@ -460,8 +461,11 @@ def prefill_step(
                         [indices_cap, indices_cap.new_zeros(pool_pages - indices_cap.numel())]
                     )
                 from tileinfer.kernels.attention.paged_decode_ascend950 import (
+                    SPLIT_MS_COMPILE,
                     plan_prefill_split_ctx,
                 )
+
+                split_ms = SPLIT_MS_COMPILE  # cache-key material only (data-independent)
 
                 split_ctx = plan_prefill_split_ctx(
                     qo_host,
@@ -495,7 +499,7 @@ def prefill_step(
             kernel_tiles,
             128,
             dtype_name,
-        ) + ((max_splits,) if split_ctx is not None else ())
+        ) + ((split_ms,) if split_ctx is not None else ())
         if not PrefillShapeManager.usable(spec):
             return False
 
@@ -651,6 +655,7 @@ class TileInferDecodeAttention:
         kv_tile_pages: int = 0,
         max_num_reqs: int = 0,
         max_num_batched_tokens: int = 0,
+        max_model_len: int = 0,
     ) -> None:
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
@@ -661,6 +666,7 @@ class TileInferDecodeAttention:
         self.kv_tile_pages = kv_tile_pages
         self.max_num_reqs = max_num_reqs or 0
         self.max_num_batched_tokens = max_num_batched_tokens or 0
+        self.max_model_len = max_model_len or 0
         self._warned = False
 
         self._config_key = (
@@ -796,29 +802,57 @@ class TileInferDecodeAttention:
 
         sub_view = _pool_sub_view(key_cache, _sub_pages(block_size))
         pool_pages = declared_pool_cap(int(sub_view.shape[0]))
-        return self._prewarm_prefill_ladder(kernel_batch, tiles_top, pool_pages)
+        # Split-prefill ladder top: a chunk step's tile count is the unsplit count times the
+        # per-request split factor at the model's longest context (the +1 keeps the runtime
+        # estimate an upper bound).  Without this, long-context steps ask for tiles past the
+        # ladder top and race a ~3.5 min lazy compile on the serving path (the D56-era rerun:
+        # tiles=512 missed a top of 256 → 3760 fallback steps).
+        tiles_top_split = tiles_top
+        if _PREFILL_KV_TILE_PAGES > 0:
+            factor = 1
+            if self.max_model_len:
+                max_pages = -(-int(self.max_model_len) // KERNEL_PAGE_SIZE)
+                factor = -(-max_pages // _PREFILL_KV_TILE_PAGES) + 1
+            tiles_top_split = min(_next_pow2(tiles_top * factor), PREFILL_MAX_TILES)
+        return self._prewarm_prefill_ladder(kernel_batch, tiles_top, tiles_top_split, pool_pages)
 
-    def _prewarm_prefill_ladder(self, kernel_batch: int, tiles_top: int, pool_pages) -> int:
+    def _prewarm_prefill_ladder(
+        self, kernel_batch: int, tiles_top: int, tiles_top_split: int, pool_pages
+    ) -> int:
+        from tileinfer.kernels.attention.paged_decode_ascend950 import SPLIT_MS_COMPILE
+
         dtype_name = _TORCH_DTYPE_NAME.get(self.dtype)
         if dtype_name is None:
             return -1
         built = 0
         tiles = 1
-        while tiles <= tiles_top:
-            spec = (
-                kernel_batch,
-                self.num_kv_heads,
-                self.group_size,
-                self.head_size,
-                KERNEL_PAGE_SIZE,
-                pool_pages,
-                tiles,
-                128,
-                dtype_name,
-            )
-            if spec not in PrefillShapeManager._ready:
-                if PrefillShapeManager.prewarm_sync(spec):
-                    built += 1
+        while tiles <= max(tiles_top, tiles_top_split):
+            specs = [
+                (
+                    kernel_batch,
+                    self.num_kv_heads,
+                    self.group_size,
+                    self.head_size,
+                    KERNEL_PAGE_SIZE,
+                    pool_pages,
+                    tiles,
+                    128,
+                    dtype_name,
+                )
+            ]
+            if _PREFILL_KV_TILE_PAGES > 0 and tiles <= tiles_top_split:
+                # The split-prefill canonical variant: the runtime always launches
+                # ``(num_tiles=kernel_tiles, num_slots=kernel_tiles+1, max_splits=
+                # SPLIT_MS_COMPILE)`` (each schedule half is dead-padded to kernel_tiles),
+                # so the ladder compiles exactly those keys — per-step data-shaped keys
+                # racing a background compile is what fell back 4400/4400 steps to FIA in
+                # the first engine A/B.  The plain ladder stays for the pathological
+                # split-blowup steps (ktp forced 0 there).
+                specs.append(specs[0] + (SPLIT_MS_COMPILE,))
+            for spec in specs:
+                if spec not in PrefillShapeManager._ready:
+                    if PrefillShapeManager.prewarm_sync(spec):
+                        built += 1
             tiles *= 2
         return built
 
@@ -1180,6 +1214,10 @@ def _build_classes():
                 except Exception:  # noqa: BLE001 - fall back to the largest bucket
                     max_num_reqs = 0
                     max_batched = 0
+                try:
+                    max_model_len = int(self.vllm_config.model_config.max_model_len)
+                except Exception:  # noqa: BLE001 - tests without a model config
+                    max_model_len = 0
                 self._tileinfer = TileInferDecodeAttention(
                     num_heads=self.num_heads,
                     num_kv_heads=self.num_kv_heads,
@@ -1193,6 +1231,7 @@ def _build_classes():
                     # Prewarm builds one plan per bucket up to this, before graph capture.
                     max_num_reqs=int(max_num_reqs or 0),
                     max_num_batched_tokens=int(max_batched or 0),
+                    max_model_len=int(max_model_len or 0),
                 )
             return self._tileinfer if self._tileinfer.supported(block_size) else None
 
