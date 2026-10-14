@@ -1516,11 +1516,13 @@ def install(raise_on_failure: bool = True) -> bool:
     logging.getLogger("tileinfer").setLevel(logging.INFO)
     _diag("install")
 
-    if not __import__("os").environ.get("TILEINFER_VLLM"):
+    # 显式 ``== "1"`` 判断:``"0"`` 等任意非空字符串曾因真值判断被误认为启用,导致
+    # TILEINFER_VLLM=0 的 FIA 对照侧(权威口径 P0 基线)仍加载本插件。只有显式
+    # ``TILEINFER_VLLM=1`` 才启用;未设置或任何其他值一律关闭。
+    if (__import__("os").environ.get("TILEINFER_VLLM") or "").strip() != "1":
         logger.warning(
-            "TileInfer's vLLM integration is opt-in: set TILEINFER_VLLM=1 to enable it.  Decode "
-            "through the kernel currently faults the device inside an EngineCore (see "
-            "docs/known-issues.md KI-1), so it stays off unless asked for explicitly."
+            "TileInfer's vLLM integration is opt-in: set TILEINFER_VLLM=1 to enable it "
+            "(any other value, including 0, keeps it off)."
         )
         return False
 
