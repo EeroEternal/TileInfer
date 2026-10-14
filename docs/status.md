@@ -3,7 +3,12 @@
 One page that answers two questions: **what has been done** (with the evidence) and **what is left**.
 Details live in the linked documents; this file is the index and the honest scoreboard.
 
-Last updated: **2026-10-13** — Qwen3.6-35B-A3B on Ascend950PR, stage-2 closure (M-MoE / M-GDN verdicts in, stage-3 deferred).
+Last updated: **2026-10-14** — Qwen3.6-35B-A3B on Ascend950PR, **stage-3 closure (P6–P9)**:
+KI-1 fixed, pool-independent kernel ABI, split-KV serving enabled opt-in and proven on long context.
+
+> Authoritative numbers and per-item verdicts are in [`performance.md`](performance.md) (the P-item
+> sections).  `.agent_loop/PERFORMANCE_REPORT.md` is the working report and is **not** part of the
+> repository, so nothing here depends on it being available.
 
 ---
 
@@ -32,13 +37,25 @@ Target scenario: **Qwen3.6-35B-A3B** (40 层:10 层 full-attention head_dim=256 
 | M-GDN gating 替换 | **disproven(显式 opt-in)**:引擎同侧 A/B 无收益,短上下文 TTFT +2~9%(归因 JIT 窗伪影);`TILEINFER_OPS` 显式含 `gdn` 才安装 | E21/H9/D29 |
 | M-GDN 9c chunk 链融合(solve_tril+recompute_w_u) | **TEMPORARY(不接入)**:TileLang 融合核数值 6/6 绿,但微基准 0.718x@T128(门槛 ≤0.6x)、14.28x@T8192(标量块逆链不可扩展) | E22/E23/E24/H10/D31;`tileinfer/kernels/gdn/chunk_wu_ascend950.py` 保留 |
 
-**能力边界(当前默认路径)**:split-KV 关闭(KI-1,长上下文 decode 2.8x 潜力未兑现)、
-M-MoE 未接入(0.86x)、gdn gating/chunk-wu 未接入(opt-in 机制就绪,`TILEINFER_OPS`);prefill 由
-TileInfer 接管但长上下文受编译窗与 KV 重扫主导(B1 价值需 L3 后兑现)。环境退化(E15 外部扫描)
-期间的图模式数字均为双侧比值口径,绝对值待环境恢复后重测。
+**阶段三收口(P6–P9,2026-10-14)**:
 
-**阶段三(L1 KI-1 诊断 → L2 池无关 ABI → L3 split-KV 启用)明确延后**,未开工;任务清单见
-[`next-tasks.md`](next-tasks.md)。
+| item | result | evidence |
+|---|---|---|
+| **KI-1 根因修复**(P6/L1):merge 内核 `PartLse` GM→UB 按 *group* 粒度拷贝,group=4 时描述符仅 16B(<32B 下限) | ✅ 设备不再 fault | [`known-issues.md`](known-issues.md) KI-1(RESOLVED 2026-10-14) |
+| **池无关内核 ABI**(P7/L2):`declared_pool_cap`(pow2 上取整 / `TILEINFER_POOL_CAP` 可钉)+ `pool_view` 零拷贝容量视图,进入内核 K/V 首维、`kv_indices` 槽与 plan/prewarm key | ✅ 内存快照池漂移(9425/9899/9600)不再使预烧失效 | 首编 83s,漂移池复命中同一产物 ~10s |
+| **split-KV 引擎在役**(P8/L3):plan 以「满额」构建(dummy_lens=表宽)、split 内核把 tile 页循环钳到运行期真实页数、`finalize_plan` 预编译 split+merge | ✅ opt-in 兑现:自研源 8K TPOT **1.411x** / 16K **2.037x**,官方源 1.093x/1.095x,TTFT 全场景无劣化 | [`performance.md`](performance.md) P8 节(H16 proven) |
+| **prefill 首见编译窗消除**(P3 + P9):canonical 变体量化 + ladder 预热覆盖在役形状 | ✅ 编译窗不再主导长上下文 | [`performance.md`](performance.md) P3 节 |
+| **M-MoE 最终判定**(P4) | ⏸ FINAL TEMPORARY:真瓶颈=GM→L1 nd2nz 转换带宽(内核内不可修复)——不接入 | [`performance.md`](performance.md) P4 节 |
+| **长度自适应分流**(P1/H11):gdnwu 融合核引擎同侧 A/B | ⏸ 长上下文零劣化、短上下文收益≈0——不默认接入(opt-in) | [`performance.md`](performance.md) P1 节 |
+| 上游 teardown double-free(O6) | 🟡 定性上游 + 缓解(KI-5),零运行期影响 | [`known-issues.md`](known-issues.md) KI-5 |
+
+**能力边界(2026-10-14)**:split-KV 已可 **opt-in 服务长上下文部署**
+(`TILEINFER_KV_TILE_PAGES=16` + `TILEINFER_ALLOW_SPLIT_KV=1`);短上下文税(b1 ~1%、并发档 11–19%)与
+首见编译窗(~15min,一次性)已定量入档,全局默认仍不开启。仍在的边界:**纯 prefill 长上下文**
+(chunked prefill 的 KV 重扫,明确不在阶段三范围,如实保留)、**M-MoE 未接入**(内核 0.86x)、
+**GDN 9c chunk-wu 未接入**(0.718x@T128)、**设备 CI 尚无**。环境退化期(E15 外部扫描)的图模式数字
+仍为双侧比值口径,绝对值待环境恢复后重测。
+
 
 ---
 
