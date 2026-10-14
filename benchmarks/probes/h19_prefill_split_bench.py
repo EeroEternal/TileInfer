@@ -114,7 +114,9 @@ def run_unsplit(label, batch, qo, lens, ref_out):
 def run_split(label, batch, qo, lens, ktp, ref_out):
     kernel_batch = _next_pow2(batch) + 1
     pages_host0 = [(-(-L // PAGE)) for L in lens]
-    splits_per_req = [max(1, -(-p // ktp)) for p in pages_host0]
+    # H20 语义:每 (req,qblock) 分段数 = head 段 + 1 frontier,最坏
+    # ceil((pages-1)/ktp)+1 —— 估算按上界(+1)取,ctx 对 kernel_tiles 不足是静默截断。
+    splits_per_req = [max(1, -(-p // ktp)) + 1 for p in pages_host0]
     split_tiles = sum(
         ((x * GROUP + 127) // 128) * s for x, s in zip(qo, splits_per_req)
     )
