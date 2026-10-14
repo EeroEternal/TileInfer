@@ -13,6 +13,70 @@ the known limits written down, so the next person can tell an improvement from a
 > 结论健康窗复核一致,见 P1 节);其列出的长上下文落差已按阶段三 L1-L3 逐项处置——KI-1 已修
 > (P6)、池无关 ABI 就绪(P7)、prefill 首见编译窗已消除(P3,110s→<5s)、split-KV opt-in
 > 在役兑现 8K TPOT 1.411x/16K 2.037x(P8 节)。终版汇总见 PERFORMANCE_REPORT §10。
+>
+> **2026-10-14(P0 权威口径基线,当前对照原点)**:下节为按权威命令口径固化的双侧
+> (FIA / TileInfer 最优配置)全场景 P50/P90/P99 基线——后续所有性能提升以此表为对照原点。
+
+## P0 权威口径基线(Qwen3.6-35B-A3B,FIA vs TileInfer,P50/P90/P99,2026-10-14)
+
+**口径**: `vllm bench serve --backend openai --endpoint /v1/completions --dataset-name random
+--random-range-ratio 0 --num-prompts 32 --ignore-eos --temperature 0 --metric-percentiles
+50,90,99`(场景=L/O/C 矩阵);serve 参数 `--max-model-len 32768 --max-num-seqs 32
+--gpu-memory-utilization 0.90 --language-model-only`(图模式 FULL_AND_PIECEWISE,bucket
+[1,4,16,32],chunked prefill 默认)。**off 侧** = `TILEINFER_VLLM=0`(FIA,vLLM 原始昇腾算子
+路径);**on 侧** = `TILEINFER_VLLM=1 TILEINFER_KV_TILE_PAGES=16 TILEINFER_ALLOW_SPLIT_KV=1`
+(TileInfer 当前最优配置:decode+prefill 接管 + split-KV opt-in)。环境:2026-10-14
+16:25-16:41 单卡独占,双侧背靠背;原始 JSON 在 `.agent_loop/run/bench_results/p0_*.json`
+(gitignored)。**在役探针(数字有效前提)**:on 侧 fallbacks=0/exceptions=0/capture_calls=40/
+ready_plans=6/prefill_calls=4400/prefill_variants=9;off 侧 serve 日志零 TileInfer 接管。
+
+### 吞吐(输出 tok/s)
+
+| 场景 | FIA | TileInfer | TI/FIA(>1 优) |
+|---|---|---|---|
+| 128/128/C1 | 105.8 | 93.9 | 0.887 |
+| 128/128/C8 | 412.4 | 452.3 | 1.097 ✓ |
+| 128/512/C8 | 427.0 | 487.7 | 1.142 ✓ |
+| 8K/128/C8 | 159.7 | 34.0 | 0.213 |
+| 16K/128/C8 | 95.0 | 11.5 | 0.121 |
+
+### TTFT (ms)
+
+| 场景 | FIA P50 | FIA P90 | FIA P99 | TI P50 | TI P90 | TI P99 | TI/FIA P50 |
+|---|---|---|---|---|---|---|---|
+| 128/128/C1 | 93.7 | 99.5 | 139.8 | 118.5 | 124.3 | 182.5 | 1.264 |
+| 128/128/C8 | 188.3 | 208.8 | 209.1 | 328.2 | 343.5 | 344.1 | 1.743 |
+| 128/512/C8 | 190.6 | 194.9 | 200.2 | 336.1 | 343.6 | 352.6 | 1.764 |
+| 8K/128/C8 | 1059.8 | 3014.4 | 4426.9 | 5836.9 | 16497.9 | 25123.5 | 5.507 |
+| 16K/128/C8 | 1720.5 | 5632.3 | 8704.0 | 14450.2 | 48402.0 | 77516.2 | 8.399 |
+
+### TPOT (ms)
+
+| 场景 | FIA P50 | FIA P90 | FIA P99 | TI P50 | TI P90 | TI P99 | TI/FIA P50 |
+|---|---|---|---|---|---|---|---|
+| 128/128/C1 | 8.77 | 8.78 | 8.78 | 9.88 | 9.88 | 9.88 | 1.126 |
+| 128/128/C8 | 18.5 | 18.6 | 18.6 | 15.2 | 15.2 | 15.2 | 0.823 ✓ |
+| 128/512/C8 | 18.8 | 18.9 | 18.9 | 15.8 | 15.8 | 15.8 | 0.840 ✓ |
+| 8K/128/C8 | 41.1 | 42.7 | 43.8 | 192.9 | 201.7 | 203.1 | 4.696 |
+| 16K/128/C8 | 69.9 | 71.9 | 72.5 | 589.3 | 602.5 | 611.9 | 8.429 |
+
+### ITL (ms)
+
+| 场景 | FIA P50 | FIA P90 | FIA P99 | TI P50 | TI P90 | TI P99 | TI/FIA P50 |
+|---|---|---|---|---|---|---|---|
+| 128/128/C1 | 8.78 | 8.99 | 9.61 | 9.88 | 9.96 | 10.2 | 1.125 |
+| 128/128/C8 | 18.4 | 19.1 | 20.1 | 15.2 | 15.3 | 15.7 | 0.826 ✓ |
+| 128/512/C8 | 18.7 | 19.4 | 20.2 | 15.8 | 16.4 | 16.7 | 0.846 ✓ |
+| 8K/128/C8 | 19.2 | 130.6 | 144.3 | 29.9 | 740.0 | 1177.7 | 1.562 |
+| 16K/128/C8 | 20.8 | 146.2 | 157.4 | 44.6 | 1670.3 | 2122.4 | 2.143 |
+
+**解读(E41)**:①短上下文 C8 净正(吞吐 +9.7~14.2%、TPOT/ITL 0.82-0.85x)——TileInfer decode
+接管在并发档即有收益;C1 轻微落后(TTFT 1.264x/TPOT 1.126x,与 E40 短上下文税同向)。
+②**长上下文×并发引擎级病态(新暴露的头号弱势)**:C8 下 8K/16K 全指标 4.7-8.4x 落后
+(duration 8K 120s vs 26s、16K 355s vs 43s)——与 E40 单流结论(TPOT 1.09-2.04x 改善、TTFT
+持平)方向相反;病态负载结构 = chunked prefill 混合调度下 prefill chunk 与 decode 交织,
+「单流内核级健康(重扫消除 1.14-1.26x)」在 C8 引擎路径上不成立。W1 重新定义为
+「长上下文×并发引擎级 prefill/decode 交织」,机理候选与取证计划见 EVIDENCE E41。
 
 ## 图模式双源全指标(Qwen3.6-35B-A3B,自研源+官方源,TI/FIA 比值)
 
