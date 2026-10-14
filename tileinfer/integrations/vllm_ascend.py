@@ -146,6 +146,11 @@ def _bucket_for(num_reqs: int) -> int:
 #: 128 ``(q_pos, head)`` rows, so 4096 tiles ≈ a 64K-token chunk at group=8).
 PREFILL_MAX_TILES = int(__import__("os").environ.get("TILEINFER_PREFILL_MAX_TILES", "4096"))
 
+# H19: split-KV prefill knob (KV pages per split tile).  0 = off (the unsplit prefill kernel).
+# Long-context serving is where the per-tile serial page walk hurts (W1-C8, E46/E47); short
+# requests stay whole automatically (a request shorter than one split never splits).
+_PREFILL_KV_TILE_PAGES = int(__import__("os").environ.get("TILEINFER_PREFILL_KV_TILE_PAGES", "0") or 0)
+
 # Per-step metadata dedup for prefill (H18, the B3 step-guard extended to the prefill path):
 # vLLM hands the *same* attention-metadata instance to every full-attention layer of a step and
 # builds a fresh one per step, but everything ``prefill_step`` derives from it (qo lengths, the
@@ -243,30 +248,59 @@ class PrefillShapeManager:
     @classmethod
     def _compile(cls, spec: tuple) -> None:
         try:
-            from tileinfer.kernels.attention.paged_decode_ascend950 import build_prefill_kernel
-
-            (
-                batch,
-                kv_heads,
-                group,
-                dim,
-                page,
-                pool_pages,
-                num_tiles,
-                block_q,
-                dtype_name,
-            ) = spec
-            build_prefill_kernel(
-                batch=batch,
-                kv_heads=kv_heads,
-                group=group,
-                dim=dim,
-                page_size=page,
-                num_pages_cap=pool_pages,
-                num_tiles=num_tiles,
-                block_q=block_q,
-                dtype=dtype_name,
+            from tileinfer.kernels.attention.paged_decode_ascend950 import (
+                build_prefill_kernel,
+                build_prefill_split_kernel,
             )
+
+            if len(spec) == 9:  # plain prefill variant
+                (
+                    batch,
+                    kv_heads,
+                    group,
+                    dim,
+                    page,
+                    pool_pages,
+                    num_tiles,
+                    block_q,
+                    dtype_name,
+                ) = spec
+                build_prefill_kernel(
+                    batch=batch,
+                    kv_heads=kv_heads,
+                    group=group,
+                    dim=dim,
+                    page_size=page,
+                    num_pages_cap=pool_pages,
+                    num_tiles=num_tiles,
+                    block_q=block_q,
+                    dtype=dtype_name,
+                )
+            else:  # split-KV prefill variant: the 10th field is ``max_splits`` (H19)
+                (
+                    batch,
+                    kv_heads,
+                    group,
+                    dim,
+                    page,
+                    pool_pages,
+                    num_tiles,
+                    block_q,
+                    dtype_name,
+                    max_splits,
+                ) = spec
+                build_prefill_split_kernel(
+                    batch=batch,
+                    kv_heads=kv_heads,
+                    group=group,
+                    dim=dim,
+                    page_size=page,
+                    num_pages_cap=pool_pages,
+                    num_tiles=num_tiles,
+                    max_splits=max_splits,
+                    block_q=block_q,
+                    dtype=dtype_name,
+                )
             cls._ready.add(spec)
             logger.info("TileInfer prefill kernel READY: %s", spec)
         except Exception:  # noqa: BLE001 - a compile failure must not kill the engine
@@ -377,7 +411,57 @@ def prefill_step(
         # which is what removes the ~110 s first-seen lazy compile from serving.
         cap = int(batch_cap) if batch_cap and batch_cap >= num_reqs else num_reqs
         kernel_batch = _bucket_for(cap) + 1
-        kernel_tiles = _next_pow2(max_tiles)
+        # Host-side page counts for the schedule: one extra tiny D2H, still once per step (was
+        # per layer, and went through plan_query_tiles' per-row ``.item()`` storm on top).
+        pages_host = (meta.kv_indptr[1:] - meta.kv_indptr[:-1]).to(torch.int64).cpu().tolist()
+
+        # H19: split-KV prefill.  ``TILEINFER_PREFILL_KV_TILE_PAGES`` splits every q-block tile
+        # along the KV axis so the per-tile serial page walks (the W1-C8 pathology's dominant
+        # device cost, E46/E47) run concurrently; the merge combines the partials.  The whole
+        # step context (schedule, masks, pack/merge indices) is host math, built once per step.
+        ktp = _PREFILL_KV_TILE_PAGES
+        split_ctx = None
+        max_splits = 0
+        if ktp > 0:
+            lpl_host = meta.kv_last_page_len.to(torch.int64).cpu().tolist()
+            splits_per_req = [max(1, -(-p // ktp)) for p in pages_host]
+            split_tiles = sum(
+                ((q * group + 127) // 128) * s for q, s in zip(qo_host, splits_per_req)
+            )
+            if split_tiles <= PREFILL_MAX_TILES:
+                kernel_tiles_split = _next_pow2(split_tiles)
+                max_splits = _next_pow2(max(splits_per_req))
+                indices_cap = meta.kv_indices.to(torch.int32)
+                if indices_cap.numel() < pool_pages:
+                    indices_cap = torch.cat(
+                        [indices_cap, indices_cap.new_zeros(pool_pages - indices_cap.numel())]
+                    )
+                from tileinfer.kernels.attention.paged_decode_ascend950 import (
+                    plan_prefill_split_ctx,
+                )
+
+                split_ctx = plan_prefill_split_ctx(
+                    qo_host,
+                    pages_host,
+                    lpl_host,
+                    group=group,
+                    kv_tile_pages=ktp,
+                    kernel_batch=kernel_batch,
+                    kernel_tiles=kernel_tiles_split,
+                    kv_heads=num_kv_heads,
+                    block_q=128,
+                    max_qo_tokens=max(qo_host),
+                    page_size=KERNEL_PAGE_SIZE,
+                    indices=indices_cap,
+                    device=device,
+                )
+                kernel_tiles = kernel_tiles_split
+            else:
+                # pathological split blow-up (huge batch × huge context): serve this step
+                # through the unsplit kernel instead of refusing it entirely
+                ktp = 0
+        if split_ctx is None:
+            kernel_tiles = _next_pow2(max_tiles)
         spec = (
             kernel_batch,
             num_kv_heads,
@@ -388,22 +472,20 @@ def prefill_step(
             kernel_tiles,
             128,
             dtype_name,
-        )
+        ) + ((max_splits,) if split_ctx is not None else ())
         if not PrefillShapeManager.usable(spec):
             return False
 
-        # Host-side page counts for the schedule: one extra tiny D2H, still once per step (was
-        # per layer, and went through plan_query_tiles' per-row ``.item()`` storm on top).
-        pages_host = (meta.kv_indptr[1:] - meta.kv_indptr[:-1]).to(torch.int64).cpu().tolist()
-        schedule = plan_query_tiles_from_host(
-            [q * group for q in qo_host],
-            pages_host,
-            device=device,
-            block_q=128,
-            load_balance=False,
-        )
-        if kernel_tiles != schedule.num_tiles:
-            schedule = _pad_tile_schedule(schedule, kernel_tiles, kernel_batch - 1)
+        if split_ctx is None:
+            schedule = plan_query_tiles_from_host(
+                [q * group for q in qo_host],
+                pages_host,
+                device=device,
+                block_q=128,
+                load_balance=False,
+            )
+            if kernel_tiles != schedule.num_tiles:
+                schedule = _pad_tile_schedule(schedule, kernel_tiles, kernel_batch - 1)
         qo_dev = torch.tensor(qo_host, dtype=torch.int32, device=device)
         shared = {
             "num_reqs": num_reqs,
@@ -413,7 +495,8 @@ def prefill_step(
             "max_qo": max(qo_host),
             "kernel_batch": kernel_batch,
             "meta": meta,
-            "schedule": schedule,
+            "schedule": None if split_ctx is not None else schedule,
+            "split_ctx": split_ctx,
             "qo_dev": qo_dev,
         }
         if step_id is not None:
@@ -449,17 +532,28 @@ def prefill_step(
 
     from tileinfer.kernels.attention.paged_decode_ascend950 import forward_prefill
 
-    out4 = forward_prefill(
-        q_pad,
-        _pool_sub_view(key_cache, _sub_pages(block_size)),
-        _pool_sub_view(value_cache, _sub_pages(block_size)),
-        shared["meta"],
-        shared["schedule"],
-        shared["qo_dev"],
-        group=group,
-        block_q=128,
-        kernel_batch=shared["kernel_batch"],
-    )
+    if shared["split_ctx"] is not None:
+        from tileinfer.kernels.attention.paged_decode_ascend950 import forward_prefill_split
+
+        out4 = forward_prefill_split(
+            q_pad,
+            _pool_sub_view(key_cache, _sub_pages(block_size)),
+            _pool_sub_view(value_cache, _sub_pages(block_size)),
+            shared["split_ctx"],
+            group=group,
+        )
+    else:
+        out4 = forward_prefill(
+            q_pad,
+            _pool_sub_view(key_cache, _sub_pages(block_size)),
+            _pool_sub_view(value_cache, _sub_pages(block_size)),
+            shared["meta"],
+            shared["schedule"],
+            shared["qo_dev"],
+            group=group,
+            block_q=128,
+            kernel_batch=shared["kernel_batch"],
+        )
     # Unpack [batch, H, max_qo, D] -> [num_tokens, H, D] with the engine's layout.
     offset = 0
     for b, qo in enumerate(qo_host):

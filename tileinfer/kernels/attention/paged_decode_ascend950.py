@@ -28,6 +28,7 @@ strings that can no longer resolve the enclosing function's locals.
 
 import math
 import os
+from typing import List
 
 import torch
 import tilelang
@@ -40,6 +41,10 @@ __all__ = [
     "build_decode_kernel",
     "paged_prefill_ascend950",
     "build_prefill_kernel",
+    "paged_prefill_split_ascend950",
+    "build_prefill_split_kernel",
+    "plan_prefill_split_ctx",
+    "forward_prefill_split",
     "build_split_kernel",
     "build_merge_kernel",
     "build_tile_slots",
@@ -847,6 +852,255 @@ def build_prefill_kernel(**spec):
     return kernel
 
 
+def paged_prefill_split_ascend950(
+    batch: int,
+    kv_heads: int,
+    group: int,
+    dim: int,
+    page_size: int,
+    num_pages_cap: int,
+    num_tiles: int,
+    max_splits: int,
+    block_q: int = 128,
+    dtype: str = "bfloat16",
+    threads: int = 128,
+):
+    """Split-KV **prefill / append**: the prefill kernel writing *partial* results (H19).
+
+    Identical arithmetic to :func:`paged_prefill_ascend950` — same M tile (``block_q`` rows in
+    flattened ``(q_pos, head)`` order), same per-row causal thresholds (``RowThr``), same D-split
+    — with two differences:
+
+    * each tile visits only the page range the scheduler gave it (``kv_page_starts[tile]``,
+      ``TilePageLens[tile]`` pages, further clamped to the pages that actually exist), so one
+      (request, query-block) split ``ceil(pages / kv_tile_pages)`` ways runs its ranges
+      **concurrently** instead of one tile paging through the whole prefix serially — the W1-C8
+      pathology (E46: per-tile serial page walks, vector chain 96% busy, blocks <10% occupied);
+    * the epilogue writes the tile's *normalised* output plus its log-sum-exp into the dense
+      slot layout (``(seq_id * max_splits + split_id) * kv_heads + bh``) exactly like the decode
+      split kernel, so a merge step combines the partials with softmax weights.  A fully-masked
+      or emptied tile writes ``(out=0, lse=-1e30)`` (the ``l_safe`` guard), which the merge
+      weights at zero.
+
+    ``RowThr`` thresholds are *global* KV positions, so no per-split mask adjustment is needed:
+    a split whose whole range lies past a row's causal frontier simply produces the zero-weight
+    ``(0, -1e30)`` partial.  The per-page ``limit`` keeps the request's real last page (wherever
+    the split puts it) from reading past ``kv_last_page_len``.
+
+    Like every kernel here, ``KCache``/``VCache`` are declared at the declared capacity, not the
+    real pool (L2 pool-agnostic ABI).
+    """
+    BR = block_q
+    BC = page_size
+    D = dim
+    ROWS = BR // 2
+    accum = "float32"
+    scale = 1.0 / math.sqrt(dim)
+    num_slots = batch * max_splits
+
+    assert BR % 32 == 0, "the ND->NZ copy template wants ROWS = BR // 2 to be a multiple of 16"
+    assert BR <= 128, "one L0C tile holds BR x BC floats; keep block_q <= 128 at page_size 128"
+    assert dim in (128, 256), "the Ascend 950 attention path is tuned for head_dim 128 or 256"
+    assert page_size % 2 == 0
+
+    @T.prim_func
+    def main(
+        QPacked: T.Tensor((num_tiles * kv_heads, BR, dim), dtype),
+        KCache: T.Tensor((num_pages_cap, page_size, kv_heads, dim), dtype),
+        VCache: T.Tensor((num_pages_cap, page_size, kv_heads, dim), dtype),
+        kv_indptr: T.Tensor((batch + 1,), "int32"),
+        kv_indices: T.Tensor((num_pages_cap,), "int32"),
+        kv_last_page_len: T.Tensor((batch,), "int32"),
+        seq_ids: T.Tensor((num_tiles,), "int32"),
+        q_offsets: T.Tensor((num_tiles,), "int32"),
+        tile_rows: T.Tensor((num_tiles,), "int32"),
+        kv_page_starts: T.Tensor((num_tiles,), "int32"),
+        causal_shift: T.Tensor((batch,), "int32"),
+        RowThr: T.Tensor((num_tiles * BR,), "int32"),
+        TilePageLens: T.Tensor((num_tiles,), "int32"),
+        tile_slots: T.Tensor((num_tiles,), "int32"),
+        PartOut: T.Tensor((num_slots * kv_heads, BR, dim), dtype),
+        PartLse: T.Tensor((num_slots * kv_heads * BR,), accum),
+    ):
+        with T.Kernel(num_tiles * kv_heads) as bx:
+            tile = bx // kv_heads
+            bh = bx % kv_heads
+            b = seq_ids[tile]
+            q_off = q_offsets[tile]
+            rows = tile_rows[tile]
+            shift = causal_shift[b]
+            start = kv_page_starts[tile]
+            req_pages = kv_indptr[b + 1] - kv_indptr[b]
+            # Same truncation contract as the plain prefill kernel (TilePageLens = the tile's
+            # causal frontier) plus the split-KV clamp: a tile may only visit its own page range
+            # ``[start, start + plen)`` and never past the pages that exist.  An emptied tile
+            # (range past the frontier, or a padded tile) runs zero iterations and the epilogue's
+            # ``l_safe`` turns its slot into (out=0, lse=-1e30) — the merge's zero weight.
+            plen = TilePageLens[tile]
+            eff = req_pages - start
+            eff = T.if_then_else(eff < 0, 0, eff)
+            plen = T.if_then_else(plen < eff, plen, eff)
+            plen = T.if_then_else(plen < 0, 0, plen)
+            slot = tile_slots[tile]
+
+            q_l1 = T.alloc_l1((BR, D), dtype)
+            k_l1 = T.alloc_l1((BC, D), dtype)
+            v_l1 = T.alloc_l1((D, BC), dtype)
+            p_l1 = T.alloc_l1((BR, BC), dtype)
+
+            # D-split, see paged_decode_ascend950: keeps L0A/L0B within capacity for dim=256.
+            D2 = min(D, 128)
+            qk_a = T.alloc_l0a((BR, D2), dtype)
+            qk_b = T.alloc_l0b((BC, D2), dtype)
+            pv_a = T.alloc_l0a((BR, BC), dtype)
+            pv_b = T.alloc_l0b((D2, BC), dtype)
+            qk_acc = T.alloc_l0c((BR, BC), accum)
+            pv_acc0 = T.alloc_l0c((BR, D2), accum)
+            if D > D2:
+                pv_acc1 = T.alloc_l0c((BR, D2), accum)
+
+            thr_ub = T.alloc_shared((ROWS,), "int32")
+            s_ub = T.alloc_shared((ROWS, BC), accum)
+            p_ub = T.alloc_shared((ROWS, BC), dtype)
+            o_ub0 = T.alloc_shared((ROWS, D2), accum)
+            o_tmp0 = T.alloc_shared((ROWS, D2), accum)
+            out_ub0 = T.alloc_shared((ROWS, D2), dtype)
+            if D > D2:
+                o_ub1 = T.alloc_shared((ROWS, D2), accum)
+                o_tmp1 = T.alloc_shared((ROWS, D2), accum)
+                out_ub1 = T.alloc_shared((ROWS, D2), dtype)
+            m_ub = T.alloc_shared((ROWS,), accum)
+            l_ub = T.alloc_shared((ROWS,), accum)
+
+            T.copy(QPacked[bx, 0:BR, 0:D], q_l1)
+            T.dual_copy(RowThr[tile * BR : (tile + 1) * BR], thr_ub)
+            T.fill(m_ub, T.float32(-1e30))
+            T.fill(l_ub, T.float32(0))
+            T.fill(o_ub0, T.float32(0))
+            if D > D2:
+                T.fill(o_ub1, T.float32(0))
+            for p in T.serial(plen):
+                pid = kv_indices[kv_indptr[b] + start + p]
+
+                T.copy(KCache[pid, 0:BC, bh, 0:D], k_l1)
+                T.copy(q_l1[0:BR, 0:D2], qk_a)
+                T.copy(k_l1[0:BC, 0:D2], qk_b)
+                T.gemm(qk_a, qk_b, qk_acc, transpose_B=True, clear_accum=True)
+                if D > D2:
+                    T.copy(q_l1[0:BR, D2:D], qk_a)
+                    T.copy(k_l1[0:BC, D2:D], qk_b)
+                    T.gemm(qk_a, qk_b, qk_acc, transpose_B=True)
+                T.dual_copy(qk_acc, s_ub)
+
+                # only the request's *last* page can be partially filled, wherever the split puts it
+                limit = T.if_then_else(start + p + 1 < req_pages, BC, kv_last_page_len[b])
+                with T.SimtVF(threads=threads):
+                    s_frag = T.alloc_fragment((ROWS, BC), accum)
+                    for r, c in T.Parallel(ROWS, BC):
+                        # causal + tail masks: ``thr_ub`` holds *global* KV thresholds, so a split
+                        # range entirely past a row's frontier masks every position of it.
+                        # Nested if_then_else (not a boolean `and`): the flattened compound
+                        # predicate mis-lowers on multi-block launches — frontier-truncated
+                        # tiles ran with the causal mask effectively dropped (h19 forensics).
+                        kv_pos = (start + p) * BC + c
+                        masked = T.if_then_else(c < limit, s_ub[r, c] * T.float32(scale), T.float32(-1e30))
+                        s_frag[r, c] = T.if_then_else(kv_pos <= thr_ub[r], masked, T.float32(-1e30))
+                    row_max = T.alloc_reducer((ROWS,), accum, op="max")
+                    T.reducer_init(row_max)
+                    for r, c in T.Parallel(ROWS, BC):
+                        T.reducer_update(row_max[r], s_frag[r, c])
+                    new_m = T.alloc_fragment((ROWS,), accum)
+                    T.finalize_reducer(row_max, new_m)
+
+                    alpha = T.alloc_fragment((ROWS,), accum)
+                    for r in T.Parallel(ROWS):
+                        alpha[r] = T.exp(m_ub[r] - T.max(m_ub[r], new_m[r]))
+                        m_ub[r] = T.max(m_ub[r], new_m[r])
+
+                    row_sum = T.alloc_reducer((ROWS,), accum, op="sum")
+                    T.reducer_init(row_sum)
+                    for r, c in T.Parallel(ROWS, BC):
+                        s_frag[r, c] = T.exp(s_frag[r, c] - m_ub[r])
+                        T.reducer_update(row_sum[r], s_frag[r, c])
+                    partial = T.alloc_fragment((ROWS,), accum)
+                    T.finalize_reducer(row_sum, partial)
+
+                    for r in T.Parallel(ROWS):
+                        l_ub[r] = l_ub[r] * alpha[r] + partial[r]
+                    for r, d in T.Parallel(ROWS, D2):
+                        o_ub0[r, d] = o_ub0[r, d] * alpha[r]
+                    if D > D2:
+                        for r, d in T.Parallel(ROWS, D2):
+                            o_ub1[r, d] = o_ub1[r, d] * alpha[r]
+                    for r, c in T.Parallel(ROWS, BC):
+                        p_ub[r, c] = T.Cast(dtype, s_frag[r, c])
+
+                T.dual_copy(p_ub[0:ROWS, 0:BC], p_l1[0:BR, 0:BC])
+                T.copy(VCache[pid, 0:BC, bh, 0:D], v_l1[0:D, 0:BC], transpose=True)
+                T.copy(p_l1[0:BR, 0:BC], pv_a)
+                T.copy(v_l1[0:D2, 0:BC], pv_b)
+                T.gemm(pv_a, pv_b, pv_acc0, transpose_B=True, clear_accum=True)
+                if D > D2:
+                    T.copy(v_l1[D2:D, 0:BC], pv_b)
+                    T.gemm(pv_a, pv_b, pv_acc1, transpose_B=True, clear_accum=True)
+                T.dual_copy(pv_acc0, o_tmp0)
+                if D > D2:
+                    T.dual_copy(pv_acc1, o_tmp1)
+                with T.SimtVF(threads=threads):
+                    for r, d in T.Parallel(ROWS, D2):
+                        o_ub0[r, d] = o_ub0[r, d] + o_tmp0[r, d]
+                    if D > D2:
+                        for r, d in T.Parallel(ROWS, D2):
+                            o_ub1[r, d] = o_ub1[r, d] + o_tmp1[r, d]
+
+            with T.SimtVF(threads=threads):
+                # l_safe: an emptied/fully-masked tile carries l=0 — divide by 1 instead, so the
+                # slot gets (out=0, lse=-1e30 + log(1)) = the merge's zero-weight filler (the
+                # decode split kernel's exact contract).
+                for r, d in T.Parallel(ROWS, D2):
+                    l_safe = T.if_then_else(l_ub[r] > 0, l_ub[r], T.float32(1))
+                    out_ub0[r, d] = T.Cast(dtype, o_ub0[r, d] / l_safe)
+                if D > D2:
+                    for r, d in T.Parallel(ROWS, D2):
+                        l_safe = T.if_then_else(l_ub[r] > 0, l_ub[r], T.float32(1))
+                        out_ub1[r, d] = T.Cast(dtype, o_ub1[r, d] / l_safe)
+                # the LSE overwrites ``m_ub`` in place: m/l/o_ub are dead from here on, and one
+                # fewer 1-D shared buffer keeps this kernel in the 3-buffer layout the plain
+                # prefill and decode-split kernels use — with four, the compiler has been
+                # observed to overlap their UB ranges (thr_ub/m_ub/l_ub colliding), which
+                # corrupted the causal mask on frontier-truncated tiles
+                for r in T.Parallel(ROWS):
+                    l_safe = T.if_then_else(l_ub[r] > 0, l_ub[r], T.float32(1))
+                    m_ub[r] = m_ub[r] + T.log(l_safe)
+
+            T.dual_copy(out_ub0[0:ROWS, 0:D2], PartOut[slot * kv_heads + bh, 0:BR, 0:D2])
+            if D > D2:
+                T.dual_copy(out_ub1[0:ROWS, 0:D2], PartOut[slot * kv_heads + bh, 0:BR, D2:D])
+            T.dual_copy(
+                m_ub[0:ROWS],
+                PartLse[(slot * kv_heads + bh) * BR : (slot * kv_heads + bh + 1) * BR],
+            )
+
+    return main
+
+
+def build_prefill_split_kernel(**spec):
+    """Compile (and cache) the split-KV prefill kernel (H19).  See `build_prefill_kernel`
+    re: `num_pages_cap` (quantized to the ABI's declared capacity, key stays pool-agnostic)."""
+    if spec.get("num_pages_cap") is not None:
+        spec["num_pages_cap"] = declared_pool_cap(spec["num_pages_cap"])
+    key = ("prefill_split",) + tuple(sorted(spec.items()))
+    kernel = _KERNEL_CACHE.get(key)
+    if kernel is None:
+        kernel = tilelang.compile(
+            paged_prefill_split_ascend950(**spec),
+            out_idx=[],
+            pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
+        )
+        _KERNEL_CACHE[key] = kernel
+    return kernel
+
+
 def build_tile_slots(schedule, max_splits: int) -> torch.Tensor:
     """Dense slot index for every tile: ``slot = request * max_splits + split_id``.
 
@@ -1164,6 +1418,352 @@ def forward_prefill(
     if out is not None:
         out.copy_(result)
         return out
+    return result
+
+
+def plan_prefill_split_ctx(
+    qo_tokens_host: List[int],
+    pages_host: List[int],
+    lpl_host: List[int],
+    *,
+    group: int,
+    kv_tile_pages: int,
+    kernel_batch: int,
+    kernel_tiles: int,
+    kv_heads: int,
+    block_q: int,
+    max_qo_tokens: int,
+    page_size: int,
+    indices,
+    device,
+):
+    """Build the split-prefill step context entirely on the host (H19, zero device syncs).
+
+    Mirrors :func:`tileinfer.plan.plan_query_tiles_from_host`'s tile enumeration *exactly*
+    (same request order, same ``range(0, q_rows, block_q)`` q-blocks, same
+    ``range(0, pages, kv_tile_pages)`` splits — the two must never drift) and derives every
+    layer-independent structure a split prefill step needs, once per step:
+
+    * ``schedule`` — the (KV-split) :class:`TileSchedule`, padded to ``kernel_tiles`` dead tiles
+      pointing at the trash row ``kernel_batch - 1`` (P3 canonical-variant quantization);
+    * ``row_thr`` / ``tile_page_lens`` / ``causal_shift`` / ``indptr`` / ``lpl`` / ``indices`` —
+      the kernel's mask/truncation/page-table inputs, previously derived per layer from device
+      tensors inside :func:`forward_prefill`, here plain host integers (the caller already holds
+      every length on the host; ``indices`` is the step's page table, padded to the declared
+      capacity here);
+    * ``pack_idx`` — flat gather index materialising ``q_packed`` from ``q_flat`` with one
+      ``index_select`` (split tiles of one q-block share the same query rows, so the old
+      per-tile Python pack loop would scale with the split factor);
+    * ``gather_idx`` / ``scatter_idx`` — the merge's slot gather (per q-block × split; missing
+      entries point at a dedicated zero-weight trash slot) and the unpack scatter into
+      ``out_flat``.
+
+    Split counts may differ per request (ragged pages); ``ms_compile`` is the power-of-two
+    ceiling and the slot layout's ``max_splits`` — unused splits gather the trash slot, which
+    carries ``(out=0, lse=-1e30)`` and merges at exactly zero weight.
+
+    A tile's page loop is cut to its causal frontier exactly like :func:`forward_prefill` does
+    (KV-rescan truncation): ``needed_pages = frontier // page_size + 1`` pages from page 0, so a
+    split tile covering ``[kv_start, kv_start + kv_len)`` scans
+    ``clamp(needed_pages - kv_start, 0, kv_len)`` pages; ranges entirely past the frontier run
+    zero iterations and merge at zero weight.
+    """
+    from tileinfer.plan import TileSchedule, plan_query_tiles_from_host
+
+    schedule = plan_query_tiles_from_host(
+        [q * group for q in qo_tokens_host],
+        pages_host,
+        device=device,
+        block_q=block_q,
+        kv_tile_pages=kv_tile_pages,
+        load_balance=False,
+    )
+    if kernel_tiles != schedule.num_tiles:
+        from tileinfer.integrations.vllm_ascend import _pad_tile_schedule
+
+        schedule = _pad_tile_schedule(schedule, kernel_tiles, kernel_batch - 1)
+
+    ms_per_req = (
+        [max(1, -(-pages // kv_tile_pages)) for pages in pages_host]
+        if kv_tile_pages > 0
+        else [1] * len(pages_host)
+    )
+    ms_compile = 1
+    for ms in ms_per_req:
+        while ms_compile < ms:
+            ms_compile *= 2
+
+    BR = block_q
+    kernel_slots = kernel_batch * ms_compile
+    num_qblocks = 0
+    pack: List[int] = []
+    gather: List[int] = []
+    scatter: List[int] = []
+    page_lens_host: List[int] = []
+    thr_host: List[int] = []
+    trash_part = kernel_slots * kv_heads  # flat row of the dedicated trash slot
+    for b, qo_tokens in enumerate(qo_tokens_host):
+        q_rows = qo_tokens * group
+        pages = pages_host[b] if b < len(pages_host) else 0
+        if q_rows <= 0:
+            continue
+        lpl = lpl_host[b] if b < len(lpl_host) else page_size
+        kv_tokens = (pages - 1) * page_size + lpl if pages > 0 else 0
+        shift = kv_tokens - qo_tokens
+        splits = (
+            [(s, min(kv_tile_pages, pages - s)) for s in range(0, pages, kv_tile_pages)]
+            if kv_tile_pages > 0
+            else [(0, pages)]
+        )
+        for q_start in range(0, q_rows, BR):
+            rows = min(BR, q_rows - q_start)
+            q_pos_last = (q_start + rows - 1) // group
+            needed_pages = (q_pos_last + shift) // page_size + 1
+            # per-row causal thresholds, global KV positions (forward_prefill's RowThr, host
+            # form) — one full BR row set **per tile**, i.e. per split of this q-block
+            thr_rows = [((q_start + i) // group + shift) if i < rows else -1 for i in range(BR)]
+            num_qblocks += 1
+            for split_id, (kv_start, kv_len) in enumerate(splits):
+                page_lens_host.append(max(0, min(needed_pages - kv_start, kv_len)))
+                thr_host.extend(thr_rows)
+                for bh in range(kv_heads):
+                    slot = (b * ms_compile + split_id) * kv_heads + bh
+                    gather.append(slot)
+                    for i in range(BR):
+                        # padding rows: point at real memory, masked by thr anyway
+                        pack.append(
+                            (b * kv_heads + bh) * (max_qo_tokens * group)
+                            + (q_start + i if i < rows else 0)
+                        )
+            # unpack scatter: source rows are merged.view(-1, dim), i.e. (g, bh, i)-major with
+            # ``i`` fastest within a head — keep the exact same order.  index_copy_ needs one
+            # index per source row, so padding rows point at out_flat's dedicated zero dummy
+            # row (allocated by the runner, never read: it sits past every live output row).
+            for bh in range(kv_heads):
+                for i in range(BR):
+                    if i < rows:
+                        scatter.append(
+                            (b * kv_heads + bh) * (max_qo_tokens * group) + q_start + i
+                        )
+                    else:
+                        scatter.append(-1)  # resolved to the dummy row by the runner
+            # splits this q-block does not have (ragged split counts under one power-of-two
+            # ``ms_compile``) gather the trash slot: (out=0, lse=-1e30) merges at zero weight
+            for _s in range(len(splits), ms_compile):
+                for _bh in range(kv_heads):
+                    gather.append(trash_part)
+    # dead (padding) tiles: zero page iterations, thr = -1, pack rows point at real memory
+    dead = schedule.num_tiles - (len(page_lens_host))
+    for _t in range(dead):
+        page_lens_host.append(0)
+        thr_host.extend([-1] * BR)
+        for _bh in range(kv_heads):
+            pack.extend([0] * BR)
+
+    # P3 canonical-variant batch padding: trash rows (0 pages, full-page lpl) so the derived
+    # kv_len is exactly 0; a padded tile only ever references the trash row.
+    causal_shift_host = [
+        ((pages_host[b] - 1) * page_size + lpl_host[b] - qo_tokens_host[b])
+        if b < len(qo_tokens_host) and pages_host[b] > 0
+        else 0
+        for b in range(kernel_batch)
+    ]
+    indptr_host: List[int] = [0]
+    for b in range(len(qo_tokens_host)):
+        indptr_host.append(indptr_host[-1] + pages_host[b])
+    while len(indptr_host) < kernel_batch + 1:
+        indptr_host.append(indptr_host[-1])
+    lpl_padded = [lpl_host[b] if b < len(lpl_host) else page_size for b in range(kernel_batch)]
+
+    cap = int(indices.numel())  # caller passes the already capacity-padded page table
+    # out_flat gets one extra all-zero dummy row; scatter entries marked -1 (padding rows of a
+    # q-block) are resolved to it so index_copy_ keeps one index per merged source row.
+    dummy_row = len(qo_tokens_host) * kv_heads * max_qo_tokens * group
+    ctx = {
+        "schedule": schedule,
+        "ms_compile": ms_compile,
+        "kernel_slots": kernel_slots,
+        "num_qblocks": num_qblocks,
+        "num_tiles": schedule.num_tiles,
+        "kv_heads": kv_heads,
+        "block_q": BR,
+        "tile_page_lens": torch.tensor(page_lens_host, dtype=torch.int32, device=device),
+        "row_thr": torch.tensor(thr_host, dtype=torch.int32, device=device),
+        "causal_shift": torch.tensor(causal_shift_host, dtype=torch.int32, device=device),
+        "indptr": torch.tensor(indptr_host, dtype=torch.int32, device=device),
+        "lpl": torch.tensor(lpl_padded, dtype=torch.int32, device=device),
+        "indices": indices,
+        "pack_idx": torch.tensor(pack, dtype=torch.int64, device=device),
+        "gather_idx": (
+            torch.tensor(gather, dtype=torch.int64, device=device).view(
+                num_qblocks, ms_compile, kv_heads
+            )
+            if num_qblocks
+            else torch.zeros((0, ms_compile, kv_heads), dtype=torch.int64, device=device)
+        ),
+        "scatter_idx": torch.tensor(
+            [dummy_row if s < 0 else s for s in scatter], dtype=torch.int64, device=device
+        ),
+        "dummy_row": dummy_row,
+        "cap": cap,
+    }
+    return ctx
+
+
+def _merge_prefill_partials(
+    part_out: torch.Tensor,
+    part_lse: torch.Tensor,
+    ctx: dict,
+    *,
+    dim: int,
+    o_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Merge split partials into per-q-block outputs (the torch half of :func:`forward_prefill_split`).
+
+    Reads normalized partials plus per-slot LSE (the decode split kernel's exact contract):
+    ``merged[g, bh] = Σ_s softmax_s(lse) ⊙ partial_s``.  Slots a request does not use gather the
+    trash slot ``(0, -1e30)`` and contribute exactly zero.  fp32 math; chunked over q-blocks to
+    keep the fp32 partial upcast bounded.  Returns ``[num_qblocks, kv_heads, block_q, dim]`` in
+    ``o_dtype``.
+
+    Exposed at module level so tests can drive it with synthetic partials (CPU).
+    """
+    g = ctx["num_qblocks"]
+    kv_heads = ctx["kv_heads"]
+    br = ctx["block_q"]
+    ms = ctx["ms_compile"]
+    merged = torch.empty((g, kv_heads, br, dim), dtype=o_dtype, device=part_out.device)
+    if not g:
+        return merged
+    lse_rows = part_lse.view(-1, br)
+    lse_parts = []
+    for s in range(ms):
+        idx_s = ctx["gather_idx"][:, s, :].reshape(-1)
+        lse_parts.append(lse_rows.index_select(0, idx_s))
+    lse_stack = torch.stack(lse_parts, dim=1).view(g, kv_heads, ms, br)
+    m = lse_stack.max(dim=2, keepdim=True).values
+    lse_all = m.squeeze(2) + torch.log(torch.exp(lse_stack - m).sum(dim=2))  # [g, kvh, br]
+    # Explicit normalization (the decode merge kernel's ``/norm``): fp32 collapses ``lse_all``
+    # to the shared value when every split carries the -1e30 filler (all-masked rows), and the
+    # raw weights would come out as 1 each; their partials are exactly 0, but normalize anyway
+    # so the contract (weights sum to 1) holds bit-for-bit in every case.
+    w = torch.exp(lse_stack - lse_all.unsqueeze(2))
+    w = w / w.sum(dim=2, keepdim=True)
+    CH = 64
+    for g0 in range(0, g, CH):
+        g1 = min(g0 + CH, g)
+        acc = None
+        for s in range(ms):
+            idx_gs = ctx["gather_idx"][g0:g1, s, :].reshape(-1)  # [(g1-g0)*kvh]
+            outs = part_out.index_select(0, idx_gs).view(g1 - g0, kv_heads, br, dim)
+            term = w[g0:g1, :, s, :].unsqueeze(-1) * outs.to(torch.float32)
+            acc = term if acc is None else acc + term
+        merged[g0:g1] = acc.to(o_dtype)
+    return merged
+
+
+def forward_prefill_split(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    ctx: dict,
+    *,
+    group: int,
+    dtype: str | None = None,
+) -> torch.Tensor:
+    """Run split-KV prefill from a prebuilt :func:`plan_prefill_split_ctx` (H19).
+
+    ``q`` is ``[batch, kv_heads * group, max_qo, dim]`` (the integration's padded staging).  The
+    step runs as: one ``index_select`` pack → the split kernel (partial, per-slot outputs) → a
+    log-sum-exp weighted merge of the splits (plain tensor ops; the prefill path is eager, so no
+    capture constraints) → one ``index_copy_`` unpack.  Every index was built once per step on
+    the host, so the per-layer cost is a dozen device ops regardless of the split factor.
+
+    The merge reads normalized partials plus per-slot LSE (the decode split kernel's exact
+    contract): ``merged = Σ_s softmax_s(lse) ⊙ partial_s``.  Slots a request does not use gather
+    the trash slot ``(0, -1e30)`` and contribute exactly zero.
+    """
+    import torch
+
+    batch, num_qo_heads, max_qo, dim = q.shape
+    kv_heads = k_cache.shape[2]
+    page_size = int(k_cache.shape[1])
+    dtype = dtype or _TORCH_TO_TILELANG_DTYPE[q.dtype]
+    br = ctx["block_q"]
+    schedule = ctx["schedule"]
+    num_tiles = ctx["num_tiles"]
+    ms = ctx["ms_compile"]
+    kernel_slots = ctx["kernel_slots"]
+    assert num_qo_heads == kv_heads * group
+
+    # [batch, kv_heads, group, q_pos, dim] -> [batch, kv_heads, q_pos * group, dim]
+    q_flat = (
+        q.view(batch, kv_heads, group, max_qo, dim)
+        .permute(0, 1, 3, 2, 4)
+        .reshape(batch, kv_heads, max_qo * group, dim)
+        .contiguous()
+    )
+    q_packed = q_flat.view(-1, dim).index_select(0, ctx["pack_idx"]).view(
+        num_tiles * kv_heads, br, dim
+    )
+
+    # Partial buffers + the dedicated trash slot (out=0, lse=-1e30): merge rows a request does
+    # not use gather it, so unused split slots never need pre-filling.
+    part_out = torch.empty(
+        ((kernel_slots + 1) * kv_heads, br, dim), dtype=q.dtype, device=q.device
+    )
+    part_lse = torch.empty(((kernel_slots + 1) * kv_heads * br,), dtype=torch.float32, device=q.device)
+    part_out[-kv_heads:].zero_()
+    part_lse[-kv_heads * br :].fill_(-1e30)
+
+    kernel = build_prefill_split_kernel(
+        batch=batch,
+        kv_heads=kv_heads,
+        group=group,
+        dim=dim,
+        page_size=page_size,
+        num_pages_cap=ctx["cap"],
+        num_tiles=num_tiles,
+        max_splits=ms,
+        block_q=br,
+        dtype=dtype,
+    )
+    kernel(
+        q_packed,
+        pool_view(k_cache, ctx["cap"]),
+        pool_view(v_cache, ctx["cap"]),
+        ctx["indptr"],
+        ctx["indices"],
+        ctx["lpl"],
+        schedule.seq_ids.to(torch.int32),
+        schedule.q_offsets.to(torch.int32),
+        schedule.q_lens.to(torch.int32),
+        schedule.kv_page_starts.to(torch.int32),
+        ctx["causal_shift"],
+        ctx["row_thr"],
+        ctx["tile_page_lens"],
+        (schedule.seq_ids.to(torch.int32) * ms + schedule.split_ids.to(torch.int32)).contiguous(),
+        part_out.narrow(0, 0, kernel_slots * kv_heads),
+        part_lse.narrow(0, 0, kernel_slots * kv_heads * br),
+    )
+
+    # Merge: log-sum-exp weights over the split axis (see _merge_prefill_partials), then one
+    # scatter unpack into the flattened output rows.  The extra dummy row (all zeros, resolved
+    # from the ctx's -1 markers) absorbs the padding rows of a q-block; it is never read.
+    out_flat = torch.zeros(
+        (batch * kv_heads * max_qo * group + 1, dim), dtype=q.dtype, device=q.device
+    )
+    if ctx["num_qblocks"]:
+        merged = _merge_prefill_partials(part_out, part_lse, ctx, dim=dim, o_dtype=q.dtype)
+        out_flat.view(-1, dim).index_copy_(0, ctx["scatter_idx"], merged.view(-1, dim))
+
+    result = (
+        out_flat[: batch * kv_heads * max_qo * group]
+        .view(batch, kv_heads, max_qo, group, dim)
+        .permute(0, 1, 3, 2, 4)
+        .reshape(batch, num_qo_heads, max_qo, dim)
+        .contiguous()
+    )
     return result
 
 
