@@ -1096,8 +1096,13 @@ def paged_prefill_split_head_ascend950(
     block_q: int = 128,
     dtype: str = "bfloat16",
     threads: int = 128,
+    num_slots: int | None = None,
 ):
     """Head-split prefill: the **fully-visible** page chunks of a q-block (H20).
+
+    ``num_slots`` overrides the partial-slot capacity (dense per-tile slot layout: one slot
+    per (q-block, split) pair — the default ``batch * max_splits`` only names the decode-path
+    shape, which has no q-block axis).
 
     Arithmetic is identical to :func:`paged_prefill_split_ascend950` minus the per-row causal
     predicate: the scheduler only ever gives a head tile pages entirely before every row's
@@ -1114,7 +1119,7 @@ def paged_prefill_split_head_ascend950(
     ROWS = BR // 2
     accum = "float32"
     scale = 1.0 / math.sqrt(dim)
-    num_slots = batch * max_splits
+    num_slots = num_slots if num_slots is not None else batch * max_splits
 
     assert BR % 32 == 0
     assert BR <= 128
@@ -1291,25 +1296,32 @@ def paged_prefill_split_frontier_ascend950(
     block_q: int = 128,
     dtype: str = "bfloat16",
     threads: int = 128,
+    num_slots: int | None = None,
 ):
-    """Frontier-split prefill: the causal-frontier page chunk, plain-kernel mask form (H20).
+    """Frontier-split prefill: the causal-frontier page chunk (H20, 3e mask form).
 
-    The exact :func:`paged_prefill_ascend950` body — including the multi-block-verified
-    compound ``and`` predicate over ``RowThr`` (0a99edd) — with three deltas taken from the
-    split kernel: the tile starts at ``kv_page_starts[tile]`` instead of page 0, ``plen`` is
-    clamped to the pages that actually exist, and the epilogue writes the normalised partial
-    plus LSE into the dense slot layout (instead of a final output), so the unchanged merge
-    combines it with the head splits' partials.  The scheduler gives each q-block exactly one
-    frontier tile covering ``[P_vis, pages)``; every page it visits may be partially masked
-    for some rows, which the ``RowThr`` predicate handles (this is the plain kernel's
-    multi-block-tested path, unlike the split kernel's — E48).
+    ``num_slots`` overrides the partial-slot capacity (dense per-tile slot layout, see the
+    head kernel).
 
-    IR-parity note (E50/D52): the predicate must stay *syntactically identical* to the plain
-    kernel's — ``kv_pos = p * BC + c`` and ``limit = (p + 1 < eff)``.  The tile's page offset
-    enters only through host-side values: ``RowThr`` arrives pre-relativised
-    (``thr − start * BC``, see :func:`plan_prefill_split_ctx`) and ``eff`` is already a kernel
-    scalar.  Carrying ``start`` inside the SimtVF predicate (as the failed H19 kernel did) is
-    exactly the Let-bound-loop-invariant shape that trips the tilelang #3491 vectorizer bug.
+    The exact :func:`paged_prefill_ascend950` body — including the per-row ``RowThr`` causal
+    mask — with three deltas taken from the split kernel: the tile starts at
+    ``kv_page_starts[tile]`` instead of page 0, ``plen`` is clamped to the pages that actually
+    exist, and the epilogue writes the normalised partial plus LSE into the dense slot layout
+    (instead of a final output), so the unchanged merge combines it with the head splits'
+    partials.  The scheduler gives each q-block exactly one frontier tile covering
+    ``[P_vis, pages_needed)``; every page it visits may be partially masked for some rows,
+    which the ``RowThr`` predicate handles.
+
+    Mask-form history (the tilelang 0.1.15 failure domain, E48/E54-E57): the plain kernel's
+    *vectorized* compound predicate (literal syntactic parity, E50/D52) compiles for plain but
+    sends this kernel's pass pipeline into a >60 min blowup (E54; the head kernel — identical
+    minus the per-row term — compiles in 2m14s).  Scalarizing the predicate straight into the
+    distributed fragment (3b) compiles (29.3s) but mis-numbers (E56/E57: flat ~0.25 error,
+    single tile already wrong) — serial-in-SimtVF fragment-write ownership is the suspect.
+    The working form (3e, iter-047) computes the mask element-by-element into **shared**
+    (``s_ub`` in place) and feeds the fragment through the plain kernels' proven Parallel
+    shared→fragment copy; every other statement of the softmax body is byte-identical to the
+    green head kernel (E56).
     """
     BR = block_q
     BC = page_size
@@ -1317,7 +1329,7 @@ def paged_prefill_split_frontier_ascend950(
     ROWS = BR // 2
     accum = "float32"
     scale = 1.0 / math.sqrt(dim)
-    num_slots = batch * max_splits
+    num_slots = num_slots if num_slots is not None else batch * max_splits
 
     assert BR % 32 == 0
     assert BR <= 128
@@ -1405,28 +1417,31 @@ def paged_prefill_split_frontier_ascend950(
                     T.gemm(qk_a, qk_b, qk_acc, transpose_B=True)
                 T.dual_copy(qk_acc, s_ub)
 
-                # Syntactic parity with the plain kernel (E50/D52): p is the only loop
-                # variable here; the page offset lives in the relativised RowThr host-side.
+                # Page offset enters only through host-side values: RowThr arrives pre-relativised
+                # (thr − start·BC, plan_prefill_split_ctx) and eff is a kernel scalar — p is the
+                # only loop variable in the mask (E50/D52 relativisation, kept in 3e).
                 limit = T.if_then_else(p + 1 < eff, BC, kv_last_page_len[b])
                 with T.SimtVF(threads=threads):
-                    s_frag = T.alloc_fragment((ROWS, BC), accum)
-                    # Scalarized predicate (E54, 3b): the vectorized compound predicate over
-                    # the dual-copied ``thr_ub`` — literally the plain kernel's mask — sent
-                    # the Ascend pass pipeline into a >60 min blowup (E54: head, identical
-                    # minus ``eff``/``start`` scalars, compiles in 2m14s).  The extra let-bound
-                    # scalar chain is exactly tilelang #3492's unfoldable-Lets independence
-                    # analysis domain; computing the mask element-by-element keeps the SimtVF
-                    # region (reducers/exp stay vectorized) but the predicate never reaches
-                    # the vectorizer.  Frontier tiles are ~1 per q-block, so the redundant
-                    # per-lane scalar work is bounded and correctness comes first.
+                    # 3e (iter-047, E57 结论 3): 逐元素标量谓词写 **shared**（s_ub 就地），
+                    # fragment 由与 plain/head 内核同构的 Parallel 拷贝填充。E57 候选①：
+                    # 3b 的 serial-in-SimtVF 直接写分布式 fragment（s_frag）时 owned-element
+                    # 判定失准/写序无屏障 → 单 tile 即错、误差平坦（0.24-0.28）；shared 写在
+                    # SimtVF 内有在役先例（m_ub/l_ub/o_ub*），serial 仅决定执行序、无归属歧义，
+                    # 而 Parallel 拷贝（shared 读 → fragment 写）是 plain/head 内核已验证形态。
+                    # 其余 softmax 体与 head 内核（E56 数值已绿 0.0005）逐字节一致。
+                    # （历史：向量化复合谓词 = plain 字面同构，但编译 >60min blowup，E54/E55。）
                     for r in T.serial(ROWS):
+                        thr_r = thr_ub[r]
                         for c in T.serial(BC):
                             kv_pos = p * BC + c
-                            s_frag[r, c] = T.if_then_else(
-                                (c < limit) and (kv_pos <= thr_ub[r]),
+                            s_ub[r, c] = T.if_then_else(
+                                (c < limit) and (kv_pos <= thr_r),
                                 s_ub[r, c] * T.float32(scale),
                                 T.float32(-1e30),
                             )
+                    s_frag = T.alloc_fragment((ROWS, BC), accum)
+                    for r, c in T.Parallel(ROWS, BC):
+                        s_frag[r, c] = s_ub[r, c]
                     row_max = T.alloc_reducer((ROWS,), accum, op="max")
                     T.reducer_init(row_max)
                     for r, c in T.Parallel(ROWS, BC):
@@ -1937,9 +1952,15 @@ def plan_prefill_split_ctx(
                     group=group,
                     page_size=page_size,
                     kv_tile_pages=kv_tile_pages,
+                    block_q=BR,
                 )
             else:
-                splits = [(0, pages, True)]
+                # ktp=0 degenerate layout (one frontier-form tile per q-block): same
+                # thin-window truncation as the primitive — pages past the block's highest
+                # live-row threshold are zero-weight for every row.
+                live = min(BR, q_rows - q_start)
+                pages_needed = ((q_start + live - 1) // group + shift) // page_size + 1
+                splits = [(0, min(pages, max(1, pages_needed)), True)]
             thr_rows = [((q_start + i) // group + shift) if i < rows else -1 for i in range(BR)]
             blocks.append((b, q_start, rows, splits, thr_rows))
     ms_compile = 1
@@ -1947,25 +1968,38 @@ def plan_prefill_split_ctx(
         while ms_compile < len(splits):
             ms_compile *= 2
 
-    kernel_slots = kernel_batch * ms_compile
     num_qblocks = 0
-    head_tiles = []  # (b, q_start, rows, kv_start, kv_len, split_id)
-    frontier_tiles = []  # (b, q_start, rows, kv_start, kv_len, split_id, thr_rows)
+    head_tiles = []  # (b, q_start, rows, kv_start, kv_len, split_id, slot_id)
+    frontier_tiles = []  # (b, q_start, rows, kv_start, kv_len, split_id, thr_rows, slot_id)
     pack_h: List[int] = []
     pack_f: List[int] = []
     gather: List[int] = []
     scatter: List[int] = []
+    live_pairs = sum(len(splits) for _b, _q, _r, splits, _t in blocks)
+    # Dense per-(q-block, split) slot ids (iter-047 fix): the previous (request * ms + split)
+    # layout had **no q-block axis**, so every q-block of a request wrote its split-<sid>
+    # partial into the SAME slot — the last-written tile won and the merge combined one
+    # block's partials into every block (device-confirmed: all frontier slots byte-identical
+    # to the last q-block's).  Decode never saw this (one q-block per request); prefill split
+    # has one partial per (q-block, split), so slots are allocated densely in enumeration
+    # order and carried per tile (the tilelang ``tile_slots`` input, same as the decode
+    # path's ``build_tile_slots``).  Capacity covers the pow2 tile quantisation; slot
+    # ``kernel_slots`` itself is the dedicated trash slot (dead tiles write it; it is
+    # pre-filled (0, -1e30) and never gathered for a live split).
+    kernel_slots = max(kernel_tiles, live_pairs)
     trash_part = kernel_slots * kv_heads  # flat row of the dedicated trash slot
+    slot_counter = 0
     for b, q_start, rows, splits, thr_rows in blocks:
         num_qblocks += 1
         for split_id, (kv_start, kv_len, is_frontier) in enumerate(splits):
+            slot_id = slot_counter
+            slot_counter += 1
             if is_frontier:
-                frontier_tiles.append((b, q_start, rows, kv_start, kv_len, split_id, thr_rows))
+                frontier_tiles.append((b, q_start, rows, kv_start, kv_len, split_id, thr_rows, slot_id))
             else:
-                head_tiles.append((b, q_start, rows, kv_start, kv_len, split_id))
+                head_tiles.append((b, q_start, rows, kv_start, kv_len, split_id, slot_id))
             for bh in range(kv_heads):
-                slot = (b * ms_compile + split_id) * kv_heads + bh
-                gather.append(slot)
+                gather.append(slot_id * kv_heads + bh)
                 dst = pack_f if is_frontier else pack_h
                 for i in range(BR):
                     dst.append(
@@ -1998,6 +2032,7 @@ def plan_prefill_split_ctx(
     kvs_h = [t[3] for t in head_tiles]
     kvl_h = [t[4] for t in head_tiles]
     sid_h = [t[5] for t in head_tiles]
+    slot_h = [t[6] for t in head_tiles]
     pack = list(pack_h)
     num_head_tiles = len(head_tiles)
     # ---- frontier-half arrays: RowThr lives only here ----
@@ -2007,6 +2042,7 @@ def plan_prefill_split_ctx(
     kvs_f = [t[3] for t in frontier_tiles]
     kvl_f = [t[4] for t in frontier_tiles]
     sid_f = [t[5] for t in frontier_tiles]
+    slot_f = [t[7] for t in frontier_tiles]
     thr_host: List[int] = []
     page_lens_host: List[int] = [t[4] for t in head_tiles]  # head half first (tile order)
     for t in frontier_tiles:
@@ -2020,7 +2056,7 @@ def plan_prefill_split_ctx(
     # dead (padding) tiles: zero page iterations, thr = -1, pack rows point at real memory.
     # They sit at the schedule's tail, i.e. always inside the frontier half.  (The integration
     # always passes kernel_tiles = next_pow2(live) ≥ live; the max() just keeps the CPU tests'
-    # no-padding calls well-formed.)
+    # no-padding calls well-formed.)  Their writes go to the dedicated trash slot.
     dead = max(0, kernel_tiles - (num_head_tiles + len(frontier_tiles)))
     seq_f.extend([kernel_batch - 1] * dead)
     qoff_f.extend([0] * dead)
@@ -2028,6 +2064,7 @@ def plan_prefill_split_ctx(
     kvs_f.extend([0] * dead)
     kvl_f.extend([0] * dead)
     sid_f.extend([0] * dead)
+    slot_f.extend([kernel_slots] * dead)
     for _t in range(dead):
         page_lens_host.append(0)
         thr_host.extend([-1] * BR)
@@ -2071,6 +2108,12 @@ def plan_prefill_split_ctx(
         "schedule": schedule,
         "ms_compile": ms_compile,
         "kernel_slots": kernel_slots,
+        "kernel_batch": kernel_batch,
+        # Dense per-tile slot ids (head half first, then frontier, then dead → trash slot):
+        # what the two split kernels write through ``tile_slots`` and the merge gathers
+        # through ``gather_idx`` (the (request*ms+split) layout had no q-block axis and
+        # collided across a request's q-blocks — iter-047 root cause).
+        "tile_slots": torch.tensor(slot_h + slot_f, dtype=torch.int32, device=device),
         "num_qblocks": num_qblocks,
         "num_tiles": schedule.num_tiles,
         "num_head_tiles": num_head_tiles,
@@ -2199,7 +2242,7 @@ def forward_prefill_split(
     )
 
     # Partial buffers + the dedicated trash slot (out=0, lse=-1e30): merge rows a request does
-    # not use gather it, so unused split slots never need pre-filling.
+    # not use gather it, dead padding tiles write it (their per-tile slot is kernel_slots).
     part_out = torch.empty(
         ((kernel_slots + 1) * kv_heads, br, dim), dtype=q.dtype, device=q.device
     )
@@ -2208,21 +2251,25 @@ def forward_prefill_split(
     part_lse[-kv_heads * br :].fill_(-1e30)
 
     # H20 two-kernel launch: the schedule/pack layout puts every head tile before every
-    # frontier tile, so the two halves slice off the same tensors contiguously.  Both write
-    # the same dense (seq * ms + split) partial slots; the merge is unchanged.
+    # frontier tile, so the two halves slice off the same tensors contiguously.  Each tile
+    # writes its dense slot (ctx["tile_slots"]); the merge gathers the same ids.
     head_rows = num_head_tiles * kv_heads
     frontier_rows = (num_tiles - num_head_tiles) * kv_heads
-    slots = (schedule.seq_ids.to(torch.int32) * ms + schedule.split_ids.to(torch.int32)).contiguous()
-    part_out_view = part_out.narrow(0, 0, kernel_slots * kv_heads)
-    part_lse_view = part_lse.narrow(0, 0, kernel_slots * kv_heads * br)
+    slots = ctx["tile_slots"]
+    part_out_view = part_out.narrow(0, 0, (kernel_slots + 1) * kv_heads)
+    part_lse_view = part_lse.narrow(0, 0, (kernel_slots + 1) * kv_heads * br)
     head_spec = dict(
-        batch=batch,
+        # the launch passes the *padded* indptr/lpl (kernel_batch rows), so the kernel's
+        # batch declaration must be kernel_batch — not q.shape[0] (the padding rows are
+        # trash: seq_ids point at row kernel_batch-1 whose indptr repeats the last entry).
+        batch=ctx["kernel_batch"],
         kv_heads=kv_heads,
         group=group,
         dim=dim,
         page_size=page_size,
         num_pages_cap=ctx["cap"],
         max_splits=ms,
+        num_slots=kernel_slots + 1,
         block_q=br,
         dtype=dtype,
     )

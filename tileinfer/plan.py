@@ -175,6 +175,7 @@ def frontier_page_splits(
     group: int,
     page_size: int,
     kv_tile_pages: int,
+    block_q: int = 128,
 ) -> List[Tuple[int, int, bool]]:
     """H20 split-prefill page partitioning for ONE (request, query-block): the
     fully-visible head splits plus the frontier split.
@@ -185,25 +186,37 @@ def frontier_page_splits(
     then attends to the whole page, so the head kernel needs no per-row causal predicate
     (which is what sidesteps the tilelang SimtVF multi-block mask bug, E48): head splits tile
     ``[0, P_vis)`` where ``P_vis = (min_thr + 1) // page_size`` into ``kv_tile_pages``-page
-    chunks; the single **frontier split** covers ``[P_vis, pages)`` (absent when
-    ``P_vis >= pages``) and keeps the plain kernel's per-row ``RowThr`` form
-    (multi-block-verified, 0a99edd).
+    chunks; the single **frontier split** covers ``[P_vis, pages_needed)`` (absent when
+    ``P_vis >= pages_needed``) and keeps the per-row ``RowThr`` form.
 
-    Returns ``[(kv_start, kv_len, is_frontier), ...]``; ``kv_len`` is the true page count (the
-    frontier split is *not* frontier-truncated — the RowThr mask does the row-level cutting).
+    The frontier split is **thin-window truncated** (iter-047): ``pages_needed`` is the page
+    containing the block's *highest* live-row threshold — every page past it is invisible to
+    ALL rows of the block (the ``RowThr`` mask would zero-weight them), so visiting them is
+    pure dead work.  A block spans ``min(block_q, qo_tokens * group)`` flattened rows, i.e.
+    consecutive query positions, so the window is ``<= ceil(block_q/group)/page_size + 1``
+    pages (1-2 in serving shapes).
+
+    Returns ``[(kv_start, kv_len, is_frontier), ...];`` the frontier ``kv_len`` is the
+    truncated count; the kernel's scalar tail ``limit`` still handles a partial request-last
+    page inside the window.
     """
     assert kv_tile_pages > 0
     if qo_tokens <= 0 or pages <= 0:
         return []
     kv_tokens = (pages - 1) * page_size + lpl
-    min_thr = q_start_rows // group + (kv_tokens - qo_tokens)
+    shift = kv_tokens - qo_tokens
+    min_thr = q_start_rows // group + shift
     p_vis = (min_thr + 1) // page_size
     p_vis = max(0, min(p_vis, pages))
     splits: List[Tuple[int, int, bool]] = []
     for s in range(0, p_vis, kv_tile_pages):
         splits.append((s, min(kv_tile_pages, p_vis - s), False))
-    if p_vis < pages:
-        splits.append((p_vis, pages - p_vis, True))
+    live_rows = min(block_q, qo_tokens * group - q_start_rows)
+    max_thr = (q_start_rows + live_rows - 1) // group + shift
+    pages_needed = max_thr // page_size + 1
+    f_len = min(pages, pages_needed) - p_vis
+    if f_len > 0:
+        splits.append((p_vis, f_len, True))
     return splits
 
 

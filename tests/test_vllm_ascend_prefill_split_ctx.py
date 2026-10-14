@@ -29,14 +29,18 @@ def _live_tiles(qo_tokens, pages, lpl, group, ktp, block_q=128, page_size=128):
     heads, fronts = [], []
     for b, qo in enumerate(qo_tokens):
         q_rows = qo * group
+        shift = ((pages[b] - 1) * page_size + lpl[b]) - qo if pages[b] > 0 else -qo
         for q_start in range(0, q_rows, block_q):
             if ktp > 0:
                 splits = frontier_page_splits(
                     q_start, qo, pages[b], lpl[b],
-                    group=group, page_size=page_size, kv_tile_pages=ktp,
+                    group=group, page_size=page_size, kv_tile_pages=ktp, block_q=block_q,
                 )
             else:
-                splits = [(0, pages[b], True)]
+                # mirror of the ctx's ktp=0 degenerate path (thin-window truncated)
+                live = min(block_q, q_rows - q_start)
+                pages_needed = ((q_start + live - 1) // group + shift) // page_size + 1
+                splits = [(0, min(pages[b], max(1, pages_needed)), True)]
             for sid, (ks, kl, f) in enumerate(splits):
                 (fronts if f else heads).append((b, q_start, ks, kl, sid))
     return heads, fronts
@@ -89,6 +93,38 @@ def test_frontier_page_splits_partition():
     ]
     # degenerate: zero pages
     assert frontier_page_splits(0, 40, 0, 128, group=8, page_size=128, kv_tile_pages=4) == []
+
+
+def test_frontier_split_thin_window_truncation():
+    """The frontier split stops at the block's highest live-row threshold page (iter-047):
+    pages past it are invisible to every row of the block (zero-weight under the RowThr
+    mask) — visiting them is dead work.  Heads + frontier must cover exactly
+    ``[0, min(pages, pages_needed))``."""
+    group = 8
+    # already-thin cases keep their exact splits (all serving shapes)
+    assert frontier_page_splits(0, 40, 16, 128, group=group, page_size=128, kv_tile_pages=4) == [
+        (0, 4, False), (4, 4, False), (8, 4, False), (12, 3, False), (15, 1, True)
+    ]
+    assert frontier_page_splits(0, 64, 17, 128, group=group, page_size=128, kv_tile_pages=4) == [
+        (0, 4, False), (4, 4, False), (8, 4, False), (12, 4, False), (16, 1, True)
+    ]
+    # invariant sweep: the frontier never passes the block's needed-window end
+    for qo in (1, 9, 40, 128, 130, 300):
+        for pages in (4, 16, 33):
+            for q_start in (0, 128, 256):
+                if q_start >= qo * group:
+                    continue
+                splits = frontier_page_splits(
+                    q_start, qo, pages, 128, group=group, page_size=128, kv_tile_pages=4
+                )
+                live = min(128, qo * group - q_start)
+                shift = (pages - 1) * 128 + 128 - qo
+                pages_needed = ((q_start + live - 1) // group + shift) // 128 + 1
+                for ks, kl, f in splits:
+                    if f:
+                        assert 0 < ks + kl <= min(pages, pages_needed), (qo, pages, q_start, ks, kl)
+                covered = sum(kl for _ks, kl, _f in splits)
+                assert covered == min(pages, pages_needed), (qo, pages, q_start, splits)
 
 
 def test_ctx_layout_heads_first():
@@ -284,6 +320,9 @@ def test_unsplit_ctx_is_whole_tiles():
     """ktp=0 degenerates to one frontier-form tile per q-block (the plain prefill layout)."""
     ctx = _build_ctx([300, 100], [9, 4], [128, 64], group=8, kv_heads=2, ktp=0, max_qo=300)
     heads, fronts = _live_tiles([300, 100], [9, 4], [128, 64], 8, 0)
+    # one split per q-block -> ms_compile = 1; slots are dense per tile (iter-047), so the
+    # dead padding tiles no longer need a "never-gathered" sid corner — they write the
+    # dedicated trash slot through ctx["tile_slots"].
     assert ctx["ms_compile"] == 1
     assert ctx["num_head_tiles"] == 0
     assert ctx["schedule"].num_tiles == len(fronts)
@@ -295,3 +334,32 @@ def test_unsplit_ctx_is_whole_tiles():
             ref_off.append(q_start)
     assert ctx["schedule"].seq_ids.tolist() == ref_seq
     assert ctx["schedule"].q_offsets.tolist() == ref_off
+
+
+def test_dense_tile_slots_unique_per_qblock_split():
+    """Slot ids are dense and unique per (q-block, split) pair (iter-047 root-cause fix):
+    the previous (request*ms + split) layout collided across a request's q-blocks — every
+    block's split-<sid> partial landed in one slot and the merge combined the LAST block's
+    partials into every block (device-confirmed).  Live tiles get 0..live-1; dead padding
+    tiles point at the dedicated trash slot (kernel_slots); gather_idx mirrors the ids."""
+    qo, pages, lpl = [300, 40], [9, 16], [96, 128]
+    ctx = _build_ctx(qo, pages, lpl, ktp=4, max_qo=300)
+    heads, fronts = _live_tiles(qo, pages, lpl, 8, 4)
+    slots = ctx["tile_slots"].tolist()
+    live = len(heads) + len(fronts)
+    dead = ctx["schedule"].num_tiles - live
+    # globally dense 0..live-1 (head half concatenated before frontier half, so not sorted)
+    assert sorted(slots[:live]) == list(range(live)), "live slots must be dense 0..live-1"
+    assert slots[live:] == [ctx["kernel_slots"]] * dead, "dead tiles must hit the trash slot"
+    assert max(slots) <= ctx["kernel_slots"]  # trash slot only appears when dead > 0
+    # gather_idx values are the same dense ids (plus trash for missing splits)
+    g = ctx["gather_idx"]
+    assert int(g.min()) >= 0 and int(g.max()) <= ctx["kernel_slots"] * ctx["gather_idx"].shape[2]
+    used = set()
+    for gi in range(ctx["num_qblocks"]):
+        for s in range(ctx["ms_compile"]):
+            for bh in range(2):
+                v = int(g[gi, s, bh])
+                if v < ctx["kernel_slots"] * 2:
+                    used.add(v // 2)
+    assert used == set(range(live)), "every live slot must be gathered exactly by its block"

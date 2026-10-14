@@ -129,6 +129,11 @@ def _case(dim, kv_lens, qo_lens, ktp, group=8, kv_heads=2, seed=0, pad_batch=0):
         from tileinfer.integrations.vllm_ascend import _pad_tile_schedule
 
         ref_sched = _pad_tile_schedule(ref_sched, kernel_tiles, kernel_batch - 1)
+    # the padded-schedule kernel is built for kernel_batch rows; forward_prefill pads
+    # indptr/lpl internally but the caller must pad qo_lens the same way (trash rows = 0)
+    if kernel_batch > batch:
+        pad = kernel_batch - batch
+        qo = torch.cat([qo, torch.zeros(pad, dtype=qo.dtype, device=qo.device)])
     unsplit = forward_prefill(
         q, k_cache, v_cache, meta, ref_sched, qo, group=group, block_q=BLOCK_Q,
         kernel_batch=kernel_batch,

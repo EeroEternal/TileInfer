@@ -303,6 +303,7 @@ class PrefillShapeManager:
                     num_pages_cap=pool_pages,
                     num_tiles=num_tiles,
                     max_splits=max_splits,
+                    num_slots=num_tiles + 1,
                     block_q=block_q,
                     dtype=dtype_name,
                 )
@@ -315,6 +316,7 @@ class PrefillShapeManager:
                     num_pages_cap=pool_pages,
                     num_tiles=num_tiles,
                     max_splits=max_splits,
+                    num_slots=num_tiles + 1,
                     block_q=block_q,
                     dtype=dtype_name,
                 )
