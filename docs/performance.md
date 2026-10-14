@@ -8,6 +8,11 @@ the known limits written down, so the next person can tell an improvement from a
 > 双源 A/B 见下方「图模式双源全指标」节;完整流程、逐场景 P50/P99 与原始 JSON 索引在
 > `.agent_loop/PERFORMANCE_REPORT.md`(第 5 节,TEMPORARY_PASS 比值口径)。本文件其余章节为
 > Qwen2.5-1.5B/d128 时代的库级基线,方法论仍有效,绝对值不可与 Qwen3.6 数字混读。
+>
+> **2026-10-14(阶段 3 更新)**:下表比值仍为 E15 干扰期 TEMPORARY 口径(结构未变,短上下文
+> 结论健康窗复核一致,见 P1 节);其列出的长上下文落差已按阶段三 L1-L3 逐项处置——KI-1 已修
+> (P6)、池无关 ABI 就绪(P7)、prefill 首见编译窗已消除(P3,110s→<5s)、split-KV opt-in
+> 在役兑现 8K TPOT 1.411x/16K 2.037x(P8 节)。终版汇总见 PERFORMANCE_REPORT §10。
 
 ## 图模式双源全指标(Qwen3.6-35B-A3B,自研源+官方源,TI/FIA 比值)
 
@@ -37,8 +42,10 @@ chunk-wu 未接入(opt-in 机制就绪)——即对比的是"TileInfer decode+pr
 0.94-0.95、TPOT P50 1.06;并发 4/16/32 吞吐 0.96/0.95/0.94;8K 吞吐 **0.33**/TTFT P50 **4.04**;
 16K 吞吐 **0.21**/TTFT P50 **5.76**。
 
-解读:短上下文与并发(≤512 输入、≤32 并发)双源一致 TI≈FIA;长上下文 2-6x 为结构性
-(KI-1 split-KV 未启用 + D22 prefill 编译窗 + chunked prefill KV 重扫),属阶段三 L1-L3 范围。
+解读:短上下文与并发(≤512 输入、≤32 并发)双源一致 TI≈FIA;长上下文 2-6x 为测量期结构性
+(KI-1 split-KV 未启用 + D22 prefill 编译窗 + chunked prefill KV 重扫)——阶段三已处置:
+KI-1 修复(P6)+ 首见编译窗消除(P3)+ split-KV opt-in 兑现 decode 侧 1.41x/2.04x(P8);
+纯 prefill 剩余差距(chunked prefill KV 重扫)不在本阶段范围,如实保留。
 
 ## P1/H10 短/长上下文长度自适应分流(gdnwu 融合核,引擎同侧 A/B,2026-10-14)
 
