@@ -345,17 +345,21 @@ def moe_down_prenz(
     dtype: str = "bfloat16",
     threads: int = 128,
 ):
-    """Down-projection grouped GEMM with a **pre-packed NZ** weight (D45, restart路线).
+    """Down-projection grouped GEMM with a **pre-packed NZ** weight — EXPERIMENTAL, NOT WIRED.
 
-    Identical arithmetic to :func:`moe_down`, but the weight is read from a compact-NZ packed
-    tensor ``W2nz`` ``[E * NT, block_n, block_k]`` (one NZ tile per (expert, n-tile); see
-    :mod:`tileinfer.kernels.moe.prenz`) through a UB staging buffer annotated with
-    ``make_ascend_compact_nz_layout``.  Per the offline probe (``benchmarks/probes/moe_prenz_nd2nz.py``)
-    this makes the weight path lower to ``asc_copy_gm2ub_align`` + ``asc_copy_ub2l1`` instead of the
-    ``asc_copy_gm2l1_nd2nz`` conversion E36 identified as the structural bottleneck.
+    Status (D45/D46): the *offline* mechanism works (the UB->L1 copy lowers to a raw DMA instead
+    of the nd2nz conversion; see ``benchmarks/probes/moe_prenz_nd2nz.py``), but the device result
+    is **wrong** (isolated in ``benchmarks/probes/moe_prenz_device.py``):
 
-    A single K iteration is required (``block_k == inter``) so the packed tile covers the whole
-    reduction axis; the caller packs one ``[block_n, inter]`` NZ tile per (expert, n-tile).
+    * ``plain_nd``  (GM->L1)                    diff 0.011  (reference)
+    * ``ub_plain``  (GM->UB->L1, no annotation) diff 0.011  (UB staging is fine)
+    * ``ub_nz_pack``(GM(NZ)->UB(compact_nz)->L1) diff ~1e36  (WRONG)
+
+    i.e. a plain UB staging hop is correct, but the compact-NZ annotation produces an L1 image the
+    Cube's L0B read does not agree with -- the pre-NZ physical order needs a different L0B-side
+    geometry, not just the pack order.  This matches (and sharpens) E36's conclusion that pre-NZ
+    "direct load" is not a drop-in for the nd2nz path.  **Kept as a documented negative result;
+    not wired into any kernel factory.**  Do not enable without a device certification.
     """
     EM = num_tiles_max
     R = rows_slots
