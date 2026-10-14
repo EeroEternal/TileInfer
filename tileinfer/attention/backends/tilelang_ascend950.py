@@ -195,6 +195,32 @@ class TileLangAscend950Backend(AttentionBackend):
             state["kv_indptr_buf"] = torch.empty(plan.batch_size + 1, dtype=torch.int32, device=plan.device)
             state["kv_indices_buf"] = torch.zeros(cap, dtype=torch.int32, device=plan.device)
             state["last_page_len_buf"] = torch.empty(plan.batch_size, dtype=torch.int32, device=plan.device)
+            # Prewarm the two split-path kernels *here*: the first forward_split would otherwise
+            # compile inside the ACLGraph capture window (~2.5 min, risking a capture timeout).
+            from ...kernels.attention.paged_decode_ascend950 import (
+                build_merge_kernel,
+                build_split_kernel,
+            )
+
+            build_split_kernel(
+                batch=plan.batch_size,
+                kv_heads=plan.num_kv_heads,
+                group=plan.gqa_group_size,
+                dim=plan.head_dim,
+                page_size=plan.page_size,
+                num_pages_cap=cap,
+                num_tiles=plan.schedule.num_tiles,
+                max_splits=max_splits,
+                dtype=_TILELANG_DTYPE[plan.dtype],
+            )
+            build_merge_kernel(
+                batch=plan.batch_size,
+                kv_heads=plan.num_kv_heads,
+                group=plan.gqa_group_size,
+                dim=plan.head_dim,
+                max_splits=max_splits,
+                dtype=_TILELANG_DTYPE[plan.dtype],
+            )
             _refresh_metadata(plan, state, meta=None)
         else:
             from ...kernels.attention.paged_decode_ascend950 import build_decode_kernel

@@ -238,3 +238,100 @@ def test_declared_cap_beyond_pool_is_exact(monkeypatch, kv_tile_pages):
     got, expected = _case(2, 2, 8, 128, 128, [130, 300], kv_tile_pages=kv_tile_pages)
     diff = (got - expected).abs().max().item()
     assert diff < TOL, f"declared-cap binding (kv_tile_pages={kv_tile_pages}): {diff:.4f} > {TOL}"
+
+
+# -------------------------------------------------------------------------------------------
+# P8 (L3): one *full* split plan serves any page-count distribution.  Graph capture pins one
+# plan per bucket while replay-time sequences grow a page per step, so the plan's schedule is
+# built as if every request spanned the whole table width; the split kernel clamps each tile to
+# the pages that actually exist (empty tiles write the merge's zero-weight filler) and the merge
+# reads the same slots regardless.  This is the device-level contract behind the integration's
+# `_build_plan` full-plan path and the TILEINFER_KV_TILE_PAGES opt-in.
+# -------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "batch,kv_heads,group,dim,width_pages,kv_tile_pages,kv_lens,label",
+    [
+        (2, 8, 4, 128, 8, 2, [260, 130], "full plan, ragged lens, empty tail splits"),
+        (2, 8, 4, 128, 8, 2, [1, 128], "full plan, near-empty batch"),
+        (1, 8, 4, 128, 16, 4, [513], "full plan, partial last split"),
+        (4, 8, 4, 128, 16, 4, [2050, 1024, 129, 1], "full plan, serving-config skew"),
+    ],
+)
+def test_full_split_plan_clamps_to_real_pages(
+    batch, kv_heads, group, dim, width_pages, kv_tile_pages, kv_lens, label
+):
+    os.environ["TILEINFER_ALLOW_SPLIT_KV"] = "1"
+    from tileinfer import BatchAttention
+    from tileinfer.metadata import RaggedMetadata
+
+    device = torch.device("npu", 0)
+    torch.manual_seed(7)
+    page_size = 128
+
+    def _meta(lens, pool_pages):
+        indptr = [0]
+        lpl = []
+        for length in lens:
+            indptr.append(indptr[-1] + -(-length // page_size))
+            lpl.append(page_size if length % page_size == 0 else length % page_size)
+        n = indptr[-1]
+        ids = torch.arange(pool_pages, dtype=torch.int32, device=device)
+        idx = ids.repeat(-(-n // pool_pages))[:n].contiguous()
+        return RaggedMetadata(
+            kv_indptr=torch.tensor(indptr, dtype=torch.int32, device=device),
+            kv_indices=idx,
+            kv_last_page_len=torch.tensor(lpl, dtype=torch.int32, device=device),
+            page_size=page_size,
+        )
+
+    # the pool must hold at least batch*width pages (the full plan's kv_indices slot is
+    # bucket*width long — in the engine bucket*width <= pool holds by the trash-slot check)
+    pool_pages = batch * width_pages + 1
+    k_cache = torch.randn(pool_pages, page_size, kv_heads, dim, dtype=DTYPE, device=device)
+    v_cache = torch.randn_like(k_cache)
+    real = _meta(kv_lens, pool_pages)
+    # the plan-side lens describe the *full* table width (what `_build_plan` does); the values
+    # are irrelevant beyond their shape — run() re-binds the real metadata every step
+    full = _meta([width_pages * page_size] * batch, pool_pages)
+    q = torch.randn(batch, kv_heads * group, 1, dim, dtype=DTYPE, device=device) * 0.2
+
+    attn = BatchAttention(backend="tilelang-ascend950", device=device, dtype=DTYPE)
+    plan = attn.plan(
+        kv_indptr=full.kv_indptr,
+        kv_indices=full.kv_indices,
+        kv_last_page_len=full.kv_last_page_len,
+        page_size=page_size,
+        num_qo_heads=kv_heads * group,
+        num_kv_heads=kv_heads,
+        head_dim=dim,
+        causal=False,
+        kv_tile_pages=kv_tile_pages,
+        k_cache=k_cache,
+        v_cache=v_cache,
+    )
+    assert plan.schedule.needs_merge
+    got = attn.run(
+        q,
+        k_cache,
+        v_cache,
+        plan=plan,
+        kv_indptr=real.kv_indptr,
+        kv_indices=real.kv_indices,
+        kv_last_page_len=real.kv_last_page_len,
+    )
+    torch.npu.synchronize()
+
+    host = RaggedMetadata(
+        kv_indptr=real.kv_indptr.cpu(),
+        kv_indices=real.kv_indices.cpu(),
+        kv_last_page_len=real.kv_last_page_len.cpu(),
+        page_size=page_size,
+    )
+    host.qo_indptr = torch.arange(batch + 1, dtype=torch.int32)
+    expected = reference_attention(
+        q.cpu().float(), k_cache.cpu().float(), v_cache.cpu().float(), host
+    ).float()
+    diff = (got.cpu().float() - expected).abs().max().item()
+    assert diff < TOL, f"{label}: max abs diff {diff:.4f} exceeds {TOL}"

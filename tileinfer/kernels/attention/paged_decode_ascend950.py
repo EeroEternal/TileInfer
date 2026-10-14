@@ -307,6 +307,15 @@ def paged_decode_split(
             start = page_starts[tile]
             plen = page_lens[tile]
             req_pages = kv_indptr[b + 1] - kv_indptr[b]
+            # One *full* plan serves any page-count distribution (graph capture pins the plan
+            # while replay-time sequences grow): clamp this tile's page loop to the pages that
+            # actually exist.  An emptied tile (start >= req_pages) skips the loop entirely and
+            # writes l=0 -> the l_safe below turns its slot into (out=0, lse=-1e30), exactly the
+            # pre-filled values the merge weights at zero; a partially covered tile stops at
+            # req_pages and the `limit` inside the loop still pins the request's real last page.
+            eff = req_pages - start
+            eff = T.if_then_else(eff < 0, 0, eff)
+            plen = T.if_then_else(plen < eff, plen, eff)
             slot = tile_slots[tile]
 
             q_l1 = T.alloc_l1((BR, D), dtype)
@@ -415,13 +424,18 @@ def paged_decode_split(
                             o_ub1[r, d] = o_ub1[r, d] + o_tmp1[r, d]
 
             with T.SimtVF(threads=threads):
+                # l_safe: an emptied tile carries l=0 — divide by 1 instead, so the slot gets
+                # (out=0, lse=-1e30 + log(1)) = the merge's zero-weight filler, never a NaN.
                 for r, d in T.Parallel(ROWS, D2):
-                    out_ub0[r, d] = T.Cast(dtype, o_ub0[r, d] / l_ub[r])
+                    l_safe = T.if_then_else(l_ub[r] > 0, l_ub[r], T.float32(1))
+                    out_ub0[r, d] = T.Cast(dtype, o_ub0[r, d] / l_safe)
                 if D > D2:
                     for r, d in T.Parallel(ROWS, D2):
-                        out_ub1[r, d] = T.Cast(dtype, o_ub1[r, d] / l_ub[r])
+                        l_safe = T.if_then_else(l_ub[r] > 0, l_ub[r], T.float32(1))
+                        out_ub1[r, d] = T.Cast(dtype, o_ub1[r, d] / l_safe)
                 for r in T.Parallel(ROWS):
-                    lse_ub[r] = m_ub[r] + T.log(l_ub[r])
+                    l_safe = T.if_then_else(l_ub[r] > 0, l_ub[r], T.float32(1))
+                    lse_ub[r] = m_ub[r] + T.log(l_safe)
 
             T.dual_copy(out_ub0[0:ROWS, 0:D2], PartOut[slot * kv_heads + bh, 0:BR, 0:D2])
             if D > D2:
@@ -859,8 +873,6 @@ def forward_split(
     """
     import torch
 
-    batch, num_qo_heads, qo_len, dim = q.shape
-    assert qo_len == 1
     kv_heads = k_cache.shape[2]
     page_size = int(k_cache.shape[1])
     br = padded_rows(group)
@@ -869,6 +881,21 @@ def forward_split(
     # Declared ABI capacity (covers the real pool; see declared_pool_cap): sizes the split
     # kernel's kv_indices slot and its K/V page extents (the pools are capacity views).
     cap = declared_pool_cap(int(k_cache.shape[0]))
+
+    if q.dim() == 3:
+        # Integration path: q is the caller's *already padded* staging buffer
+        # ([batch, kv_heads*BR, dim] — what the vLLM integration fills before run()), passed
+        # in place of the `q_pad` argument, which is then ignored.  The result stays 3-D
+        # (the integration copies it into the engine's output buffer itself).
+        batch, hbr, dim = q.shape
+        assert hbr == kv_heads * br, (hbr, kv_heads, br)
+        q_pad = q
+    else:
+        batch, num_qo_heads, qo_len, dim = q.shape
+        assert qo_len == 1
+        q_pad.view(batch, kv_heads, br, dim)[:, :, :group] = q[:, :, 0, :].view(
+            batch, kv_heads, group, dim
+        )
 
     split = build_split_kernel(
         batch=batch,
@@ -883,10 +910,6 @@ def forward_split(
     )
     merge = build_merge_kernel(
         batch=batch, kv_heads=kv_heads, group=group, dim=dim, max_splits=max_splits, dtype=dtype
-    )
-
-    q_pad.view(batch, kv_heads, br, dim)[:, :, :group] = q[:, :, 0, :].view(
-        batch, kv_heads, group, dim
     )
 
     # Prefer the plan-owned metadata buffers (stable addresses, caller tensors untouched).
@@ -934,6 +957,11 @@ def forward_split(
     _hook("after split")
     merge(part_out, part_lse, out_pad)
     _hook("after merge")
+
+    if q.dim() == 3:
+        # integration path: the engine integration reads out_pad through its own plan-owned
+        # view — hand back the padded buffer untouched
+        return out_pad
 
     result = out_pad.view(batch, kv_heads, br, dim)[:, :, :group].reshape(
         batch, num_qo_heads, dim

@@ -156,6 +156,47 @@ source .agent_loop/run/env.sh
 .venv/bin/python benchmarks/bench_moe_devtime.py   # 设备时间口径(门槛判据)
 ```
 
+## P8 split-KV 引擎启用 + 长上下文 A/B(2026-10-14,opt-in 兑现)
+
+**机制**(E39):plan 的 schedule 以「满额」构建(dummy_lens=表宽,每请求
+max_splits=ceil(width/kv_tile_pages)),split 内核把每 tile 页循环钳到运行期真实页数
+(eff=min(plen, req_pages−start)),空 tile 经 l→1 写 0/−1e30 槽被 merge 零权重吸收——
+同一预烧 plan 服务任意页数分布,满足图捕获固定 plan 约束;finalize_plan 预编译 split+merge
+(否则 capture 窗内首编 ~2.5min)。kv_tile_pages=16。
+
+**引擎 A/B**(2026-10-14 10:14-11:00,NPU 空闲窗,双侧背靠背,r=3 取中位):
+
+| 场景(自研源,ms) | plain(基线) | split-KV on | 比值 |
+|---|---|---|---|
+| long8k_128tok TPOT | 17.62 | **12.49** | **1.411x**(−29.1%) |
+| long16k_128tok TPOT | 25.60 | **12.57** | **2.037x**(−50.9%) |
+| long8k TTFT | 1556.6 | 1523.7 | 1.022x(噪声带) |
+| long16k TTFT | 3938.2 | 3942.7 | 0.999x |
+| decode_128tok TPOT(b1) | 9.28 | 9.38 | 0.989x(税 ~1%) |
+| decode_512tok TPOT(b1) | 9.56 | 9.91 | 0.965x |
+| conc_16 TPOT | 14.20 | 15.90 | 0.893x(并发税,如实记录) |
+| conc_32 TPOT | 17.30 | 21.26 | 0.814x(并发税,如实记录) |
+
+官方源(vllm_bench_serve,含并发):8K TPOT 59.0→54.0(**1.093x**)/16K 153.6→140.2
+(**1.095x**),TTFT ±2.4%;conc16 1.05x/conc32 1.04x/tok512 1.09x。
+
+**探针**:双侧 fallbacks=0、exceptions=0、capture_calls=40、6 桶 split plan READY、
+prefill_calls=980/markers 50960 同构——split 路径真实在役。启动 15min(满额 split plan
+首见真实编译 2.7min/桶,一次性;预烧缓存命中后 ~3min)。
+
+**判定**:H16 **proven**。长上下文收益双源兑现(E39 期望带 30-60% 内:8K 29%/16K 51%),
+内核级 2.8x(b1/64K)在引擎 16K 收窄至 2.04x(全注意力仅 10/40 层);TTFT 全场景无劣化。
+**部署形态=opt-in**:`TILEINFER_KV_TILE_PAGES=16 + TILEINFER_ALLOW_SPLIT_KV=1` 显式开启
+服务长上下文部署;短上下文税(b1 ~1%/并发档 11-19%)与编译窗(首见 15min)已定量入档,
+全局默认不开启。
+
+Reproduce with:
+
+```bash
+source .agent_loop/run/env.sh
+PORT=8355 bash .agent_loop/run/p8_ab.sh on    # split 侧
+PORT=8356 bash .agent_loop/run/p8_ab.sh off   # plain 基线侧
+```
 
 Reproduce with:
 

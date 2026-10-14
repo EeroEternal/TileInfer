@@ -700,11 +700,19 @@ class TileInferDecodeAttention:
         # A *dummy* page table: only its shape matters (it sizes the plan's workspace, so it is the
         # request's real table width, not the whole pool).  Decode without KV splitting produces
         # one work tile per request, so the schedule does not depend on the lengths; the values are
-        # refreshed every step by the caller.  Plans are always built on kernel pages (128 tokens)
-        # and the pool is presented as its 128-token sub-page view.
+        # refreshed every step by the caller.  With KV splitting the plan must be *full*: graph
+        # capture pins one plan per bucket, while replay-time sequences grow one page per step, so
+        # the schedule is built as if every request spanned the whole table width (max_splits =
+        # ceil(width / kv_tile_pages)) and the kernel clamps each tile to the pages that actually
+        # exist at run time (see paged_decode_split).  Plans are always built on kernel pages
+        # (128 tokens) and the pool is presented as its 128-token sub-page view.
+        # (128 tokens) and the pool is presented as its 128-token sub-page view.  NOTE: the
+        # page-table lens are in *tokens* (`PageTable` derives ceil(len/128) pages), so the
+        # full-plan fill is width pages × the kernel page size.
         sub = _sub_pages(block_size)
         pool = _pool_sub_view(key_cache, sub)
-        dummy_lens = torch.ones(bucket, dtype=torch.int32, device=self.device)
+        dummy_len = width * KERNEL_PAGE_SIZE if self.kv_tile_pages > 0 else 1
+        dummy_lens = torch.full((bucket,), dummy_len, dtype=torch.int32, device=self.device)
         dummy = RaggedMetadata(
             kv_indptr=torch.arange(0, bucket + 1, dtype=torch.int32, device=self.device),
             kv_indices=torch.zeros(bucket, dtype=torch.int32, device=self.device),
