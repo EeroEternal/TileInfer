@@ -118,13 +118,19 @@ kernel's exact form: running `(m,l)` + per-page rescale, rows=16 / page 128 / 8 
 that shape shows **SIMD 4.7 µs vs SIMT 12.4 µs → 2.6× faster**, both bit-exact vs the fp32 oracle —
 so the T5 speed payoff is now demonstrated, not assumed.
 
-*Integration (in progress)*: the decode kernel's per-page online softmax now has an opt-in
-packed-SIMD path behind `TILEINFER_SIMD_SOFTMAX=1` in `paged_decode_ascend950.py` — **decode main
-kernel done** (device suite `tests/test_tilelang_ascend950_decode.py` passes 25/25 with the flag
-off **and** on; CPU contract `test_decode_simd_softmax_gate`).  It writes fp32 weights and keeps the
-`o = o*alpha` rescale in a separate SIMT block (a direct UB read-modify-write adjacent to the add is
-a hazard — measured `o` diff=1.0 with m/l/alpha exact).  Remaining: the other softmax sites (split /
-merge / prefill) port the same way, then `scripts/run_device_ci.sh` + the serving A/B for the
+*Integration*: **all five softmax sites** now have an opt-in packed-SIMD path behind
+`TILEINFER_SIMD_SOFTMAX=1` in `paged_decode_ascend950.py` — `paged_decode_ascend950`,
+`paged_decode_split`, and the three prefill kernels (`paged_prefill_ascend950`,
+`paged_prefill_split_ascend950`, `paged_prefill_split_head_ascend950`,
+`paged_prefill_split_frontier_ascend950`).  Decode + split are **device-verified** (decode suite
+`tests/test_tilelang_ascend950_decode.py` 25/25 with the flag off **and** on; prefill-split suite
+6/6).  CPU contract `test_decode_simd_softmax_gate` lowers all 7 kernels both ways (145 CPU tests
+pass).  Design points: it writes fp32 weights and casts in the existing SIMT epilogue (a SIMD
+f32->bf16 store interleaves lanes); the `o = o*alpha` rescale stays a **separate** SIMT block (an
+adjacent UB read-modify-write is a hazard — measured `o` diff=1.0 with m/l/alpha exact); the causal
+mask uses `vadds(vci(0), page*BC)` for the runtime column base and two chained `vsel`s (a `vand` of
+two `boolx256` masks fails to infer its default mask width).  Remaining: run
+`scripts/run_device_ci.sh` (prefill split/head/frontier device suites) + the serving A/B for the
 end-to-end verdict.
 
 
