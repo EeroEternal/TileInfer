@@ -178,6 +178,31 @@ PREFILL_MAX_TILES = int(__import__("os").environ.get("TILEINFER_PREFILL_MAX_TILE
 # requests stay whole automatically (a request shorter than one split never splits).
 _PREFILL_KV_TILE_PAGES = int(__import__("os").environ.get("TILEINFER_PREFILL_KV_TILE_PAGES", "0") or 0)
 
+# D57-①(W1 收尾):长上下文 prefill 步分流回退 FIA。TI prefill 内核的单位功效率随 KV
+# 上下文线性劣化(E46 aiv_vec_ratio=0.96/mac=0.02 + E47 同功线性扩展),C8 饱和下 8K/16K
+# 场景整体吞吐仅 0.213x/0.121x(E41),split 路线亦无增益(E63);把 KV 上下文(按内核页
+# 128 token 粒度上取整)超过该阈值的 prefill 步交还 vLLM 原生 FIA 路径——decode 接管
+# (P8 已在役)不受影响。0 = 关闭(默认,行为零变化);决策零新增同步(读的 pages_host
+# 是共享构建链本来就要算的量)。
+_PREFILL_MAX_CTX = int(__import__("os").environ.get("TILEINFER_PREFILL_MAX_CTX", "0") or 0)
+
+#: D57-① 在役探针计数(被分流回 FIA 的 prefill 步数;metrics dumper 合并输出)。
+_PREFILL_STATS: Dict[str, int] = {"prefill_long_skips": 0}
+#: 被分流步的守卫 (step_id, num_reqs, num_tokens):同一步的其余层快速短路,免重复构建
+#: 共享面。键含形状,与 _PREFILL_STEP_GUARD 的 belt-and-braces 同款防 id 复用。
+_PREFILL_SKIP_GUARD: tuple = ()
+
+
+def _prefill_ctx_shunt(pages_host, threshold: int) -> bool:
+    """D57-① 决策纯函数:该步 KV 上下文是否超阈(超阈 → 该步回退 FIA)。
+
+    ``pages_host`` 是每请求的内核页数(128 token 粒度,上取整——与内核实际遍历量一致,
+    故比较值天然保守:真上下文只会更小)。``threshold<=0`` 恒 False(开关关闭)。
+    """
+    if threshold <= 0 or not pages_host:
+        return False
+    return max(pages_host) * KERNEL_PAGE_SIZE > threshold
+
 # Per-step metadata dedup for prefill (H18, the B3 step-guard extended to the prefill path):
 # vLLM hands the *same* attention-metadata instance to every full-attention layer of a step and
 # builds a fresh one per step, but everything ``prefill_step`` derives from it (qo lengths, the
@@ -401,13 +426,19 @@ def prefill_step(
     Returns True when TileInfer served the step; False means "use FIA" (shape not compiled yet
     or structurally unsupported).  Eager-only: must not be called under a graph capture.
     """
-    global _PREFILL_STEP_GUARD, _PREFILL_STEP_OBJ
+    global _PREFILL_STEP_GUARD, _PREFILL_STEP_OBJ, _PREFILL_SKIP_GUARD
     num_reqs = int(seq_lens.numel())
     if num_reqs == 0 or num_reqs != int(query_start_loc.numel()) - 1:
         _refuse("req/qsl mismatch", num_reqs, int(query_start_loc.numel()) - 1)
         return False
 
     step_id = id(step_obj) if step_obj is not None else None
+    # D57-①:已被分流的步,同一步其余层直接短路(免重复的页表展开/共享面构建)。
+    if (
+        step_id is not None
+        and _PREFILL_SKIP_GUARD == (step_id, num_reqs, int(query.shape[0]))
+    ):
+        return False
     shared = _PREFILL_STEP_SHARED if (step_id is not None and step_id == _PREFILL_STEP_GUARD) else None
     if shared is not None and (
         shared["num_reqs"] != num_reqs or shared["sum_qo"] != int(query.shape[0])
@@ -460,6 +491,17 @@ def prefill_step(
         # Host-side page counts for the schedule: one extra tiny D2H, still once per step (was
         # per layer, and went through plan_query_tiles' per-row ``.item()`` storm on top).
         pages_host = (meta.kv_indptr[1:] - meta.kv_indptr[:-1]).to(torch.int64).cpu().tolist()
+
+        # D57-①(W1 收尾):长上下文 prefill 步分流回退 FIA。决策在共享面构建之后、
+        # split 规划/形状登记之前——同一步其余层走顶部短路,一步只付一次页表展开。
+        if _prefill_ctx_shunt(pages_host, _PREFILL_MAX_CTX):
+            _PREFILL_STATS["prefill_long_skips"] = (
+                _PREFILL_STATS.get("prefill_long_skips", 0) + 1
+            )
+            if step_id is not None:
+                _PREFILL_SKIP_GUARD = (step_id, num_reqs, int(query.shape[0]))
+            _refuse("ctx shunt", max(pages_host) * KERNEL_PAGE_SIZE, _PREFILL_MAX_CTX)
+            return False
 
         # H19: split-KV prefill.  ``TILEINFER_PREFILL_KV_TILE_PAGES`` splits every q-block tile
         # along the KV axis so the per-tile serial page walks (the W1-C8 pathology's dominant
@@ -1743,6 +1785,8 @@ def start_metrics_dumper() -> bool:
             try:
                 cls = TileInferDecodeAttention
                 stats = dict(getattr(cls, "_stats", {}))
+                # D57-①:prefill 侧计数(长上下文分流)独立于类状态,合并进同一视图。
+                stats.update(_PREFILL_STATS)
                 stats["ready_plans"] = len(getattr(cls, "_plans", {}))
                 marker = getattr(cls, "_marker", None)
                 stats["kernel_markers"] = int(marker.item()) if marker is not None else -1
