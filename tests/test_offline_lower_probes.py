@@ -124,6 +124,8 @@ def test_decode_simd_softmax_gate():
         assert "vcmax" not in s_off, "split 默认路径不应含 SIMD 归约内在函数"
         pspec = dict(batch=1, kv_heads=2, group=8, dim=128, page_size=128, num_pages_cap=16,
                      num_tiles=4, threads=128)
+        sspec_prefill = dict(batch=1, kv_heads=2, group=8, dim=128, page_size=128,
+                             num_pages_cap=16, num_tiles=4, max_splits=2, threads=128)
         p_off = compile_kernel_source(K.paged_prefill_ascend950(**pspec), target="ascend")
         assert "vcmax" not in p_off, "prefill 默认路径不应含 SIMD 归约内在函数"
 
@@ -142,6 +144,17 @@ def test_decode_simd_softmax_gate():
         p_on = compile_kernel_source(K.paged_prefill_ascend950(**pspec), target="ascend")
         for op in ("vcmps", "vcmp", "vcmax", "vcadd", "vexp", "vadds"):
             assert op in p_on, f"T5 prefill SIMD 路径未降到 {op}"
+
+        # prefill split / head / frontier: same gate, same SIMD softmax.  split + frontier carry the
+        # causal mask; head carries only the scalar tail mask.
+        for name, sp in (
+            ("prefill_split", K.paged_prefill_split_ascend950),
+            ("prefill_head", K.paged_prefill_split_head_ascend950),
+            ("prefill_frontier", K.paged_prefill_split_frontier_ascend950),
+        ):
+            on = compile_kernel_source(sp(**sspec_prefill), target="ascend")
+            for op in ("vcmps", "vcmax", "vcadd", "vexp"):
+                assert op in on, f"T5 {name} SIMD 路径未降到 {op}"
     finally:
         os.environ.pop("TILEINFER_SIMD_SOFTMAX", None)
         if saved is not None:

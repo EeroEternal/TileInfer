@@ -1142,6 +1142,10 @@ def paged_prefill_split_ascend950(
                 out_ub1 = T.alloc_shared((ROWS, D2), dtype)
             m_ub = T.alloc_shared((ROWS,), accum)
             l_ub = T.alloc_shared((ROWS,), accum)
+            if _simd_softmax_enabled():
+                p_f32_ub = T.alloc_shared((ROWS, BC), accum)
+                a_ub = T.alloc_shared((ROWS,), accum)
+                ll_ub = T.alloc_shared((1,), "int32")
 
             T.copy(QPacked[bx, 0:BR, 0:D], q_l1)
             T.dual_copy(RowThr[tile * BR : (tile + 1) * BR], thr_ub)
@@ -1150,6 +1154,8 @@ def paged_prefill_split_ascend950(
             T.fill(o_ub0, T.float32(0))
             if D > D2:
                 T.fill(o_ub1, T.float32(0))
+            if _simd_softmax_enabled():
+                T.copy(kv_last_page_len[b : b + 1], ll_ub)
             for p in T.serial(plen):
                 pid = kv_indices[kv_indptr[b] + start + p]
 
@@ -1164,47 +1170,92 @@ def paged_prefill_split_ascend950(
                 T.dual_copy(qk_acc, s_ub)
 
                 # only the request's *last* page can be partially filled, wherever the split puts it
-                limit = T.if_then_else(start + p + 1 < req_pages, BC, kv_last_page_len[b])
-                with T.SimtVF(threads=threads):
-                    s_frag = T.alloc_fragment((ROWS, BC), accum)
-                    for r, c in T.Parallel(ROWS, BC):
-                        # causal + tail masks: ``thr_ub`` holds *global* KV thresholds, so a split
-                        # range entirely past a row's frontier masks every position of it.
-                        # Nested if_then_else (not a boolean `and`): the flattened compound
-                        # predicate mis-lowers on multi-block launches — frontier-truncated
-                        # tiles ran with the causal mask effectively dropped (h19 forensics).
-                        kv_pos = (start + p) * BC + c
-                        masked = T.if_then_else(c < limit, s_ub[r, c] * T.float32(scale), T.float32(-1e30))
-                        s_frag[r, c] = T.if_then_else(kv_pos <= thr_ub[r], masked, T.float32(-1e30))
-                    row_max = T.alloc_reducer((ROWS,), accum, op="max")
-                    T.reducer_init(row_max)
-                    for r, c in T.Parallel(ROWS, BC):
-                        T.reducer_update(row_max[r], s_frag[r, c])
-                    new_m = T.alloc_fragment((ROWS,), accum)
-                    T.finalize_reducer(row_max, new_m)
-
-                    alpha = T.alloc_fragment((ROWS,), accum)
-                    for r in T.Parallel(ROWS):
-                        alpha[r] = T.exp(m_ub[r] - T.max(m_ub[r], new_m[r]))
-                        m_ub[r] = T.max(m_ub[r], new_m[r])
-
-                    row_sum = T.alloc_reducer((ROWS,), accum, op="sum")
-                    T.reducer_init(row_sum)
-                    for r, c in T.Parallel(ROWS, BC):
-                        s_frag[r, c] = T.exp(s_frag[r, c] - m_ub[r])
-                        T.reducer_update(row_sum[r], s_frag[r, c])
-                    partial = T.alloc_fragment((ROWS,), accum)
-                    T.finalize_reducer(row_sum, partial)
-
-                    for r in T.Parallel(ROWS):
-                        l_ub[r] = l_ub[r] * alpha[r] + partial[r]
-                    for r, d in T.Parallel(ROWS, D2):
-                        o_ub0[r, d] = o_ub0[r, d] * alpha[r]
-                    if D > D2:
+                if _simd_softmax_enabled():
+                    # T5 packed-SIMD online softmax (causal + tail mask, two chained `vsel`s).
+                    # `kv_pos` is the *global* column `(start+p)*BC + lane`; `vci` needs a
+                    # compile-time start, so the page offset is added with `vadds`.
+                    limit = T.if_then_else(start + p + 1 < req_pages, BC, ll_ub[0])
+                    with T.SimdVF():
+                        for r in T.serial(ROWS):
+                            idx0 = T.simd.vci(0, "int32", order="INC_ORDER")
+                            idx1 = T.simd.vci(64, "int32", order="INC_ORDER")
+                            kp0 = T.simd.vadds(T.simd.vci(0, "int32", order="INC_ORDER"), (start + p) * BC)
+                            kp1 = T.simd.vadds(T.simd.vci(64, "int32", order="INC_ORDER"), (start + p) * BC)
+                            tb = T.simd.vdupv(T.simd.vld(thr_ub[r], dist="BRC_B32"), pos="POS_LOWEST")
+                            sc = T.simd.vdup(T.float32(scale), "float32")
+                            a0 = T.simd.vmul(T.simd.vld(s_ub[r, 0], dist="NORM"), sc)
+                            a1 = T.simd.vmul(T.simd.vld(s_ub[r, 64], dist="NORM"), sc)
+                            neg = T.simd.vdup(T.float32(-1e30), "float32")
+                            a0 = T.simd.vsel(a0, neg, T.simd.vcmps(idx0, limit, op="lt"))
+                            a1 = T.simd.vsel(a1, neg, T.simd.vcmps(idx1, limit, op="lt"))
+                            a0 = T.simd.vsel(a0, neg, T.simd.vcmp(kp0, tb, op="le"))
+                            a1 = T.simd.vsel(a1, neg, T.simd.vcmp(kp1, tb, op="le"))
+                            pm = T.simd.vdupv(T.simd.vld(m_ub[r], dist="BRC_B32"), pos="POS_LOWEST")
+                            nm = T.simd.vmax(pm, T.simd.vmax(T.simd.vcmax(a0), T.simd.vcmax(a1)))
+                            nml = T.simd.vdupv(nm, pos="POS_LOWEST")
+                            al = T.simd.vexp(T.simd.vsub(pm, nml))
+                            e0 = T.simd.vexp(T.simd.vsub(a0, nml))
+                            e1 = T.simd.vexp(T.simd.vsub(a1, nml))
+                            lp = T.simd.vdupv(T.simd.vld(l_ub[r], dist="BRC_B32"), pos="POS_LOWEST")
+                            ln = T.simd.vadd(
+                                T.simd.vmul(lp, al),
+                                T.simd.vadd(T.simd.vcadd(e0), T.simd.vcadd(e1)),
+                            )
+                            T.simd.vsts(m_ub[r], nml, dist="ONEPT_B32")
+                            T.simd.vsts(l_ub[r], T.simd.vdupv(ln, pos="POS_LOWEST"), dist="ONEPT_B32")
+                            T.simd.vsts(a_ub[r], T.simd.vdupv(al, pos="POS_LOWEST"), dist="ONEPT_B32")
+                            T.simd.vsts(p_f32_ub[r, 0], e0)
+                            T.simd.vsts(p_f32_ub[r, 64], e1)
+                    with T.SimtVF(threads=threads):
                         for r, d in T.Parallel(ROWS, D2):
-                            o_ub1[r, d] = o_ub1[r, d] * alpha[r]
-                    for r, c in T.Parallel(ROWS, BC):
-                        p_ub[r, c] = T.Cast(dtype, s_frag[r, c])
+                            o_ub0[r, d] = o_ub0[r, d] * a_ub[r]
+                        if D > D2:
+                            for r, d in T.Parallel(ROWS, D2):
+                                o_ub1[r, d] = o_ub1[r, d] * a_ub[r]
+                        for r, c in T.Parallel(ROWS, BC):
+                            p_ub[r, c] = T.Cast(dtype, p_f32_ub[r, c])
+                else:
+                    limit = T.if_then_else(start + p + 1 < req_pages, BC, kv_last_page_len[b])
+                    with T.SimtVF(threads=threads):
+                        s_frag = T.alloc_fragment((ROWS, BC), accum)
+                        for r, c in T.Parallel(ROWS, BC):
+                            # causal + tail masks: ``thr_ub`` holds *global* KV thresholds, so a split
+                            # range entirely past a row's frontier masks every position of it.
+                            # Nested if_then_else (not a boolean `and`): the flattened compound
+                            # predicate mis-lowers on multi-block launches — frontier-truncated
+                            # tiles ran with the causal mask effectively dropped (h19 forensics).
+                            kv_pos = (start + p) * BC + c
+                            masked = T.if_then_else(c < limit, s_ub[r, c] * T.float32(scale), T.float32(-1e30))
+                            s_frag[r, c] = T.if_then_else(kv_pos <= thr_ub[r], masked, T.float32(-1e30))
+                        row_max = T.alloc_reducer((ROWS,), accum, op="max")
+                        T.reducer_init(row_max)
+                        for r, c in T.Parallel(ROWS, BC):
+                            T.reducer_update(row_max[r], s_frag[r, c])
+                        new_m = T.alloc_fragment((ROWS,), accum)
+                        T.finalize_reducer(row_max, new_m)
+
+                        alpha = T.alloc_fragment((ROWS,), accum)
+                        for r in T.Parallel(ROWS):
+                            alpha[r] = T.exp(m_ub[r] - T.max(m_ub[r], new_m[r]))
+                            m_ub[r] = T.max(m_ub[r], new_m[r])
+
+                        row_sum = T.alloc_reducer((ROWS,), accum, op="sum")
+                        T.reducer_init(row_sum)
+                        for r, c in T.Parallel(ROWS, BC):
+                            s_frag[r, c] = T.exp(s_frag[r, c] - m_ub[r])
+                            T.reducer_update(row_sum[r], s_frag[r, c])
+                        partial = T.alloc_fragment((ROWS,), accum)
+                        T.finalize_reducer(row_sum, partial)
+
+                        for r in T.Parallel(ROWS):
+                            l_ub[r] = l_ub[r] * alpha[r] + partial[r]
+                        for r, d in T.Parallel(ROWS, D2):
+                            o_ub0[r, d] = o_ub0[r, d] * alpha[r]
+                        if D > D2:
+                            for r, d in T.Parallel(ROWS, D2):
+                                o_ub1[r, d] = o_ub1[r, d] * alpha[r]
+                        for r, c in T.Parallel(ROWS, BC):
+                            p_ub[r, c] = T.Cast(dtype, s_frag[r, c])
 
                 T.dual_copy(p_ub[0:ROWS, 0:BC], p_l1[0:BR, 0:BC])
                 T.copy(VCache[pid, 0:BC, bh, 0:D], v_l1[0:D, 0:BC], transpose=True)
@@ -1354,6 +1405,10 @@ def paged_prefill_split_head_ascend950(
                 out_ub1 = T.alloc_shared((ROWS, D2), dtype)
             m_ub = T.alloc_shared((ROWS,), accum)
             l_ub = T.alloc_shared((ROWS,), accum)
+            if _simd_softmax_enabled():
+                p_f32_ub = T.alloc_shared((ROWS, BC), accum)
+                a_ub = T.alloc_shared((ROWS,), accum)
+                ll_ub = T.alloc_shared((1,), "int32")
 
             T.copy(QPacked[bx, 0:BR, 0:D], q_l1)
             T.fill(m_ub, T.float32(-1e30))
@@ -1361,6 +1416,8 @@ def paged_prefill_split_head_ascend950(
             T.fill(o_ub0, T.float32(0))
             if D > D2:
                 T.fill(o_ub1, T.float32(0))
+            if _simd_softmax_enabled():
+                T.copy(kv_last_page_len[b : b + 1], ll_ub)
             for p in T.serial(plen):
                 pid = kv_indices[kv_indptr[b] + start + p]
 
@@ -1374,43 +1431,82 @@ def paged_prefill_split_head_ascend950(
                     T.gemm(qk_a, qk_b, qk_acc, transpose_B=True)
                 T.dual_copy(qk_acc, s_ub)
 
-                limit = T.if_then_else(start + p + 1 < req_pages, BC, kv_last_page_len[b])
-                with T.SimtVF(threads=threads):
-                    s_frag = T.alloc_fragment((ROWS, BC), accum)
-                    # Scalar tail mask only — deliberately no per-row predicate (H20/E48).
-                    for r, c in T.Parallel(ROWS, BC):
-                        s_frag[r, c] = T.if_then_else(
-                            c < limit, s_ub[r, c] * T.float32(scale), T.float32(-1e30)
-                        )
-                    row_max = T.alloc_reducer((ROWS,), accum, op="max")
-                    T.reducer_init(row_max)
-                    for r, c in T.Parallel(ROWS, BC):
-                        T.reducer_update(row_max[r], s_frag[r, c])
-                    new_m = T.alloc_fragment((ROWS,), accum)
-                    T.finalize_reducer(row_max, new_m)
-
-                    alpha = T.alloc_fragment((ROWS,), accum)
-                    for r in T.Parallel(ROWS):
-                        alpha[r] = T.exp(m_ub[r] - T.max(m_ub[r], new_m[r]))
-                        m_ub[r] = T.max(m_ub[r], new_m[r])
-
-                    row_sum = T.alloc_reducer((ROWS,), accum, op="sum")
-                    T.reducer_init(row_sum)
-                    for r, c in T.Parallel(ROWS, BC):
-                        s_frag[r, c] = T.exp(s_frag[r, c] - m_ub[r])
-                        T.reducer_update(row_sum[r], s_frag[r, c])
-                    partial = T.alloc_fragment((ROWS,), accum)
-                    T.finalize_reducer(row_sum, partial)
-
-                    for r in T.Parallel(ROWS):
-                        l_ub[r] = l_ub[r] * alpha[r] + partial[r]
-                    for r, d in T.Parallel(ROWS, D2):
-                        o_ub0[r, d] = o_ub0[r, d] * alpha[r]
-                    if D > D2:
+                if _simd_softmax_enabled():
+                    # T5 packed-SIMD online softmax; head tiles carry only the scalar tail mask (no
+                    # per-row causal predicate, H20/E48).
+                    limit = T.if_then_else(start + p + 1 < req_pages, BC, ll_ub[0])
+                    with T.SimdVF():
+                        for r in T.serial(ROWS):
+                            idx0 = T.simd.vci(0, "int32", order="INC_ORDER")
+                            idx1 = T.simd.vci(64, "int32", order="INC_ORDER")
+                            sc = T.simd.vdup(T.float32(scale), "float32")
+                            a0 = T.simd.vmul(T.simd.vld(s_ub[r, 0], dist="NORM"), sc)
+                            a1 = T.simd.vmul(T.simd.vld(s_ub[r, 64], dist="NORM"), sc)
+                            neg = T.simd.vdup(T.float32(-1e30), "float32")
+                            a0 = T.simd.vsel(a0, neg, T.simd.vcmps(idx0, limit, op="lt"))
+                            a1 = T.simd.vsel(a1, neg, T.simd.vcmps(idx1, limit, op="lt"))
+                            pm = T.simd.vdupv(T.simd.vld(m_ub[r], dist="BRC_B32"), pos="POS_LOWEST")
+                            nm = T.simd.vmax(pm, T.simd.vmax(T.simd.vcmax(a0), T.simd.vcmax(a1)))
+                            nml = T.simd.vdupv(nm, pos="POS_LOWEST")
+                            al = T.simd.vexp(T.simd.vsub(pm, nml))
+                            e0 = T.simd.vexp(T.simd.vsub(a0, nml))
+                            e1 = T.simd.vexp(T.simd.vsub(a1, nml))
+                            lp = T.simd.vdupv(T.simd.vld(l_ub[r], dist="BRC_B32"), pos="POS_LOWEST")
+                            ln = T.simd.vadd(
+                                T.simd.vmul(lp, al),
+                                T.simd.vadd(T.simd.vcadd(e0), T.simd.vcadd(e1)),
+                            )
+                            T.simd.vsts(m_ub[r], nml, dist="ONEPT_B32")
+                            T.simd.vsts(l_ub[r], T.simd.vdupv(ln, pos="POS_LOWEST"), dist="ONEPT_B32")
+                            T.simd.vsts(a_ub[r], T.simd.vdupv(al, pos="POS_LOWEST"), dist="ONEPT_B32")
+                            T.simd.vsts(p_f32_ub[r, 0], e0)
+                            T.simd.vsts(p_f32_ub[r, 64], e1)
+                    with T.SimtVF(threads=threads):
                         for r, d in T.Parallel(ROWS, D2):
-                            o_ub1[r, d] = o_ub1[r, d] * alpha[r]
-                    for r, c in T.Parallel(ROWS, BC):
-                        p_ub[r, c] = T.Cast(dtype, s_frag[r, c])
+                            o_ub0[r, d] = o_ub0[r, d] * a_ub[r]
+                        if D > D2:
+                            for r, d in T.Parallel(ROWS, D2):
+                                o_ub1[r, d] = o_ub1[r, d] * a_ub[r]
+                        for r, c in T.Parallel(ROWS, BC):
+                            p_ub[r, c] = T.Cast(dtype, p_f32_ub[r, c])
+                else:
+                    limit = T.if_then_else(start + p + 1 < req_pages, BC, kv_last_page_len[b])
+                    with T.SimtVF(threads=threads):
+                        s_frag = T.alloc_fragment((ROWS, BC), accum)
+                        # Scalar tail mask only — deliberately no per-row predicate (H20/E48).
+                        for r, c in T.Parallel(ROWS, BC):
+                            s_frag[r, c] = T.if_then_else(
+                                c < limit, s_ub[r, c] * T.float32(scale), T.float32(-1e30)
+                            )
+                        row_max = T.alloc_reducer((ROWS,), accum, op="max")
+                        T.reducer_init(row_max)
+                        for r, c in T.Parallel(ROWS, BC):
+                            T.reducer_update(row_max[r], s_frag[r, c])
+                        new_m = T.alloc_fragment((ROWS,), accum)
+                        T.finalize_reducer(row_max, new_m)
+
+                        alpha = T.alloc_fragment((ROWS,), accum)
+                        for r in T.Parallel(ROWS):
+                            alpha[r] = T.exp(m_ub[r] - T.max(m_ub[r], new_m[r]))
+                            m_ub[r] = T.max(m_ub[r], new_m[r])
+
+                        row_sum = T.alloc_reducer((ROWS,), accum, op="sum")
+                        T.reducer_init(row_sum)
+                        for r, c in T.Parallel(ROWS, BC):
+                            s_frag[r, c] = T.exp(s_frag[r, c] - m_ub[r])
+                            T.reducer_update(row_sum[r], s_frag[r, c])
+                        partial = T.alloc_fragment((ROWS,), accum)
+                        T.finalize_reducer(row_sum, partial)
+
+                        for r in T.Parallel(ROWS):
+                            l_ub[r] = l_ub[r] * alpha[r] + partial[r]
+                        for r, d in T.Parallel(ROWS, D2):
+                            o_ub0[r, d] = o_ub0[r, d] * alpha[r]
+                        if D > D2:
+                            for r, d in T.Parallel(ROWS, D2):
+                                o_ub1[r, d] = o_ub1[r, d] * alpha[r]
+                        for r, c in T.Parallel(ROWS, BC):
+                            p_ub[r, c] = T.Cast(dtype, s_frag[r, c])
 
                 T.dual_copy(p_ub[0:ROWS, 0:BC], p_l1[0:BR, 0:BC])
                 T.copy(VCache[pid, 0:BC, bh, 0:D], v_l1[0:D, 0:BC], transpose=True)
@@ -1567,6 +1663,10 @@ def paged_prefill_split_frontier_ascend950(
             # Per-row causal threshold for this AIV's half of the M tile (dual_copy splits it
             # exactly like s_ub, see paged_prefill_ascend950).
             thr_ub = T.alloc_shared((ROWS,), "int32")
+            if _simd_softmax_enabled():
+                p_f32_ub = T.alloc_shared((ROWS, BC), accum)
+                a_ub = T.alloc_shared((ROWS,), accum)
+                ll_ub = T.alloc_shared((1,), "int32")
 
             T.copy(QPacked[bx, 0:BR, 0:D], q_l1)
             T.dual_copy(RowThr[tile * BR : (tile + 1) * BR], thr_ub)
@@ -1575,6 +1675,8 @@ def paged_prefill_split_frontier_ascend950(
             T.fill(o_ub0, T.float32(0))
             if D > D2:
                 T.fill(o_ub1, T.float32(0))
+            if _simd_softmax_enabled():
+                T.copy(kv_last_page_len[b : b + 1], ll_ub)
             for p in T.serial(plen):
                 pid = kv_indices[kv_indptr[b] + start + p]
 
@@ -1591,57 +1693,101 @@ def paged_prefill_split_frontier_ascend950(
                 # Page offset enters only through host-side values: RowThr arrives pre-relativised
                 # (thr − start·BC, plan_prefill_split_ctx) and eff is a kernel scalar — p is the
                 # only loop variable in the mask (E50/D52 relativisation, kept in 3e).
-                limit = T.if_then_else(p + 1 < eff, BC, kv_last_page_len[b])
-                with T.SimtVF(threads=threads):
-                    # 3e (iter-047, E57 结论 3): 逐元素标量谓词写 **shared**（s_ub 就地），
-                    # fragment 由与 plain/head 内核同构的 Parallel 拷贝填充。E57 候选①：
-                    # 3b 的 serial-in-SimtVF 直接写分布式 fragment（s_frag）时 owned-element
-                    # 判定失准/写序无屏障 → 单 tile 即错、误差平坦（0.24-0.28）；shared 写在
-                    # SimtVF 内有在役先例（m_ub/l_ub/o_ub*），serial 仅决定执行序、无归属歧义，
-                    # 而 Parallel 拷贝（shared 读 → fragment 写）是 plain/head 内核已验证形态。
-                    # 其余 softmax 体与 head 内核（E56 数值已绿 0.0005）逐字节一致。
-                    # （历史：向量化复合谓词 = plain 字面同构，但编译 >60min blowup，E54/E55。）
-                    for r in T.serial(ROWS):
-                        thr_r = thr_ub[r]
-                        for c in T.serial(BC):
-                            kv_pos = p * BC + c
-                            s_ub[r, c] = T.if_then_else(
-                                (c < limit) and (kv_pos <= thr_r),
-                                s_ub[r, c] * T.float32(scale),
-                                T.float32(-1e30),
+                if _simd_softmax_enabled():
+                    # T5 packed-SIMD online softmax (causal + tail mask, two chained `vsel`s).
+                    # RowThr is pre-relativised, so `kv_pos` is the in-request column `p*BC + lane`.
+                    limit = T.if_then_else(p + 1 < eff, BC, ll_ub[0])
+                    with T.SimdVF():
+                        for r in T.serial(ROWS):
+                            idx0 = T.simd.vci(0, "int32", order="INC_ORDER")
+                            idx1 = T.simd.vci(64, "int32", order="INC_ORDER")
+                            kp0 = T.simd.vadds(T.simd.vci(0, "int32", order="INC_ORDER"), p * BC)
+                            kp1 = T.simd.vadds(T.simd.vci(64, "int32", order="INC_ORDER"), p * BC)
+                            tb = T.simd.vdupv(T.simd.vld(thr_ub[r], dist="BRC_B32"), pos="POS_LOWEST")
+                            sc = T.simd.vdup(T.float32(scale), "float32")
+                            a0 = T.simd.vmul(T.simd.vld(s_ub[r, 0], dist="NORM"), sc)
+                            a1 = T.simd.vmul(T.simd.vld(s_ub[r, 64], dist="NORM"), sc)
+                            neg = T.simd.vdup(T.float32(-1e30), "float32")
+                            a0 = T.simd.vsel(a0, neg, T.simd.vcmps(idx0, limit, op="lt"))
+                            a1 = T.simd.vsel(a1, neg, T.simd.vcmps(idx1, limit, op="lt"))
+                            a0 = T.simd.vsel(a0, neg, T.simd.vcmp(kp0, tb, op="le"))
+                            a1 = T.simd.vsel(a1, neg, T.simd.vcmp(kp1, tb, op="le"))
+                            pm = T.simd.vdupv(T.simd.vld(m_ub[r], dist="BRC_B32"), pos="POS_LOWEST")
+                            nm = T.simd.vmax(pm, T.simd.vmax(T.simd.vcmax(a0), T.simd.vcmax(a1)))
+                            nml = T.simd.vdupv(nm, pos="POS_LOWEST")
+                            al = T.simd.vexp(T.simd.vsub(pm, nml))
+                            e0 = T.simd.vexp(T.simd.vsub(a0, nml))
+                            e1 = T.simd.vexp(T.simd.vsub(a1, nml))
+                            lp = T.simd.vdupv(T.simd.vld(l_ub[r], dist="BRC_B32"), pos="POS_LOWEST")
+                            ln = T.simd.vadd(
+                                T.simd.vmul(lp, al),
+                                T.simd.vadd(T.simd.vcadd(e0), T.simd.vcadd(e1)),
                             )
-                    s_frag = T.alloc_fragment((ROWS, BC), accum)
-                    for r, c in T.Parallel(ROWS, BC):
-                        s_frag[r, c] = s_ub[r, c]
-                    row_max = T.alloc_reducer((ROWS,), accum, op="max")
-                    T.reducer_init(row_max)
-                    for r, c in T.Parallel(ROWS, BC):
-                        T.reducer_update(row_max[r], s_frag[r, c])
-                    new_m = T.alloc_fragment((ROWS,), accum)
-                    T.finalize_reducer(row_max, new_m)
-
-                    alpha = T.alloc_fragment((ROWS,), accum)
-                    for r in T.Parallel(ROWS):
-                        alpha[r] = T.exp(m_ub[r] - T.max(m_ub[r], new_m[r]))
-                        m_ub[r] = T.max(m_ub[r], new_m[r])
-
-                    row_sum = T.alloc_reducer((ROWS,), accum, op="sum")
-                    T.reducer_init(row_sum)
-                    for r, c in T.Parallel(ROWS, BC):
-                        s_frag[r, c] = T.exp(s_frag[r, c] - m_ub[r])
-                        T.reducer_update(row_sum[r], s_frag[r, c])
-                    partial = T.alloc_fragment((ROWS,), accum)
-                    T.finalize_reducer(row_sum, partial)
-
-                    for r in T.Parallel(ROWS):
-                        l_ub[r] = l_ub[r] * alpha[r] + partial[r]
-                    for r, d in T.Parallel(ROWS, D2):
-                        o_ub0[r, d] = o_ub0[r, d] * alpha[r]
-                    if D > D2:
+                            T.simd.vsts(m_ub[r], nml, dist="ONEPT_B32")
+                            T.simd.vsts(l_ub[r], T.simd.vdupv(ln, pos="POS_LOWEST"), dist="ONEPT_B32")
+                            T.simd.vsts(a_ub[r], T.simd.vdupv(al, pos="POS_LOWEST"), dist="ONEPT_B32")
+                            T.simd.vsts(p_f32_ub[r, 0], e0)
+                            T.simd.vsts(p_f32_ub[r, 64], e1)
+                    with T.SimtVF(threads=threads):
                         for r, d in T.Parallel(ROWS, D2):
-                            o_ub1[r, d] = o_ub1[r, d] * alpha[r]
-                    for r, c in T.Parallel(ROWS, BC):
-                        p_ub[r, c] = T.Cast(dtype, s_frag[r, c])
+                            o_ub0[r, d] = o_ub0[r, d] * a_ub[r]
+                        if D > D2:
+                            for r, d in T.Parallel(ROWS, D2):
+                                o_ub1[r, d] = o_ub1[r, d] * a_ub[r]
+                        for r, c in T.Parallel(ROWS, BC):
+                            p_ub[r, c] = T.Cast(dtype, p_f32_ub[r, c])
+                else:
+                    limit = T.if_then_else(p + 1 < eff, BC, kv_last_page_len[b])
+                    with T.SimtVF(threads=threads):
+                        # 3e (iter-047, E57 结论 3): 逐元素标量谓词写 **shared**（s_ub 就地），
+                        # fragment 由与 plain/head 内核同构的 Parallel 拷贝填充。E57 候选①：
+                        # 3b 的 serial-in-SimtVF 直接写分布式 fragment（s_frag）时 owned-element
+                        # 判定失准/写序无屏障 → 单 tile 即错、误差平坦（0.24-0.28）；shared 写在
+                        # SimtVF 内有在役先例（m_ub/l_ub/o_ub*），serial 仅决定执行序、无归属歧义，
+                        # 而 Parallel 拷贝（shared 读 → fragment 写）是 plain/head 内核已验证形态。
+                        # 其余 softmax 体与 head 内核（E56 数值已绿 0.0005）逐字节一致。
+                        # （历史：向量化复合谓词 = plain 字面同构，但编译 >60min blowup，E54/E55。）
+                        for r in T.serial(ROWS):
+                            thr_r = thr_ub[r]
+                            for c in T.serial(BC):
+                                kv_pos = p * BC + c
+                                s_ub[r, c] = T.if_then_else(
+                                    (c < limit) and (kv_pos <= thr_r),
+                                    s_ub[r, c] * T.float32(scale),
+                                    T.float32(-1e30),
+                                )
+                        s_frag = T.alloc_fragment((ROWS, BC), accum)
+                        for r, c in T.Parallel(ROWS, BC):
+                            s_frag[r, c] = s_ub[r, c]
+                        row_max = T.alloc_reducer((ROWS,), accum, op="max")
+                        T.reducer_init(row_max)
+                        for r, c in T.Parallel(ROWS, BC):
+                            T.reducer_update(row_max[r], s_frag[r, c])
+                        new_m = T.alloc_fragment((ROWS,), accum)
+                        T.finalize_reducer(row_max, new_m)
+
+                        alpha = T.alloc_fragment((ROWS,), accum)
+                        for r in T.Parallel(ROWS):
+                            alpha[r] = T.exp(m_ub[r] - T.max(m_ub[r], new_m[r]))
+                            m_ub[r] = T.max(m_ub[r], new_m[r])
+
+                        row_sum = T.alloc_reducer((ROWS,), accum, op="sum")
+                        T.reducer_init(row_sum)
+                        for r, c in T.Parallel(ROWS, BC):
+                            s_frag[r, c] = T.exp(s_frag[r, c] - m_ub[r])
+                            T.reducer_update(row_sum[r], s_frag[r, c])
+                        partial = T.alloc_fragment((ROWS,), accum)
+                        T.finalize_reducer(row_sum, partial)
+
+                        for r in T.Parallel(ROWS):
+                            l_ub[r] = l_ub[r] * alpha[r] + partial[r]
+                        for r, d in T.Parallel(ROWS, D2):
+                            o_ub0[r, d] = o_ub0[r, d] * alpha[r]
+                        if D > D2:
+                            for r, d in T.Parallel(ROWS, D2):
+                                o_ub1[r, d] = o_ub1[r, d] * alpha[r]
+                        for r, c in T.Parallel(ROWS, BC):
+                            p_ub[r, c] = T.Cast(dtype, s_frag[r, c])
 
                 T.dual_copy(p_ub[0:ROWS, 0:BC], p_l1[0:BR, 0:BC])
                 T.copy(VCache[pid, 0:BC, bh, 0:D], v_l1[0:D, 0:BC], transpose=True)
