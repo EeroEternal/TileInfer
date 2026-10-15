@@ -32,4 +32,4 @@ profiling/
 exception_info.*
 *.o
 .tilelang_cache/
-benchmarks/probes/h27_perm_*.npy
+benchmarks/probes/h2[79]_perm_*.npy
