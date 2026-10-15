@@ -17,7 +17,7 @@ contains; nothing is speculative.
 | vLLM-Ascend integration | ✅ **Qwen3.6-35B-A3B 图模式真实在役**:6 plan READY、capture_calls=40、fallbacks=0、logprobs 逐位一致;双源 A/B 数字落盘(PERFORMANCE_REPORT §5) |
 | Performance baseline (decode, unsplit) | ✅ 138–147 GB/s at wide shapes, 51 GB/s at batch 1(启用 split-KV 可 3x,受 KI-1 门禁) |
 | 融合算子层(M-MoE / M-GDN) | ⏸ **收口**:M-MoE TEMPORARY(0.86x 交决策)、M-GDN 9a/9b 关闭、gating disproven(opt-in)、9c chunk-wu TEMPORARY(0.718x 未过门槛)——详见 [`status.md`](status.md) §0 |
-| Device CI | ⏳ none yet |
+| Device CI | ✅ 入口脚本 `scripts/run_device_ci.sh`(canary → `pytest -m npu` 套件 → 汇总+退出码,2026-10-15) |
 
 Open bugs and post-mortems live in [`known-issues.md`](known-issues.md) (KI-1 split-path instability,
 KI-4 离线/serve 口径,PM-1/PM-2 resolved) and the environment traps in [`architecture.md`](architecture.md).
@@ -90,21 +90,25 @@ the kernel `dual_copy`s it exactly like `s_ub` — each AIV half receives its ow
 is correct on both halves.  The `block_q // 2` planning restriction is **gone**; the full `block_q`
 tile is used end to end (`BR = block_q`).  Locked by `tests/test_offline_lower_probes.py`.
 
-### T5 · SIMD softmax 🟡(**机制已证可表达,性能待设备**)
+### T5 · SIMD softmax 🟡(**机制可表达 + 数值等价已证,性能待集成**)
 
 *Why*: the SIMT softmax was the right first trade (a few lines instead of a hundred), but it keeps
 vector time on the critical path; upstream's FlashAttention uses the packed `T.simd.*` path.
 
 *Progress (2026-10-15)*: the offline-lower probe `benchmarks/probes/simd_softmax_lower.py` lowers the
 current SIMT softmax (→ 0 vector intrinsics, 11 scalar `for`) and a candidate SIMD softmax written with
-`T.simd.*` inside `T.SimdVF()` (→ `vlds_norm`/`vcmax`/`vsub`/`vexp`/`vcgmax`/`vmul`/`vsts_norm`, 1
-scalar `for`).  **Mechanism proven expressible on this backend** (no device needed).  CPU contract:
-`tests/test_offline_lower_probes.py`.
+`T.simd.*` inside `T.SimdVF()`.  **Mechanism proven expressible** (no device).  Then the device probe
+`benchmarks/probes/simd_softmax_device.py` (32×64, one fp32 row = one register) shows **both paths match
+the fp32 oracle exactly: max|diff| = 0.00000** — **numerical equivalence proven on device**.  Key
+semantics: `vcmax`/`vcadd` are full-vector reductions with the result in lane 0 (broadcast with
+`vdupv`); `vcgmax` is *per-datablock* max, not sum.  CPU contract: `tests/test_offline_lower_probes.py`.
 
-*Remaining*: numerical equivalence vs the fp32 oracle + a measurable gain — **needs device** (port one
-softmax step at a time into `paged_decode_ascend950.py`, then run the device tests + the serving probe).
+*Remaining*: an end-to-end **speed** gain (SIMD row width vs SIMT threads; the >64-wide cross-register
+reduction merge; UB liveness) — port one softmax at a time into `paged_decode_ascend950.py`, then run
+`scripts/run_device_ci.sh` + the serving probe.
 
 *Done when*: the probe shows a measurable gain and the device tests still match the oracle.
+
 
 
 ### T6 · Warm-up and batch bucketing as first-class features ✅(**done,2026-10-15**)

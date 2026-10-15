@@ -21,6 +21,7 @@ import pytest
 
 from tileinfer.integrations.prewarm import (
     KERNEL_PAGE_SIZE,
+    build_prewarm_argv,
     build_prewarm_plan,
     bucket_for,
     decode_buckets,
@@ -288,4 +289,45 @@ def test_prewarm_plan_to_dict_is_json_safe():
     assert d["prefill_plain"] + d["prefill_split"] == len(plan.prefill)
     assert d["prefill_split"] > 0  # ktp=64 → 有 split 变体
     assert isinstance(s, str) and s
+
+
+# ------------------------------------------------------------------ 6. T6 收尾:启动器 argv
+
+
+def test_build_prewarm_argv_roundtrips_to_cli():
+    """argv 必须能被预烧脚本的 argparse 完整解析,且字段值一致(启动器→脚本不丢参)。"""
+    import argparse
+
+    argv = build_prewarm_argv(
+        num_kv_heads=2, group_size=8, head_size=256, dtype="bfloat16",
+        block_size=128, engine_pages=15589, max_num_reqs=32,
+        max_num_batched_tokens=8192, max_model_len=32768, prefill=True,
+        prefill_kv_tile_pages=64,
+    )
+    # 与脚本 args 定义等价的极简 parser(只校验我们产出的键都能被接受)
+    p = argparse.ArgumentParser()
+    for name in ("kv-heads", "group", "dim", "block-size", "num-engine-pages",
+                 "max-num-reqs", "max-num-batched-tokens", "max-model-len",
+                 "prefill-kv-tile-pages"):
+        p.add_argument("--" + name, type=int)
+    p.add_argument("--dtype")
+    p.add_argument("--prefill", action="store_true")
+    ns = p.parse_args(argv)
+    assert ns.kv_heads == 2 and ns.group == 8 and ns.dim == 256
+    assert ns.block_size == 128 and ns.num_engine_pages == 15589
+    assert ns.max_num_reqs == 32 and ns.max_num_batched_tokens == 8192 and ns.max_model_len == 32768
+    assert ns.dtype == "bfloat16" and ns.prefill is True and ns.prefill_kv_tile_pages == 64
+
+
+def test_build_prewarm_argv_prefill_optional():
+    """prefill=False 时不带 --prefill/--prefill-kv-tile-pages(decode-only 配方保持可用)。"""
+    argv = build_prewarm_argv(
+        num_kv_heads=2, group_size=6, head_size=128, dtype="bfloat16",
+        block_size=128, engine_pages=9425, max_num_reqs=32,
+        max_num_batched_tokens=8192, max_model_len=2048, prefill=False,
+    )
+    assert "--prefill" not in argv
+    assert "--prefill-kv-tile-pages" not in argv
+    assert "--num-engine-pages" in argv and "9425" in argv
+
 

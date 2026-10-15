@@ -48,6 +48,20 @@ def test_simt_softmax_lowers_to_scalar_loops():
     assert "for (" in src, "SIMT 路径应有标量线程循环"
 
 
+def test_simd_device_softmax_lowers():
+    """T5 设备探针的 SIMD softmax 必须在 CPU 上也能 lower(锁住内在函数选择,防回归)。
+
+    设备数值等价由 ``benchmarks/probes/simd_softmax_device.py`` 在 NPU 上验证;这里只保证
+    lower 不退化(含 vdupv 广播与 vcadd 求和——归约结果的正确广播是 T5 的关键陷阱)。
+    """
+    from benchmarks.probes.simd_softmax_device import _simd_softmax
+    from tilelang.tools.compile_only import compile_kernel_source
+
+    src = compile_kernel_source(_simd_softmax(), target="ascend")
+    for op in ("vlds_norm", "vcmax", "vdupv", "vsub", "vexp", "vcadd", "vdiv", "vsts_norm"):
+        assert op in src, f"T5 SIMD softmax 未降到 {op}"
+
+
 def test_prefill_uses_full_m_tile():
     """T4(PM-2,5730b66):prefill 内核用 full block_q tile,无 `block_q // 2` 半区规划。
 

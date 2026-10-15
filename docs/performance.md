@@ -384,6 +384,9 @@ PROBES=A bash .agent_loop/run/w1iso_probe.sh   # 或 B;单景 16384x128_c8
   预烧脚本(此前 prefill 完全未预烧)。
 - `prewarm_plan_to_dict` + `--plan-only --json`:预烧规格的机器可读产物,可在不编译的机器上复算、
   diff、入库——把"预烧与引擎一致"从人工比对日志升级为可复现的产物对比。
+- `build_prewarm_argv` + 启动器 `TILEINFER_PREWARM=1`:`scripts/vllm_tileinfer_launch.py` 从 serve
+  argv 与模型 `config.json` 推导参数,**serve 启动前自动预烧**(经已测脚本,不重复实现编译);池大小
+  由 `TILEINFER_PREWARM_PAGES` 显式给出(服务器快照值,见启动日志 `GPU KV cache size`)。
 
 **验收数字(CPU 契约,`tests/test_prewarm_specs.py`,24 用例全绿)**:
 
@@ -447,7 +450,7 @@ TILELANG_CACHE_DIR=.work/tl_cache_950 python scripts/prewarm-tileinfer-kernels.p
 `dual_copy` 它——两半各得自己的阈值,掩码在两半都正确。`block_q // 2` 规划限制**已移除**,全 tile
 端到端使用(`BR = block_q`)。CPU 契约:`tests/test_offline_lower_probes.py::test_prefill_uses_full_m_tile`。
 
-### T5 SIMD softmax = 🟡 机制已证可表达,数值/性能待设备
+### T5 SIMD softmax = 🟡 机制可表达 + **数值等价已证**,性能待集成
 **动机**:当前 decode/prefill 的 online softmax 用 `T.SimtVF` + `T.alloc_reducer`(几行而非上百行,
 是正确的首版取舍),但它把向量时间留在关键路径;上游 FlashAttention 用打包的 `T.simd.*` 微 API。
 
@@ -462,16 +465,28 @@ TILELANG_CACHE_DIR=.work/tl_cache_950 python scripts/prewarm-tileinfer-kernels.p
 ——**机制可表达已证**。CPU 契约:`tests/test_offline_lower_probes.py` 两个用例(SIMD 降到向量内在
 函数、SIMT 降到标量循环)。
 
-**未证(需设备)**:①数值等价(SimdVF 的 `vexp` 精度须与 fp32 oracle 对拍);②是否更快(SIMD 行宽
-vs SIMT 线程数、UB 存活期是新成本)。集成点=`kernels/attention/paged_decode_ascend950.py` 的三处
-softmax(decode + prefill ×2),逐段替换后跑设备套件 + 在役探针。
+**设备数值等价(2026-10-15 实测,`benchmarks/probes/simd_softmax_device.py`,32×64 fp32 一行=一寄存器)**:
 
-**全量 CPU 回归**:`pytest tests -m "not npu"` **133 passed**(较 T6 前的 130 + 3 探针用例)。
+| 路径 | max\|diff\| vs fp32 oracle | max\|rowsum−1\| | 判定 |
+|---|---|---|---|
+| SIMT(`T.SimtVF`+reducer) | **0.00000** | 0.00000 | PASS |
+| **SIMD**(`T.simd.*`,`vcmax`→`vdupv` 广播→`vexp`→`vcadd`→`vdiv`) | **0.00000** | 0.00000 | PASS |
+
+**数值等价已证**。关键语义(读自 `simd_inst.h`):`vcmax`/`vcadd` 是**整向量**归约、结果落 lane 0,
+须 `vdupv(POS_LOWEST)` 广播回所有 lane;`vcgmax` 是**按 datablock** 的 max(非 sum——离线探针早先用错过,
+设备探针已改用 `vcadd`)。CPU 契约:`test_offline_lower_probes.py::test_simd_device_softmax_lowers`。
+
+**仍未证(需集成+设备)**:端到端**是否更快**(SIMD 行宽 vs SIMT 线程数、行宽 >64 时的跨寄存器归约合并、
+UB 存活期是新成本)。集成点=`kernels/attention/paged_decode_ascend950.py` 的三处 softmax(decode +
+prefill ×2),逐段替换后跑设备套件(`scripts/run_device_ci.sh`)+ 在役探针。
+
+**全量 CPU 回归**:`pytest tests -m "not npu"` **136 passed**。
 
 Reproduce with:
 
 ```bash
-.venv/bin/python benchmarks/probes/simd_softmax_lower.py     # 离线,打印两路径的指令混合
+.venv/bin/python benchmarks/probes/simd_softmax_lower.py      # 离线:两路径指令混合
+.venv/bin/python benchmarks/probes/simd_softmax_device.py     # 设备:数值对拍(NPU)
 .venv/bin/python -m pytest tests/test_offline_lower_probes.py -q
 ```
 

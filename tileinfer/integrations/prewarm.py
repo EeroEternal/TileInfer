@@ -275,3 +275,42 @@ def prewarm_plan_to_dict(plan: PrewarmPlan) -> dict:
     }
 
 
+def build_prewarm_argv(
+    *,
+    num_kv_heads: int,
+    group_size: int,
+    head_size: int,
+    dtype: str,
+    block_size: int,
+    engine_pages: int,
+    max_num_reqs: int,
+    max_num_batched_tokens: int,
+    max_model_len: int,
+    prefill: bool = True,
+    prefill_kv_tile_pages: int = 0,
+) -> List[str]:
+    """把 serve 配置翻译成 ``scripts/prewarm-tileinfer-kernels.py`` 的 argv(T6 收尾)。
+
+    启动器(``scripts/vllm_tileinfer_launch.py``)在 ``TILEINFER_PREWARM=1`` 时用它在 serve 前
+    自动预烧:配置的唯一真源仍是 :func:`build_prewarm_plan`,这里只负责拼参数,**不重复实现
+    编译逻辑**(编译走已测脚本)。纯函数,CPU 可测。
+    """
+    argv = [
+        "--kv-heads", str(int(num_kv_heads)),
+        "--group", str(int(group_size)),
+        "--dim", str(int(head_size)),
+        "--dtype", str(dtype),
+        "--block-size", str(int(block_size)),
+        "--num-engine-pages", str(int(engine_pages)),
+        "--max-num-reqs", str(int(max_num_reqs)),
+        "--max-num-batched-tokens", str(int(max_num_batched_tokens)),
+        "--max-model-len", str(int(max_model_len)),
+    ]
+    if prefill:
+        argv.append("--prefill")
+        if prefill_kv_tile_pages > 0:
+            argv += ["--prefill-kv-tile-pages", str(int(prefill_kv_tile_pages))]
+    return argv
+
+
+
