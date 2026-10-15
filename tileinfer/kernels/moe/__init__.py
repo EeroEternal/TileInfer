@@ -6,7 +6,11 @@ from .align import (
     moe_down_align,
     moe_gate_up_swiglu_align,
     pack_down,
+    pack_down_inplace,
     pack_gate_up,
+    pack_gate_up_inplace,
+    unpack_down_inplace,
+    unpack_gate_up_inplace,
 )
 from .grouped_gemm_ascend950 import (
     build_down_kernel,
@@ -36,7 +40,11 @@ __all__ = [
     "moe_gate_up_swiglu_align",
     "moe_gate_up_swiglu_paired",
     "pack_down",
+    "pack_down_inplace",
     "pack_gate_up",
+    "pack_gate_up_inplace",
+    "unpack_down_inplace",
+    "unpack_gate_up_inplace",
     "pair_gate_up_rows",
     "pack_nd_to_compact_nz",
     "unpack_compact_nz_to_nd",

@@ -261,6 +261,54 @@ def pack_down(w2, inter: int):
     return packed.reshape(-1).contiguous()
 
 
+# ---- D73 平内存:原地 pack / 可逆 unpack(E78:MoE 权重 60GiB,双副本超 HBM 预算) ----
+#
+# 打包序与 ``pack_gate_up`` / ``pack_down`` 完全一致;原地版把同一置换写回权重自身存储
+# (等 numel 纯置换,零第二副本;临时峰=单层一份同 numel 暂存)。unpack 为同一置换式
+# 作用在打包后的视图形状上(转置自逆,round-trip 逐位恒等),供回落原实现前还原 ND。
+# 引擎接入纪律:打包态下权重内容 = 打包序,任何回落路径必须先 release(unpack)。
+
+
+def pack_gate_up_inplace(w13, inter: int):
+    """原地版 :func:`pack_gate_up`:w13 存储改写为打包序(ND 副本不再保留)。"""
+    E, two_i, K = w13.shape
+    assert two_i == 2 * inter
+    BN = GATE_UP_BLOCK_N
+    NT = inter // BN
+    tmp = w13.view(E, 2, NT, BN, K).permute(0, 1, 2, 4, 3).contiguous()
+    w13.view(-1).copy_(tmp.view(-1))
+
+
+def unpack_gate_up_inplace(w13, inter: int):
+    """:func:`pack_gate_up_inplace` 的逆置换(逐位还原 ND)。"""
+    E, two_i, K = w13.shape
+    assert two_i == 2 * inter
+    BN = GATE_UP_BLOCK_N
+    NT = inter // BN
+    tmp = w13.view(E, 2, NT, K, BN).permute(0, 1, 2, 4, 3).contiguous()
+    w13.view(-1).copy_(tmp.view(-1))
+
+
+def pack_down_inplace(w2, inter: int):
+    """原地版 :func:`pack_down`:w2 存储改写为打包序(ND 副本不再保留)。"""
+    E, Hd, I = w2.shape
+    assert I == inter
+    BN = DOWN_BLOCK_N
+    NT = Hd // BN
+    tmp = w2.view(E, NT, BN, I).permute(0, 1, 3, 2).contiguous()
+    w2.view(-1).copy_(tmp.view(-1))
+
+
+def unpack_down_inplace(w2, inter: int):
+    """:func:`pack_down_inplace` 的逆置换(逐位还原 ND)。"""
+    E, Hd, I = w2.shape
+    assert I == inter
+    BN = DOWN_BLOCK_N
+    NT = Hd // BN
+    tmp = w2.view(E, NT, I, BN).permute(0, 1, 3, 2).contiguous()
+    w2.view(-1).copy_(tmp.view(-1))
+
+
 _KERNEL_CACHE: dict = {}
 
 
