@@ -429,6 +429,47 @@ w1s 不触 decode),分流对短场景零影响;c1 TPOT 比 1.000 直接达标。
 (shunt 修长上下文 prefill + 分带保短上下文零税并留 b≤4 长上下文 decode 收益);
 两者默认均 opt-in(默认路径=P0 行为)。D57-② 内核效率重写维持暂缓。
 
+## P-PROF 流程画像:FIA 侧设备分段占比 + decode 设备-bound 判定(2026-10-15,iter-061,E79)
+
+方法:`p_prof_side.sh`(vLLM 0.23 内置 profiler + torch_npu Text 导出)对 FIA 侧
+(纯净 vLLM 基线)采集双窗 timeline——prefill 窗 8192x4_c8、decode 窗 128x256_c8;
+`p_prof_summarize.py` 按阶段×层类型×内核聚合(GDN 规则含 w_u)。聚合明细:
+`.agent_loop/run/prof_summary_fia.md`(TI 侧补采见 pprof_ti_chain,等设备窗)。
+
+### decode 窗(257 步,设备总 4951.1 ms = 19.3 ms/步;与 h21 TPOT 19.20 ms 同量级)
+判定:**TPOT≈设备时间,decode 端到端为设备-bound(主机已隐藏)**——后续 decode 优化
+必须以设备时间为靶,主机侧收益上限极小。
+
+| 层类型 | 设备耗时(ms) | 占比 | 最大内核 |
+|---|---|---|---|
+| MoE | 2663.9 | 53.8% | GroupedMatmul 2397.0(48.4%,avg 116.6µs×80/步)+ routing 等 266.9(5.4%) |
+| dense+胶水 | 1566.5 | 31.6% | MatMulV3 1038.8(21.0%,avg 14.9µs×271/步:shared expert 80/步+attn/GDN 投影+router) |
+| GDN | 573.7 | 11.6% | fused_gdn_gating 301.9(6.1%)+ RecurrentGatedDeltaRule 164.8(3.3%) |
+| full-attn | 47.7 | 1.0% | — |
+| other | 99.3 | 2.0% | — |
+
+### prefill 窗(设备总 4095.9 ms)
+
+| 层类型 | 占比 | 最大内核 |
+|---|---|---|
+| MoE | 35.6% | GroupedMatmul 1237.8(30.2%,avg 429.8µs) |
+| dense+胶水 | 29.0% | MatMulV3 603.7(14.7%) |
+| GDN | 18.9% | ChunkGatedDeltaRuleFwdH 316.8(7.7%)+ recompute_w_u 241.4(5.9%) |
+| full-attn | 6.5% | FusedInferAttentionScore 216.2(5.3%) |
+| other | 10.1% | — |
+
+### 热点归因与战略推论(E79)
+1. **MoE routed GEMM(FIA)48.4%** 是 decode 第一热点——即 M-MoE 内核线(H27 preNZ)
+   对标的替换对象;模型含 shared expert(config shared_expert_intermediate_size=512,
+   40 层×2 GEMM/步)是 dense 段 MatMulV3 21% 的重要组成部分。
+2. **30% 端到端目标的可达域**:decode 19.3 ms/步中 routed MoE 段仅 ~9.3 ms;H27 preNZ
+   达标(内核 0.813x→1.0x aclnn)单独折算端到端 ~3%(MoE 内核段×16-19% 税),不足以
+   单独撑起 30% TPOT;其余可达域=TI 路径特有胶水/slot/主机段(待 TI 侧画像定量)、
+   dense 段 shared-expert 融合(DeepSeek 模式候选)、GDN(已收口)。**瓶颈证明
+   (终止条件 b)暂不触发,等 TI 侧画像补全后裁决。**
+3. 派生假设 H28(shared expert 融合)已登记候选池,立项与否待 TI 侧画像确认 dense 段
+   在 TI 路径中的占比后定。
+
 ## T6 warm-up / batch bucketing 一等公民化:配置驱动的单一真源(2026-10-15)
 
 **问题(隐式双真源)**:TileLang 内核按形状编译(冷编译 ~100 s),服务路径上必须**零编译**
