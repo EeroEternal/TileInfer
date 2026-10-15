@@ -15,6 +15,15 @@ src_stride/dst_stride = burst_len → 平坦连续拷贝。K-slice [BN, BK] 在 
 内 = 连续 BN*BK*2 字节(列组连续),起点元素偏移 = k0*BN。取 burst_len=4096B(已验证
 量级,DeepGEMM fp8 同量级),BN=256/BK=128 与 BN=64/BK=512 的 slice 均 = 65536B = 16 burst。
 
+H30 同步修复(E83,2026-10-15):raw call_extern 对 tilelang 管线调度不可见——
+baseline 的 T.copy GM→L1 每条带独立 event 的 notify/wait(MTE2→MTE1),消费点前 wait;
+raw align 拷贝无任何同步 → l12l0b(L1→L0B)与在途 MTE2 拷贝竞态(E82 全部异常:
+up 码未生效/跨 run 残留/K 双倍/负值脏区)。修复 = 每次发射后 `ascend_pipe_barrier
+("PIPE_MTE2")`(等待 MTE2 全部在途拷贝落地)+ 末次权重 L1 读后 `ascend_pipe_barrier
+("PIPE_MTE1")`(防下轮迭代 align 覆盖 w_l1 的 WAR)。barrier 属 opaque op,与 align
+同组 FIFO 保持脚本顺序(用户 set/wait flag 会被调度器重排到 align 之前,不可用,
+E83 离线取证)。
+
 用法(设备,NPU 空闲窗)::
 
     source .agent_loop/run/env.sh
@@ -127,36 +136,40 @@ def moe_gate_up_swiglu_align(
                                 T.evaluate(call_extern("void", "asc_set_gm2l1_loop2_stride", 0, 0))
                                 T.evaluate(call_extern(
                                     "void", "asc_copy_gm2l1_align",
-                                    T.access_ptr(wg_l1, "r"),
+                                    T.access_ptr(wg_l1, "w"),
                                     T.access_ptr(Wnz[base_g + k0 * BN], "r"),
                                     bursts, blen, 0, 0, 0, 0, blen, blen))
                                 T.evaluate(call_extern(
                                     "void", "asc_copy_gm2l1_align",
-                                    T.access_ptr(wu_l1, "r"),
+                                    T.access_ptr(wu_l1, "w"),
                                     T.access_ptr(Wnz[base_g + up_off + k0 * BN], "r"),
                                     bursts, blen, 0, 0, 0, 0, blen, blen))
+                                T.evaluate(T.ascend_pipe_barrier("PIPE_MTE2"))
                                 T.copy(a_l1, ga)
                                 T.copy(wg_l1, gb)
                                 T.gemm(ga, gb, acc_g, transpose_B=True, clear_accum=True)
                                 T.copy(wu_l1, gb)
-                                T.gemm(ga, gb, acc_u, transpose_B=True, clear_accum=True)
+                                T.evaluate(T.ascend_pipe_barrier("PIPE_MTE1"))
+                                T.gemm(ga, gb, acc_u, transpose_B=True)
                                 for k in T.serial(K // BK - 1):
                                     k0 = (k + 1) * BK
                                     T.copy(X[row0:row0 + block_m, k0:k0 + BK], a_l1)
                                     T.evaluate(call_extern(
                                         "void", "asc_copy_gm2l1_align",
-                                        T.access_ptr(wg_l1, "r"),
+                                        T.access_ptr(wg_l1, "w"),
                                         T.access_ptr(Wnz[base_g + k0 * BN], "r"),
                                         bursts, blen, 0, 0, 0, 0, blen, blen))
                                     T.evaluate(call_extern(
                                         "void", "asc_copy_gm2l1_align",
-                                        T.access_ptr(wu_l1, "r"),
+                                        T.access_ptr(wu_l1, "w"),
                                         T.access_ptr(Wnz[base_g + up_off + k0 * BN], "r"),
                                         bursts, blen, 0, 0, 0, 0, blen, blen))
+                                    T.evaluate(T.ascend_pipe_barrier("PIPE_MTE2"))
                                     T.copy(a_l1, ga)
                                     T.copy(wg_l1, gb)
                                     T.gemm(ga, gb, acc_g, transpose_B=True)
                                     T.copy(wu_l1, gb)
+                                    T.evaluate(T.ascend_pipe_barrier("PIPE_MTE1"))
                                     T.gemm(ga, gb, acc_u, transpose_B=True)
                                 T.dual_copy(acc_g, g_ub)
                                 T.dual_copy(acc_u, u_ub)
@@ -230,22 +243,26 @@ def moe_down_align(
                                 T.evaluate(call_extern("void", "asc_set_gm2l1_loop2_stride", 0, 0))
                                 T.evaluate(call_extern(
                                     "void", "asc_copy_gm2l1_align",
-                                    T.access_ptr(w_l1, "r"),
+                                    T.access_ptr(w_l1, "w"),
                                     T.access_ptr(Wnz[base + k0 * BN], "r"),
                                     bursts, blen, 0, 0, 0, 0, blen, blen))
+                                T.evaluate(T.ascend_pipe_barrier("PIPE_MTE2"))
                                 T.copy(a_l1, ga)
                                 T.copy(w_l1, gb)
+                                T.evaluate(T.ascend_pipe_barrier("PIPE_MTE1"))
                                 T.gemm(ga, gb, acc, transpose_B=True, clear_accum=True)
                                 for k in T.serial(I // BK - 1):
                                     k0 = (k + 1) * BK
                                     T.copy(Y[row0:row0 + block_m, k0:k0 + BK], a_l1)
                                     T.evaluate(call_extern(
                                         "void", "asc_copy_gm2l1_align",
-                                        T.access_ptr(w_l1, "r"),
+                                        T.access_ptr(w_l1, "w"),
                                         T.access_ptr(Wnz[base + k0 * BN], "r"),
                                         bursts, blen, 0, 0, 0, 0, blen, blen))
+                                    T.evaluate(T.ascend_pipe_barrier("PIPE_MTE2"))
                                     T.copy(a_l1, ga)
                                     T.copy(w_l1, gb)
+                                    T.evaluate(T.ascend_pipe_barrier("PIPE_MTE1"))
                                     T.gemm(ga, gb, acc, transpose_B=True)
                                 T.dual_copy(acc, o_ub)
                                 with T.SimtVF(threads=threads):
@@ -272,6 +289,13 @@ def pack_gate_up(w13: torch.Tensor) -> torch.Tensor:
     return packed.reshape(-1).contiguous()
 
 
+def pack_gate_up_identity(w13: torch.Tensor) -> torch.Tensor:
+    """恒等 pack(H29 判别):ND 原序 strip 平坦化,零转置。"""
+    E_, two_i, K = w13.shape
+    assert two_i == 2 * I
+    return w13.reshape(-1).contiguous()
+
+
 def pack_down(w2: torch.Tensor) -> torch.Tensor:
     """[E, H, I] → flat [E*NT*BN*I],strip=(e,nt),BN=64;H27 修正=转置连续序(同上)。"""
     E_, Hd, I_ = w2.shape
@@ -279,6 +303,22 @@ def pack_down(w2: torch.Tensor) -> torch.Tensor:
     NT = Hd // BN
     packed = w2.view(E_, NT, BN, I_).transpose(-2, -1).contiguous()
     return packed.reshape(-1).contiguous()
+
+
+def pack_down_identity(w2: torch.Tensor) -> torch.Tensor:
+    """恒等 pack(H29 判别)。"""
+    return w2.reshape(-1).contiguous()
+
+
+_WIN_PACK = "transposed"
+
+
+def _pack_weights(mode: str):
+    if mode == "transposed":
+        return pack_gate_up, pack_down
+    if mode == "identity":
+        return pack_gate_up_identity, pack_down_identity
+    raise ValueError(mode)
 
 
 def build_align_gate_up(**spec):
@@ -305,81 +345,91 @@ def build_align_down(**spec):
 
 
 def run_numeric(dev: str = "npu") -> bool:
-    """H26 变体 vs 生产 ND 内核互检(真实 bench 形状)+ vs fp32 oracle(小形状)。"""
+    """H26 变体 vs 生产 ND 内核互检(真实 bench 形状)+ vs fp32 oracle(小形状)。
+
+    H30:同步修复后逐 pack 契约判别(transposed/identity),胜者记入 _WIN_PACK 供 bench 用。
+    """
+    global _WIN_PACK  # noqa: PLW0603
     from tileinfer.kernels.moe import build_down_kernel, build_gate_up_kernel
 
     g = torch.Generator(device="cpu").manual_seed(42)
     w13 = (torch.randn((E, 2 * I, H), dtype=torch.float32, generator=g) * 0.02).to(dev).to(torch.bfloat16)
     w2 = (torch.randn((E, H, I), dtype=torch.float32, generator=g) * 0.02).to(dev).to(torch.bfloat16)
-    w13nz = pack_gate_up(w13)
-    w2nz = pack_down(w2)
-    ok = True
 
-    for name, tokens, skewed in (("decode_b32", 32, False), ("prefill_400", 400, False)):
-        if skewed:
-            flat = torch.zeros((tokens * TOPK,), dtype=torch.int64)
-            flat[: tokens * TOPK // 2] = 0
-            flat[tokens * TOPK // 2:] = torch.randint(1, E, (tokens * TOPK // 2,), generator=g)
-            topk_ids = flat.view(tokens, TOPK).to(dev)
-        else:
-            topk_ids = torch.randint(0, E, (tokens, TOPK), generator=g).to(dev)
-        x = torch.randn((tokens, H), dtype=torch.float32, generator=g).to(dev).to(torch.bfloat16)
+    pack_mode_results = {}
+    for pack_mode in ("transposed", "identity"):
+        pg, pd = _pack_weights(pack_mode)
+        w13nz = pg(w13)
+        w2nz = pd(w2)
+        ok = True
+        for name, tokens, skewed in (("decode_b32", 32, False), ("prefill_400", 400, False)):
+            if skewed:
+                flat = torch.zeros((tokens * TOPK,), dtype=torch.int64)
+                flat[: tokens * TOPK // 2] = 0
+                flat[tokens * TOPK // 2:] = torch.randint(1, E, (tokens * TOPK // 2,), generator=g)
+                topk_ids = flat.view(tokens, TOPK).to(dev)
+            else:
+                topk_ids = torch.randint(0, E, (tokens, TOPK), generator=g).to(dev)
+            x = torch.randn((tokens, H), dtype=torch.float32, generator=g).to(dev).to(torch.bfloat16)
 
-        expanded = x.unsqueeze(1).expand(-1, TOPK, -1).reshape(-1, H)
-        lay = build_slot_layout(topk_ids, BM, num_experts=E)
-        rows = lay["num_tiles"] * BM
-        x_slots = gather_slots(expanded, lay["sorted_ids"], lay["num_expanded"]).contiguous()
-        ids = lay["expert_ids"].contiguous()
-        sids = lay["sorted_ids"].contiguous()
-        y_nd = torch.empty((rows, I), dtype=torch.bfloat16, device=dev)
-        out_nd = torch.empty((rows, H), dtype=torch.bfloat16, device=dev)
-        y_al = torch.empty_like(y_nd)
-        out_al = torch.empty_like(out_nd)
+            expanded = x.unsqueeze(1).expand(-1, TOPK, -1).reshape(-1, H)
+            lay = build_slot_layout(topk_ids, BM, num_experts=E)
+            rows = lay["num_tiles"] * BM
+            x_slots = gather_slots(expanded, lay["sorted_ids"], lay["num_expanded"]).contiguous()
+            ids = lay["expert_ids"].contiguous()
+            sids = lay["sorted_ids"].contiguous()
+            y_nd = torch.empty((rows, I), dtype=torch.bfloat16, device=dev)
+            out_nd = torch.empty((rows, H), dtype=torch.bfloat16, device=dev)
+            y_al = torch.empty_like(y_nd)
+            out_al = torch.empty_like(out_nd)
 
-        k1 = build_gate_up_kernel(num_tiles_max=lay["num_tiles"], rows_slots=rows,
-                                  num_experts=E, inter=I, hidden=H, block_m=BM, block_n=256)
-        k2 = build_down_kernel(num_tiles_max=lay["num_tiles"], rows_slots=rows,
-                               num_experts=E, inter=I, hidden=H, block_m=BM, block_n=64, block_k=512)
-        a1 = build_align_gate_up(num_tiles_max=lay["num_tiles"], rows_slots=rows,
-                                 num_experts=E, inter=I, hidden=H, block_m=BM, block_n=256)
-        a2 = build_align_down(num_tiles_max=lay["num_tiles"], rows_slots=rows,
-                              num_experts=E, inter=I, hidden=H, block_m=BM, block_n=64, block_k=512)
-        torch.npu.synchronize()
+            k1 = build_gate_up_kernel(num_tiles_max=lay["num_tiles"], rows_slots=rows,
+                                      num_experts=E, inter=I, hidden=H, block_m=BM, block_n=256)
+            k2 = build_down_kernel(num_tiles_max=lay["num_tiles"], rows_slots=rows,
+                                   num_experts=E, inter=I, hidden=H, block_m=BM, block_n=64, block_k=512)
+            a1 = build_align_gate_up(num_tiles_max=lay["num_tiles"], rows_slots=rows,
+                                     num_experts=E, inter=I, hidden=H, block_m=BM, block_n=256)
+            a2 = build_align_down(num_tiles_max=lay["num_tiles"], rows_slots=rows,
+                                  num_experts=E, inter=I, hidden=H, block_m=BM, block_n=64, block_k=512)
+            torch.npu.synchronize()
 
-        # fp32 oracle(生产内核与 H26 变体都应对齐)
-        xf = x.float()
-        ref_y = torch.zeros((rows, I), dtype=torch.float32, device=dev)
-        ref_o = torch.zeros((rows, H), dtype=torch.float32, device=dev)
-        for t in range(lay["num_tiles"]):
-            r0, r1 = t * BM, (t + 1) * BM
-            if int(lay["sorted_ids"][r0]) >= lay["num_expanded"]:
-                continue
-            e = int(lay["expert_ids"][t])
-            xs = x_slots[r0:r1].float()
-            gu = xs @ w13[e].float().T
-            gt, up = gu[:, :I], gu[:, I:]
-            ref_y[r0:r1] = gt * torch.sigmoid(gt) * up
-            ref_o[r0:r1] = ref_y[r0:r1] @ w2[e].float().T
+            # fp32 oracle(生产内核与 H26 变体都应对齐)
+            ref_y = torch.zeros((rows, I), dtype=torch.float32, device=dev)
+            ref_o = torch.zeros((rows, H), dtype=torch.float32, device=dev)
+            for t in range(lay["num_tiles"]):
+                r0, r1 = t * BM, (t + 1) * BM
+                if int(lay["sorted_ids"][r0]) >= lay["num_expanded"]:
+                    continue
+                e = int(lay["expert_ids"][t])
+                xs = x_slots[r0:r1].float()
+                gu = xs @ w13[e].float().T
+                gt, up = gu[:, :I], gu[:, I:]
+                ref_y[r0:r1] = gt * torch.sigmoid(gt) * up
+                ref_o[r0:r1] = ref_y[r0:r1] @ w2[e].float().T
 
-        k1(x_slots, w13, ids, sids, y_nd)
-        k2(y_nd, w2, ids, sids, out_nd)
-        a1(x_slots, w13nz, ids, sids, y_al)
-        a2(y_al, w2nz, ids, sids, out_al)
-        torch.npu.synchronize()
+            k1(x_slots, w13, ids, sids, y_nd)
+            k2(y_nd, w2, ids, sids, out_nd)
+            a1(x_slots, w13nz, ids, sids, y_al)
+            a2(y_al, w2nz, ids, sids, out_al)
+            torch.npu.synchronize()
 
-        scale_y = ref_y.abs().max().item()
-        scale_o = ref_o.abs().max().item()
-        nd_y = (y_nd.float() - ref_y).abs().max().item()
-        nd_o = (out_nd.float() - ref_o).abs().max().item()
-        al_y = (y_al.float() - ref_y).abs().max().item()
-        al_o = (out_al.float() - ref_o).abs().max().item()
-        rel = lambda d, s: d / max(s, 1e-9)  # noqa: E731
-        print(f"[numeric {name}] nd rel_y={rel(nd_y, scale_y):.4g} rel_o={rel(nd_o, scale_o):.4g} | "
-              f"h26 rel_y={rel(al_y, scale_y):.4g} rel_o={rel(al_o, scale_o):.4g}")
-        if not (rel(al_y, scale_y) < TOL and rel(al_o, scale_o) < TOL):
-            ok = False
-    print("NUMERIC:", "OK" if ok else "FAIL")
-    return ok
+            scale_y = ref_y.abs().max().item()
+            scale_o = ref_o.abs().max().item()
+            nd_y = (y_nd.float() - ref_y).abs().max().item()
+            nd_o = (out_nd.float() - ref_o).abs().max().item()
+            al_y = (y_al.float() - ref_y).abs().max().item()
+            al_o = (out_al.float() - ref_o).abs().max().item()
+            rel = lambda d, s: d / max(s, 1e-9)  # noqa: E731
+            print(f"[numeric {pack_mode} {name}] nd rel_y={rel(nd_y, scale_y):.4g} rel_o={rel(nd_o, scale_o):.4g} | "
+                  f"h26 rel_y={rel(al_y, scale_y):.4g} rel_o={rel(al_o, scale_o):.4g}")
+            if not (rel(al_y, scale_y) < TOL and rel(al_o, scale_o) < TOL):
+                ok = False
+        pack_mode_results[pack_mode] = ok
+        if ok:
+            _WIN_PACK = pack_mode
+    print(f"PACK_RESULTS: {pack_mode_results} winner={_WIN_PACK}")
+    print("NUMERIC:", "OK" if pack_mode_results[_WIN_PACK] else "FAIL")
+    return pack_mode_results[_WIN_PACK]
 
 
 # ---------------------------------------------------------------- 微基准
@@ -464,8 +514,10 @@ def run_bench(out_path: str, gate_only: bool, iters: int = 100, dev: str = "npu"
     _w["w2"] = (torch.randn((E, H, I), dtype=torch.float32, generator=g) * 0.02).to(dev).to(torch.bfloat16)
     _w["w13_ac"] = _w["w13"].transpose(1, 2).contiguous()
     _w["w2_ac"] = _w["w2"].transpose(1, 2).contiguous()
-    _w["w13nz"] = pack_gate_up(_w["w13"])
-    _w["w2nz"] = pack_down(_w["w2"])
+    pg, pd = _pack_weights(_WIN_PACK)
+    _w["w13nz"] = pg(_w["w13"])
+    _w["w2nz"] = pd(_w["w2"])
+    print(f"BENCH_PACK={_WIN_PACK}")
 
     scenarios = [
         ("decode_b1", 1, False), ("decode_b4", 4, False), ("decode_b16", 16, False),
