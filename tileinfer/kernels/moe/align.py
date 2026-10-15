@@ -12,10 +12,15 @@ CANN c_api 的免转换 ``asc_copy_gm2l1_align``,直接平载主机侧预打包�
 - 发射级前置证明见 h26_l1_offset_probe.py(L1 非 0 偏移一致)与
   h26_gm_addr_probe.py(静态/动态 GM 寻址全折进指针)。
 
-权重布局契约:
-- ``pack_gate_up(w13)``: [E, 2I, K] → flat [E*2*NT*BN*K] compact-NZ,
-  strip=(e, h, nt),h: 0=gate / 1=up,gate strip=(e*2*NT+nt),up strip 同 +NT;
-- ``pack_down(w2)``: [E, H, I] → flat [E*NT*BN*I] compact-NZ,strip=(e, nt)。
+权重布局契约(H27/E76 实测修正):
+- nd2nz 写入 L1 的真实物理序 = **转置连续序**(物理槽 i ← 语义 (c=i//K, k=i%K);由
+  h27_l1_layout_probe.py GEMM 单 hot 反推 32768/32768 确证),E70 的 compact-NZ 静态
+  反推被推翻;
+- align 直载 = 恒等平载 ⇒ packer 输出 = 每 [BN,K]/[BN,I] slice ``transpose(-2,-1)``
+  后平坦化(``pack_gate_up`` / ``pack_down``);
+- ``pack_gate_up(w13)``: [E, 2I, K] → flat [E*2*NT*BN*K],strip=(e, h, nt),
+  gate strip=(e*2*NT+nt),up strip 同 +NT;
+- ``pack_down(w2)``: [E, H, I] → flat [E*NT*BN*I],strip=(e, nt)。
 """
 
 import tilelang
@@ -232,26 +237,27 @@ def moe_down_align(
 
 
 def pack_gate_up(w13, inter: int):
-    """[E, 2I, K] → flat [E*2*NT*BN*K] compact-NZ(strip=(e,h,nt),h: 0=gate/1=up)。"""
-    from tileinfer.kernels.moe.prenz import pack_nd_to_compact_nz
+    """[E, 2I, K] → flat [E*2*NT*BN*K](strip=(e,h,nt),h: 0=gate/1=up)。
 
+    H27 修正(E76):nd2nz 实测 L1 物理序=转置连续(列 c 外轴、行 k 内轴,32768/32768),
+    非 compact-NZ(E70 静态反推错误)。align 恒等平载 ⇒ GM flat 序 = 每 [BN,K] slice
+    转置后平坦化。
+    """
     E_, two_i, K = w13.shape
     assert two_i == 2 * inter
     BN = GATE_UP_BLOCK_N
     NT = inter // BN
-    packed = pack_nd_to_compact_nz(w13.view(E_, 2, NT, BN, K).contiguous())
+    packed = w13.view(E_, 2, NT, BN, K).transpose(-2, -1).contiguous()
     return packed.reshape(-1).contiguous()
 
 
 def pack_down(w2, inter: int):
-    """[E, H, I] → flat [E*NT*BN*I] compact-NZ(strip=(e,nt),BN=64)。"""
-    from tileinfer.kernels.moe.prenz import pack_nd_to_compact_nz
-
+    """[E, H, I] → flat [E*NT*BN*I](strip=(e,nt));H27 修正=转置连续序(同上)。"""
     E_, Hd, I_ = w2.shape
     assert I_ == inter
     BN = DOWN_BLOCK_N
     NT = Hd // BN
-    packed = pack_nd_to_compact_nz(w2.view(E_, NT, BN, I_).contiguous())
+    packed = w2.view(E_, NT, BN, I_).transpose(-2, -1).contiguous()
     return packed.reshape(-1).contiguous()
 
 

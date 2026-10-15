@@ -40,7 +40,6 @@ import torch_npu  # noqa: F401
 import tilelang
 import tilelang.ascend.language as T
 from tilelang.language.tir.op import call_extern
-from tileinfer.kernels.moe.prenz import pack_nd_to_compact_nz
 from tileinfer.testing.moe_reference import build_slot_layout, gather_slots
 
 E = 256
@@ -259,21 +258,26 @@ def moe_down_align(
 
 
 def pack_gate_up(w13: torch.Tensor) -> torch.Tensor:
-    """[E, 2I, K] → flat [E*2*NT*BN*K] compact-NZ(strip=(e,h,nt),h: 0=gate/1=up)。"""
+    """[E, 2I, K] → flat [E*2*NT*BN*K],strip=(e,h,nt),h: 0=gate/1=up。
+
+    H27 修正(E76):nd2nz 实测 L1 物理序=转置连续(列 c 外轴、行 k 内轴,32768/32768),
+    非 compact-NZ(E70 静态反推错误)。align 恒等平载 ⇒ GM flat 序 = 每 [BN,K] slice
+    转置后平坦化。
+    """
     E_, two_i, K = w13.shape
     assert two_i == 2 * I
     BN = 256
     NT = I // BN
-    packed = pack_nd_to_compact_nz(w13.view(E_, 2, NT, BN, K).contiguous())
+    packed = w13.view(E_, 2, NT, BN, K).transpose(-2, -1).contiguous()
     return packed.reshape(-1).contiguous()
 
 
 def pack_down(w2: torch.Tensor) -> torch.Tensor:
-    """[E, H, I] → flat [E*NT*BN*I] compact-NZ(strip=(e,nt),BN=64)。"""
+    """[E, H, I] → flat [E*NT*BN*I],strip=(e,nt),BN=64;H27 修正=转置连续序(同上)。"""
     E_, Hd, I_ = w2.shape
     BN = 64
     NT = Hd // BN
-    packed = pack_nd_to_compact_nz(w2.view(E_, NT, BN, I_).contiguous())
+    packed = w2.view(E_, NT, BN, I_).transpose(-2, -1).contiguous()
     return packed.reshape(-1).contiguous()
 
 

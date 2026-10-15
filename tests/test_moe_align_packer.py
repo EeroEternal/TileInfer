@@ -1,8 +1,9 @@
 """CPU contract tests for the H26 preNZ align module (tileinfer.kernels.moe.align).
 
 Scope (CPU-only by design):
-* ``pack_gate_up`` / ``pack_down`` strip-layout bookkeeping: flat output must decode, strip by
-  strip, back to the original ND weights via ``unpack_compact_nz_to_nd``;
+* ``pack_gate_up`` / ``pack_down`` transposed-continuous layout bookkeeping (H27/E76: the
+  measured nd2nz L1 physical order is column-major-continuous, NOT compact-NZ; align loads
+  GM flat verbatim, so each [BN,K] slice must be transposed before flattening);
 * strip addressing contract consumed by the align kernels (gate strip = e*2*NT+nt, up = +NT,
   down = e*NT+nt), including the multi-tile (NT>1) case;
 * kernel factory constructibility and the burst geometry constants.
@@ -22,7 +23,6 @@ from tileinfer.kernels.moe import (
     moe_gate_up_swiglu_align,
     pack_down,
     pack_gate_up,
-    unpack_compact_nz_to_nd,
 )
 from tileinfer.kernels.moe.align import (
     BURST_BYTES,
@@ -49,14 +49,10 @@ def test_pack_gate_up_strip_roundtrip():
     assert nt >= 1
     flat = pack_gate_up(w13, inter=I)
     assert flat.shape == (E * 2 * nt * GATE_UP_BLOCK_N * H,)
-    # strip (e, h, nt) must decode to w13[e, h*I + nt*BN : +BN, :] ([BN, K] compact-NZ tile)
-    strips = flat.view(E, 2, nt, GATE_UP_BLOCK_N, H)
-    for e in range(E):
-        for h in range(2):
-            for t in range(nt):
-                nz = unpack_compact_nz_to_nd(strips[e, h, t])
-                ref = w13[e, h * I + t * GATE_UP_BLOCK_N: h * I + (t + 1) * GATE_UP_BLOCK_N]
-                assert torch.equal(nz, ref)
+    # transposed-continuous: flat.view(..., K, BN) == w13.view(..., BN, K).transpose(-2, -1)
+    strips = flat.view(E, 2, nt, H, GATE_UP_BLOCK_N)
+    ref = w13.view(E, 2, nt, GATE_UP_BLOCK_N, H).transpose(-2, -1)
+    assert torch.equal(strips, ref.contiguous())
 
 
 def test_pack_gate_up_multi_tile_strip_addressing():
@@ -66,7 +62,7 @@ def test_pack_gate_up_multi_tile_strip_addressing():
     w13 = (torch.randn((E, 2 * i2, H), generator=g) * 0.02).to(torch.bfloat16)
     nt = i2 // GATE_UP_BLOCK_N
     flat = pack_gate_up(w13, inter=i2)
-    strips = flat.view(E, 2, nt, GATE_UP_BLOCK_N, H)
+    strips = flat.view(E, 2, nt, H, GATE_UP_BLOCK_N)
     # gate strip (e, 0, nt) at offset (e*2*NT+nt); up strip = +NT (kernel's base_g / up_off math)
     for e in range(E):
         for t in range(nt):
@@ -83,11 +79,9 @@ def test_pack_down_strip_roundtrip():
     nt = H // DOWN_BLOCK_N
     flat = pack_down(w2, inter=I)
     assert flat.shape == (E * nt * DOWN_BLOCK_N * I,)
-    strips = flat.view(E, nt, DOWN_BLOCK_N, I)
-    for e in range(E):
-        for t in range(nt):
-            nz = unpack_compact_nz_to_nd(strips[e, t])
-            assert torch.equal(nz, w2[e, t * DOWN_BLOCK_N: (t + 1) * DOWN_BLOCK_N])
+    strips = flat.view(E, nt, I, DOWN_BLOCK_N)
+    ref = w2.view(E, nt, DOWN_BLOCK_N, I).transpose(-2, -1)
+    assert torch.equal(strips, ref.contiguous())
 
 
 def test_pack_non_contiguous_input_rejected_or_handled():
