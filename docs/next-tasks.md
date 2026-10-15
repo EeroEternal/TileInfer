@@ -105,9 +105,19 @@ reduction merge** (`vmax(vcmax(r0),vcmax(r1))` / `vadd(vcadd(e0),vcadd(e1))`).  
 `vcmax`/`vcadd` are full-vector reductions with the result in lane 0 (broadcast with `vdupv`);
 `vcgmax` is *per-datablock* max, not sum.  CPU contract: `tests/test_offline_lower_probes.py`.
 
-*Remaining*: an end-to-end **speed** gain (SIMD row width vs SIMT threads; the >64-wide cross-register
-reduction merge; UB liveness) — port one softmax at a time into `paged_decode_ascend950.py`, then run
-`scripts/run_device_ci.sh` + the serving probe.
+Then `benchmarks/probes/simd_softmax_paged_device.py` validates the **paged + masked + runtime-loop**
+shape the decode kernel actually uses (runtime `for p in T.serial(pages)`, runtime `last_len` staged
+from UB, tail mask via `vcmps`+`vsel`, cross-register merge): **max|diff| = 0.00000 at tail
+128/64/13** — bit-exact.  Two back-end limits found: (1) SIMD_VF cannot read global memory (stage
+`kv_last_page_len` into UB first); (2) bisheng cannot lower f32 `select`/`sitofp` — mask with an
+**int32 lane index vs int scalar** (`vci(int32)` + `vcmps` int overload), not a float `if_then_else`.
+
+*Remaining (integration)*: the two-pass paged form is the proven blueprint.  The kernel's own
+**online** form additionally needs `o = o*alpha + e` (the running-sum rescale); a direct SIMD
+read-modify-write of `o` in UB is **not reliable** (measured `max|diff|=1.0` with the m/l/alpha part
+exact — a UB RMW hazard).  Integrate the **two-pass** form (or keep the `o` rescale on the SIMT side)
+one softmax at a time into `paged_decode_ascend950.py`, then run `scripts/run_device_ci.sh` + the
+serving probe for the **speed** verdict.
 
 *Done when*: the probe shows a measurable gain and the device tests still match the oracle.
 
