@@ -12,6 +12,12 @@ CANN c_api 的免转换 ``asc_copy_gm2l1_align``,直接平载主机侧预打包�
 - 发射级前置证明见 h26_l1_offset_probe.py(L1 非 0 偏移一致)与
   h26_gm_addr_probe.py(静态/动态 GM 寻址全折进指针)。
 
+H30 同步纪律(E83):raw ``call_extern`` 对 tilelang 调度器依赖分析不可见——dst 必须用
+``T.access_ptr(l1, "w")`` 明示写依赖(调度器自动合成 RAW/WAR 事件边),且每次发射后
+``ascend_pipe_barrier("PIPE_MTE2")``(MTE2 在途拷贝落地)+ 末次权重 L1 读后
+``ascend_pipe_barrier("PIPE_MTE1")``(防下轮迭代 align 覆盖 w_l1 的 WAR)冗余守卫。
+barrier 属 opaque op,与 align 同组 FIFO 保序;用户 set/wait flag 会被调度器重排,不可用。
+
 权重布局契约(H27/E76 实测修正):
 - nd2nz 写入 L1 的真实物理序 = **转置连续序**(物理槽 i ← 语义 (c=i//K, k=i%K);由
   h27_l1_layout_probe.py GEMM 单 hot 反推 32768/32768 确证),E70 的 compact-NZ 静态
@@ -54,7 +60,8 @@ def moe_gate_up_swiglu_align(
     """gate_up+SwiGLU 融合内核的 align 直载变体。
 
     权重实参 = ``Wnz`` flat [E*2*NT*BN*K]:strip (e, h, nt) = 生产 ``W13[e, h*I+nt*BN
-    : +BN, :]`` 的 [BN, K] compact-NZ 打包;gate strip = eid*2*NT+nt,up strip 同 +NT。
+    : +BN, :]`` 的 [BN, K] 转置连续打包(见 :func:`pack_gate_up`);gate strip =
+    eid*2*NT+nt,up strip 同 +NT。
     """
     EM, R = num_tiles_max, rows_slots
     E_, K = num_experts, hidden
@@ -106,36 +113,40 @@ def moe_gate_up_swiglu_align(
                                 T.evaluate(call_extern("void", "asc_set_gm2l1_loop2_stride", 0, 0))
                                 T.evaluate(call_extern(
                                     "void", "asc_copy_gm2l1_align",
-                                    T.access_ptr(wg_l1, "r"),
+                                    T.access_ptr(wg_l1, "w"),
                                     T.access_ptr(Wnz[base_g + k0 * BN], "r"),
                                     bursts, blen, 0, 0, 0, 0, blen, blen))
                                 T.evaluate(call_extern(
                                     "void", "asc_copy_gm2l1_align",
-                                    T.access_ptr(wu_l1, "r"),
+                                    T.access_ptr(wu_l1, "w"),
                                     T.access_ptr(Wnz[base_g + up_off + k0 * BN], "r"),
                                     bursts, blen, 0, 0, 0, 0, blen, blen))
+                                T.evaluate(T.ascend_pipe_barrier("PIPE_MTE2"))
                                 T.copy(a_l1, ga)
                                 T.copy(wg_l1, gb)
                                 T.gemm(ga, gb, acc_g, transpose_B=True, clear_accum=True)
                                 T.copy(wu_l1, gb)
-                                T.gemm(ga, gb, acc_u, transpose_B=True, clear_accum=True)
+                                T.evaluate(T.ascend_pipe_barrier("PIPE_MTE1"))
+                                T.gemm(ga, gb, acc_u, transpose_B=True)
                                 for k in T.serial(K // BK - 1):
                                     k0 = (k + 1) * BK
                                     T.copy(X[row0:row0 + block_m, k0:k0 + BK], a_l1)
                                     T.evaluate(call_extern(
                                         "void", "asc_copy_gm2l1_align",
-                                        T.access_ptr(wg_l1, "r"),
+                                        T.access_ptr(wg_l1, "w"),
                                         T.access_ptr(Wnz[base_g + k0 * BN], "r"),
                                         bursts, blen, 0, 0, 0, 0, blen, blen))
                                     T.evaluate(call_extern(
                                         "void", "asc_copy_gm2l1_align",
-                                        T.access_ptr(wu_l1, "r"),
+                                        T.access_ptr(wu_l1, "w"),
                                         T.access_ptr(Wnz[base_g + up_off + k0 * BN], "r"),
                                         bursts, blen, 0, 0, 0, 0, blen, blen))
+                                    T.evaluate(T.ascend_pipe_barrier("PIPE_MTE2"))
                                     T.copy(a_l1, ga)
                                     T.copy(wg_l1, gb)
                                     T.gemm(ga, gb, acc_g, transpose_B=True)
                                     T.copy(wu_l1, gb)
+                                    T.evaluate(T.ascend_pipe_barrier("PIPE_MTE1"))
                                     T.gemm(ga, gb, acc_u, transpose_B=True)
                                 T.dual_copy(acc_g, g_ub)
                                 T.dual_copy(acc_u, u_ub)
@@ -209,22 +220,26 @@ def moe_down_align(
                                 T.evaluate(call_extern("void", "asc_set_gm2l1_loop2_stride", 0, 0))
                                 T.evaluate(call_extern(
                                     "void", "asc_copy_gm2l1_align",
-                                    T.access_ptr(w_l1, "r"),
+                                    T.access_ptr(w_l1, "w"),
                                     T.access_ptr(Wnz[base + k0 * BN], "r"),
                                     bursts, blen, 0, 0, 0, 0, blen, blen))
+                                T.evaluate(T.ascend_pipe_barrier("PIPE_MTE2"))
                                 T.copy(a_l1, ga)
                                 T.copy(w_l1, gb)
+                                T.evaluate(T.ascend_pipe_barrier("PIPE_MTE1"))
                                 T.gemm(ga, gb, acc, transpose_B=True, clear_accum=True)
                                 for k in T.serial(I // BK - 1):
                                     k0 = (k + 1) * BK
                                     T.copy(Y[row0:row0 + block_m, k0:k0 + BK], a_l1)
                                     T.evaluate(call_extern(
                                         "void", "asc_copy_gm2l1_align",
-                                        T.access_ptr(w_l1, "r"),
+                                        T.access_ptr(w_l1, "w"),
                                         T.access_ptr(Wnz[base + k0 * BN], "r"),
                                         bursts, blen, 0, 0, 0, 0, blen, blen))
+                                    T.evaluate(T.ascend_pipe_barrier("PIPE_MTE2"))
                                     T.copy(a_l1, ga)
                                     T.copy(w_l1, gb)
+                                    T.evaluate(T.ascend_pipe_barrier("PIPE_MTE1"))
                                     T.gemm(ga, gb, acc, transpose_B=True)
                                 T.dual_copy(acc, o_ub)
                                 with T.SimtVF(threads=threads):
@@ -313,7 +328,8 @@ _KERNEL_CACHE: dict = {}
 
 
 def build_align_gate_up(**spec):
-    key = ("h26_gu_align",) + tuple(sorted(spec.items()))
+    # key 前缀带 H30:同步修复改变生成源,防止 TILELANG_CACHE_DIR 陈旧 .o 复用
+    key = ("h30_gu_align",) + tuple(sorted(spec.items()))
     if key not in _KERNEL_CACHE:
         _KERNEL_CACHE[key] = tilelang.compile(
             moe_gate_up_swiglu_align(**spec), out_idx=[],
@@ -323,7 +339,7 @@ def build_align_gate_up(**spec):
 
 
 def build_align_down(**spec):
-    key = ("h26_dn_align",) + tuple(sorted(spec.items()))
+    key = ("h30_dn_align",) + tuple(sorted(spec.items()))
     if key not in _KERNEL_CACHE:
         _KERNEL_CACHE[key] = tilelang.compile(
             moe_down_align(**spec), out_idx=[],
