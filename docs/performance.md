@@ -364,6 +364,100 @@ PROBES=A bash .agent_loop/run/w1iso_probe.sh   # 或 B;单景 16384x128_c8
   (W1 原始命题未达成,证据链完整,交用户决策;后续路线见 .agent_loop/state/DECISIONS.md D57:
   ①长上下文 prefill 步分流回退 FIA(零内核成本,期望 →~0.45x+)②内核效率重写(需新证据))。
 
+## T6 warm-up / batch bucketing 一等公民化:配置驱动的单一真源(2026-10-15)
+
+**问题(隐式双真源)**:TileLang 内核按形状编译(冷编译 ~100 s),服务路径上必须**零编译**
+(否则卡住 EngineCore)。做法是启动前 out-of-process 预烧进 `TILELANG_CACHE_DIR`。但历史实现里
+"要编译哪些变体"由**两处独立公式**决定:引擎内联的 `TileInferDecodeAttention.prewarm_prefill`
+(含 prefill ladder)与 `scripts/prewarm-tileinfer-kernels.py`(只覆盖 decode,且池大小/桶/ladder
+顶**要从日志手抄**)。两处一旦漂移,预烧静默失效 → 服务路径掉回惰性编译 → FIA 回退。
+
+**方案(`tileinfer/integrations/prewarm.py`)**:把公式抽成**纯函数**(不 import torch/tilelang/vllm),
+引擎与预烧脚本调用同一份实现,消除双真源:
+- `bucket_for` / `decode_buckets`:批量向上取整到 `BATCH_BUCKETS`;
+- `prefill_ladder_tops` / `prefill_specs`:prefill 的 canonical ladder(`kernel_batch=bucket+1` 的
+  trash 行、tiles 取 2 的幂到顶、split 变体按 `max_splits` 追加),顶由 token 预算与 `max_model_len`
+  推导;
+- `declared_cap`:内核 ABI 的声明容量(2 的幂上取整 / `TILEINFER_POOL_CAP` 钉死),池从内存快照
+  漂移也落同桶(L2 池无关 ABI),预烧跨运行命中。
+- `build_prewarm_plan`:`(配置) → (decode 桶, prefill ladder spec)` 的唯一入口,`--prefill` 落地到
+  预烧脚本(此前 prefill 完全未预烧)。
+- `prewarm_plan_to_dict` + `--plan-only --json`:预烧规格的机器可读产物,可在不编译的机器上复算、
+  diff、入库——把"预烧与引擎一致"从人工比对日志升级为可复现的产物对比。
+
+**验收数字(CPU 契约,`tests/test_prewarm_specs.py`,24 用例全绿)**:
+
+| 项 | 数字 | 判据 |
+|---|---|---|
+| **漂移守护**:引擎常量/函数 ≡ prewarm 模块 | `KERNEL_PAGE_SIZE`/`BATCH_BUCKETS`/`PREFILL_MAX_TILES`/`_next_pow2`/`_sub_pages`/`_bucket_for` 逐值相等 | 一致 |
+| `declared_cap` ≡ 内核 `declared_pool_cap` | 池 {1,2,3,100,9425,9899,2288,65536} 逐值相等 | 一致 |
+| 池漂移同桶(9425→9899,真实 vLLM 快照波动) | `declared_cap` 同值 | 跨运行命中 |
+| `prefill_ladder_tops` vs 引擎内联公式 | 6 组配置(含缺省/长上下文/split 档)逐项相等 | 一致 |
+| `prefill_specs` vs 引擎 `_prewarm_prefill_ladder` | 3 组 ktp×model_len 规格序列逐项相等 | 一致 |
+| 变体字段形状 | plain=9 字段、split=10 字段;批=bucket+1、block_q=128 | 与 `_compile` 解包一致 |
+| ladder 变体数 | ≤32(P3/D39 上限) | 通过 |
+| Qwen3.6 端到端推导 | decode=[1..32]、prefill 11 变体(1..1024 tiles)、pool=16384 | 通过 |
+| `plan → JSON` 可序列化 | 字段与 plan 一致、split>0(ktp=64) | 通过 |
+| 全量 CPU 回归 | `pytest tests -m "not npu"` 130 passed | 无回归 |
+
+**端到端(NPU 在役)**:待 NPU 空闲窗口执行(环境当前被外部 serve 占用)。验证口径与 P0 一致:
+serve 启动后 `grep -c "compiling prefill kernel for shape"` = 0、`prefill_fallbacks`=0、
+`prefill_calls` 全接管——即"startup 后零编译"目标契约。届时本节补入实测数字。
+
+Reproduce with:
+
+```bash
+.venv/bin/python -m pytest tests/test_prewarm_specs.py -q            # CPU 契约(24,含漂移守护)
+# 预烧规格(CPU,不编译;可 diff/入库):
+python scripts/prewarm-tileinfer-kernels.py --kv-heads 2 --group 8 --dim 256 \
+    --block-size 2048 --num-engine-pages 600 --max-num-reqs 32 \
+    --max-num-batched-tokens 8192 --max-model-len 32768 --prefill --plan-only --json
+# 真编译(NPU 空闲时执行,产出落 TILELANG_CACHE_DIR):
+TILELANG_CACHE_DIR=.work/tl_cache_950 python scripts/prewarm-tileinfer-kernels.py \
+    --kv-heads 2 --group 8 --dim 256 --block-size 2048 --num-engine-pages 600 \
+    --max-num-reqs 32 --max-num-batched-tokens 8192 --max-model-len 32768 --prefill
+```
+
+## T4/T5 内核机制离线取证:full M tile(已完成)与 SIMD softmax(机制可表达)(2026-10-15)
+
+两条 P1 内核路线都属"机制是否可表达"一类,结论读自生成的 CCE,**无需设备**(仿 D45 的离线下探
+方法:`benchmarks/probes/*_lower.py` + `compile_kernel_source(target="ascend")`)。
+
+### T4 prefill full M tile = ✅ 已完成(commit `5730b66`,PM-2)
+`next-tasks.md` 曾把 full M tile 列为未做,实为**过期文档**。实际方案(见 [`known-issues.md`](known-issues.md#pm-2--prefillappend-multi-tile-wrong-prefill-multi-tile-misplaced-rowspm-2)):
+因果掩码需要**全局**行号,而向量区只见本 AIV 的行(`dual_copy` 把 M 半分);解法不是取 AIV 索引,
+而是 **host 预算每行因果阈值** `q_pos + shift` 写入 `RowThr`(超出行数的填 -1),内核像 `s_ub` 一样
+`dual_copy` 它——两半各得自己的阈值,掩码在两半都正确。`block_q // 2` 规划限制**已移除**,全 tile
+端到端使用(`BR = block_q`)。CPU 契约:`tests/test_offline_lower_probes.py::test_prefill_uses_full_m_tile`。
+
+### T5 SIMD softmax = 🟡 机制已证可表达,数值/性能待设备
+**动机**:当前 decode/prefill 的 online softmax 用 `T.SimtVF` + `T.alloc_reducer`(几行而非上百行,
+是正确的首版取舍),但它把向量时间留在关键路径;上游 FlashAttention 用打包的 `T.simd.*` 微 API。
+
+**离线取证**(`benchmarks/probes/simd_softmax_lower.py`,32×128 tile):
+
+| 路径 | 向量内在函数 | 标量 `for` |
+|---|---|---|
+| 现状(SIMT,`T.SimtVF`+reducer) | **0** | **11** |
+| 候选(SIMD,`T.simd.*` in `T.SimdVF()`) | **7**(`vlds_norm`/`vcmax`/`vsub`/`vexp`/`vcgmax`/`vmul`/`vsts_norm`) | **1** |
+
+**判读**:纯 SIMD softmax(减行 max → exp → 乘行和的倒数)在本后端能完整 lower 成向量内在函数
+——**机制可表达已证**。CPU 契约:`tests/test_offline_lower_probes.py` 两个用例(SIMD 降到向量内在
+函数、SIMT 降到标量循环)。
+
+**未证(需设备)**:①数值等价(SimdVF 的 `vexp` 精度须与 fp32 oracle 对拍);②是否更快(SIMD 行宽
+vs SIMT 线程数、UB 存活期是新成本)。集成点=`kernels/attention/paged_decode_ascend950.py` 的三处
+softmax(decode + prefill ×2),逐段替换后跑设备套件 + 在役探针。
+
+**全量 CPU 回归**:`pytest tests -m "not npu"` **133 passed**(较 T6 前的 130 + 3 探针用例)。
+
+Reproduce with:
+
+```bash
+.venv/bin/python benchmarks/probes/simd_softmax_lower.py     # 离线,打印两路径的指令混合
+.venv/bin/python -m pytest tests/test_offline_lower_probes.py -q
+```
+
 ## Prefill KV 重扫截断(prefill kernel KV-rescan truncation,2026-10-14)
 
 **问题**:prefill 内核每个 query tile 都循环该请求的**全部** KV pages(`for p in T.serial(req_pages)`),

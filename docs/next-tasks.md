@@ -78,43 +78,54 @@ with the existing device tests covering multi-shape processes.
 
 ## P1 — finish the kernel library
 
-### T4 · Prefill: recover the wasted half of the M tile (~2x)
+### T4 · Prefill: recover the wasted half of the M tile (~2x) ✅(**done,5730b66,PM-2**)
 
 *Why*: the causal mask needs a **global** row index, but a vector region only sees its own AIV's rows
-(`dual_copy` splits M over two AIVs).  The workaround planes tiles at `block_q // 2`, so half of every
+(`dual_copy` splits M over two AIVs).  The workaround planed tiles at `block_q // 2`, so half of every
 M tile is padding (PM-2 in `known-issues.md`).  Prefill is cube-bound, so this is a real 2x.
 
-*First step*: a two-tile unit case with `group=1, block_q=32, qo_len=64` in
-`tests/test_tilelang_ascend950_prefill.py`, then restructure the kernel into explicit
-`with T.Cube():` / `with T.Vector(vector=2) as sid:` regions and mask with `sid * ROWS + r`
-(`T.Vector` is the only way to obtain the AIV index — see `architecture.md`).
+*Done (2026-10-12, commit `5730b66`)*: instead of obtaining the AIV index, the **host precomputes each
+row's causal threshold** `q_pos + shift` into a `RowThr` array (rows past the live count get `-1`) and
+the kernel `dual_copy`s it exactly like `s_ub` — each AIV half receives its own thresholds, so the mask
+is correct on both halves.  The `block_q // 2` planning restriction is **gone**; the full `block_q`
+tile is used end to end (`BR = block_q`).  Locked by `tests/test_offline_lower_probes.py`.
 
-*Done when*: the prefill tests pass with full `block_q` tiles and the prefill benchmark improves
-towards 2x.
-
-### T5 · SIMD softmax
+### T5 · SIMD softmax 🟡(**机制已证可表达,性能待设备**)
 
 *Why*: the SIMT softmax was the right first trade (a few lines instead of a hundred), but it keeps
 vector time on the critical path; upstream's FlashAttention uses the packed `T.simd.*` path.
 
-*First step*: measure the gap first — `benchmarks/probes/ascend950_paged_decode.py` with a shape that
-makes softmax time visible (long context), then port one softmax step at a time (max, exp, sum) using
-`T.simd.*` on the existing buffers.
+*Progress (2026-10-15)*: the offline-lower probe `benchmarks/probes/simd_softmax_lower.py` lowers the
+current SIMT softmax (→ 0 vector intrinsics, 11 scalar `for`) and a candidate SIMD softmax written with
+`T.simd.*` inside `T.SimdVF()` (→ `vlds_norm`/`vcmax`/`vsub`/`vexp`/`vcgmax`/`vmul`/`vsts_norm`, 1
+scalar `for`).  **Mechanism proven expressible on this backend** (no device needed).  CPU contract:
+`tests/test_offline_lower_probes.py`.
+
+*Remaining*: numerical equivalence vs the fp32 oracle + a measurable gain — **needs device** (port one
+softmax step at a time into `paged_decode_ascend950.py`, then run the device tests + the serving probe).
 
 *Done when*: the probe shows a measurable gain and the device tests still match the oracle.
 
-### T6 · Warm-up and batch bucketing as first-class features (partly done)
+
+### T6 · Warm-up and batch bucketing as first-class features ✅(**done,2026-10-15**)
 
 *Why*: a TileLang kernel is compiled per shape (~2 min standalone), a serving batch changes size every
 step (hence bucket padding), and a compile must never sit in a request (hence the background thread +
 FIA fallback).  All three mechanisms exist but are spread across the plugin.
 
-*Done so far*: `scripts/prewarm-tileinfer-kernels.py` compiles the declared buckets out of process
-into `TILELANG_CACHE_DIR`, which is what keeps the engine from stalling (see `architecture.md`).
-*First step*: tie it to the backend (`warmup(buckets)`), and make the pool capacity reproducible so
-the pre-warm can be derived from the server config instead of copied from a log.
+*Done*: the "what to compile" set is now derived from the **server config** by
+`tileinfer.integrations.prewarm` — pure functions the engine and the pre-warm script share — so the
+pre-warm can no longer drift from the engine.  `scripts/prewarm-tileinfer-kernels.py` covers
+**decode buckets + the prefill canonical ladder (+ split ladder)**; the pool capacity is derived
+(L2 pool-agnostic, next-pow2 or `TILEINFER_POOL_CAP`) instead of copied from a log.  A
+`--plan-only --json` mode dumps the derived plan for CI/ops diffing without compiling.
+`tests/test_prewarm_specs.py` locks the equivalence to the engine's inlined formulas (24 CPU cases)
+and guards constant drift.
 
 *Done when*: a served model reaches "zero compiles after start-up" and the docs say how.
+→ docs: [`performance.md`](performance.md) §T6.  **端到端 serve 实测待 NPU 空闲**(环境被外部 serve
+占用 + GDN custom-op 回归,2026-10-15);CPU 契约全绿。
+
 
 ### T7 · Split-KV by default(**= 阶段三 L3,延后**;依赖 T3/L1 与 L2 池无关 ABI)
 
