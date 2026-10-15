@@ -810,3 +810,34 @@ Method notes that mattered: the kernels must be pre-warmed **out of process** (a
 engine stalls it, see `architecture.md`), the KV pool must be pinned (`--num-gpu-blocks-override`) so
 the pre-warm key is reproducible, and a bare `wait` in the harness waits for the server process too -
 which is what made three earlier "engine hangs" look like engine hangs when the engine was idle.
+
+## MoE 专项终态:preNZ align 直载线终裁关闭,内核 0.813x/0.842x 为技术栈上限(FINAL TEMPORARY,2026-10-16 iter-067)
+
+**结论**:MoE 层专项的 30% 端到端目标未达成,以 FINAL TEMPORARY 交用户裁决
+(PERFORMANCE_REPORT §13;优化台账 PERF_OPTIMIZATION 共 19 次尝试)。
+
+**终裁证据链(E88)**:H30 发射竞态白盒破案并修复后(E83/E85,955bd21→e43a18e:
+dst 写访问让调度器合成 RAW/WAR 事件边 + MTE2/MTE1 pipe_barrier,生成源逐 token 等价,
+CPU 契约 23/23 绿),设备 numeric 复验(2026-10-16 02:10,空闲窗完整跑通)双 pack
+全 FAIL——transposed rel_y=3.818/3.24、identity rel_y=3.851/4.597(TOL 3e-2),与
+修复前(E82)同量级;同 run 生产 nd 内核 0.0019-0.0028 全绿。恒等 pack 与转置 pack
+同量级错=决定性判据:**nd2nz 重排是 MTE copy 引擎(asc_copy_gm2l1_align)固有语义,
+主机侧预打包在 tilelang call_extern 路径不可绕过**。
+
+**MoE 内核线上限的构成**(全攻击面已裁决,详见 PERFORMANCE_REPORT §13.2):
+- 融合内核本体 0.813x(decode_b32)/0.842x(prefill_400) vs aclnn 链,缺口=GM→L1
+  nd2nz 转换带宽(~50GB/s/核,E36),内核内不可修;
+- 官方参照线全部负结果:DeepGEMM-Ascend m_grouped 0.565x(E74)、weight_nz_mode=2
+  启动 abort(E43)、工作树 prenz 编译失败(E66)、H24 两内核合一收益 ~2% 降级(D69);
+- 端到端数学上界:内核缺口 16% × decode MoE 占比 53.8%(E79)≈ TPOT ~8.6%,
+  30% 目标在 MoE 域内不可达。
+
+**代码终态**:生产在役路径零变更;`tileinfer/kernels/moe/align.py` 的同步修复保留
+(独立正确性改进);D73 平内存 pack/unpack + `moe_prenz` 接入层封存
+(`TILEINFER_OPS=moe` 门控,默认不激活——numeric 门槛未过,禁止接入在役)。
+
+**本专项已落地的引擎级收益**(基线=vLLM 原始昇腾算子路径 FIA,详见 §12/P8):
+W1 长上下文 prefill 分流(8K/16K C8 吞吐 0.226x/0.130x → 0.754x/0.758x)、
+W2 per-bucket ktp 分带(并发税归零,TPOT 0.995/0.987)、split-KV 长上下文 decode
+(1.41x/2.04x)。遗留候选:H28 shared expert 融合(TPOT 上界 ~6%,等 TI 侧画像,
+pprof_ti_chain_v2.sh 重试链在挂)。
