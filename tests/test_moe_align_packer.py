@@ -112,3 +112,26 @@ def test_slice_burst_contract():
         assert total % BURST_BYTES == 0
         assert total // BURST_BYTES == 16
     assert NUM_CORES == 28
+
+
+def test_prenz_state_pack_cache_multilayer():
+    """多层模型契约:逐层各一份缓存,交替访问零重 pack;版本变更才失效(iter-060)。"""
+    from tileinfer.integrations.moe_prenz import _PrenzMoeState
+
+    st = _PrenzMoeState(inter=I, hidden=H, num_experts=E)
+    w13a, w2a = _w(10)
+    w13b, w2b = _w(11)
+    pa = st.pack_weights(w13a, w2a)
+    pb = st.pack_weights(w13b, w2b)  # 层 B 不得逐出层 A(旧 clear 语义的反例)
+    assert len(st._wcache) == 2
+    assert st.pack_weights(w13a, w2a) is not None
+    assert st.pack_weights(w13a, w2a) == (st._wcache[(id(w13a), id(w2a))][3],
+                                          st._wcache[(id(w13a), id(w2a))][4])
+    assert st.pack_weights(w13a, w2a)[0] is pa[0] and st.pack_weights(w13a, w2a)[1] is pa[1]
+    assert st.pack_weights(w13b, w2b)[0] is pb[0] and st.pack_weights(w13b, w2b)[1] is pb[1]
+    assert len(st._wcache) == 2
+    # 对象同一性:新对象同 id 不可能(强引用钉住),但版本变更必须重 pack
+    w13b.mul_(1.0)  # in-place 触发 _version 递增
+    pb2 = st.pack_weights(w13b, w2b)
+    assert pb2[0] is not pb[0]
+    assert len(st._wcache) == 2

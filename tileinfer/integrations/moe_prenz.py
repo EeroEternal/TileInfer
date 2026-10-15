@@ -17,9 +17,12 @@ patch 点 = ``vllm_ascend.ops.fused_moe.moe_comm_method.unified_apply_mlp``(模�
 opt-in:``TILEINFER_OPS`` 显式含 ``moe``(BACKLOG 纪律:内核线 ≥1.0x aclnn 门槛
 (H27 bench)通过后才默认提供;此处仅注册安装路径)。
 
-权重打包:懒触发(首次 forward,``id``+``_version`` 校验缓存;~GB 级一次性,被
-引擎 warmup 吸收)。内核实例按 ``(rows_static, em_static)`` 缓存,首次出现的新几何
-触发 tilelang 编译(同样被 warmup 吸收)。
+权重打包:懒触发(首次 forward,``id``+``_version``+对象同一性校验缓存;逐层各一份,
+一次性成本被引擎 warmup 吸收)。注意:打包副本与原 ND 权重并存(MoE 全模型 +60GiB,
+超 HBM 预算,E78)——引擎级接入必须改「加载期逐层原地 pack+可逆 unpack 回退」平内存
+方案(D72),当前双副本形态仅适用于单层探针/微基准链。内核实例按
+``(rows_static, em_static)`` 缓存,首次出现的新几何触发 tilelang 编译(同样被 warmup
+吸收)。
 """
 
 from __future__ import annotations
@@ -67,12 +70,14 @@ class _PrenzMoeState:
         key = (id(w13), id(w2))
         hit = self._wcache.get(key)
         ver = (w13._version, w2._version)
-        if hit is not None and hit[0] == ver:
-            return hit[1], hit[2]
+        # 多层模型逐层各一套权重:命中须同时校验版本与对象同一性(强引用钉住,
+        # 防 id 复用误命中);注意打包副本与原权重并存,引擎级接入须改加载期
+        # 原地 pack 平内存(D72/E78:MoE 权重 60GiB,双副本超 HBM 预算)
+        if hit is not None and hit[0] == ver and hit[1] is w13 and hit[2] is w2:
+            return hit[3], hit[4]
         packed13 = pack_gate_up(w13.detach(), inter=self.inter)
         packed2 = pack_down(w2.detach(), inter=self.inter)
-        self._wcache.clear()  # 单层单套权重;旧权重对象释放
-        self._wcache[key] = (ver, packed13, packed2)
+        self._wcache[key] = (ver, w13, w2, packed13, packed2)
         return packed13, packed2
 
     # ---- 缓冲按需增长(rows_static 只增不减,分配在 capture 外) -----------
