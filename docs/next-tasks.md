@@ -118,11 +118,14 @@ kernel's exact form: running `(m,l)` + per-page rescale, rows=16 / page 128 / 8 
 that shape shows **SIMD 4.7 µs vs SIMT 12.4 µs → 2.6× faster**, both bit-exact vs the fp32 oracle —
 so the T5 speed payoff is now demonstrated, not assumed.
 
-*Remaining (integration)*: port the per-page online core into `paged_decode_ascend950.py`'s decode
-softmax block behind an opt-in (`TILEINFER_SIMD_SOFTMAX`).  Keep the kernel's existing structure:
-the softmax block writes only `p/alpha/l`, and the `o = o*alpha` rescale stays a **separate** block
-(a direct UB read-modify-write adjacent to the add is a hazard — measured `o` diff=1.0 with m/l/alpha
-exact).  Then run `scripts/run_device_ci.sh` + the serving probe for the end-to-end verdict.
+*Integration (in progress)*: the decode kernel's per-page online softmax now has an opt-in
+packed-SIMD path behind `TILEINFER_SIMD_SOFTMAX=1` in `paged_decode_ascend950.py` — **decode main
+kernel done** (device suite `tests/test_tilelang_ascend950_decode.py` passes 25/25 with the flag
+off **and** on; CPU contract `test_decode_simd_softmax_gate`).  It writes fp32 weights and keeps the
+`o = o*alpha` rescale in a separate SIMT block (a direct UB read-modify-write adjacent to the add is
+a hazard — measured `o` diff=1.0 with m/l/alpha exact).  Remaining: the other softmax sites (split /
+merge / prefill) port the same way, then `scripts/run_device_ci.sh` + the serving A/B for the
+end-to-end verdict.
 
 
 *Done when*: the probe shows a measurable gain and the device tests still match the oracle.

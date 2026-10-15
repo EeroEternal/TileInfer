@@ -99,6 +99,37 @@ def test_simd_online_softmax_lowers():
         assert op in src, f"T5 online SIMD softmax 未降到 {op}"
 
 
+def test_decode_simd_softmax_gate():
+    """T5 集成开关：``TILEINFER_SIMD_SOFTMAX`` 让 decode 内核在 SIMT/SIMD softmax 间切换。
+
+    默认关闭时内核不含 ``vcmax``(与改造前一致);置 1 时含 SIMD 归约内在函数。两路径都必须在
+    CPU 上可 lower。设备等价由 ``tests/test_tilelang_ascend950_decode.py``(off/on 各 25 用例)
+    与 ``benchmarks/probes/simd_softmax_*_device.py`` 共同保证。
+    """
+    import os
+
+    from tilelang.tools.compile_only import compile_kernel_source
+    import tileinfer.kernels.attention.paged_decode_ascend950 as K
+
+    spec = dict(batch=1, kv_heads=2, group=8, dim=128, page_size=128,
+                num_pages_cap=16, threads=128)
+    saved = os.environ.pop("TILEINFER_SIMD_SOFTMAX", None)
+    try:
+        assert K._simd_softmax_enabled() is False
+        src_off = compile_kernel_source(K.paged_decode_ascend950(**spec), target="ascend")
+        assert "vcmax" not in src_off, "默认路径不应含 SIMD 归约内在函数"
+
+        os.environ["TILEINFER_SIMD_SOFTMAX"] = "1"
+        assert K._simd_softmax_enabled() is True
+        src_on = compile_kernel_source(K.paged_decode_ascend950(**spec), target="ascend")
+        for op in ("vci", "vcmps", "vsel", "vcmax", "vmax", "vcadd", "vadd", "vexp"):
+            assert op in src_on, f"T5 decode SIMD 路径未降到 {op}"
+    finally:
+        os.environ.pop("TILEINFER_SIMD_SOFTMAX", None)
+        if saved is not None:
+            os.environ["TILEINFER_SIMD_SOFTMAX"] = saved
+
+
 def test_prefill_uses_full_m_tile():
     """T4(PM-2,5730b66):prefill 内核用 full block_q tile,无 `block_q // 2` 半区规划。
 
