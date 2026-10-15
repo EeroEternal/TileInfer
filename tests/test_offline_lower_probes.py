@@ -84,6 +84,20 @@ def test_simd_paged_softmax_lowers():
         assert op in src, f"T5 分页 SIMD softmax 未降到 {op}"
 
 
+def test_simd_online_softmax_lowers():
+    """T5 逐页 online SIMD softmax 核心(= decode 内核形态)必须 lower。
+
+    设备数值等价由 ``benchmarks/probes/simd_softmax_online_device.py`` 验证;这里锁住
+    running (m,l) 的两处跨页累积(vdupv 广播 + vadd/vmul/vcadd)可 lower。
+    """
+    from benchmarks.probes.simd_softmax_online_device import perpage_online_simd
+    from tilelang.tools.compile_only import compile_kernel_source
+
+    src = compile_kernel_source(perpage_online_simd(16, 128, 8), target="ascend")
+    for op in ("vlds_norm", "vcmax", "vmax", "vsub", "vexp", "vcadd", "vadd", "vmul",
+               "vdupv", "vsts_norm"):
+        assert op in src, f"T5 online SIMD softmax 未降到 {op}"
+
 
 def test_prefill_uses_full_m_tile():
     """T4(PM-2,5730b66):prefill 内核用 full block_q tile,无 `block_q // 2` 半区规划。

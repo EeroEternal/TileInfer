@@ -112,12 +112,18 @@ from UB, tail mask via `vcmps`+`vsel`, cross-register merge): **max|diff| = 0.00
 `kv_last_page_len` into UB first); (2) bisheng cannot lower f32 `select`/`sitofp` — mask with an
 **int32 lane index vs int scalar** (`vci(int32)` + `vcmps` int overload), not a float `if_then_else`.
 
-*Remaining (integration)*: the two-pass paged form is the proven blueprint.  The kernel's own
-**online** form additionally needs `o = o*alpha + e` (the running-sum rescale); a direct SIMD
-read-modify-write of `o` in UB is **not reliable** (measured `max|diff|=1.0` with the m/l/alpha part
-exact — a UB RMW hazard).  Integrate the **two-pass** form (or keep the `o` rescale on the SIMT side)
-one softmax at a time into `paged_decode_ascend950.py`, then run `scripts/run_device_ci.sh` + the
-serving probe for the **speed** verdict.
+And `benchmarks/probes/simd_softmax_online_device.py` validates the **per-page online** core (the
+kernel's exact form: running `(m,l)` + per-page rescale, rows=16 / page 128 / 8 pages):
+`p/l` matches `torch.softmax` to **max|diff|=0.00148** (bf16 tolerance).  A **speed** measurement at
+that shape shows **SIMD 4.7 µs vs SIMT 12.4 µs → 2.6× faster**, both bit-exact vs the fp32 oracle —
+so the T5 speed payoff is now demonstrated, not assumed.
+
+*Remaining (integration)*: port the per-page online core into `paged_decode_ascend950.py`'s decode
+softmax block behind an opt-in (`TILEINFER_SIMD_SOFTMAX`).  Keep the kernel's existing structure:
+the softmax block writes only `p/alpha/l`, and the `o = o*alpha` rescale stays a **separate** block
+(a direct UB read-modify-write adjacent to the add is a hazard — measured `o` diff=1.0 with m/l/alpha
+exact).  Then run `scripts/run_device_ci.sh` + the serving probe for the end-to-end verdict.
+
 
 *Done when*: the probe shows a measurable gain and the device tests still match the oracle.
 

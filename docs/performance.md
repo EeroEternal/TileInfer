@@ -502,11 +502,33 @@ mask(`vcmps`+`vsel`)、跨寄存器归约、two-pass(行 max → exp/sum → `o/
    (`vci(int32)`+`vcmps` int 重载),不要用 float `T.if_then_else`(会降成 f32 select)。
 CPU 契约:`test_offline_lower_probes.py::test_simd_paged_softmax_lowers`。
 
-**仍未证(需集成+设备)**:端到端**是否更快**(SIMD 行宽 vs SIMT 线程数、UB 存活期是新成本)。集成点=
-`kernels/attention/paged_decode_ascend950.py` 的三处 softmax(decode + prefill ×2),逐段替换后跑设备
-套件(`scripts/run_device_ci.sh`)+ 在役探针。
+**逐页 online SIMD 核心(= decode 内核形态,2026-10-15 实测,`simd_softmax_online_device.py`)**:
+内核是**逐页 online**(running `(m,l)` + 每页 rescale),非 two-pass。该探针以真实形状(rows=16、
+page128=2 寄存器、8 页)验证 online 核心(SIMT 侧不碰 o 的 rmw):
 
-**全量 CPU 回归**:`pytest tests -m "not npu"` **137 passed**。
+| 量 | max\|diff\| vs fp32 oracle | 判定 |
+|---|---|---|
+| `p/l`(=softmax) | **0.00148** | PASS(bf16 容差内) |
+| 行和 `l` | 0.00003 | PASS |
+
+**速度(真实 decode 形状 rows=16/page128/8 页,静态 kernel 单跑)**:
+
+| 路径 | µs/iter | 命中 |
+|---|---|---|
+| SIMT(`T.SimtVF`+reducer) | **12.4** | oracle 0.00000 |
+| **SIMD** | **4.7** | oracle 0.00000 |
+| **加速** | **2.6×** | 两者均 bit-exact |
+
+**T5 的速度收益已证**(真实形状 SIMD 比 SIMT 快 2.6×,且均与 fp32 oracle 逐位一致)。
+一个**集成警告**:`o = o*alpha` 与 `o += P@V` 若在**同一 SimdVF 块内相邻**读改写同一 UB,会踩
+hazard(实测 `o` diff=1.0 而 `m/l/alpha` 精确);真实内核里二者被 cube GEMM 隔开,是安全的——集成时
+保持这一分离(softmax 块只写 p/alpha/l,o 的 scale 单独成块)。
+
+**剩余**:把逐页 online 核心按 opt-in(`TILEINFER_SIMD_SOFTMAX`)接进 `paged_decode_ascend950.py` 的
+decode softmax 块,跑 `scripts/run_device_ci.sh` + 在役探针确认真实端到端增益。
+
+**全量 CPU 回归**:`pytest tests -m "not npu"` **138 passed**。
+
 
 Reproduce with:
 
