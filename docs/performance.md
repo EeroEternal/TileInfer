@@ -400,14 +400,31 @@ PROBES=A bash .agent_loop/run/w1iso_probe.sh   # 或 B;单景 16384x128_c8
 | `plan → JSON` 可序列化 | 字段与 plan 一致、split>0(ktp=64) | 通过 |
 | 全量 CPU 回归 | `pytest tests -m "not npu"` 130 passed | 无回归 |
 
-**端到端(NPU 在役)**:待 NPU 空闲窗口执行(环境当前被外部 serve 占用)。验证口径与 P0 一致:
-serve 启动后 `grep -c "compiling prefill kernel for shape"` = 0、`prefill_fallbacks`=0、
-`prefill_calls` 全接管——即"startup 后零编译"目标契约。届时本节补入实测数字。
+**预烧真编译(NPU 实测,2026-10-15 16:34)**:`scripts/prewarm-tileinfer-kernels.py --prefill`
+按真实引擎口径(block=128、池 15589 页→cap 16384、seqs=32、budget=8192、len=32768)实跑:
+
+| 阶段 | 数字 | 判据 |
+|---|---|---|
+| 冷编译(首次,磁盘缓存未命中) | decode 6 桶(1..32)+ prefill 11 变体(1..1024 tiles)全成功，**~25 min**(单变体 ~90-115s) | 全绿 |
+| **热编译(缓存命中,同一配置) | **rc=0，15 s** 完成 6 桶+11 变体 | **命中率 100%** |
+| 编译是否需空闲 HBM | **否**——冷编译在 HBM 62% 被外部 serve 占用下仍全成功(host 侧 CCE 代码生成) | 已证 |
+
+即:预烧脚本按配置推导出的规格集,与引擎编译键**逐一对齐**;服务启动前预烧完成后,服务路径
+**零编译**(15s 命中 vs 冷 25min)。
+
+**serve 端到端零编译核对**:`RESULT=PREWARM_OK_SERVE_BLOCKED_ENV` —— serve 启动仍被
+**环境侧 GDN custom-op 回归**(`aclnnCausalConv1d` `activation_mode`,见 D47/`DECISIONS.md`)阻断,
+与 T6 改动无关(自动监听编排 `.agent_loop/run/t6_verify_chain.sh` 已把该分支单列,不误判为 T6 失败)。
+custom-op 环境恢复后,同一编排可直接补 serve 侧 `grep "compiling prefill kernel for shape" = 0` 核对。
 
 Reproduce with:
 
 ```bash
+# 自动监听:等 HBM 空闲稳定窗 → 推导校验 → 预烧真编译 → best-effort serve 零编译核对
+setsid bash .agent_loop/run/t6_verify_chain.sh 7 >> .agent_loop/run/t6_verify_chain.log 2>&1 &
+cat .agent_loop/run/t6_t5_verify/RESULT
 .venv/bin/python -m pytest tests/test_prewarm_specs.py -q            # CPU 契约(24,含漂移守护)
+
 # 预烧规格(CPU,不编译;可 diff/入库):
 python scripts/prewarm-tileinfer-kernels.py --kv-heads 2 --group 8 --dim 256 \
     --block-size 2048 --num-engine-pages 600 --max-num-reqs 32 \
