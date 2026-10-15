@@ -118,12 +118,21 @@ def test_decode_simd_softmax_gate():
         assert K._simd_softmax_enabled() is False
         src_off = compile_kernel_source(K.paged_decode_ascend950(**spec), target="ascend")
         assert "vcmax" not in src_off, "默认路径不应含 SIMD 归约内在函数"
+        sspec = dict(batch=3, kv_heads=2, group=8, dim=128, page_size=128, num_pages_cap=16,
+                     num_tiles=4, max_splits=2, threads=128)
+        s_off = compile_kernel_source(K.paged_decode_split(**sspec), target="ascend")
+        assert "vcmax" not in s_off, "split 默认路径不应含 SIMD 归约内在函数"
 
         os.environ["TILEINFER_SIMD_SOFTMAX"] = "1"
         assert K._simd_softmax_enabled() is True
         src_on = compile_kernel_source(K.paged_decode_ascend950(**spec), target="ascend")
         for op in ("vci", "vcmps", "vsel", "vcmax", "vmax", "vcadd", "vadd", "vexp"):
             assert op in src_on, f"T5 decode SIMD 路径未降到 {op}"
+
+        # split kernel: same gate + same SIMD softmax (per-tile online over `plen` pages).
+        s_on = compile_kernel_source(K.paged_decode_split(**sspec), target="ascend")
+        for op in ("vcmps", "vcmax", "vcadd", "vexp"):
+            assert op in s_on, f"T5 split SIMD 路径未降到 {op}"
     finally:
         os.environ.pop("TILEINFER_SIMD_SOFTMAX", None)
         if saved is not None:
