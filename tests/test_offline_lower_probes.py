@@ -122,6 +122,10 @@ def test_decode_simd_softmax_gate():
                      num_tiles=4, max_splits=2, threads=128)
         s_off = compile_kernel_source(K.paged_decode_split(**sspec), target="ascend")
         assert "vcmax" not in s_off, "split 默认路径不应含 SIMD 归约内在函数"
+        pspec = dict(batch=1, kv_heads=2, group=8, dim=128, page_size=128, num_pages_cap=16,
+                     num_tiles=4, threads=128)
+        p_off = compile_kernel_source(K.paged_prefill_ascend950(**pspec), target="ascend")
+        assert "vcmax" not in p_off, "prefill 默认路径不应含 SIMD 归约内在函数"
 
         os.environ["TILEINFER_SIMD_SOFTMAX"] = "1"
         assert K._simd_softmax_enabled() is True
@@ -133,6 +137,11 @@ def test_decode_simd_softmax_gate():
         s_on = compile_kernel_source(K.paged_decode_split(**sspec), target="ascend")
         for op in ("vcmps", "vcmax", "vcadd", "vexp"):
             assert op in s_on, f"T5 split SIMD 路径未降到 {op}"
+
+        # prefill main kernel: causal + tail mask via two chained vsel (vcmp on kv_pos).
+        p_on = compile_kernel_source(K.paged_prefill_ascend950(**pspec), target="ascend")
+        for op in ("vcmps", "vcmp", "vcmax", "vcadd", "vexp", "vadds"):
+            assert op in p_on, f"T5 prefill SIMD 路径未降到 {op}"
     finally:
         os.environ.pop("TILEINFER_SIMD_SOFTMAX", None)
         if saved is not None:

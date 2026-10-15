@@ -856,6 +856,10 @@ def paged_prefill_ascend950(
             # exactly like `s_ub`, so a local row r holds the threshold of global row
             # `sid * ROWS + r` without the kernel ever needing the AIV index.
             thr_ub = T.alloc_shared((ROWS,), "int32")
+            if _simd_softmax_enabled():
+                p_f32_ub = T.alloc_shared((ROWS, BC), accum)
+                a_ub = T.alloc_shared((ROWS,), accum)
+                ll_ub = T.alloc_shared((1,), "int32")
 
             T.copy(QPacked[bx, 0:BR, 0:D], q_l1)
             T.dual_copy(RowThr[tile * BR : (tile + 1) * BR], thr_ub)
@@ -864,6 +868,8 @@ def paged_prefill_ascend950(
             T.fill(o_ub0, T.float32(0))
             if D > D2:
                 T.fill(o_ub1, T.float32(0))
+            if _simd_softmax_enabled():
+                T.copy(kv_last_page_len[b : b + 1], ll_ub)
 
             for p in T.serial(plen):
                 pid = kv_indices[kv_indptr[b] + p]
@@ -878,49 +884,95 @@ def paged_prefill_ascend950(
                     T.gemm(qk_a, qk_b, qk_acc, transpose_B=True)
                 T.dual_copy(qk_acc, s_ub)
 
-                limit = T.if_then_else(p + 1 < req_pages, BC, kv_last_page_len[b])
-                with T.SimtVF(threads=threads):
-                    s_frag = T.alloc_fragment((ROWS, BC), accum)
-                    for r, c in T.Parallel(ROWS, BC):
-                        # causal + tail masks, both before exp.  The row's global query position
-                        # arrives as a precomputed threshold (`thr_ub`, split like `s_ub`), so the
-                        # mask is correct for either AIV half; padded rows carry thr < 0 and are
-                        # therefore fully masked.
-                        kv_pos = p * BC + c
-                        s_frag[r, c] = T.if_then_else(
-                            (c < limit) and (kv_pos <= thr_ub[r]),
-                            s_ub[r, c] * T.float32(scale),
-                            T.float32(-1e30),
-                        )
-                    row_max = T.alloc_reducer((ROWS,), accum, op="max")
-                    T.reducer_init(row_max)
-                    for r, c in T.Parallel(ROWS, BC):
-                        T.reducer_update(row_max[r], s_frag[r, c])
-                    new_m = T.alloc_fragment((ROWS,), accum)
-                    T.finalize_reducer(row_max, new_m)
-
-                    alpha = T.alloc_fragment((ROWS,), accum)
-                    for r in T.Parallel(ROWS):
-                        alpha[r] = T.exp(m_ub[r] - T.max(m_ub[r], new_m[r]))
-                        m_ub[r] = T.max(m_ub[r], new_m[r])
-
-                    row_sum = T.alloc_reducer((ROWS,), accum, op="sum")
-                    T.reducer_init(row_sum)
-                    for r, c in T.Parallel(ROWS, BC):
-                        s_frag[r, c] = T.exp(s_frag[r, c] - m_ub[r])
-                        T.reducer_update(row_sum[r], s_frag[r, c])
-                    partial = T.alloc_fragment((ROWS,), accum)
-                    T.finalize_reducer(row_sum, partial)
-
-                    for r in T.Parallel(ROWS):
-                        l_ub[r] = l_ub[r] * alpha[r] + partial[r]
-                    for r, d in T.Parallel(ROWS, D2):
-                        o_ub0[r, d] = o_ub0[r, d] * alpha[r]
-                    if D > D2:
+                if _simd_softmax_enabled():
+                    # T5 packed-SIMD online softmax with causal + tail mask, applied as two chained
+                    # `vsel`s (a `vand` of two `boolx256` masks fails to infer its default mask
+                    # width).  `kv_pos` uses `vadds(vci(0), p*BC)` because `vci` needs a
+                    # compile-time start.  fp32 weights -> `p_f32_ub`; cast/rescale stay below.
+                    limit = T.if_then_else(p + 1 < req_pages, BC, ll_ub[0])
+                    with T.SimdVF():
+                        for r in T.serial(ROWS):
+                            idx0 = T.simd.vci(0, "int32", order="INC_ORDER")
+                            idx1 = T.simd.vci(64, "int32", order="INC_ORDER")
+                            kp0 = T.simd.vadds(T.simd.vci(0, "int32", order="INC_ORDER"), p * BC)
+                            kp1 = T.simd.vadds(T.simd.vci(64, "int32", order="INC_ORDER"), p * BC)
+                            tb = T.simd.vdupv(T.simd.vld(thr_ub[r], dist="BRC_B32"), pos="POS_LOWEST")
+                            sc = T.simd.vdup(T.float32(scale), "float32")
+                            a0 = T.simd.vmul(T.simd.vld(s_ub[r, 0], dist="NORM"), sc)
+                            a1 = T.simd.vmul(T.simd.vld(s_ub[r, 64], dist="NORM"), sc)
+                            neg = T.simd.vdup(T.float32(-1e30), "float32")
+                            a0 = T.simd.vsel(a0, neg, T.simd.vcmps(idx0, limit, op="lt"))
+                            a1 = T.simd.vsel(a1, neg, T.simd.vcmps(idx1, limit, op="lt"))
+                            a0 = T.simd.vsel(a0, neg, T.simd.vcmp(kp0, tb, op="le"))
+                            a1 = T.simd.vsel(a1, neg, T.simd.vcmp(kp1, tb, op="le"))
+                            pm = T.simd.vdupv(T.simd.vld(m_ub[r], dist="BRC_B32"), pos="POS_LOWEST")
+                            nm = T.simd.vmax(pm, T.simd.vmax(T.simd.vcmax(a0), T.simd.vcmax(a1)))
+                            nml = T.simd.vdupv(nm, pos="POS_LOWEST")
+                            al = T.simd.vexp(T.simd.vsub(pm, nml))
+                            e0 = T.simd.vexp(T.simd.vsub(a0, nml))
+                            e1 = T.simd.vexp(T.simd.vsub(a1, nml))
+                            lp = T.simd.vdupv(T.simd.vld(l_ub[r], dist="BRC_B32"), pos="POS_LOWEST")
+                            ln = T.simd.vadd(
+                                T.simd.vmul(lp, al),
+                                T.simd.vadd(T.simd.vcadd(e0), T.simd.vcadd(e1)),
+                            )
+                            T.simd.vsts(m_ub[r], nml, dist="ONEPT_B32")
+                            T.simd.vsts(l_ub[r], T.simd.vdupv(ln, pos="POS_LOWEST"), dist="ONEPT_B32")
+                            T.simd.vsts(a_ub[r], T.simd.vdupv(al, pos="POS_LOWEST"), dist="ONEPT_B32")
+                            T.simd.vsts(p_f32_ub[r, 0], e0)
+                            T.simd.vsts(p_f32_ub[r, 64], e1)
+                    with T.SimtVF(threads=threads):
                         for r, d in T.Parallel(ROWS, D2):
-                            o_ub1[r, d] = o_ub1[r, d] * alpha[r]
-                    for r, c in T.Parallel(ROWS, BC):
-                        p_ub[r, c] = T.Cast(dtype, s_frag[r, c])
+                            o_ub0[r, d] = o_ub0[r, d] * a_ub[r]
+                        if D > D2:
+                            for r, d in T.Parallel(ROWS, D2):
+                                o_ub1[r, d] = o_ub1[r, d] * a_ub[r]
+                        for r, c in T.Parallel(ROWS, BC):
+                            p_ub[r, c] = T.Cast(dtype, p_f32_ub[r, c])
+                else:
+                    limit = T.if_then_else(p + 1 < req_pages, BC, kv_last_page_len[b])
+                    with T.SimtVF(threads=threads):
+                        s_frag = T.alloc_fragment((ROWS, BC), accum)
+                        for r, c in T.Parallel(ROWS, BC):
+                            # causal + tail masks, both before exp.  The row's global query position
+                            # arrives as a precomputed threshold (`thr_ub`, split like `s_ub`), so the
+                            # mask is correct for either AIV half; padded rows carry thr < 0 and are
+                            # therefore fully masked.
+                            kv_pos = p * BC + c
+                            s_frag[r, c] = T.if_then_else(
+                                (c < limit) and (kv_pos <= thr_ub[r]),
+                                s_ub[r, c] * T.float32(scale),
+                                T.float32(-1e30),
+                            )
+                        row_max = T.alloc_reducer((ROWS,), accum, op="max")
+                        T.reducer_init(row_max)
+                        for r, c in T.Parallel(ROWS, BC):
+                            T.reducer_update(row_max[r], s_frag[r, c])
+                        new_m = T.alloc_fragment((ROWS,), accum)
+                        T.finalize_reducer(row_max, new_m)
+
+                        alpha = T.alloc_fragment((ROWS,), accum)
+                        for r in T.Parallel(ROWS):
+                            alpha[r] = T.exp(m_ub[r] - T.max(m_ub[r], new_m[r]))
+                            m_ub[r] = T.max(m_ub[r], new_m[r])
+
+                        row_sum = T.alloc_reducer((ROWS,), accum, op="sum")
+                        T.reducer_init(row_sum)
+                        for r, c in T.Parallel(ROWS, BC):
+                            s_frag[r, c] = T.exp(s_frag[r, c] - m_ub[r])
+                            T.reducer_update(row_sum[r], s_frag[r, c])
+                        partial = T.alloc_fragment((ROWS,), accum)
+                        T.finalize_reducer(row_sum, partial)
+
+                        for r in T.Parallel(ROWS):
+                            l_ub[r] = l_ub[r] * alpha[r] + partial[r]
+                        for r, d in T.Parallel(ROWS, D2):
+                            o_ub0[r, d] = o_ub0[r, d] * alpha[r]
+                        if D > D2:
+                            for r, d in T.Parallel(ROWS, D2):
+                                o_ub1[r, d] = o_ub1[r, d] * alpha[r]
+                        for r, c in T.Parallel(ROWS, BC):
+                            p_ub[r, c] = T.Cast(dtype, s_frag[r, c])
 
                 T.dual_copy(p_ub[0:ROWS, 0:BC], p_l1[0:BR, 0:BC])
                 T.copy(VCache[pid, 0:BC, bh, 0:D], v_l1[0:D, 0:BC], transpose=True)
