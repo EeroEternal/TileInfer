@@ -465,20 +465,28 @@ TILELANG_CACHE_DIR=.work/tl_cache_950 python scripts/prewarm-tileinfer-kernels.p
 ——**机制可表达已证**。CPU 契约:`tests/test_offline_lower_probes.py` 两个用例(SIMD 降到向量内在
 函数、SIMT 降到标量循环)。
 
-**设备数值等价(2026-10-15 实测,`benchmarks/probes/simd_softmax_device.py`,32×64 fp32 一行=一寄存器)**:
+**设备数值等价(2026-10-15 实测,`benchmarks/probes/simd_softmax_device.py`,两档宽度)**:
 
-| 路径 | max\|diff\| vs fp32 oracle | max\|rowsum−1\| | 判定 |
-|---|---|---|---|
-| SIMT(`T.SimtVF`+reducer) | **0.00000** | 0.00000 | PASS |
-| **SIMD**(`T.simd.*`,`vcmax`→`vdupv` 广播→`vexp`→`vcadd`→`vdiv`) | **0.00000** | 0.00000 | PASS |
+| 宽度 | 路径 | max\|diff\| vs fp32 oracle | max\|rowsum−1\| | 判定 |
+|---|---|---|---|---|
+| BC=64(单寄存器) | SIMT(`T.SimtVF`+reducer) | 0.00000 | 0.00000 | PASS |
+| BC=64 | **SIMD**(`T.simd.*`) | **0.00000** | 0.00000 | PASS |
+| **BC=128(真实 page_size,跨 2 寄存器)** | **SIMD** | **0.00000** | 0.00000 | PASS |
+| BC=128 | SIMT | (信息性*) | — | — |
 
-**数值等价已证**。关键语义(读自 `simd_inst.h`):`vcmax`/`vcadd` 是**整向量**归约、结果落 lane 0,
-须 `vdupv(POS_LOWEST)` 广播回所有 lane;`vcgmax` 是**按 datablock** 的 max(非 sum——离线探针早先用错过,
-设备探针已改用 `vcadd`)。CPU 契约:`test_offline_lower_probes.py::test_simd_device_softmax_lowers`。
+\* 合成 harness 只 `T.copy` 单块稠密 tile,不复现真实内核的 `dual_copy`/GEMM 输出布局,故其 SIMT
+reducer 在 BC>64 会错(与 SIMD 无关);真实 SIMT 基准由设备内核套件
+`tests/test_tilelang_ascend950_decode.py` 提供。**SIMD 在 BC=64 与 BC=128 都与 fp32 oracle 逐位一致**。
 
-**仍未证(需集成+设备)**:端到端**是否更快**(SIMD 行宽 vs SIMT 线程数、行宽 >64 时的跨寄存器归约合并、
-UB 存活期是新成本)。集成点=`kernels/attention/paged_decode_ascend950.py` 的三处 softmax(decode +
-prefill ×2),逐段替换后跑设备套件(`scripts/run_device_ci.sh`)+ 在役探针。
+**数值等价已证(含跨寄存器归约)**。关键语义(读自 `simd_inst.h`):`vcmax`/`vcadd` 是**整向量**归约、
+结果落 lane 0,须 `vdupv(POS_LOWEST)` 广播回所有 lane;`vcgmax` 是**按 datablock** 的 max(非 sum——
+离线探针早先用错过,设备探针已改用 `vcadd`);行宽 >64 时用 `vmax`/`vadd` **跨寄存器合并**两段的
+lane-0 归约结果(`vmax(vcmax(r0),vcmax(r1))` / `vadd(vcadd(e0),vcadd(e1))`)——这是 BC=128 集成的关键。
+CPU 契约:`test_offline_lower_probes.py::test_simd_device_softmax_lowers`(锁 BC=64 与 BC=128 两档)。
+
+**仍未证(需集成+设备)**:端到端**是否更快**(SIMD 行宽 vs SIMT 线程数、UB 存活期是新成本)。集成点=
+`kernels/attention/paged_decode_ascend950.py` 的三处 softmax(decode + prefill ×2),逐段替换后跑设备
+套件(`scripts/run_device_ci.sh`)+ 在役探针。
 
 **全量 CPU 回归**:`pytest tests -m "not npu"` **136 passed**。
 

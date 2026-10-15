@@ -98,10 +98,12 @@ vector time on the critical path; upstream's FlashAttention uses the packed `T.s
 *Progress (2026-10-15)*: the offline-lower probe `benchmarks/probes/simd_softmax_lower.py` lowers the
 current SIMT softmax (→ 0 vector intrinsics, 11 scalar `for`) and a candidate SIMD softmax written with
 `T.simd.*` inside `T.SimdVF()`.  **Mechanism proven expressible** (no device).  Then the device probe
-`benchmarks/probes/simd_softmax_device.py` (32×64, one fp32 row = one register) shows **both paths match
-the fp32 oracle exactly: max|diff| = 0.00000** — **numerical equivalence proven on device**.  Key
-semantics: `vcmax`/`vcadd` are full-vector reductions with the result in lane 0 (broadcast with
-`vdupv`); `vcgmax` is *per-datablock* max, not sum.  CPU contract: `tests/test_offline_lower_probes.py`.
+`benchmarks/probes/simd_softmax_device.py` shows, at **both BC=64 (one register) and BC=128 (the real
+decode page_size, two registers per row), the SIMD softmax matches the fp32 oracle exactly:
+max|diff| = 0.00000** — **numerical equivalence proven on device, including the cross-register
+reduction merge** (`vmax(vcmax(r0),vcmax(r1))` / `vadd(vcadd(e0),vcadd(e1))`).  Key semantics:
+`vcmax`/`vcadd` are full-vector reductions with the result in lane 0 (broadcast with `vdupv`);
+`vcgmax` is *per-datablock* max, not sum.  CPU contract: `tests/test_offline_lower_probes.py`.
 
 *Remaining*: an end-to-end **speed** gain (SIMD row width vs SIMT threads; the >64-wide cross-register
 reduction merge; UB liveness) — port one softmax at a time into `paged_decode_ascend950.py`, then run

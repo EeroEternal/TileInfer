@@ -52,14 +52,20 @@ def test_simd_device_softmax_lowers():
     """T5 设备探针的 SIMD softmax 必须在 CPU 上也能 lower(锁住内在函数选择,防回归)。
 
     设备数值等价由 ``benchmarks/probes/simd_softmax_device.py`` 在 NPU 上验证;这里只保证
-    lower 不退化(含 vdupv 广播与 vcadd 求和——归约结果的正确广播是 T5 的关键陷阱)。
+    lower 不退化。含两档宽度:BC=64(单寄存器)与 BC=128(真实 page_size,跨寄存器归约合并
+    ``vmax``/``vadd``——这是 T5 集成到 decode 内核的关键形状)。
     """
-    from benchmarks.probes.simd_softmax_device import _simd_softmax
+    from benchmarks.probes.simd_softmax_device import _simd_softmax_64, _simd_softmax_128
     from tilelang.tools.compile_only import compile_kernel_source
 
-    src = compile_kernel_source(_simd_softmax(), target="ascend")
-    for op in ("vlds_norm", "vcmax", "vdupv", "vsub", "vexp", "vcadd", "vdiv", "vsts_norm"):
-        assert op in src, f"T5 SIMD softmax 未降到 {op}"
+    base = ("vlds_norm", "vcmax", "vdupv", "vsub", "vexp", "vcadd", "vdiv", "vsts_norm")
+    src64 = compile_kernel_source(_simd_softmax_64(32), target="ascend")
+    for op in base:
+        assert op in src64, f"BC=64 SIMD softmax 未降到 {op}"
+
+    src128 = compile_kernel_source(_simd_softmax_128(32), target="ascend")
+    for op in (*base, "vmax", "vadd"):  # 跨寄存器归约合并
+        assert op in src128, f"BC=128 SIMD softmax 未降到 {op}"
 
 
 def test_prefill_uses_full_m_tile():
