@@ -129,6 +129,33 @@ def _bucket_for(num_reqs: int) -> int:
     )
 
 
+def _parse_ktp_policy(raw: str) -> Dict[int, int]:
+    """Parse ``TILEINFER_KV_TILE_PAGES_POLICY`` (H21): ``"1:16,2:32,8:128"`` → per-bucket ktp.
+
+    The concurrency tax of decode split-KV is *wave-quantised* (E61): the schedule launches
+    ``bucket × ceil(width / ktp)`` tiles regardless of the real context lengths, and a tile
+    costs a full AIV wave slot even when its page loop is clamped to zero — b8 × ktp16 = 128
+    tiles ≈ 4.6 waves vs plain's 1 wave (measured 4.54x), while the *same* split machinery at
+    ≤28 total tiles is free (E61 matrix C: width-16 plan ≡ plain).  So the ktp that is right
+    for batch 1 (max splits, starved device) is exactly wrong for batch 32 (device already
+    full; unsplit).  The policy picks one ktp per bucket; buckets left out fall back to the
+    global ``TILEINFER_KV_TILE_PAGES``.
+    """
+    policy: Dict[int, int] = {}
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        bucket, sep, ktp = part.partition(":")
+        if not sep or not bucket.strip().isdigit() or not ktp.strip().isdigit():
+            raise ValueError(
+                f"bad TILEINFER_KV_TILE_PAGES_POLICY entry {part!r} "
+                '(expected comma-separated "bucket:ktp" pairs, e.g. "1:16,8:128")'
+            )
+        policy[int(bucket)] = int(ktp)
+    return policy
+
+
 # ---------------------------------------------------------------------------------------
 # B1: prefill / append through the TileLang prefill kernel.
 #
@@ -634,6 +661,8 @@ class TileInferDecodeAttention:
     # reference to the object is kept so its id cannot be recycled while it is the guard.
     _step_guard: tuple = ()
     _step_obj: Any = None
+    # H21: the active per-bucket split policy as built (metrics dumper reads this).
+    _policy_view: Optional[Dict[str, int]] = None
     _stats: Dict[str, int] = {
         "capture_calls": 0,
         "eager_calls": 0,
@@ -668,6 +697,18 @@ class TileInferDecodeAttention:
         self.max_num_batched_tokens = max_num_batched_tokens or 0
         self.max_model_len = max_model_len or 0
         self._warned = False
+        # H21: per-bucket split policy ("1:16,2:32,4:64,8:128") — the wave-quantised tax makes
+        # a single global ktp either starve small batches or tax concurrency (E61); buckets not
+        # listed fall back to the global ``kv_tile_pages``.
+        self._ktp_policy: Dict[int, int] = _parse_ktp_policy(
+            os.environ.get("TILEINFER_KV_TILE_PAGES_POLICY", "")
+        )
+        if any(ktp > 0 for ktp in self._ktp_policy.values()):
+            # The policy entry *is* the split opt-in (two envs for one intent is a footgun:
+            # the backend's gate would fail every split plan and silently fall back to FIA).
+            os.environ.setdefault("TILEINFER_ALLOW_SPLIT_KV", "1")
+        # Metrics view for the in-service probe: what this process will actually build.
+        type(self)._policy_view = {"global": int(kv_tile_pages), **self._ktp_policy}
 
         self._config_key = (
             num_heads,
@@ -684,6 +725,11 @@ class TileInferDecodeAttention:
     @property
     def group_size(self) -> int:
         return max(1, self.num_heads // max(1, self.num_kv_heads))
+
+    def ktp_for(self, bucket: int) -> int:
+        """This bucket's split factor: the H21 policy entry, else the global ktp."""
+        ktp = self._ktp_policy.get(bucket)
+        return self.kv_tile_pages if ktp is None else ktp
 
     def supported(self, block_size: int) -> bool:
         """Whether the kernel can handle this configuration at all."""
@@ -720,8 +766,11 @@ class TileInferDecodeAttention:
         ``pool_cap`` is the kernel ABI's *declared* capacity (:func:`declared_pool_cap`), not the
         exact pool: vLLM derives the pool from a memory snapshot that drifts run to run, and an
         exact-pool key silently invalidated out-of-process pre-warm (L2).
+
+        The bucket's *own* ktp (H21 policy) is part of the key: buckets with different split
+        factors must not share a plan (their schedules and staging buffers differ).
         """
-        return (self._config_key, bucket, width, block_size, pool_cap)
+        return (self._config_key, int(self.ktp_for(bucket)), bucket, width, block_size, pool_cap)
 
     def prewarm(self, width: int, block_size: int, key_cache: torch.Tensor) -> None:
         """Synchronously build a plan for *every* bucket up to ``max_num_reqs``.
@@ -762,10 +811,11 @@ class TileInferDecodeAttention:
         if built:
             logger.info(
                 "TileInfer: prewarmed %d plan(s) (buckets up to %d, table width %d pages) "
-                "before graph capture",
+                "before graph capture%s",
                 built,
                 limit,
                 width,
+                f"; split policy {self._ktp_policy}" if self._ktp_policy else "",
             )
         built_prefill = self.prewarm_prefill(block_size, key_cache)
         cls._stats["prefill_variants"] = len(PrefillShapeManager._ready)
@@ -926,7 +976,8 @@ class TileInferDecodeAttention:
         # full-plan fill is width pages × the kernel page size.
         sub = _sub_pages(block_size)
         pool = _pool_sub_view(key_cache, sub)
-        dummy_len = width * KERNEL_PAGE_SIZE if self.kv_tile_pages > 0 else 1
+        ktp = self.ktp_for(bucket)
+        dummy_len = width * KERNEL_PAGE_SIZE if ktp > 0 else 1
         dummy_lens = torch.full((bucket,), dummy_len, dtype=torch.int32, device=self.device)
         dummy = RaggedMetadata(
             kv_indptr=torch.arange(0, bucket + 1, dtype=torch.int32, device=self.device),
@@ -944,7 +995,7 @@ class TileInferDecodeAttention:
             head_dim=self.head_size,
             sm_scale=self.scale,
             causal=False,
-            kv_tile_pages=self.kv_tile_pages,
+            kv_tile_pages=ktp,
             k_cache=pool,
             # Only the *shape* is read (`finalize_plan` asserts K/V match); a full
             # `empty_like(key_cache)` duplicate of the V pool is ~0.8 GiB here and OOMs whenever
@@ -1708,6 +1759,9 @@ def start_metrics_dumper() -> bool:
                 ):
                     time.sleep(_METRICS_INTERVAL_S)
                     continue
+                # H21 在役探针:A/B 侧断言"策略确实在役"用(策略缺失/为空即配置未生效)。
+                # 放在静默守卫之后:空进程不得因它而开始写文件。
+                stats["ktp_policy"] = getattr(cls, "_policy_view", None)
                 tmp = f"{path}.tmp"
                 with open(tmp, "w", encoding="utf-8") as handle:
                     json.dump(stats, handle)
