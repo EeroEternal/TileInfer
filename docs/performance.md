@@ -328,6 +328,42 @@ Reproduce with:
 PROBES=A bash .agent_loop/run/w1iso_probe.sh   # 或 B;单景 16384x128_c8
 ```
 
+## W1-C8 权威口径 A/B:H20 split-KV prefill(ktp=64)工程闭环但性能门失败,W1-C8 主因改判(2026-10-15,iter-048)
+
+### 背景
+- P0 基线(iter-036)定位头号新弱势:长上下文×C8,8K 吞吐 0.213x/16K 0.121x(TTFT 5.51x/8.40x)。
+- 归因链:E44 2×2 隔离(病态 100% 随 TI prefill 接管域)→ E45 主机链(E46 步守卫修复)→
+  E46 profiler(mac=0.02、aiv_vec 0.96)→ E47 多行因子否证(线性扩展)→ H19/H20 split-KV
+  prefill(双内核 head+frontier,iter-039..047)。
+
+### 本轮工程闭环(提交 ed8d1b3 + d6aa3f6)
+- 数值:槽位碰撞根因修复(iter-047 稠密 per-tile 槽位)后设备套件 6/6、探针 7/7 全绿。
+- 在役:发射键量化(半区死 tile 填充至 kernel_tiles,SPLIT_MS_COMPILE=16 统一缓存键)+
+  split 阶梯预热(顶按最大上下文 split 因子扩展至 1024)后,权威口径 on 侧
+  **prefill_calls=4400 全接管、零回退、零异常**、capture_calls=40、ready_plans=6。
+
+### 权威口径 A/B 数字(ktp=64,P50;off 侧 fresh 与 P0 锚点一致,环境无漂移)
+| 指标 | 8K/128/C8 | 16K/128/C8 |
+|---|---|---|
+| 吞吐 TI/FIA | 0.226x | 0.130x |
+| TTFT P50 比 | 5.22x | 7.53x |
+| TPOT P50 比 | 4.30x | 7.84x |
+- 对照:plain prefill 时代(P0)0.213x/0.121x——split 增益 ~+4%,门(≤2x)失败。
+- 短场景 TI 接管净正不变:吞吐 1.13x/1.15x,TPOT 0.82x/0.84x;C1 TTFT 0.980x。
+
+### 判定(W1-C8 主因改判,三证据收拢)
+1. E46:prefill 内核计算时间 88% 在 main_kernel,mac 利用率 0.02(向量链主导、页串行依赖)。
+2. E47:同功多行形状 1.00-1.11x(时间随 tiles 线性=吞吐界)。
+3. E63:split 提并行 ×3 引擎无增益——C8 饱和下并行度不是瓶颈。
+→ **W1-C8 主因=TI prefill 内核单位功效率(vs FIA 的算法/内核级差距 ~8x),非并行度/
+   主机链/重扫**(后两者已修但占比小)。split-KV 路线对该弱势项已到顶。
+
+### 处置
+- `TILEINFER_PREFILL_KV_TILE_PAGES` 保持 opt-in 默认 0(默认路径=P0 行为);ktp>0 供
+  延迟敏感场景(单 chunk 微基准 stair 1.75x)与后续实验。VERDICT: TEMPORARY_PASS
+  (W1 原始命题未达成,证据链完整,交用户决策;后续路线见 .agent_loop/state/DECISIONS.md D57:
+  ①长上下文 prefill 步分流回退 FIA(零内核成本,期望 →~0.45x+)②内核效率重写(需新证据))。
+
 ## Prefill KV 重扫截断(prefill kernel KV-rescan truncation,2026-10-14)
 
 **问题**:prefill 内核每个 query tile 都循环该请求的**全部** KV pages(`for p in T.serial(req_pages)`),
