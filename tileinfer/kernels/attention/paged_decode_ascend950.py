@@ -171,10 +171,8 @@ def paged_decode_ascend950(
             m_ub = T.alloc_shared((ROWS,), accum)
             l_ub = T.alloc_shared((ROWS,), accum)
             if _simd_softmax_enabled():
-                # T5: fp32 weights from the SIMD softmax (the existing epilogue casts them to
-                # `dtype`), the per-row rescale factor, and the staged per-request last-page length
-                # (SIMD_VF cannot read global memory).
-                p_f32_ub = T.alloc_shared((ROWS, BC), accum)
+                # T5: per-row rescale factor and staged per-request last-page length (SIMD_VF cannot
+                # read global memory); the fp32 weights reuse `s_ub` in place.
                 a_ub = T.alloc_shared((ROWS,), accum)
                 ll_ub = T.alloc_shared((1,), "int32")
 
@@ -211,7 +209,7 @@ def paged_decode_ascend950(
                     # T5 packed-SIMD online softmax: row max/sum via `vcmax`/`vcadd` (+`vmax`/`vadd`
                     # to merge the two registers of a 128-wide page), tail mask via an int32 lane
                     # ramp, running state in `(ROWS,)` read with `BRC_B32`/written with `ONEPT_B32`.
-                    # Emits fp32 weights into `p_f32_ub`; the cast to `dtype` and the output rescale
+                    # Emits fp32 weights into `s_ub`; the cast to `dtype` and the output rescale
                     # stay below (unchanged).
                     limit = T.if_then_else(p + 1 < num_pages, BC, ll_ub[0])
                     with T.SimdVF():
@@ -238,8 +236,8 @@ def paged_decode_ascend950(
                             T.simd.vsts(m_ub[r], nml, dist="ONEPT_B32")
                             T.simd.vsts(l_ub[r], T.simd.vdupv(ln, pos="POS_LOWEST"), dist="ONEPT_B32")
                             T.simd.vsts(a_ub[r], T.simd.vdupv(al, pos="POS_LOWEST"), dist="ONEPT_B32")
-                            T.simd.vsts(p_f32_ub[r, 0], e0)
-                            T.simd.vsts(p_f32_ub[r, 64], e1)
+                            T.simd.vsts(s_ub[r, 0], e0)
+                            T.simd.vsts(s_ub[r, 64], e1)
                     with T.SimtVF(threads=threads):
                         for r, d in T.Parallel(ROWS, D2):
                             o_ub0[r, d] = o_ub0[r, d] * a_ub[r]
@@ -247,7 +245,7 @@ def paged_decode_ascend950(
                             for r, d in T.Parallel(ROWS, D2):
                                 o_ub1[r, d] = o_ub1[r, d] * a_ub[r]
                         for r, c in T.Parallel(ROWS, BC):
-                            p_ub[r, c] = T.Cast(dtype, p_f32_ub[r, c])
+                            p_ub[r, c] = T.Cast(dtype, s_ub[r, c])
                 else:
                     limit = T.if_then_else(p + 1 < num_pages, BC, kv_last_page_len[b])
                     with T.SimtVF(threads=threads):
@@ -428,7 +426,6 @@ def paged_decode_split(
             m_ub = T.alloc_shared((ROWS,), accum)
             l_ub = T.alloc_shared((ROWS,), accum)
             if _simd_softmax_enabled():
-                p_f32_ub = T.alloc_shared((ROWS, BC), accum)
                 a_ub = T.alloc_shared((ROWS,), accum)
                 ll_ub = T.alloc_shared((1,), "int32")
 
@@ -481,8 +478,8 @@ def paged_decode_split(
                             T.simd.vsts(m_ub[r], nml, dist="ONEPT_B32")
                             T.simd.vsts(l_ub[r], T.simd.vdupv(ln, pos="POS_LOWEST"), dist="ONEPT_B32")
                             T.simd.vsts(a_ub[r], T.simd.vdupv(al, pos="POS_LOWEST"), dist="ONEPT_B32")
-                            T.simd.vsts(p_f32_ub[r, 0], e0)
-                            T.simd.vsts(p_f32_ub[r, 64], e1)
+                            T.simd.vsts(s_ub[r, 0], e0)
+                            T.simd.vsts(s_ub[r, 64], e1)
                     with T.SimtVF(threads=threads):
                         for r, d in T.Parallel(ROWS, D2):
                             o_ub0[r, d] = o_ub0[r, d] * a_ub[r]
@@ -490,7 +487,7 @@ def paged_decode_split(
                             for r, d in T.Parallel(ROWS, D2):
                                 o_ub1[r, d] = o_ub1[r, d] * a_ub[r]
                         for r, c in T.Parallel(ROWS, BC):
-                            p_ub[r, c] = T.Cast(dtype, p_f32_ub[r, c])
+                            p_ub[r, c] = T.Cast(dtype, s_ub[r, c])
                 else:
                     limit = T.if_then_else(start + p + 1 < req_pages, BC, kv_last_page_len[b])
                     with T.SimtVF(threads=threads):
@@ -857,7 +854,6 @@ def paged_prefill_ascend950(
             # `sid * ROWS + r` without the kernel ever needing the AIV index.
             thr_ub = T.alloc_shared((ROWS,), "int32")
             if _simd_softmax_enabled():
-                p_f32_ub = T.alloc_shared((ROWS, BC), accum)
                 a_ub = T.alloc_shared((ROWS,), accum)
                 ll_ub = T.alloc_shared((1,), "int32")
 
@@ -888,7 +884,7 @@ def paged_prefill_ascend950(
                     # T5 packed-SIMD online softmax with causal + tail mask, applied as two chained
                     # `vsel`s (a `vand` of two `boolx256` masks fails to infer its default mask
                     # width).  `kv_pos` uses `vadds(vci(0), p*BC)` because `vci` needs a
-                    # compile-time start.  fp32 weights -> `p_f32_ub`; cast/rescale stay below.
+                    # compile-time start.  fp32 weights -> `s_ub`; cast/rescale stay below.
                     limit = T.if_then_else(p + 1 < req_pages, BC, ll_ub[0])
                     with T.SimdVF():
                         for r in T.serial(ROWS):
@@ -919,8 +915,8 @@ def paged_prefill_ascend950(
                             T.simd.vsts(m_ub[r], nml, dist="ONEPT_B32")
                             T.simd.vsts(l_ub[r], T.simd.vdupv(ln, pos="POS_LOWEST"), dist="ONEPT_B32")
                             T.simd.vsts(a_ub[r], T.simd.vdupv(al, pos="POS_LOWEST"), dist="ONEPT_B32")
-                            T.simd.vsts(p_f32_ub[r, 0], e0)
-                            T.simd.vsts(p_f32_ub[r, 64], e1)
+                            T.simd.vsts(s_ub[r, 0], e0)
+                            T.simd.vsts(s_ub[r, 64], e1)
                     with T.SimtVF(threads=threads):
                         for r, d in T.Parallel(ROWS, D2):
                             o_ub0[r, d] = o_ub0[r, d] * a_ub[r]
@@ -928,7 +924,7 @@ def paged_prefill_ascend950(
                             for r, d in T.Parallel(ROWS, D2):
                                 o_ub1[r, d] = o_ub1[r, d] * a_ub[r]
                         for r, c in T.Parallel(ROWS, BC):
-                            p_ub[r, c] = T.Cast(dtype, p_f32_ub[r, c])
+                            p_ub[r, c] = T.Cast(dtype, s_ub[r, c])
                 else:
                     limit = T.if_then_else(p + 1 < req_pages, BC, kv_last_page_len[b])
                     with T.SimtVF(threads=threads):
@@ -1143,7 +1139,6 @@ def paged_prefill_split_ascend950(
             m_ub = T.alloc_shared((ROWS,), accum)
             l_ub = T.alloc_shared((ROWS,), accum)
             if _simd_softmax_enabled():
-                p_f32_ub = T.alloc_shared((ROWS, BC), accum)
                 a_ub = T.alloc_shared((ROWS,), accum)
                 ll_ub = T.alloc_shared((1,), "int32")
 
@@ -1204,8 +1199,8 @@ def paged_prefill_split_ascend950(
                             T.simd.vsts(m_ub[r], nml, dist="ONEPT_B32")
                             T.simd.vsts(l_ub[r], T.simd.vdupv(ln, pos="POS_LOWEST"), dist="ONEPT_B32")
                             T.simd.vsts(a_ub[r], T.simd.vdupv(al, pos="POS_LOWEST"), dist="ONEPT_B32")
-                            T.simd.vsts(p_f32_ub[r, 0], e0)
-                            T.simd.vsts(p_f32_ub[r, 64], e1)
+                            T.simd.vsts(s_ub[r, 0], e0)
+                            T.simd.vsts(s_ub[r, 64], e1)
                     with T.SimtVF(threads=threads):
                         for r, d in T.Parallel(ROWS, D2):
                             o_ub0[r, d] = o_ub0[r, d] * a_ub[r]
@@ -1213,7 +1208,7 @@ def paged_prefill_split_ascend950(
                             for r, d in T.Parallel(ROWS, D2):
                                 o_ub1[r, d] = o_ub1[r, d] * a_ub[r]
                         for r, c in T.Parallel(ROWS, BC):
-                            p_ub[r, c] = T.Cast(dtype, p_f32_ub[r, c])
+                            p_ub[r, c] = T.Cast(dtype, s_ub[r, c])
                 else:
                     limit = T.if_then_else(start + p + 1 < req_pages, BC, kv_last_page_len[b])
                     with T.SimtVF(threads=threads):
@@ -1406,7 +1401,6 @@ def paged_prefill_split_head_ascend950(
             m_ub = T.alloc_shared((ROWS,), accum)
             l_ub = T.alloc_shared((ROWS,), accum)
             if _simd_softmax_enabled():
-                p_f32_ub = T.alloc_shared((ROWS, BC), accum)
                 a_ub = T.alloc_shared((ROWS,), accum)
                 ll_ub = T.alloc_shared((1,), "int32")
 
@@ -1459,8 +1453,8 @@ def paged_prefill_split_head_ascend950(
                             T.simd.vsts(m_ub[r], nml, dist="ONEPT_B32")
                             T.simd.vsts(l_ub[r], T.simd.vdupv(ln, pos="POS_LOWEST"), dist="ONEPT_B32")
                             T.simd.vsts(a_ub[r], T.simd.vdupv(al, pos="POS_LOWEST"), dist="ONEPT_B32")
-                            T.simd.vsts(p_f32_ub[r, 0], e0)
-                            T.simd.vsts(p_f32_ub[r, 64], e1)
+                            T.simd.vsts(s_ub[r, 0], e0)
+                            T.simd.vsts(s_ub[r, 64], e1)
                     with T.SimtVF(threads=threads):
                         for r, d in T.Parallel(ROWS, D2):
                             o_ub0[r, d] = o_ub0[r, d] * a_ub[r]
@@ -1468,7 +1462,7 @@ def paged_prefill_split_head_ascend950(
                             for r, d in T.Parallel(ROWS, D2):
                                 o_ub1[r, d] = o_ub1[r, d] * a_ub[r]
                         for r, c in T.Parallel(ROWS, BC):
-                            p_ub[r, c] = T.Cast(dtype, p_f32_ub[r, c])
+                            p_ub[r, c] = T.Cast(dtype, s_ub[r, c])
                 else:
                     limit = T.if_then_else(start + p + 1 < req_pages, BC, kv_last_page_len[b])
                     with T.SimtVF(threads=threads):
@@ -1664,7 +1658,6 @@ def paged_prefill_split_frontier_ascend950(
             # exactly like s_ub, see paged_prefill_ascend950).
             thr_ub = T.alloc_shared((ROWS,), "int32")
             if _simd_softmax_enabled():
-                p_f32_ub = T.alloc_shared((ROWS, BC), accum)
                 a_ub = T.alloc_shared((ROWS,), accum)
                 ll_ub = T.alloc_shared((1,), "int32")
 
@@ -1726,8 +1719,8 @@ def paged_prefill_split_frontier_ascend950(
                             T.simd.vsts(m_ub[r], nml, dist="ONEPT_B32")
                             T.simd.vsts(l_ub[r], T.simd.vdupv(ln, pos="POS_LOWEST"), dist="ONEPT_B32")
                             T.simd.vsts(a_ub[r], T.simd.vdupv(al, pos="POS_LOWEST"), dist="ONEPT_B32")
-                            T.simd.vsts(p_f32_ub[r, 0], e0)
-                            T.simd.vsts(p_f32_ub[r, 64], e1)
+                            T.simd.vsts(s_ub[r, 0], e0)
+                            T.simd.vsts(s_ub[r, 64], e1)
                     with T.SimtVF(threads=threads):
                         for r, d in T.Parallel(ROWS, D2):
                             o_ub0[r, d] = o_ub0[r, d] * a_ub[r]
@@ -1735,7 +1728,7 @@ def paged_prefill_split_frontier_ascend950(
                             for r, d in T.Parallel(ROWS, D2):
                                 o_ub1[r, d] = o_ub1[r, d] * a_ub[r]
                         for r, c in T.Parallel(ROWS, BC):
-                            p_ub[r, c] = T.Cast(dtype, p_f32_ub[r, c])
+                            p_ub[r, c] = T.Cast(dtype, s_ub[r, c])
                 else:
                     limit = T.if_then_else(p + 1 < eff, BC, kv_last_page_len[b])
                     with T.SimtVF(threads=threads):
