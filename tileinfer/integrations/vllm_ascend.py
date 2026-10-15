@@ -1867,7 +1867,8 @@ def install(raise_on_failure: bool = True) -> bool:
         _INSTALLED = True
         start_metrics_dumper()
         # GDN gating 接管为**显式 opt-in**(E21/D29:引擎内 A/B 无收益、TTFT +2~9%,不进默认
-        # 路径;TILEINFER_OPS 显式含 gdn 时才安装)。decode/prefill/moe 维持缺省全开。
+        # 路径;TILEINFER_OPS 显式含 gdn 时才安装)。decode/prefill 维持缺省全开;moe 同为
+        # 显式 opt-in(H27/D70:内核线 ≥1.0x 门槛通过前不进默认路径)。
         _spec = (os.environ.get("TILEINFER_OPS") or "").strip().lower()
         _parts = {s.strip() for s in _spec.split(",") if s.strip()}
         if "gdn" in _parts:
@@ -1888,6 +1889,18 @@ def install(raise_on_failure: bool = True) -> bool:
                 logger.warning("TileInfer GDN chunk wu dispatch not installed: %s", exc)
         else:
             logger.info("TileInfer GDN chunk wu takeover left off (TILEINFER_OPS does not list gdnwu)")
+        if "moe" in _parts:
+            # MoE preNZ 直载接入(H27/D70):显式 opt-in——内核线 ≥1.0x aclnn 门槛
+            # (H27 bench)通过前不得进默认路径(验收纪律:接入以微基准门槛为前置)
+            try:
+                from .moe_prenz import install_moe_prenz
+
+                install_moe_prenz()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("TileInfer MoE preNZ dispatch not installed: %s", exc)
+        else:
+            logger.info("TileInfer MoE preNZ takeover left off (TILEINFER_OPS does not list moe; "
+                        "explicit opt-in until the H27 kernel gate passes)")
         logger.info(
             "TileInfer registered as the CUSTOM attention backend (decode accelerated, "
             "prefill falls back to vLLM-Ascend)"

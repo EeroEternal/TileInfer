@@ -20,6 +20,7 @@ from .grouped_gemm_ascend950 import (
     pair_gate_up_rows,
 )
 from .prenz import pack_nd_to_compact_nz, unpack_compact_nz_to_nd
+from .slot_layout import em_upper_bound, slot_layout_from_group_list
 
 __all__ = [
     "build_align_down",
@@ -39,4 +40,6 @@ __all__ = [
     "pair_gate_up_rows",
     "pack_nd_to_compact_nz",
     "unpack_compact_nz_to_nd",
+    "em_upper_bound",
+    "slot_layout_from_group_list",
 ]
