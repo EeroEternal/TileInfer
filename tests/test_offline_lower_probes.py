@@ -68,6 +68,23 @@ def test_simd_device_softmax_lowers():
         assert op in src128, f"BC=128 SIMD softmax 未降到 {op}"
 
 
+def test_simd_paged_softmax_lowers():
+    """T5 分页 masked SIMD softmax 必须 lower(锁住集成蓝本的算子集,防回归)。
+
+    设备数值等价由 ``benchmarks/probes/simd_softmax_paged_device.py`` 验证;这里保证
+    masking(`vci` lane 索引 + `vcmps` int 比较 + `vsel`)与运行期页循环可 lower——
+    这是 decode 内核集成的关键(避开 f32 select/sitofp 两个后端限制)。
+    """
+    from benchmarks.probes.simd_softmax_paged_device import paged_softmax_simd
+    from tilelang.tools.compile_only import compile_kernel_source
+
+    src = compile_kernel_source(paged_softmax_simd(16, 128, 3), target="ascend")
+    for op in ("vci", "vcmps", "vsel", "vcmax", "vmax", "vcadd", "vadd", "vexp", "vdiv",
+               "vdupv", "vlds_norm", "vsts_norm"):
+        assert op in src, f"T5 分页 SIMD softmax 未降到 {op}"
+
+
+
 def test_prefill_uses_full_m_tile():
     """T4(PM-2,5730b66):prefill 内核用 full block_q tile,无 `block_q // 2` 半区规划。
 

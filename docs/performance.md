@@ -484,11 +484,29 @@ reducer 在 BC>64 会错(与 SIMD 无关);真实 SIMT 基准由设备内核套�
 lane-0 归约结果(`vmax(vcmax(r0),vcmax(r1))` / `vadd(vcadd(e0),vcadd(e1))`)——这是 BC=128 集成的关键。
 CPU 契约:`test_offline_lower_probes.py::test_simd_device_softmax_lowers`(锁 BC=64 与 BC=128 两档)。
 
+**分页 masked 数等价(2026-10-15 实测,`benchmarks/probes/simd_softmax_paged_device.py`)**:decode 内核
+的 softmax 是**分页 + masked + 运行期页循环**,比上表更复杂。该探针在设备上验证了这一组合:
+
+| 场景(tail=最后一页有效列数) | max\|diff\| vs fp32 oracle | 判定 |
+|---|---|---|
+| tail=128(整页) | **0.00000** | PASS |
+| tail=64(半页) | **0.00000** | PASS |
+| tail=13(奇数尾) | **0.00000** | PASS |
+
+覆盖:运行期 `for p in T.serial(pages)` 页循环、运行期 per-request `last_len`(从 UB 读)、尾页
+mask(`vcmps`+`vsel`)、跨寄存器归约、two-pass(行 max → exp/sum → `o/l`,与内核 online 形式等值)。
+
+**集成必须绕开的两个后端限制**(已定位):
+1. **SIMD_VF 不能读全局内存**——`kv_last_page_len` 须先 `T.copy` 进 UB 再在 SimdVF 内用;
+2. **bisheng 不支持 f32 `select`/`sitofp`**——mask 比较用 **int32 lane 索引 vs int 标量**
+   (`vci(int32)`+`vcmps` int 重载),不要用 float `T.if_then_else`(会降成 f32 select)。
+CPU 契约:`test_offline_lower_probes.py::test_simd_paged_softmax_lowers`。
+
 **仍未证(需集成+设备)**:端到端**是否更快**(SIMD 行宽 vs SIMT 线程数、UB 存活期是新成本)。集成点=
 `kernels/attention/paged_decode_ascend950.py` 的三处 softmax(decode + prefill ×2),逐段替换后跑设备
 套件(`scripts/run_device_ci.sh`)+ 在役探针。
 
-**全量 CPU 回归**:`pytest tests -m "not npu"` **136 passed**。
+**全量 CPU 回归**:`pytest tests -m "not npu"` **137 passed**。
 
 Reproduce with:
 
