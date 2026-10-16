@@ -81,7 +81,7 @@ def _sub_pages(block_size: int) -> int:
 #: GDN gating 的 opt-in 小算子接管)的独立开关。
 #: ``gdnproj`` 是 GDN in_proj_ba→in_proj_qkvz 权重融合(H32/S-GDN 投影族,E100:ba 为
 #: 纯内核启动延迟税 ~0.67% TPOT,融合逐位等价)的独立开关。
-_OPS_ALL = {"decode", "prefill", "gdn", "gdnwu", "moe", "sampling", "gdnproj"}
+_OPS_ALL = {"decode", "prefill", "gdn", "gdnwu", "moe", "sampling", "gdnproj", "gdnsmall"}
 
 
 def ops_enabled(op: str) -> bool:
@@ -723,6 +723,11 @@ class TileInferDecodeAttention:
         # H32:GDN in_proj_ba→in_proj_qkvz 权重融合(S-GDN 投影族),命中/回退计数
         "gdnproj_calls": 0,
         "gdnproj_fallbacks": 0,
+        # H35:GDN 小核链削减(rearrange cat-free/conv1d 转置缓存/l2norm 配对融合)
+        "gdnsmall_rearrange_calls": 0,
+        "gdnsmall_conv_hits": 0,
+        "gdnsmall_l2norm_fused": 0,
+        "gdnsmall_fallbacks": 0,
     }
 
     def __init__(
@@ -1823,6 +1828,74 @@ def install_gdn_proj_fusion() -> bool:
     return True
 
 
+_GDN_SMALL_INSTALLED = False
+
+
+def install_gdn_small_fusion() -> bool:
+    """GDN 小核链削减(H35/S-GDN 域,``TILEINFER_OPS=gdnsmall``)。
+
+    三个独立包装(E105 decode 窗定距命中,#19033 蓝本):
+    1. ``QwenGatedDeltaNetAttention.rearrange_mixed_qkv`` cat-free 覆写(活类,
+       与 H32 同一 patch 目标;split+reshape 视图替代 reshape(-1)+cat 材料化);
+    2. ``torch.ops._C_ascend.npu_causal_conv1d_custom`` 权重参数连续缓存包装,
+       消每层每步 aclnnContiguous_Transpose(storage 弱引用校验防陈旧);
+    3. ``vllm_ascend.ops.gdn.l2norm_fwd`` 配对融合包装,q/k 为同一连续缓冲相邻区
+       (seq_len==1)时一次内核,与两次调用数值等价(逐行归一与分组无关)。
+
+    全部按 ``ops_enabled("gdnsmall")`` 每步读取,异常回退原实现;三处全部就绪才
+    安装(部分失败整体放弃,不产生半接管态);须在引擎构建前安装(install() 时序,
+    同 gdnproj 先例)。
+    """
+    global _GDN_SMALL_INSTALLED
+    if _GDN_SMALL_INSTALLED:
+        return True
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+        QwenGatedDeltaNetAttention as _gdn_cls,
+    )
+
+    if getattr(_gdn_cls, "_tileinfer_gdnsmall_installed", False):
+        _GDN_SMALL_INSTALLED = True
+        return True
+
+    if "rearrange_mixed_qkv" not in _gdn_cls.__dict__:
+        logger.warning(
+            "TileInfer GDN small fusion not installed: rearrange_mixed_qkv not on "
+            "QwenGatedDeltaNetAttention (upstream layout changed?)"
+        )
+        return False
+    _ns = getattr(torch.ops, "_C_ascend", None)
+    _orig_conv = getattr(_ns, "npu_causal_conv1d_custom", None) if _ns is not None else None
+    import vllm_ascend.ops.gdn as _gdn_mod
+
+    _orig_l2 = getattr(_gdn_mod, "l2norm_fwd", None)
+    if _orig_conv is None or _orig_l2 is None:
+        logger.warning(
+            "TileInfer GDN small fusion not installed: npu_causal_conv1d_custom="
+            f"{_orig_conv is not None}, l2norm_fwd={_orig_l2 is not None}"
+        )
+        return False
+
+    from tileinfer.kernels.gdn import small_ops
+
+    cls_stats = TileInferDecodeAttention._stats
+    small_ops._stats_sink = lambda name: cls_stats.__setitem__(
+        name, cls_stats.get(name, 0) + 1
+    )
+    small_ops._orig_conv = _orig_conv
+    small_ops._orig_l2norm = _orig_l2
+    small_ops._conv_ns = _ns
+    _gdn_cls._tileinfer_rearrange_orig = _gdn_cls.__dict__["rearrange_mixed_qkv"]
+    _gdn_cls.rearrange_mixed_qkv = small_ops.cat_free_rearrange
+    setattr(_ns, "npu_causal_conv1d_custom", small_ops.make_conv1d_wrapper(_orig_conv))
+    _gdn_mod.l2norm_fwd = small_ops.make_l2norm_wrapper(_orig_l2)
+    _gdn_cls._tileinfer_gdnsmall_installed = True
+    _GDN_SMALL_INSTALLED = True
+    logger.info(
+        "TileInfer GDN small fusion dispatch installed (H35, TILEINFER_OPS governs)"
+    )
+    return True
+
+
 _SAMPLER_TOPK_INSTALLED = False
 
 
@@ -2047,6 +2120,18 @@ def install(raise_on_failure: bool = True) -> bool:
             logger.info(
                 "TileInfer GDN in_proj fusion left off (TILEINFER_OPS does not list "
                 "gdnproj; H32 engine A/B pending)"
+            )
+        if "gdnsmall" in _parts:
+            # H35(S-GDN 小核链):cat-free rearrange + conv1d 转置缓存 + l2norm
+            # 配对融合,显式 opt-in——引擎 A/B(在役探针)通过前不进默认路径
+            try:
+                install_gdn_small_fusion()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("TileInfer GDN small fusion not installed: %s", exc)
+        else:
+            logger.info(
+                "TileInfer GDN small fusion left off (TILEINFER_OPS does not list "
+                "gdnsmall; H35 engine A/B pending)"
             )
         if "sampling" in _parts:
             # 采样 top-k 阈值替换(BACKLOG 采样条目澄清):显式 opt-in,性质同 GDN gating。
