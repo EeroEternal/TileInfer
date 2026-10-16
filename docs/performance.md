@@ -872,3 +872,39 @@ TI 画像确认其 TPOT 上界 5-8%(E91.4),但 MoE 专项以 FINAL TEMPORARY 收
 
 注:聚合器脚本对 TI 双窗 CSV 存在并集显示缺陷,本表数字以 per-window 真值
 (E91)为准;原始数据 .agent_loop/run/prof/ti/ 双目录 CSV。
+
+## 系统级专项 H31:shared expert multistream 官方开关(零代码),短/中场景 TPOT -1.5%~-2.3%(2026-10-16 iter-072,E94-E98)
+
+用户裁决 D84 开系统级优化专项后首项落地。机制=vllm-ascend 0.23.0 内置
+`multistream_overlap_shared_expert`:shared expert 的 gate_up+act+down 切到独立 NPU
+stream(`fused_moe.py:734` npu_stream_switch),与 routed dispatch/GMM1/GMM2/combine
+事件级重叠,bf16/TP1 走 `_shared_experts_part1/2` 分支;启动时官方
+`_validate_shared_expert_consistency` 断言 split 与 integrated 数值等价(内建 oracle)。
+
+**占比真相(E97,离线深挖 E91 decode 窗 kernel_details.csv 形状聚类)**:shared expert
+两 MatMul(gate_up 1.49% + down 1.08%)合计 **2.57%** 设备时间——H28 立项口径
+5-8% 为含 shared_gate/胶水的理想化上界;multistream 完美重叠的理论上界即 ~2.6%。
+
+**权威口径单变量 A/B**(TI 最优配置 KTP16+split-KV 固定,± 开关;双侧 rc=0,
+5 场景×32 请求 completed/failed 全绿;图模式 FULL_AND_PIECEWISE capture [1,4,16,32];
+TI 在役探针 ready_plans=6/kernel_markers=73970):
+
+| 场景 | TPOT_P50 off→on(ms) | ΔTPOT | Δ吞吐 |
+|---|---|---|---|
+| 128x128_c1 | 9.882→9.656 | **-2.28%** | +1.94% |
+| 128x128_c8 | 15.252→14.992 | **-1.70%** | +1.43% |
+| 128x512_c8 | 15.792→15.553 | **-1.52%** | +1.54% |
+| 8192x128_c8 | 192.750→193.526 | +0.40%(<±5% 红线) | -0.15% |
+| 16384x128_c8 | 590.991→589.354 | -0.28% | +0.46% |
+
+**结论**:H31 proven(PERF_OPTIMIZATION 优化尝试 20)。短/中场景 TPOT/吞吐双向收益、
+长场景中性、无场景越过不劣化红线 → 开关纳入推荐配置:
+`--additional-config '{"multistream_overlap_shared_expert": true}'`(与 split-KV/KTP16
+正交可叠加;与 fused_mc2 互斥,单卡不涉及)。长场景中性原因:prefill 段占比高、
+decode 段 shared 摊薄。原始 JSON:.agent_loop/run/bench_results/h28_h28ms_*.json(gitignored)。
+
+**攻击序修正(E97,「份额×可达增益」底册首个量化重排)**:dense 31.6% 的最大子项
+实为 GDN 投影 MM3 族(in_proj_qkvz 7.84% + w/u 4.97% 等,合计 ~10.6%),其次 lm_head
+采样路径 3.74%(per-step);shared 线已收。上游动向(E96):vllm-ascend 近 90 天
+shared expert multistream 活跃(Kimi K3 驱动 PR #18818/#18904/#18950),量化+SP 场景
+有踩坑史(#18894),我方 bf16/TP1 路径独立于其上。
