@@ -220,3 +220,55 @@ def test_reordered_gemm_tol_equal_on_device():
     m2, z2, b2, a2 = split_reordered(y_perm, HK, HV, DK, DV, 1)
     for u, v in ((m1, m2), (z1, z2), (b1, b2), (a1, a2)):
         assert torch.equal(u.float(), v.float())
+
+
+def test_ops_all_contains_gdnreorder():
+    """接线门:gdnreorder 在 _OPS_ALL 且每步读取语义不受影响(CPU 零设备)。"""
+    from tileinfer.integrations.vllm_ascend import _OPS_ALL, ops_enabled
+
+    assert "gdnreorder" in _OPS_ALL
+    import os
+
+    old = os.environ.get("TILEINFER_OPS")
+    try:
+        os.environ["TILEINFER_OPS"] = "gdnreorder"
+        assert ops_enabled("gdnreorder") is True
+        os.environ["TILEINFER_OPS"] = "decode,prefill,gdnproj"
+        assert ops_enabled("gdnreorder") is False
+        os.environ["TILEINFER_OPS"] = ""
+        assert ops_enabled("gdnreorder") is True
+    finally:
+        if old is None:
+            os.environ.pop("TILEINFER_OPS", None)
+        else:
+            os.environ["TILEINFER_OPS"] = old
+
+
+def test_stats_counters_registered():
+    """在役探针断言依赖:计数键预置于 _stats(零设备)。"""
+    from tileinfer.integrations.vllm_ascend import TileInferDecodeAttention
+
+    stats = TileInferDecodeAttention._stats
+    assert "gdnreorder_calls" in stats
+    assert "gdnreorder_fallbacks" in stats
+
+
+def test_install_gdn_proj_reorder_wiring():
+    """安装函数接线(类级包装,无设备依赖):覆写生效、幂等、标记属性独立命名。"""
+    pytest.importorskip("vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn")
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+        QwenGatedDeltaNetAttention as cls,
+    )
+
+    from tileinfer.integrations.vllm_ascend import install_gdn_proj_reorder
+
+    original = cls.forward_cuda
+    assert install_gdn_proj_reorder() is True
+    assert getattr(cls, "_tileinfer_gdnreorder_installed", False)
+    assert cls.forward_cuda is not original
+    assert install_gdn_proj_reorder() is True  # 幂等
+    assert getattr(cls, "_tileinfer_gdnproj_installed", False) is not None
+    # 独立失败缓存命名,与 H32 互不可见(契约:对象级属性缺省)
+    layer = object.__new__(cls)
+    assert not hasattr(layer, "_tileinfer_reordered_inproj")
+    assert not hasattr(layer, "_tileinfer_reordered_inproj_failed")

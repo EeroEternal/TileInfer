@@ -84,6 +84,9 @@ def _sub_pages(block_size: int) -> int:
 #: ``moeprefetch`` 是 MoE 权重 prefetch 阈值对齐(H37/S-MoE 域,#19033 第 2 项移植:
 #: 管道已在 vllm-ascend 0.23.0 在役路径上,E109 管道核查;阈值 96→1 + 惰性武装兜底)
 #: 的独立开关。
+#: ``gdnreorder`` 是 GDN fused(qkvz+ba)权重 load 期行重排(H34/S-GDN 投影族,
+#: E102 vLLM #55260 同构:终序单 GEMM+零拷贝切片替代 forward 期 ordering/rearrange/cat)
+#: 的独立开关;置于 gdnproj 之上(接管成功时 gdnproj 包装不触达)。
 _OPS_ALL = {
     "decode",
     "prefill",
@@ -92,6 +95,7 @@ _OPS_ALL = {
     "moe",
     "sampling",
     "gdnproj",
+    "gdnreorder",
     "gdnsmall",
     "greedy",
     "moeprefetch",
@@ -737,6 +741,9 @@ class TileInferDecodeAttention:
         # H32:GDN in_proj_ba→in_proj_qkvz 权重融合(S-GDN 投影族),命中/回退计数
         "gdnproj_calls": 0,
         "gdnproj_fallbacks": 0,
+        # H34:GDN fused 权重 load 期行重排(终序单 GEMM+零拷贝切片),命中/回退计数
+        "gdnreorder_calls": 0,
+        "gdnreorder_fallbacks": 0,
         # H35:GDN 小核链削减(rearrange cat-free/conv1d 转置缓存/l2norm 配对融合)
         "gdnsmall_rearrange_calls": 0,
         "gdnsmall_conv_hits": 0,
@@ -1842,6 +1849,65 @@ def install_gdn_proj_fusion() -> bool:
     return True
 
 
+_GDN_REORDER_INSTALLED = False
+
+
+def install_gdn_proj_reorder() -> bool:
+    """GDN fused(qkvz+ba)权重 load 期行重排(H34/S-GDN 投影族,``TILEINFER_OPS=gdnreorder``)。
+
+    H32 融合后 forward 仍走 ``fix_query_key_value_ordering``(view+split+reshape)→
+    3×rearrange → cat,E105 实证 Cat [32768+32768+65536] ×7650 定距命中(真实拷贝)。
+    本钩子把 fused 权重行序在懒构建期重排为消费终序 ``[q|k|v|z|b|a]``,单 GEMM 输出
+    即终态,forward 仅零拷贝切片(E102:vLLM #55260 行重排 bit-identical 先例;设备
+    tiling 差异由 TOL 断言覆盖,与 H32 同口径)。包装叠于 gdnproj 之外:接管成功时
+    gdnproj 包装不触达(计数可归因),懒构建失败缓存属性独立命名,与 H32 互不可见。
+
+    守卫(继承 H32 build 守卫/布局校验)不满足或运行期异常均回退原实现;
+    ``ops_enabled("gdnreorder")`` 每步读取,翻转 ``TILEINFER_OPS`` + 重启即回退。
+    须在引擎构建前安装(install() 时序,同 gdnproj 先例)。
+    """
+    global _GDN_REORDER_INSTALLED
+    if _GDN_REORDER_INSTALLED:
+        return True
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+        QwenGatedDeltaNetAttention as _gdn_cls,
+    )
+
+    if getattr(_gdn_cls, "_tileinfer_gdnreorder_installed", False):
+        _GDN_REORDER_INSTALLED = True
+        return True
+
+    from tileinfer.kernels.gdn.reorder import fused_forward_reordered
+
+    cls_stats = TileInferDecodeAttention._stats
+    # _original 是安装时刻的 forward_cuda:gdnproj 先装时即 H32 包装(回落链
+    # H34→H32→原实现);单独安装时即原实现。
+    _original = _gdn_cls.forward_cuda
+
+    def _forward_cuda(self, hidden_states, output):
+        if ops_enabled("gdnreorder"):
+            try:
+                if fused_forward_reordered(self, hidden_states, output):
+                    cls_stats["gdnreorder_calls"] = cls_stats.get("gdnreorder_calls", 0) + 1
+                    return
+                cls_stats["gdnreorder_fallbacks"] = (
+                    cls_stats.get("gdnreorder_fallbacks", 0) + 1
+                )
+            except Exception:  # noqa: BLE001 - 终序路径任何异常都回退原实现
+                cls_stats["gdnreorder_fallbacks"] = (
+                    cls_stats.get("gdnreorder_fallbacks", 0) + 1
+                )
+        return _original(self, hidden_states, output)
+
+    _gdn_cls.forward_cuda = _forward_cuda
+    _gdn_cls._tileinfer_gdnreorder_installed = True
+    _GDN_REORDER_INSTALLED = True
+    logger.info(
+        "TileInfer GDN in_proj reorder dispatch installed (H34, TILEINFER_OPS governs)"
+    )
+    return True
+
+
 _GDN_SMALL_INSTALLED = False
 
 
@@ -2181,6 +2247,18 @@ def install(raise_on_failure: bool = True) -> bool:
             logger.info(
                 "TileInfer GDN in_proj fusion left off (TILEINFER_OPS does not list "
                 "gdnproj; H32 engine A/B pending)"
+            )
+        if "gdnreorder" in _parts:
+            # H34(S-GDN 投影族):fused 权重 load 期行重排(终序单 GEMM+零拷贝切片),
+            # 显式 opt-in;包装叠于 gdnproj 之外,接管成功时 gdnproj 计数不增(A/B 归因)
+            try:
+                install_gdn_proj_reorder()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("TileInfer GDN in_proj reorder not installed: %s", exc)
+        else:
+            logger.info(
+                "TileInfer GDN in_proj reorder left off (TILEINFER_OPS does not list "
+                "gdnreorder; H34 engine A/B pending)"
             )
         if "gdnsmall" in _parts:
             # H35(S-GDN 小核链):cat-free rearrange + conv1d 转置缓存 + l2norm
