@@ -77,7 +77,9 @@ def _sub_pages(block_size: int) -> int:
 #: seconds, not the recompile a config change would be) takes a suspicious op out of the chain
 #: without touching the others — the fallback for every disabled op is the stock FIA path.
 #: ``gdnwu`` 是 chunk 链中段融合核(H10/阶段 3 P1)的独立开关,与 ``gdn`` 解耦做同侧 A/B 归因。
-_OPS_ALL = {"decode", "prefill", "gdn", "gdnwu", "moe"}
+#: ``sampling`` 是采样 top-k 阈值替换(BACKLOG 采样条目澄清:非采样链整体融合,性质同
+#: GDN gating 的 opt-in 小算子接管)的独立开关。
+_OPS_ALL = {"decode", "prefill", "gdn", "gdnwu", "moe", "sampling"}
 
 
 def ops_enabled(op: str) -> bool:
@@ -713,6 +715,9 @@ class TileInferDecodeAttention:
         "gdn_gating_calls": 0,
         "gdn_wu_calls": 0,
         "gdn_wu_fallbacks": 0,
+        # 采样 top-k 阈值替换(BACKLOG 采样条目):命中/回退计数,在役探针断言用
+        "sampler_topk_calls": 0,
+        "sampler_topk_fallbacks": 0,
     }
 
     def __init__(
@@ -1758,6 +1763,68 @@ def install_gdn_chunk_wu() -> bool:
     return True
 
 
+_SAMPLER_TOPK_INSTALLED = False
+
+
+def install_sampler_topk() -> bool:
+    """接管 vLLM-Ascend 采样阶段的 top-k 阈值选择(BACKLOG 采样条目,``TILEINFER_OPS=sampling``)。
+
+    原生 A5 对整张词表(fp32)做 ``probs.sort``(O(B·V log V))求第 k 大概率;本钩子替换为
+    DeepSelect ``topk``(bf16, ``sorted=False``, int32)在 logits 上求第 k 大值作阈值
+    (softmax 严格单调,两者等价,保留并列项语义一致)。设备耗时包络内实测降至
+    0.12~0.17x,L1 wall 0.87~0.88x,在线 TPOT +16~22%(npu_flash 侧证据,见
+    tileinfer_topk_poc/PERFORMANCE.md)。
+
+    与 ``install_gdn_gating`` 同构:替换 ``vllm_ascend.sample.sampler`` 的**模块级**
+    ``apply_top_k_top_p`` 绑定;``AscendTopKTopPSampler.__init__`` 在构造时以
+    ``self.apply_top_k_top_p = apply_top_k_top_p`` 捕获该模块级名字,故须在**构造采样器
+    之前**安装(即 ``install()``,早于引擎/采样器构建)。逐调用 honours
+    ``ops_enabled("sampling")``(翻 ``TILEINFER_OPS`` + 重启即秒级回退);包络外
+    (词表 < 16384 / batch < 8 / top-p 混合)或异常一律回退原实现,绝不抛出;每次命中
+    bump 在役计数 ``sampler_topk_calls``(供 ``start_metrics_dumper`` 探针断言)。
+
+    k 标量按张量对象身份跨步缓存(稳态零 D2H)——这是与 TileInfer「plan/run 分离、
+    run 零 host 同步」设计相冲突的唯一必需例外,理由见
+    ``tileinfer.kernels.sampling.topk`` 模块注释(图模式 ACLGraph 硬要求)。
+    """
+    global _SAMPLER_TOPK_INSTALLED
+    if _SAMPLER_TOPK_INSTALLED:
+        return True
+    from vllm_ascend.sample import sampler as _sampler_mod
+
+    from tileinfer.kernels.sampling.topk import (
+        apply_top_k_top_p as _impl,
+        reset_k_cache as _reset_k_cache,
+    )
+
+    if getattr(_sampler_mod, "_tileinfer_sampler_installed", False):
+        _SAMPLER_TOPK_INSTALLED = True
+        return True
+
+    cls_stats = TileInferDecodeAttention._stats
+    _original = _sampler_mod.apply_top_k_top_p
+
+    def _apply_top_k_top_p(logits, p, k, *args, **kwargs):
+        # 顺序敏感:门控/包络判定(零 D2H)全部在实现内取 k 之前完成,回退路径零同步。
+        # 实现自检窗口后返回 None 即回退(与原生签名解耦:多余位置参数原样透传)。
+        if ops_enabled("sampling"):
+            try:
+                out = _impl(logits, p, k)
+                if out is not None:
+                    cls_stats["sampler_topk_calls"] = cls_stats.get("sampler_topk_calls", 0) + 1
+                    return out
+            except Exception:  # noqa: BLE001 - 接管失败必须静默回退,绝不破坏服务
+                cls_stats["sampler_topk_fallbacks"] = cls_stats.get("sampler_topk_fallbacks", 0) + 1
+        return _original(logits, p, k, *args, **kwargs)
+
+    _sampler_mod.apply_top_k_top_p = _apply_top_k_top_p
+    _sampler_mod._tileinfer_sampler_installed = True
+    _reset_k_cache()
+    _SAMPLER_TOPK_INSTALLED = True
+    logger.info("TileInfer sampler top-k dispatch installed (TILEINFER_OPS governs per call)")
+    return True
+
+
 _METRICS_INTERVAL_S = 1.0
 
 
@@ -1794,12 +1861,16 @@ def start_metrics_dumper() -> bool:
                 # Only a process that actually hosts TileInfer state (the EngineCore) may write:
                 # the API server imports the plugin too, and its empty view would keep overwriting
                 # the real numbers.  Empty processes stay silent instead.
+                # 采样 top-k 接管(BACKLOG 采样条目)纳入非空判据:仅承载 sampling 的进程
+                # (无 attention 计数)不得被误判为空进程而永远不写探针。
                 if (
                     stats["ready_plans"] == 0
                     and stats["capture_calls"] == 0
                     and stats["eager_calls"] == 0
                     and stats["fallbacks"] == 0
                     and stats["kernel_markers"] < 0
+                    and stats.get("sampler_topk_calls", 0) == 0
+                    and stats.get("sampler_topk_fallbacks", 0) == 0
                 ):
                     time.sleep(_METRICS_INTERVAL_S)
                     continue
@@ -1901,6 +1972,18 @@ def install(raise_on_failure: bool = True) -> bool:
         else:
             logger.info("TileInfer MoE preNZ takeover left off (TILEINFER_OPS does not list moe; "
                         "explicit opt-in until the H27 kernel gate passes)")
+        if "sampling" in _parts:
+            # 采样 top-k 阈值替换(BACKLOG 采样条目澄清):显式 opt-in,性质同 GDN gating。
+            # 安装须早于采样器构造(AscendTopKTopPSampler.__init__ 捕获模块级绑定)——
+            # install() 本身先于引擎构建,满足时序契约。
+            try:
+                install_sampler_topk()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("TileInfer sampler top-k dispatch not installed: %s", exc)
+        else:
+            logger.info(
+                "TileInfer sampler top-k takeover left off (TILEINFER_OPS does not list sampling)"
+            )
         logger.info(
             "TileInfer registered as the CUSTOM attention backend (decode accelerated, "
             "prefill falls back to vLLM-Ascend)"
