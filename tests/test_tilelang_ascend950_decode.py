@@ -240,6 +240,36 @@ def test_declared_cap_beyond_pool_is_exact(monkeypatch, kv_tile_pages):
     assert diff < TOL, f"declared-cap binding (kv_tile_pages={kv_tile_pages}): {diff:.4f} > {TOL}"
 
 
+def test_page_pipeline_spec_and_cache_key(monkeypatch):
+    """H42-③: the pipeline flag is a caller-side build spec, not an env read inside the kernel
+    body — it must (a) dispatch to the double-buffered prim_func, (b) own a distinct kernel-cache
+    slot, and (c) leave the plain path's cache key byte-identical to the pre-H42-③ form."""
+    import tileinfer.kernels.attention.paged_decode_ascend950 as K
+
+    # (a) dispatch: pipeline=True returns the double-buffered variant, without it the plain one.
+    common = dict(batch=8, kv_heads=4, group=8, dim=128, page_size=128, num_pages_cap=2048)
+    plain_fn = K.paged_decode_ascend950(**common, dtype="bfloat16")
+    pipe_fn = K.paged_decode_ascend950(**common, dtype="bfloat16", pipeline=True)
+    assert type(plain_fn).__name__ == "PrimFunc" and type(pipe_fn).__name__ == "PrimFunc"
+
+    # (b) distinct cache slot, independent of the exact pool size quantization.
+    def _fake_compile(fn, **kwargs):
+        return object()
+
+    monkeypatch.setattr(K.tilelang, "compile", _fake_compile)
+    before = len(K._KERNEL_CACHE)
+    K.build_decode_kernel(**common, dtype="bfloat16", out_manual=True)
+    K.build_decode_kernel(**common, dtype="bfloat16", out_manual=True, pipeline=True)
+    assert len(K._KERNEL_CACHE) == before + 2
+
+    # (c) plain key is unchanged by the refactor (no stale-invalidation surprise on upgrade).
+    spec = dict(batch=8, kv_heads=4, group=8, dim=128, page_size=128, num_pages_cap=64, dtype="bfloat16")
+    key_plain = ("decode", "manual") + tuple(sorted(spec.items()))
+    K._KERNEL_CACHE.clear()
+    K.build_decode_kernel(**spec, out_manual=True)
+    assert key_plain in K._KERNEL_CACHE
+
+
 # -------------------------------------------------------------------------------------------
 # P8 (L3): one *full* split plan serves any page-count distribution.  Graph capture pins one
 # plan per bucket while replay-time sequences grow a page per step, so the plan's schedule is

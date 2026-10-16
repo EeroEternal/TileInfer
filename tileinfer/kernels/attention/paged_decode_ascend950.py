@@ -81,6 +81,240 @@ def _simd_softmax_enabled() -> bool:
     return os.environ.get("TILEINFER_SIMD_SOFTMAX", "").strip() not in ("", "0", "false", "False")
 
 
+def _page_pipeline_enabled() -> bool:
+    """True when the opt-in double-buffered page pipeline is requested.
+
+    ``TILEINFER_PAGE_PIPELINE=1`` selects :func:`paged_decode_pipeline` as the plain-path decode
+    kernel.  Unlike the SIMD softmax switch this is *not* read at trace time inside the kernel
+    body: the backend passes it as an explicit spec argument, so it lands in the kernel cache key
+    and can never silently mix traces built under different settings (E116-era lesson).
+    """
+    return os.environ.get("TILEINFER_PAGE_PIPELINE", "").strip() not in ("", "0", "false", "False")
+
+
+def paged_decode_pipeline(
+    batch: int,
+    kv_heads: int,
+    group: int,
+    dim: int,
+    page_size: int,
+    num_pages_cap: int,
+    dtype: str = "bfloat16",
+    threads: int = 128,
+):
+    """Double-buffered variant of :func:`paged_decode_ascend950` (H42-③).
+
+    Math is bit-identical to the plain kernel; the only structural change is the page loop.  The
+    plain kernel serialises, per page, ``K copy → QK → softmax → P copy → V copy → PV`` — every
+    global→L1 copy stalls the Cube/Vector chain (~30µs/page at 8K ctx, E116, with a ~12x
+    bandwidth headroom).  This variant keeps **two** K/V L1 buffer pairs and issues the page
+    ``p+1`` copies *before* the page-``p`` compute chain into the spare pair, so the MTE2 copy
+    latency of the next page hides under the Cube+Vector work of the current one.
+
+    Semantics: ``T.copy`` is issued in source order; the copies target a buffer pair the current
+    iteration never reads, so no data dependency is reordered — correctness does not rely on any
+    scheduling promise (worst case the copies degenerate to synchronous and the kernel matches
+    the plain form).  A zero-length request copies page 0 once into scratch (page 0 always exists
+    in the declared pool) and never consumes it — safe padding semantics, same as the plain
+    kernel's zero-trip loop.
+    """
+    BR = max(32, ((group + 31) // 32) * 32)
+    BC = page_size
+    D = dim
+    ROWS = BR // 2
+    accum = "float32"
+    scale = 1.0 / math.sqrt(dim)
+    num_blocks = batch * kv_heads
+
+    assert BR % 2 == 0, "dual_copy splits the M dimension across the two AIVs, so group must be even"
+    assert dim in (128, 256), "the Ascend 950 attention path is tuned for head_dim 128 or 256"
+    assert page_size % 2 == 0
+
+    @T.prim_func
+    def main(
+        Q: T.Tensor((batch, kv_heads * BR, dim), dtype),
+        KCache: T.Tensor((num_pages_cap, page_size, kv_heads, dim), dtype),
+        VCache: T.Tensor((num_pages_cap, page_size, kv_heads, dim), dtype),
+        kv_indptr: T.Tensor((batch + 1,), "int32"),
+        kv_indices: T.Tensor((num_pages_cap,), "int32"),
+        kv_last_page_len: T.Tensor((batch,), "int32"),
+        Out: T.Tensor((batch, kv_heads * BR, dim), dtype),
+    ):
+        with T.Kernel(num_blocks) as bx:
+            b = bx // kv_heads
+            bh = bx % kv_heads
+
+            q_l1 = T.alloc_l1((BR, D), dtype)
+            k_l1 = T.alloc_l1((2, BC, D), dtype)
+            v_l1 = T.alloc_l1((2, D, BC), dtype)  # V stored transposed, as in the upstream FA
+            p_l1 = T.alloc_l1((BR, BC), dtype)
+
+            D2 = min(D, 128)
+            qk_a = T.alloc_l0a((BR, D2), dtype)
+            qk_b = T.alloc_l0b((BC, D2), dtype)
+            pv_a = T.alloc_l0a((BR, BC), dtype)
+            pv_b = T.alloc_l0b((D2, BC), dtype)
+            qk_acc = T.alloc_l0c((BR, BC), accum)
+            pv_acc0 = T.alloc_l0c((BR, D2), accum)
+            if D > D2:
+                pv_acc1 = T.alloc_l0c((BR, D2), accum)
+
+            s_ub = T.alloc_shared((ROWS, BC), accum)
+            p_ub = T.alloc_shared((ROWS, BC), dtype)
+            o_ub0 = T.alloc_shared((ROWS, D2), accum)
+            o_tmp0 = T.alloc_shared((ROWS, D2), accum)
+            out_ub0 = T.alloc_shared((ROWS, D2), dtype)
+            if D > D2:
+                o_ub1 = T.alloc_shared((ROWS, D2), accum)
+                o_tmp1 = T.alloc_shared((ROWS, D2), accum)
+                out_ub1 = T.alloc_shared((ROWS, D2), dtype)
+            m_ub = T.alloc_shared((ROWS,), accum)
+            l_ub = T.alloc_shared((ROWS,), accum)
+            if _simd_softmax_enabled():
+                a_ub = T.alloc_shared((ROWS,), accum)
+                ll_ub = T.alloc_shared((1,), "int32")
+
+            num_pages = kv_indptr[b + 1] - kv_indptr[b]
+
+            T.copy(Q[b, bh * BR : (bh + 1) * BR, 0:D], q_l1)
+            T.fill(m_ub, T.float32(-1e30))
+            T.fill(l_ub, T.float32(0))
+            T.fill(o_ub0, T.float32(0))
+            if D > D2:
+                T.fill(o_ub1, T.float32(0))
+            if _simd_softmax_enabled():
+                T.copy(kv_last_page_len[b : b + 1], ll_ub)
+
+            # ---- prologue: stage page 0 into buffer 0 ----
+            pid0 = kv_indices[kv_indptr[b]]
+            T.copy(KCache[pid0, 0:BC, bh, 0:D], k_l1[0, 0:BC, 0:D])
+            T.copy(VCache[pid0, 0:BC, bh, 0:D], v_l1[0, 0:D, 0:BC], transpose=True)
+
+            for p in T.serial(num_pages):
+                # ---- prefetch page p+1 into the spare pair (issued before page-p compute) ----
+                if p + 1 < num_pages:
+                    pid_n = kv_indices[kv_indptr[b] + p + 1]
+                    T.copy(KCache[pid_n, 0:BC, bh, 0:D], k_l1[(p + 1) % 2, 0:BC, 0:D])
+                    T.copy(VCache[pid_n, 0:BC, bh, 0:D], v_l1[(p + 1) % 2, 0:D, 0:BC], transpose=True)
+
+                # ---- scores = Q @ K^T from buffer (p % 2) ----
+                T.copy(q_l1[0:BR, 0:D2], qk_a)
+                T.copy(k_l1[p % 2, 0:BC, 0:D2], qk_b)
+                T.gemm(qk_a, qk_b, qk_acc, transpose_B=True, clear_accum=True)
+                if D > D2:
+                    T.copy(q_l1[0:BR, D2:D], qk_a)
+                    T.copy(k_l1[p % 2, 0:BC, D2:D], qk_b)
+                    T.gemm(qk_a, qk_b, qk_acc, transpose_B=True)
+                T.dual_copy(qk_acc, s_ub)
+
+                # ---- online softmax (identical to the plain kernel) ----
+                if _simd_softmax_enabled():
+                    limit = T.if_then_else(p + 1 < num_pages, BC, ll_ub[0])
+                    with T.SimdVF():
+                        for r in T.serial(ROWS):
+                            idx0 = T.simd.vci(0, "int32", order="INC_ORDER")
+                            idx1 = T.simd.vci(64, "int32", order="INC_ORDER")
+                            sc = T.simd.vdup(T.float32(scale), "float32")
+                            a0 = T.simd.vmul(T.simd.vld(s_ub[r, 0], dist="NORM"), sc)
+                            a1 = T.simd.vmul(T.simd.vld(s_ub[r, 64], dist="NORM"), sc)
+                            neg = T.simd.vdup(T.float32(-1e30), "float32")
+                            a0 = T.simd.vsel(a0, neg, T.simd.vcmps(idx0, limit, op="lt"))
+                            a1 = T.simd.vsel(a1, neg, T.simd.vcmps(idx1, limit, op="lt"))
+                            pm = T.simd.vdupv(T.simd.vld(m_ub[r], dist="BRC_B32"), pos="POS_LOWEST")
+                            nm = T.simd.vmax(pm, T.simd.vmax(T.simd.vcmax(a0), T.simd.vcmax(a1)))
+                            nml = T.simd.vdupv(nm, pos="POS_LOWEST")
+                            al = T.simd.vexp(T.simd.vsub(pm, nml))
+                            e0 = T.simd.vexp(T.simd.vsub(a0, nml))
+                            e1 = T.simd.vexp(T.simd.vsub(a1, nml))
+                            lp = T.simd.vdupv(T.simd.vld(l_ub[r], dist="BRC_B32"), pos="POS_LOWEST")
+                            ln = T.simd.vadd(
+                                T.simd.vmul(lp, al),
+                                T.simd.vadd(T.simd.vcadd(e0), T.simd.vcadd(e1)),
+                            )
+                            T.simd.vsts(m_ub[r], nml, dist="ONEPT_B32")
+                            T.simd.vsts(l_ub[r], T.simd.vdupv(ln, pos="POS_LOWEST"), dist="ONEPT_B32")
+                            T.simd.vsts(a_ub[r], T.simd.vdupv(al, pos="POS_LOWEST"), dist="ONEPT_B32")
+                            T.simd.vsts(s_ub[r, 0], e0)
+                            T.simd.vsts(s_ub[r, 64], e1)
+                    with T.SimtVF(threads=threads):
+                        for r, d in T.Parallel(ROWS, D2):
+                            o_ub0[r, d] = o_ub0[r, d] * a_ub[r]
+                        if D > D2:
+                            for r, d in T.Parallel(ROWS, D2):
+                                o_ub1[r, d] = o_ub1[r, d] * a_ub[r]
+                        for r, c in T.Parallel(ROWS, BC):
+                            p_ub[r, c] = T.Cast(dtype, s_ub[r, c])
+                else:
+                    limit = T.if_then_else(p + 1 < num_pages, BC, kv_last_page_len[b])
+                    with T.SimtVF(threads=threads):
+                        s_frag = T.alloc_fragment((ROWS, BC), accum)
+                        for r, c in T.Parallel(ROWS, BC):
+                            s_frag[r, c] = T.if_then_else(
+                                c < limit, s_ub[r, c] * T.float32(scale), T.float32(-1e30)
+                            )
+
+                        row_max = T.alloc_reducer((ROWS,), accum, op="max")
+                        T.reducer_init(row_max)
+                        for r, c in T.Parallel(ROWS, BC):
+                            T.reducer_update(row_max[r], s_frag[r, c])
+                        new_m = T.alloc_fragment((ROWS,), accum)
+                        T.finalize_reducer(row_max, new_m)
+
+                        alpha = T.alloc_fragment((ROWS,), accum)
+                        for r in T.Parallel(ROWS):
+                            alpha[r] = T.exp(m_ub[r] - T.max(m_ub[r], new_m[r]))
+                            m_ub[r] = T.max(m_ub[r], new_m[r])
+
+                        row_sum = T.alloc_reducer((ROWS,), accum, op="sum")
+                        T.reducer_init(row_sum)
+                        for r, c in T.Parallel(ROWS, BC):
+                            s_frag[r, c] = T.exp(s_frag[r, c] - m_ub[r])
+                            T.reducer_update(row_sum[r], s_frag[r, c])
+                        partial = T.alloc_fragment((ROWS,), accum)
+                        T.finalize_reducer(row_sum, partial)
+
+                        for r in T.Parallel(ROWS):
+                            l_ub[r] = l_ub[r] * alpha[r] + partial[r]
+                        for r, d in T.Parallel(ROWS, D2):
+                            o_ub0[r, d] = o_ub0[r, d] * alpha[r]
+                        if D > D2:
+                            for r, d in T.Parallel(ROWS, D2):
+                                o_ub1[r, d] = o_ub1[r, d] * alpha[r]
+                        for r, c in T.Parallel(ROWS, BC):
+                            p_ub[r, c] = T.Cast(dtype, s_frag[r, c])
+
+                # ---- o += P @ V from buffer (p % 2) ----
+                T.dual_copy(p_ub[0:ROWS, 0:BC], p_l1[0:BR, 0:BC])
+                T.copy(p_l1[0:BR, 0:BC], pv_a)
+                T.copy(v_l1[p % 2, 0:D2, 0:BC], pv_b)
+                T.gemm(pv_a, pv_b, pv_acc0, transpose_B=True, clear_accum=True)
+                if D > D2:
+                    T.copy(v_l1[p % 2, D2:D, 0:BC], pv_b)
+                    T.gemm(pv_a, pv_b, pv_acc1, transpose_B=True, clear_accum=True)
+                T.dual_copy(pv_acc0, o_tmp0)
+                if D > D2:
+                    T.dual_copy(pv_acc1, o_tmp1)
+                with T.SimtVF(threads=threads):
+                    for r, d in T.Parallel(ROWS, D2):
+                        o_ub0[r, d] = o_ub0[r, d] + o_tmp0[r, d]
+                    if D > D2:
+                        for r, d in T.Parallel(ROWS, D2):
+                            o_ub1[r, d] = o_ub1[r, d] + o_tmp1[r, d]
+
+            # ---- normalise and store ----
+            with T.SimtVF(threads=threads):
+                for r, d in T.Parallel(ROWS, D2):
+                    out_ub0[r, d] = T.Cast(dtype, o_ub0[r, d] / l_ub[r])
+                if D > D2:
+                    for r, d in T.Parallel(ROWS, D2):
+                        out_ub1[r, d] = T.Cast(dtype, o_ub1[r, d] / l_ub[r])
+            T.dual_copy(out_ub0[0:ROWS, 0:D2], Out[b, bh * BR : (bh + 1) * BR, 0:D2])
+            if D > D2:
+                T.dual_copy(out_ub1[0:ROWS, 0:D2], Out[b, bh * BR : (bh + 1) * BR, D2:D])
+
+    return main
+
+
 def paged_decode_ascend950(
     batch: int,
     kv_heads: int,
@@ -90,6 +324,7 @@ def paged_decode_ascend950(
     num_pages_cap: int,
     dtype: str = "bfloat16",
     threads: int = 128,
+    pipeline: bool = False,
 ):
     """Build the paged decode attention ``T.prim_func``.
 
@@ -110,7 +345,23 @@ def paged_decode_ascend950(
                  through :func:`pool_view`; pages beyond the real pool are never dereferenced
                  (every access is bounded by ``kv_indptr``/``kv_indices``).
     ``kv_indptr`` / ``kv_indices`` / ``kv_last_page_len``  the engine-agnostic page list.
+
+    ``pipeline=True`` (H42-③, opt-in via ``TILEINFER_PAGE_PIPELINE=1``) returns the
+    double-buffered page-pipeline variant :func:`paged_decode_pipeline` instead — identical
+    math, K/V L1 double-buffering so the next page's global→L1 copies overlap the current
+    page's compute.  The flag is part of the caller's build spec, hence of the kernel cache key.
     """
+    if pipeline:
+        return paged_decode_pipeline(
+            batch=batch,
+            kv_heads=kv_heads,
+            group=group,
+            dim=dim,
+            page_size=page_size,
+            num_pages_cap=num_pages_cap,
+            dtype=dtype,
+            threads=threads,
+        )
     # M of the QK^T GEMM.  Padded so that the per-AIV row count is a multiple of 16: the ND->NZ
     # copy template asserts `ROWS % 16 == 0` (see the module docstring).
     BR = max(32, ((group + 31) // 32) * 32)
@@ -721,6 +972,9 @@ def build_decode_kernel(**spec):
     output buffer is owned by the plan and reused every step, so a captured step never allocates.
     """
     out_manual = bool(spec.pop("out_manual", False))
+    pipeline = bool(spec.pop("pipeline", False))
+    if pipeline:
+        spec["pipeline"] = True
     if spec.get("num_pages_cap") is not None:
         spec["num_pages_cap"] = declared_pool_cap(spec["num_pages_cap"])
     key = ("decode", "manual" if out_manual else "auto") + tuple(sorted(spec.items()))
