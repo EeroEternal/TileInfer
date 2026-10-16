@@ -908,3 +908,31 @@ decode 段 shared 摊薄。原始 JSON:.agent_loop/run/bench_results/h28_h28ms_*
 采样路径 3.74%(per-step);shared 线已收。上游动向(E96):vllm-ascend 近 90 天
 shared expert multistream 活跃(Kimi K3 驱动 PR #18818/#18904/#18950),量化+SP 场景
 有踩坑史(#18894),我方 bf16/TP1 路径独立于其上。
+
+## 系统级专项 H32:GDN in_proj_ba→in_proj_qkvz 权重融合(S-GDN 投影族第一刀,2026-10-16 iter-073)
+
+E97 重排后 dense 域最大子项(GDN 投影 MM3 族)的可执行子项。机制=每 GDN 层
+`in_proj_ba`(M=16,K=2048,N=64,0.26MB 权重)是纯内核启动延迟税(in-engine
+3.8µs/次×30 层 ≈ 0.67% TPOT,E97/E100),把 ba 权重 cat 进 qkvz 权重尾部成单 GEMM
+(N=12352),输出零拷贝 strided 切片喂原 `fix_query_key_value_ordering`(其内部
+view 仅做末维拆分,对非连续张量合法,E101),下游 rearrange/cat 拷贝与现状一致。
+
+**取证(E100,设备微基准,互异权重轮转流式口径)**:
+- 峰值标定:950PR 纯读 1.486TB/s / triad 1.445TB/s(官方 1.6TB/s 峰值,E99);
+- 融合收益:qkvz+ba 分离 36.0µs vs 融合 27.1µs(ba 边际成本≈0);
+- 布局变体零收益:NN 预转置/NZ 权重在真实 decode 形状(M=8/16)除 out_proj/attn_qkv
+  微基准 +11% 外均持平(NZ 与 E42 一致),不构成推翻 vendor 的双侧证据;
+- lm_head 623µs=1.63TB/s 贴顶(字节削减需量化,不在授权范围,搁置);
+- in-engine vs 微基准存在 1.4-1.7x 上下文缺口(L2 全污染/MoE 流干扰),内核本体
+  非短板——机制取证列为后续候选;
+- torch split-K 代理(双 GEMM+add)失败(发射开销),单内核 split-K 留 kernel 轮。
+
+**实现**(74c106e,`TILEINFER_OPS=gdnproj` 显式 opt-in):类级包装
+`QwenGatedDeltaNetAttention.forward_cuda`;懒构建 fused 权重(预热期、图捕获前,
++1.5GB 显存);守卫(TP1/无量化/interleaved/普通权重)不满足或运行期异常即回退原路径;
+探针计数 `gdnproj_calls/fallbacks` 入 metrics dumper。数值契约=TOL 3e-2 级等价
+(N 变化致 MatMulV3 tiling 不同,bf16 ULP 级累加序差,E100.1;非逐位等价)。
+
+**A/B 结果**:(待 h32_wait_chain 门控链跑完填入)
+
+**结论**:(待 A/B)
