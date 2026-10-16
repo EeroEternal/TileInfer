@@ -81,7 +81,21 @@ def _sub_pages(block_size: int) -> int:
 #: GDN gating 的 opt-in 小算子接管)的独立开关。
 #: ``gdnproj`` 是 GDN in_proj_ba→in_proj_qkvz 权重融合(H32/S-GDN 投影族,E100:ba 为
 #: 纯内核启动延迟税 ~0.67% TPOT,融合逐位等价)的独立开关。
-_OPS_ALL = {"decode", "prefill", "gdn", "gdnwu", "moe", "sampling", "gdnproj", "gdnsmall", "greedy"}
+#: ``moeprefetch`` 是 MoE 权重 prefetch 阈值对齐(H37/S-MoE 域,#19033 第 2 项移植:
+#: 管道已在 vllm-ascend 0.23.0 在役路径上,E109 管道核查;阈值 96→1 + 惰性武装兜底)
+#: 的独立开关。
+_OPS_ALL = {
+    "decode",
+    "prefill",
+    "gdn",
+    "gdnwu",
+    "moe",
+    "sampling",
+    "gdnproj",
+    "gdnsmall",
+    "greedy",
+    "moeprefetch",
+}
 
 
 def ops_enabled(op: str) -> bool:
@@ -2053,6 +2067,8 @@ def start_metrics_dumper() -> bool:
                     and stats.get("sampler_topk_fallbacks", 0) == 0
                     and stats.get("greedy_fast_calls", 0) == 0
                     and stats.get("greedy_fast_fallbacks", 0) == 0
+                    and stats.get("moeprefetch_active", 0) == 0
+                    and stats.get("moeprefetch_fallbacks", 0) == 0
                 ):
                     time.sleep(_METRICS_INTERVAL_S)
                     continue
@@ -2202,6 +2218,27 @@ def install(raise_on_failure: bool = True) -> bool:
             logger.info(
                 "TileInfer greedy fast sampler left off (TILEINFER_OPS does not list "
                 "greedy; H36 engine A/B pending)"
+            )
+        if "moeprefetch" in _parts:
+            # H37(S-MoE 域):MoE 权重 prefetch 阈值对齐(96→1 + 惰性武装兜底),
+            # 显式 opt-in——上游 main 已移除该功能(仅 0.23.0 分支自持)且 950PR
+            # 小 M GEMM L2-bypass 可能架空预取假设(E109),权威口径引擎 A/B
+            # (在役探针 moeprefetch_active)通过前不进默认路径。
+            try:
+                from ..kernels.moe import prefetch as _moepf_impl
+                from ..kernels.moe.prefetch import install_moe_weight_prefetch
+
+                cls_stats = TileInferDecodeAttention._stats
+                _moepf_impl._stats_sink = lambda name: cls_stats.__setitem__(
+                    name, cls_stats.get(name, 0) + 1
+                )
+                install_moe_weight_prefetch()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("TileInfer MoE weight prefetch not installed: %s", exc)
+        else:
+            logger.info(
+                "TileInfer MoE weight prefetch left off (TILEINFER_OPS does not list "
+                "moeprefetch; H37 engine A/B pending)"
             )
         logger.info(
             "TileInfer registered as the CUSTOM attention backend (decode accelerated, "
