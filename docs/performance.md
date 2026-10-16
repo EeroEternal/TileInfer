@@ -429,6 +429,21 @@ w1s 不触 decode),分流对短场景零影响;c1 TPOT 比 1.000 直接达标。
 (shunt 修长上下文 prefill + 分带保短上下文零税并留 b≤4 长上下文 decode 收益);
 两者默认均 opt-in(默认路径=P0 行为)。D57-② 内核效率重写维持暂缓。
 
+## W1 靶点修正:0.75x 残余缺口 100% 在 decode 侧长上下文(2026-10-17,iter-085,E116)
+
+权威口径原始 JSON 复盘(iter-056 w1 链 + P0 锚点):**FIA 侧 decode ITL p50 对上下文长度
+平坦**(128ctx→8K→16K = 19.05/19.05/20.69ms),**TI 侧线性劣化**(19.2/37.9/62.8ms);
+TTFT p50 8K TI 943 vs FIA 1050ms(shunt 后 prefill 已对齐)。故 D57-② 原表述「prefill
+内核效率重写」不解决 0.754x/0.758x——缺口唯一主因 = TI 长 ctx decode attention:
+
+- 机理:W2 proven 分带 b8:ktp=128 → 8K(64 页)仅 1 split,grid=batch×kv_heads=16 块
+  (<28 核),每块串行 64 页 × ~30µs/页(K/V 拷贝+4 小 GEMM+SIMT softmax+rescale)≈
+  1.87ms/层 ×10 层 = 18.7ms/步,与 ITL 差值精确吻合;带宽下界 ~2.5µs/页 → ~12x 余量。
+- 结构盲区:分带按 batch 桶而非 ctx 长度(E40 全局 ktp16 长 ctx 1.41x/2.04x 有效 →
+  E61 b8 短 ctx 税 4.5x → E65 分带取零税牺牲长 ctx 并行)。
+- 行动(H42):①SIMD softmax(内核自述 decode shape 2.6x,默认 off)零代码 A/B;
+  ②per-page 成本微基准分解;③内核双缓冲/并行化改造(门槛 ≥1.5x 现役+短形状零税)。
+
 ## P-PROF 流程画像:FIA 侧设备分段占比 + decode 设备-bound 判定(2026-10-15,iter-061,E79)
 
 方法:`p_prof_side.sh`(vLLM 0.23 内置 profiler + torch_npu Text 导出)对 FIA 侧
