@@ -81,7 +81,7 @@ def _sub_pages(block_size: int) -> int:
 #: GDN gating 的 opt-in 小算子接管)的独立开关。
 #: ``gdnproj`` 是 GDN in_proj_ba→in_proj_qkvz 权重融合(H32/S-GDN 投影族,E100:ba 为
 #: 纯内核启动延迟税 ~0.67% TPOT,融合逐位等价)的独立开关。
-_OPS_ALL = {"decode", "prefill", "gdn", "gdnwu", "moe", "sampling", "gdnproj", "gdnsmall"}
+_OPS_ALL = {"decode", "prefill", "gdn", "gdnwu", "moe", "sampling", "gdnproj", "gdnsmall", "greedy"}
 
 
 def ops_enabled(op: str) -> bool:
@@ -1962,6 +1962,49 @@ def install_sampler_topk() -> bool:
     return True
 
 
+_GREEDY_FAST_INSTALLED = False
+
+
+def install_greedy_fast_sampler() -> bool:
+    """Sampler greedy 快路径(H36/采样域,``TILEINFER_OPS=greedy``)。
+
+    #19033 d-1 蓝本(E106):全批 greedy(temperature=0,权威口径即此场景)时
+    跳过基类 ``Sampler.forward`` 的 bf16→fp32 全词表 cast 与贪心不敏感处理器链,
+    直接原 dtype argmax 构造 SamplerOutput。bf16→fp32 精确单调 → argmax 逐位
+    一致;九重严格守卫(见 ``tileinfer.kernels.sampling.greedy``)任一不满足
+    或异常均回退原实现。0.23.0 的 ``AscendSampler`` 未覆写 forward(原实现即
+    基类),类级覆写在首次调用即生效;``ops_enabled("greedy")`` 每步读取,
+    翻转 ``TILEINFER_OPS`` + 重启即回退。计数器 greedy_fast_calls/fallbacks
+    供在役探针断言。
+    """
+    global _GREEDY_FAST_INSTALLED
+    if _GREEDY_FAST_INSTALLED:
+        return True
+    from vllm.v1.sample.sampler import Sampler as _base
+    from vllm_ascend.sample.sampler import AscendSampler as _cls
+
+    if getattr(_cls, "_tileinfer_greedy_fast_installed", False):
+        _GREEDY_FAST_INSTALLED = True
+        return True
+
+    from tileinfer.kernels.sampling import greedy as _impl
+
+    cls_stats = TileInferDecodeAttention._stats
+    _impl._stats_sink = lambda name: cls_stats.__setitem__(
+        name, cls_stats.get(name, 0) + 1
+    )
+    # 0.23.0 AscendSampler 自身无 forward;若上游将来覆写则取其类属性为原实现
+    orig = _cls.__dict__.get("forward", _base.forward)
+    _cls._tileinfer_greedy_forward_orig = orig
+    _cls.forward = _impl.make_greedy_forward(orig)
+    _cls._tileinfer_greedy_fast_installed = True
+    _GREEDY_FAST_INSTALLED = True
+    logger.info(
+        "TileInfer greedy fast sampler dispatch installed (H36, TILEINFER_OPS governs)"
+    )
+    return True
+
+
 _METRICS_INTERVAL_S = 1.0
 
 
@@ -2008,6 +2051,8 @@ def start_metrics_dumper() -> bool:
                     and stats["kernel_markers"] < 0
                     and stats.get("sampler_topk_calls", 0) == 0
                     and stats.get("sampler_topk_fallbacks", 0) == 0
+                    and stats.get("greedy_fast_calls", 0) == 0
+                    and stats.get("greedy_fast_fallbacks", 0) == 0
                 ):
                     time.sleep(_METRICS_INTERVAL_S)
                     continue
@@ -2144,6 +2189,19 @@ def install(raise_on_failure: bool = True) -> bool:
         else:
             logger.info(
                 "TileInfer sampler top-k takeover left off (TILEINFER_OPS does not list sampling)"
+            )
+        if "greedy" in _parts:
+            # H36(采样域):greedy 全批快路径(跳过 fp32 全词表 cast + 处理器链),
+            # 显式 opt-in——权威口径引擎 A/B(在役探针 greedy_fast_calls)通过前
+            # 不进默认路径。
+            try:
+                install_greedy_fast_sampler()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("TileInfer greedy fast sampler not installed: %s", exc)
+        else:
+            logger.info(
+                "TileInfer greedy fast sampler left off (TILEINFER_OPS does not list "
+                "greedy; H36 engine A/B pending)"
             )
         logger.info(
             "TileInfer registered as the CUSTOM attention backend (decode accelerated, "
