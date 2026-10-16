@@ -79,7 +79,9 @@ def _sub_pages(block_size: int) -> int:
 #: ``gdnwu`` 是 chunk 链中段融合核(H10/阶段 3 P1)的独立开关,与 ``gdn`` 解耦做同侧 A/B 归因。
 #: ``sampling`` 是采样 top-k 阈值替换(BACKLOG 采样条目澄清:非采样链整体融合,性质同
 #: GDN gating 的 opt-in 小算子接管)的独立开关。
-_OPS_ALL = {"decode", "prefill", "gdn", "gdnwu", "moe", "sampling"}
+#: ``gdnproj`` 是 GDN in_proj_ba→in_proj_qkvz 权重融合(H32/S-GDN 投影族,E100:ba 为
+#: 纯内核启动延迟税 ~0.67% TPOT,融合逐位等价)的独立开关。
+_OPS_ALL = {"decode", "prefill", "gdn", "gdnwu", "moe", "sampling", "gdnproj"}
 
 
 def ops_enabled(op: str) -> bool:
@@ -718,6 +720,9 @@ class TileInferDecodeAttention:
         # 采样 top-k 阈值替换(BACKLOG 采样条目):命中/回退计数,在役探针断言用
         "sampler_topk_calls": 0,
         "sampler_topk_fallbacks": 0,
+        # H32:GDN in_proj_ba→in_proj_qkvz 权重融合(S-GDN 投影族),命中/回退计数
+        "gdnproj_calls": 0,
+        "gdnproj_fallbacks": 0,
     }
 
     def __init__(
@@ -1763,6 +1768,61 @@ def install_gdn_chunk_wu() -> bool:
     return True
 
 
+_GDN_PROJ_INSTALLED = False
+
+
+def install_gdn_proj_fusion() -> bool:
+    """GDN in_proj_ba→in_proj_qkvz 权重融合(H32/S-GDN 投影族,``TILEINFER_OPS=gdnproj``)。
+
+    decode 每步每 GDN 层的 ``in_proj_ba`` 是一次 N=64/0.26MB 的纯启动延迟税 GEMM
+    (in-engine 3.8µs/次,30 层 ≈ 0.67% TPOT,E97/E100)。本钩子在
+    ``QwenGatedDeltaNetAttention.forward_cuda`` 类级包装:接管时把 ba 权重 cat 进
+    qkvz 权重(首次 forward 懒构建,预热期、图捕获前)成单 GEMM,输出零拷贝 strided
+    切片喂原 ``fix_query_key_value_ordering``(E101:view 纯维度拆分对 strided 视图
+    合法);数值与分离路径逐位等价(E100 maxdiff=0.0;上游同构先例 vLLM #41457)。
+
+    守卫(TP=1/无量化/interleaved 布局/普通权重)不满足或运行期异常均回退原实现;
+    ``ops_enabled("gdnproj")`` 每步读取,翻转 ``TILEINFER_OPS`` + 重启即回退。
+    须在引擎构建前安装(install() 时序,同 sampler 先例)。
+    """
+    global _GDN_PROJ_INSTALLED
+    if _GDN_PROJ_INSTALLED:
+        return True
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+        QwenGatedDeltaNetAttention as _gdn_cls,
+    )
+
+    if getattr(_gdn_cls, "_tileinfer_gdnproj_installed", False):
+        _GDN_PROJ_INSTALLED = True
+        return True
+
+    from tileinfer.kernels.gdn.proj_fusion import fused_forward_cuda
+
+    cls_stats = TileInferDecodeAttention._stats
+    _original = _gdn_cls.forward_cuda
+
+    def _forward_cuda(self, hidden_states, output):
+        if ops_enabled("gdnproj"):
+            try:
+                if fused_forward_cuda(self, hidden_states, output):
+                    cls_stats["gdnproj_calls"] = cls_stats.get("gdnproj_calls", 0) + 1
+                    return
+                cls_stats["gdnproj_fallbacks"] = (
+                    cls_stats.get("gdnproj_fallbacks", 0) + 1
+                )
+            except Exception:  # noqa: BLE001 - 融合路径任何异常都回退原实现
+                cls_stats["gdnproj_fallbacks"] = (
+                    cls_stats.get("gdnproj_fallbacks", 0) + 1
+                )
+        return _original(self, hidden_states, output)
+
+    _gdn_cls.forward_cuda = _forward_cuda
+    _gdn_cls._tileinfer_gdnproj_installed = True
+    _GDN_PROJ_INSTALLED = True
+    logger.info("TileInfer GDN in_proj fusion dispatch installed (H32, TILEINFER_OPS governs)")
+    return True
+
+
 _SAMPLER_TOPK_INSTALLED = False
 
 
@@ -1804,8 +1864,12 @@ def install_sampler_topk() -> bool:
     cls_stats = TileInferDecodeAttention._stats
     _original = _sampler_mod.apply_top_k_top_p
 
-    def _apply_top_k_top_p(logits, p, k, *args, **kwargs):
-        # 顺序敏感:门控/包络判定(零 D2H)全部在实现内取 k 之前完成,回退路径零同步。
+    def _apply_top_k_top_p(logits, k, p, *args, **kwargs):
+        # 顺序敏感:调用序对齐本仓 vllm_ascend(sample/sampler.py L162/L175):
+        # ``self.apply_top_k_top_p(logits, k, p[, self.top_k])``——**k 在前、p 在后**
+        # (npu_flash 原实现 `_npu_flash_apply_top_k_top_p(logits, k, p, top_k)` 同序;
+        # vLLM 上游 topk_topp_sampler.py 的 ``apply_top_k_top_p(logits, k, p)`` 亦同序)。
+        # 门控/包络判定(零 D2H)全部在实现内取 k 之前完成,回退路径零同步;
         # 实现自检窗口后返回 None 即回退(与原生签名解耦:多余位置参数原样透传)。
         if ops_enabled("sampling"):
             try:
@@ -1815,7 +1879,7 @@ def install_sampler_topk() -> bool:
                     return out
             except Exception:  # noqa: BLE001 - 接管失败必须静默回退,绝不破坏服务
                 cls_stats["sampler_topk_fallbacks"] = cls_stats.get("sampler_topk_fallbacks", 0) + 1
-        return _original(logits, p, k, *args, **kwargs)
+        return _original(logits, k, p, *args, **kwargs)
 
     _sampler_mod.apply_top_k_top_p = _apply_top_k_top_p
     _sampler_mod._tileinfer_sampler_installed = True
@@ -1972,6 +2036,18 @@ def install(raise_on_failure: bool = True) -> bool:
         else:
             logger.info("TileInfer MoE preNZ takeover left off (TILEINFER_OPS does not list moe; "
                         "explicit opt-in until the H27 kernel gate passes)")
+        if "gdnproj" in _parts:
+            # H32(S-GDN 投影族):ba→qkvz 权重融合,显式 opt-in——权威口径引擎 A/B
+            # (E100 微基准门槛已过)通过前不进默认路径
+            try:
+                install_gdn_proj_fusion()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("TileInfer GDN in_proj fusion not installed: %s", exc)
+        else:
+            logger.info(
+                "TileInfer GDN in_proj fusion left off (TILEINFER_OPS does not list "
+                "gdnproj; H32 engine A/B pending)"
+            )
         if "sampling" in _parts:
             # 采样 top-k 阈值替换(BACKLOG 采样条目澄清):显式 opt-in,性质同 GDN gating。
             # 安装须早于采样器构造(AscendTopKTopPSampler.__init__ 捕获模块级绑定)——
