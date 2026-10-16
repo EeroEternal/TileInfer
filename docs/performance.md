@@ -841,3 +841,34 @@ W1 长上下文 prefill 分流(8K/16K C8 吞吐 0.226x/0.130x → 0.754x/0.758x)
 W2 per-bucket ktp 分带(并发税归零,TPOT 0.995/0.987)、split-KV 长上下文 decode
 (1.41x/2.04x)。遗留候选:H28 shared expert 融合(TPOT 上界 ~6%,等 TI 侧画像,
 pprof_ti_chain_v2.sh 重试链在挂)。
+
+## P-PROF 补全:TI 侧画像(双窗)+ 双侧对照——MoE/dense/GDN 分段占比与 H28 上界确认(2026-10-16,iter-071,E91)
+
+采集条件:vLLM 内置 torch profiler,TI 侧(推荐部署配置:ktp 分带+shunt),
+prefill 窗=8192×4/C8、decode 窗=128×256/C8;与 FIA 侧(iter-061/E79)同口径。
+失败复盘:02:49 首跑失败真因=链进程缺 CANN 环境 source(E89/E90),10:19 环境完整
+继承后一次成功(E91)——画像工具链(P-PROF)就此双侧收口。
+
+### TI 侧设备分段占比(per-window 真值,E91;与 FIA 同表结构)
+| 窗 | 设备总 | MoE | dense+胶水 | GDN | other(自研 attention) | full-attn |
+|---|---|---|---|---|---|---|
+| prefill 8K×4/C8 | 4463.6ms | 32.8% | 26.9% | 17.5% | 17.1% | 5.7% |
+| decode 128×256/C8 | 4345.9ms | 38.5% | 37.2% | 13.3% | 11.0% | ~0% |
+
+Top-5 归因(TI decode 窗):GMM 32.3%(MoE)/MatMulV3 23.9%(dense,含 shared expert)/
+main_kernel 8.7%(TI decode attention)/fused_gdn_gating 7.0%/RecurrentGatedDeltaRule 3.8%。
+
+### 双侧对照(decode 窗,TI vs FIA)与结论
+| 段 | TI | FIA(E79) | 解读 |
+|---|---|---|---|
+| MoE | 38.5% | 53.8% | TI dense/GDN 段相对更重,MoE 内核 0.84x 的端到端杠杆 TI 侧 ≈ TPOT ~5-6% |
+| dense | 37.2%(MM3 23.9%) | 31.6%(MM3 21.0%) | shared expert 融合(H28)TPOT 上界 ~5-8%,双侧一致 → 立项候选维持 |
+| GDN | 13.3% | 11.6% | 一致(gating/recurrent 为主,融合线 H8 已按证据关闭) |
+| full-attn/other | ~0%+11.0%(main_kernel) | 1.0% | TI 自研 attention 计入 other;绝对值小,非瓶颈 |
+
+画像派生假设处置:**H28(shared expert 融合进 grouped)维持「立项候选归档」**——
+TI 画像确认其 TPOT 上界 5-8%(E91.4),但 MoE 专项以 FINAL TEMPORARY 收口
+(终止条件 b 已触发),H28 留作用户决策的下一个优化靶点,不在本专项内展开。
+
+注:聚合器脚本对 TI 双窗 CSV 存在并集显示缺陷,本表数字以 per-window 真值
+(E91)为准;原始数据 .agent_loop/run/prof/ti/ 双目录 CSV。
