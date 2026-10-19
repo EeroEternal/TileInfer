@@ -114,3 +114,29 @@ def test_env_knob_name_documented():
     src = inspect.getsource(mod)
     assert "TILEINFER_PREFILL_MAX_CTX" in src
     assert "TILEINFER_PREFILL_KV_TILE_PAGES" in src  # 既有旋钮不被误改
+
+
+# ------------------------------------------------- 4. H60:解包尾部搬运的缓冲契约
+
+
+def test_h60_unpack_tail_contract():
+    """H60 契约:``forward_prefill`` 的解包尾部在"有 out / 无 out"两条路径上
+    搬运次数不同,但**结果必须逐元素相同**,且无 out 时返回的是连续张量。
+
+    这里只做静态检查(CPU 无 tilelang 编译):确认有 ``out`` 时不再先
+    ``contiguous()`` 再 ``copy_``(那会付两次全量搬运)。
+    """
+    import inspect
+
+    from tileinfer.kernels.attention import paged_decode_ascend950 as attn
+
+    src = inspect.getsource(attn.forward_prefill)
+    # 有 out 的快速路径:copy_ 直接吃 strided view 的 reshape,不先物化
+    assert "out.copy_(" in src
+    # 尾部必须仍有 contiguous 兜底(无 out 的返回路径),否则调用方拿到非连续张量
+    assert ".contiguous()" in src
+    # 关键:不能出现 "先 contiguous 到临时变量、再 copy_ 到 out" 的旧形态
+    tail = src.split("out is not None")[-1]
+    assert "result.contiguous()" not in tail.split("return out")[0], (
+        "H60: 有 out 时不应先物化一份临时张量再拷贝"
+    )
