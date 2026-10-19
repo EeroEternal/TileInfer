@@ -477,7 +477,13 @@ def prefill_step(
         # First layer of this step (or a library-level caller without step identity):
         # build the layer-independent payload once.
         group = max(1, num_heads // num_kv_heads)
-        qo_host = (query_start_loc[1:] - query_start_loc[:-1]).to(torch.int64).cpu().tolist()
+        # H59-② 需要 ``seq_lens`` 判分流;把它与 ``qo_host`` **拼成一次 D2H**,
+        # 否则短上下文(<4K、不分流)路径会因新判据多付一次同步——那是净回归。
+        _qo_dev = (query_start_loc[1:] - query_start_loc[:-1]).to(torch.int64)
+        _seq_dev = seq_lens[:num_reqs].to(torch.int64)
+        _both = torch.cat([_qo_dev, _seq_dev]).cpu().tolist()
+        qo_host = _both[:num_reqs]
+        _seq_host = _both[num_reqs:]
         if sum(qo_host) != int(query.shape[0]):
             # 常见原因:runner 对 query 做了 token 填充(短批尤甚)。padding 行的输出会被 vLLM
             # 裁掉,因此只要 sum(qo) <= num_tokens 就可以安全接管,多余行不读不写。
@@ -493,16 +499,13 @@ def prefill_step(
         #
         # 原实现把 D57-① 的决策放在 ``_expand_page_table`` + ``ragged_from_page_table_device``
         # 之后,只为读 ``pages_host`` —— 但被分流的步根本用不到这些结果,等于每个长 prefill
-        # 步都白付一次页表展开(含一次 D2H)。这里改用 ``seq_lens`` 直接估算上限:
-        # 内核页数 = ceil(seq_len / KERNEL_PAGE_SIZE),与页表推导出的值**同界且不更小**
-        # (页表可能因稀疏/尾部留空给出更小的 real page count),因此:
+        # 步都白付一次页表展开(含一次 D2H)。这里改用 ``_seq_host``(与 qo_host 同一次 D2H)
+        # 直接估算上限:内核页数 = ceil(seq_len / KERNEL_PAGE_SIZE),与页表推导出的值
+        # **同界且不更小**(页表可能因稀疏/尾部留空给出更小的 real page count),因此:
         #   - 若估算已 <= 阈值 → 真实值只会更小 → 必不分流,可安全继续走 TI 内核;
         #   - 若估算 > 阈值 → 保守分流(宁可多分流,也不在长上下文用慢内核)。
-        # ``seq_lens`` 已在设备上且每步本来就要读,这里只多一次 tiny D2H,与旧实现同量级,
-        # 但把整条页表展开从被分流步的关键路径上摘掉。
         _ctx_pages_upper = None
         if _PREFILL_MAX_CTX > 0:
-            _seq_host = seq_lens[:num_reqs].to(torch.int64).cpu().tolist()
             _ctx_pages_upper = [
                 -(-int(s) // KERNEL_PAGE_SIZE) for s in _seq_host
             ]
