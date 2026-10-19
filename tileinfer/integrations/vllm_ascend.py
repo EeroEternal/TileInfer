@@ -2278,6 +2278,15 @@ def install(raise_on_failure: bool = True) -> bool:
     logging.getLogger("tileinfer").setLevel(logging.INFO)
     _diag("install")
 
+    # H65 诊断打点(step_diag):独立于 TILEINFER_VLLM 门控,先于其检查安装;
+    # 仅在 TILEINFER_STEP_DIAG=1 时激活(默认关=零行为变化),双侧(FIA/TI)可用。
+    try:
+        from .step_diag import install_step_diag
+
+        install_step_diag()
+    except Exception as exc:  # noqa: BLE001 - 诊断模块不得影响在役路径
+        logger.warning("TileInfer step_diag not installed: %s", exc)
+
     # 显式 ``== "1"`` 判断:``"0"`` 等任意非空字符串曾因真值判断被误认为启用,导致
     # TILEINFER_VLLM=0 的 FIA 对照侧(权威口径 P0 基线)仍加载本插件。只有显式
     # ``TILEINFER_VLLM=1`` 才启用;未设置或任何其他值一律关闭。

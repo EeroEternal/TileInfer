@@ -1456,3 +1456,33 @@ host 排空屏障(防 update_attn_params 与 replay 的 param 槽位竞争)。
   备份+还原命令在 `.agent_loop/run/pr11915/backup/` 与 DECISIONS D137)。
 - **c1 下一步**:per-step perf_counter 打点分解(H65 候选),精确记账 ~2.9ms
   host 暴露段后重排攻击序。
+
+## H65 c1 步长 host 暴露段打点分解:prep 1.126ms=最大 host 单段(<1.5ms 门槛),c1 让位 dense/H28(2026-10-20 iter-202,E264)
+
+**手段**(step_diag 新诊断模块,零 vendor 改动,`TILEINFER_STEP_DIAG=1` 门控默认关):
+monkeypatch 打点 `EngineCoreProc._process_engine_step`/`Scheduler.schedule`/
+`NPUModelRunner.execute_model`/`sample_tokens`/`_update_full_graph_params_if_needed`/
+`ACLGraphWrapper.__call__` 与 "prepare input"/"forward"/"post process" 三个
+record_function 块,JSONL 落盘;diag 开销验证 +0.2%(9.677 vs 9.66,噪声内)。
+
+**c1 decode 每步 9.662ms 权威记账**(run2,4161 decode 步):
+
+| 段 | median ms | 占周期 | 性质 |
+|---|---|---|---|
+| graph(replay+sync=设备链含上步 sampler/D2H 排空) | 7.871 | 81.5% | 设备必要 |
+| prep("prepare input" 块) | 1.126 | 11.6% | **host 暴露,设备空闲** |
+| sample_worker | 0.217 | 2.2% | host(发射) |
+| fwd 残差 + exec 开销 + post + sched + upd_out | ≈0.32 | 3.3% | host 散段 |
+| 引擎循环 gap(period−engine_step) | 0.013 | 0.1% | — |
+
+- **判决**:最大 host 暴露单段=prep 1.126ms(<1.5ms 立项门槛)→ H65 主体
+  **disproven**(归因 proven);**c1 缺口按 D105-3 让位 dense/H28 线**。
+  prep 内部(py-spy 互证)≈`_prepare_inputs` 0.7ms+`_build_attention_metadata`
+  0.5ms(gdn builder 在内)。host 暴露合计 ≈1.78ms,全消除理论下限 −18.4%。
+- **战略账**:c1 −30%(≤6.14ms vs FIA 8.77)必须叠加 kernel 域:H28 shared
+  expert 融合(≈0.4ms)+ dense 域 + H66 图内气泡(新未知数:graph 墙钟 7.871
+  vs 画像核时+采样+D2H ≈7.05,差 ~0.6-0.8ms 待 kineto 归因)。
+- **8192 补测闭环**(h69,FG=1):TPOT p50 36.56 vs 基线 36.82(−0.7% 噪声内)
+  → FG event 同步四场景全零增益,E261 判决加严(sync 非可回收成分)。
+- 工程 3 文件:`tileinfer/integrations/step_diag.py`(新)+ install() 挂钩 +
+  `tests/test_step_diag.py`(11 用例 CPU 绿);契约=默认关零行为变化、双侧可用。
