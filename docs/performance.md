@@ -1058,16 +1058,16 @@ asc_load_l2_cache_mode` 未声明。
 3. 因此下一步必须**新立 prefill 专项假设**,而不是继续消化 decode 侧队列。
 
 **建议的 prefill 攻坚路径**(按证据成本排序):
-1. **先 profile 定位**(零代码,一次窗口):用 `p_prof_side.sh` 的双窗采集
-   (窗1 = 8192 输入/4 输出/C=8,prefill 主导)对比 TI vs FIA 的
-   `op_statistic.csv`,找出 prefill 段占比最高的算子。工具链已就绪且本轮修好了
-   其自匹配 bug。
-2. **对照 H52 实测**:同一次 profile 即可读出 prefill D2H 相关主机段占比,
-   判断 4400 次 prefill_calls 里主机同步还剩多少。
-3. **若定位到 GDN conv1d/recurrent**:prefill 走 Triton/FLA 路径
-   (`qwen_gdn_linear_attn.py:228` 日志「Using Triton/FLA GDN prefill kernel」),
-   与 decode 的 custom op 不同,需单独优化。
-4. **若定位到 attention prefill 内核**:H42-②/③ 的页流水与 SIMD 内核可扩展到大 shape。
+1. **启用已有的 D57-① shunt(H59,本轮已实现)**:代码早就有"长上下文 prefill 交还
+   FIA"的机制,且注释引用了 E41/E46/E47/E63 三条独立证据说明 TI prefill 内核在长上下文
+   必然劣化。默认值从 0 改为 4096(`TILEINFER_PREFILL_MAX_CTX=0` 可显式关闭)。
+   预期:8K/16K 的 TTFT 直接回到 FIA 水平(16384 从 3146ms → ~1836ms,约 −42%),
+   TPOT 从 117.5 → ~78ms 转正;decode 优势(ITL 已领先)完整保留。
+2. **profile 定位**(零代码,一次窗口):`p_prof_side.sh` 双窗采集对比 TI vs FIA 的
+   `op_statistic.csv`,确认 shunt 后 prefill 段已无 TI 算子。
+3. **H52 D2H 实测**:同批 profile 读出打包/解包主机段,验证零 D2H 是否兑现。
+4. **若仍想赢下 prefill**:需针对 `aiv_vec_ratio=0.96 / mac=0.02`(E46)重做内核,
+   属新立项范畴(split 路线已由 E63 证否)。
 
 **方法论提醒**:TPOT 在 `output=128` 的场景被 TTFT 主导
 (`TPOT ≈ (TTFT + ITL×127)/128`),因此「ITL 领先」不能抵消「TTFT 落后」。
@@ -1135,25 +1135,38 @@ Reason: only supports "silu" or "none".
 → **TileInfer 的 decode 内核确实更快(ITL 领先 9–14%),但 prefill 慢 1.5–1.7 倍,
 把 TPOT 整体拉负。** 这是本轮最重要的定量结论:**优化重心必须转向 prefill**。
 
-### H57.3 排除假设:prefill shunt 不是长场景 TTFT 慢的原因
+### H57.3 【更正】prefill shunt 从未被启用——原"排除假设"结论无效
 
-原假设:`TILEINFER_PREFILL_MAX_CTX=4096` 把长 prefill shunt 回 FIA,shunt 本身有开销。
-实测(`TILEINFER_PREFILL_MAX_CTX=0` 关闭 shunt,其余逐字相同):
+**原记录有误,已作废**。原表把「shunt=4096」与「shunt=0」当作两个配置对比,实际上:
 
-| 场景 | shunt=4096 TTFT | shunt=0 TTFT | 差 | shunt=4096 TPOT | shunt=0 TPOT |
-|---|---|---|---|---|---|
-| 8192x128_c8 | 1592.4 | 1607.7 | +1.0% | 52.11 | 52.76 |
-| 16384x128_c8 | 3146.2 | 3428.0 | +9.0% | 117.50 | 116.42 |
+| 项 | 实际值 |
+|---|---|
+| `_PREFILL_MAX_CTX` 默认值 | **0(关闭)** |
+| E4 TI 侧启动脚本(`.work/tiserve/run.sh`) | **未设置该变量 → 0** |
+| E5 "noshunt" 脚本 | 显式 `TILEINFER_PREFILL_MAX_CTX=0` |
+| E4/E5 的 `prefill_long_skips` 计数 | **两次都是 0** |
 
-→ shunt 开关对 TTFT 几乎无影响(甚至关闭略差),**瓶颈在 prefill 本体**,
-不在分流策略。原假设推翻。
+→ **E4 与 E5 的 prefill 配置完全相同**,两次测量的 TTFT 差异(1592 vs 1608 / 3146 vs 3428)
+只是运行间噪声。原结论"shunt 开关对 TTFT 无影响"**不成立**,因为从未有过 shunt 开启的测量。
+
+**真实结论**:E4 中 8K/16K 的 TTFT 全部由 **TileInfer 自研 prefill 内核**产生
+(`prefill_calls=4400, prefill_long_skips=0`),这就是它比 FIA 慢 1.53x/1.71x 的原因。
+
+**而代码里已有针对性机制**(`vllm_ascend.py:203-209` 的 D57-① 注释):
+> TI prefill 内核的单位功效率随 KV 上下文线性劣化(E46 aiv_vec_ratio=0.96/mac=0.02 +
+> E47 同功线性扩展),C8 饱和下 8K/16K 场景整体吞吐仅 0.213x/0.121x(E41),
+> split 路线亦无增益(E63)
+
+即:**作者早已知道并实现了 shunt,只是默认关闭、且 E4 没打开**。原 H57.4 第 2 条
+"prefill 本体是瓶颈、无抓手"应更正为:**抓手就是打开 shunt(或在其基础上改进)**。
+
 
 ### H57.4 本轮结论与下一步
 
 1. **首胜**:短并发场景 TI 已明显领先 —— c8 TPOT +17.81%、吞吐 +159.77%(FIA 在该场景
    有异常,需复测确认);128x512_c8 +18.00%/+18.46%。
-2. **待解**:长场景 TTFT 慢 1.5–1.7 倍是当前最大缺口。ITL 已领先,说明只要把 prefill
-   拉到 FIA 水平,长场景 TPOT 即可转正(理论值:16384 若 TTFT=FIA,TPOT 从 117.5 → ~78)。
+2. **待解**:长场景 TTFT 慢 1.53x/1.71x 是当前最大缺口。**抓手已定位(D57-① 已实现但
+   默认关闭)**:让 KV 上下文超过阈值的 prefill 步交还 FIA。H59 把它改为默认启用。
 3. **c1 场景小幅落后(−10.59%)**:单请求无并发摊薄,decode 优势不足以覆盖固定开销。
 4. 下一步优先级:**prefill 路径攻坚**(H52 的 D2H 向量化已在代码里,需实测其 TTFT 收益;
    以及 H42-②/③ 的 per-page 成本矩阵用于定位 prefill 内核瓶颈)。
@@ -1236,3 +1249,35 @@ bash .agent_loop/run/h51_window_chain.sh
 
 
 
+
+## H59 长上下文 prefill 默认交还 FIA(D57-① 默认启用 + 决策前移,2026-10-19)
+
+### H59.1 背景:代码早有机制,但默认关着且 A/B 从未打开
+E238-2 的 P0 重锚显示:8K/16K 的 TTFT 为 1592/3146ms,而 FIA 为 1040/1836ms,
+慢 1.53x/1.71x,把 TPOT 拖成 −28.87%/−70.29%。同一批数据里 **ITL 却领先 9.2%/13.6%**
+(16.95 vs 18.66 / 19.09 vs 22.10)。
+
+而 `vllm_ascend.py` 里早有 D57-① 机制,注释引用了三条独立证据:
+> TI prefill 内核单位功效率随 KV 上下文线性劣化(E46 aiv_vec_ratio=0.96/mac=0.02 +
+> E47 同功线性扩展),C8 饱和下 8K/16K 整体吞吐仅 0.213x/0.121x(E41),
+> split 路线亦无增益(E63)
+
+**即作者早已定位到问题并实现了分流,只是 `_PREFILL_MAX_CTX` 默认 0(关闭),
+历次 A/B 基座也没有打开它** —— 所以这个负项一直挂在账上。
+
+### H59.2 改动
+| # | 内容 |
+|---|---|
+| ① | `_PREFILL_MAX_CTX` 默认 **0 → 4096**:≤4K 仍走 TI 内核,>4K 交还 FIA。显式 `=0` 恢复旧行为。 |
+| ② | **决策前移**:原实现在 `_expand_page_table` + `ragged_from_page_table_device` **之后**才判 shunt,被分流的步白付一次页表展开(含一次 D2H)。改为用 `seq_lens` 在展开前估上界 `ceil(seq_len/128)`:估 ≤ 阈值 → 真实值只会更小,安全继续;估 > 阈值 → 保守分流。保留展开后的兜底复查(防御性)。 |
+
+为什么用上界是安全的:页表推导的 real page count 可能因稀疏/尾部留空**小于** `ceil(seq_len/128)`,
+所以"估算 ≤ 阈值"蕴含"真实值 ≤ 阈值"(不会漏分流到长上下文);
+"估算 > 阈值"最多是**多分流**一个边界情况,代价只是回退 FIA(不会更慢)。
+
+### H59.3 契约与预期
+- CPU 契约:`test_vllm_ascend_prefill_ctx_shunt.py` 8 项通过
+  (含新增 `test_h59_default_shunts_long_context_only`);prefill 全族 **32 项通过**。
+- 预期(待 H51 窗口实测):16384 TTFT 3146 → ~1836ms(−42%),TPOT 117.5 → ~78ms 转正;
+  8K 同理;≤4K 短场景行为不变(仍在 TI 内核),decode 的 ITL 优势完整保留。
+- 判据:8K/16K ΔTPOT ≥ +15%,短场景 ΔTPOT 在 ±3% 内,`prefill_long_skips > 0`。
