@@ -49,9 +49,14 @@ def _init_env():
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.distributed import init_distributed_environment, initialize_model_parallel
 
-    init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://")
-    with set_current_vllm_config(VllmConfig()):
-        initialize_model_parallel(tensor_model_parallel_size=1)
+    # 套件内已初始化(gdn_reorder wiring 等先行测试触发 distributed 全局态,iter-204
+    # D141 后 install 链会提前拉起 worker patch 家族)时忽略,复用既有组。
+    try:
+        init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://")
+        with set_current_vllm_config(VllmConfig()):
+            initialize_model_parallel(tensor_model_parallel_size=1)
+    except Exception:  # noqa: BLE001 - 已初始化时复用
+        pass
 
 
 def _make(lens, seed=0, scale=0.2):

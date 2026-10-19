@@ -62,6 +62,21 @@ def _init_once():
         pass
 
 
+@pytest.fixture(autouse=True)
+def _vllm_cfg_ctx():
+    """测试体统一处于默认 config 上下文。
+
+    iter-204(D141)后 install 链在 wiring 类测试里提前拉起 worker patch 家族,
+    部分 CustomOp 转为构造期读 config(vllm/config/vllm.py:2224 断言);无上下文
+    的测试体随即报 "Current vLLM config is not set"。此 fixture 使本模块测试体
+    (不含 _init_once 自身,其自带 with 块)恒有 config。
+    """
+    from vllm.config import VllmConfig, set_current_vllm_config
+
+    with set_current_vllm_config(VllmConfig()):
+        yield
+
+
 def _make(t_total, seed=0, cu_dtype=torch.int64):
     import torch.nn.functional as F
 
