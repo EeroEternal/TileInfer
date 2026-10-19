@@ -1415,3 +1415,44 @@ h50_dense_bench.py(E172 修正形状,M∈{1,8}×9 形状,HBM-cold 流式口径,�
 - MatMulV3(F.linear)与 matmul 视图路径同水平,vendor 小 M GEMM 已最优;
 - dense 域后续攻击面=域内融合(H28 shared expert/相邻算子合并)与发射数削减。
 数据:`.agent_loop/run/h50_relay.log`(gitignored 过程产物)。
+
+## capture8 新基座权威重锚:c8 域正式达标(TPOT −34.0%/吞吐 +45.9%),c1 为唯一缺口(2026-10-20 iter-201,E258)
+
+**口径**:h65 双侧全 5 场景 ×32 prompts。FIA=baseline 全默认;TI=当前最优基座
+(TILEINFER_VLLM=1+decode/prefill/greedy+SIMD softmax+ktp 分带+H61 默认 MAX_CTX=1
++capture [1,4,8,32],D135)。在役探针 fallbacks=0,双侧 rc=0。
+
+| 场景 | FIA TPOT | TI TPOT | ΔTPOT | FIA 吞吐 | TI 吞吐 | Δ吞吐 |
+|---|---|---|---|---|---|---|
+| 128x128_c1 | 8.77 | 9.66 | **+10.2%**(慢) | 105.6 | 97.1 | −8.1% |
+| 128x128_c8 | 18.01 | 11.88 | **−34.0%** | 411.8 | 600.8 | **+45.9%** |
+| 128x512_c8 | 18.39 | 12.06 | −34.4% | 426.9 | 638.2 | +49.5% |
+| 8192x128_c8 | 38.60 | 33.99 | −12.0% | 160.3 | 176.6 | +10.2% |
+| 16384x128_c8 | 63.65 | 59.92 | −5.9% | 95.0 | 98.9 | +4.0% |
+
+- **判决**:按达成标准「c1/c8 吞吐 ≥30% 或 TPOT −≥30%,其余 ±5% 内」——
+  **c8 双指标达标**(TPOT −34.0%/吞吐 +45.9%);其余场景全改善零劣化;
+  **c1 未达标(+10.2%)=唯一缺口**。c8 达成=capture8(H64)+ TI decode 内核优势叠加兑现。
+- c1 缺口 0.89ms/步;py-spy 定位见下节。
+
+## H63-② b1/c1 host 段判决:主采样点=per-replay full sync,但消除三路径全零增益——非可回收成分(2026-10-20 iter-201,E257/E259/E261)
+
+**取证链**:py-spy 在役采样(c8:1174 样本,c1:1389 样本,250Hz)——
+`torch.npu.synchronize@acl_graph.py:256` 单点占 33.0-35.8%(调用链 100% ←
+`_model_forward` ← `execute_model`),为 vllm-ascend FULL 图模式每次 replay 前的
+host 排空屏障(防 update_attn_params 与 replay 的 param 槽位竞争)。
+
+**消除实验**(TI capture8 基座,权威 5 场景):
+| 手段 | c1 TPOT | vs 基线 | 结论 |
+|---|---|---|---|
+| h65 基线(host sync) | 9.66 | — | — |
+| h66 ENPU_ENABLE(sync 换位到 update 前) | 9.68 | +0.2% | 零增益 |
+| h68 FG event 化(#11915 移植,update 等 replay-done event) | 9.60 | −0.6% | 零增益 |
+
+- **判决**:sync 等待时长=设备必要工作时间(汇合点),不构成步长可回收成分;
+  「消除 sync ⇒ 收益」链路 disproven。h68 8192 场景 json 收割串档(数据无效,
+  其余 4 场景有效;8192 补测待下轮)。
+- **vendor patch 备案**(D137):PR #11915 移植保留于 .venv(默认关=零行为变化,
+  备份+还原命令在 `.agent_loop/run/pr11915/backup/` 与 DECISIONS D137)。
+- **c1 下一步**:per-step perf_counter 打点分解(H65 候选),精确记账 ~2.9ms
+  host 暴露段后重排攻击序。
