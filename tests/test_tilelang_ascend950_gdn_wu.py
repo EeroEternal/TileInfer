@@ -52,8 +52,11 @@ def _init_env():
     # 套件内已初始化(gdn_reorder wiring 等先行测试触发 distributed 全局态,iter-204
     # D141 后 install 链会提前拉起 worker patch 家族)时忽略,复用既有组。
     try:
-        init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://")
+        # init_world_group 链内 CustomOp 构造要求 config 上下文(iter-205 修复:
+        # 无上下文时抛 "Current vLLM config is not set" 被吞,留下 torch 已 init
+        # 而 vllm _WORLD 未建的分裂态,连坐后续文件 PCP 兜底)。
         with set_current_vllm_config(VllmConfig()):
+            init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://")
             initialize_model_parallel(tensor_model_parallel_size=1)
     except Exception:  # noqa: BLE001 - 已初始化时复用
         pass

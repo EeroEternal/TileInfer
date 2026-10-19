@@ -60,8 +60,14 @@ def _init_once():
     with set_current_vllm_config(VllmConfig()):
         try:
             if getattr(_ps, "_WORLD", None) is None:
+                # torch.distributed 已 init 时 vllm 的 backend fallback(仅存在于
+                # torch-init 分支内)被跳过,默认 "nccl" 会撞 "Distributed package
+                # doesn't have NCCL built in"(本机 torch 无 NCCL 编译,iter-205
+                # E274);显式选可用 backend,与 vllm 自身 fallback 语义一致。
+                _world_backend = "nccl" if torch.distributed.is_nccl_available() else "gloo"
                 init_distributed_environment(world_size=1, rank=0, local_rank=0,
-                                             distributed_init_method="env://")
+                                             distributed_init_method="env://",
+                                             backend=_world_backend)
         except Exception:  # noqa: BLE001
             pass
         try:
