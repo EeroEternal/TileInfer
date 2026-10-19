@@ -1862,6 +1862,16 @@ def install_gdn_proj_fusion() -> bool:
     global _GDN_PROJ_INSTALLED
     if _GDN_PROJ_INSTALLED:
         return True
+    # E272:worker patch(patch_qwen3_5:207 ``_GDN_PATCH_TARGET.forward =
+    # AscendGatedDeltaNetAttention.forward``)执行于 NPUWorker.__init__ 的
+    # adapt_patch(),晚于 install()(EngineCore.__init__ 的 load_general_plugins)
+    # 时会覆盖本包装 → 在役 calls=0(h68 探针复现)。先主动触发该 patch(幂等
+    # import,模块缓存保证仅执行一次),使 wrapper 恒居 patch 之上;两种时序下
+    # 均成立(patch 先行时此处为空操作)。
+    try:
+        import vllm_ascend.patch.worker.patch_qwen3_5  # noqa: F401
+    except Exception:  # noqa: BLE001 - 非 Qwen3.5 栈或 vendor 布局变更时静默
+        pass
     from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
         QwenGatedDeltaNetAttention as _gdn_cls,
     )
@@ -1921,6 +1931,11 @@ def install_gdn_proj_reorder() -> bool:
     global _GDN_REORDER_INSTALLED
     if _GDN_REORDER_INSTALLED:
         return True
+    # 同 H68 gdnproj:先主动触发 worker patch(幂等),防 adapt_patch 后行覆盖包装(E272)。
+    try:
+        import vllm_ascend.patch.worker.patch_qwen3_5  # noqa: F401
+    except Exception:  # noqa: BLE001 - 非 Qwen3.5 栈或 vendor 布局变更时静默
+        pass
     from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
         QwenGatedDeltaNetAttention as _gdn_cls,
     )
