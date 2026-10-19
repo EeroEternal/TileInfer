@@ -31,9 +31,12 @@ def build_fused_inproj_weight(layer: torch.nn.Module) -> torch.Tensor | None:
     """为 GDN 层构建 ``[n_qkvz + n_ba, hidden]`` fused 权重;守卫不满足返回 None。
 
     返回 None 时调用方应缓存失败标记,避免每步重复守卫(静态条件,不会自愈)。
+
+    两种 checkpoint 布局都支持(Qwen3.6-35B-A3B 是后者):
+    * ``gqa_interleaved_layout=True``(Qwen3-Next):qkvz / ba 各自按 k-head 组交错;
+    * ``gqa_interleaved_layout=False``(Qwen3.5):qkvz 为 ``[q|k|v|z]`` 四段拼接,
+      ba 为 ``[b|a]`` 两段——权重 cat 后按段切回即可,无需重排。
     """
-    if not getattr(layer, "gqa_interleaved_layout", False):
-        return None
     if getattr(layer, "tp_size", 1) != 1:
         # TP>1 时 in_proj_ba 可能 disable_tp(复制)而 qkvz 分片,cat 语义不成立
         return None
@@ -60,11 +63,13 @@ def build_fused_inproj_weight(layer: torch.nn.Module) -> torch.Tensor | None:
 
 def fused_forward_cuda(layer: torch.nn.Module, hidden_states: torch.Tensor,
                        output: torch.Tensor) -> bool:
-    """H32 融合路径的 ``forward_cuda`` 替身;返回是否接管。
+    """H32 融合路径的 forward 替身;返回是否接管。
 
-    尾部(in_proj 之后的 ordering→rearrange→core op→output projection)与上游
-    ``QwenGatedDeltaNetAttention.forward_cuda`` 的 interleaved 分支逐行同构
-    (vllm 0.23.0 qwen_gdn_linear_attn.py:908-967);上游演进时本函数需同步复核。
+    同时支持两种布局(vllm 0.23.0 qwen_gdn_linear_attn.py:908-967):
+    * ``gqa_interleaved_layout=True``:ordering → 3×rearrange → cat;
+    * ``gqa_interleaved_layout=False``(Qwen3.5,本模型):qkvz 按
+      ``[qkv_size, z_size]`` 切分、ba 按 ``chunk(2)`` 切 b/a —— 与上游逐行同构。
+    上游演进时本函数需同步复核。
     """
     weight = getattr(layer, "_tileinfer_fused_inproj", None)
     if weight is None:
@@ -79,15 +84,25 @@ def fused_forward_cuda(layer: torch.nn.Module, hidden_states: torch.Tensor,
     num_tokens = hidden_states.size(0)
     fused = torch.nn.functional.linear(hidden_states, weight)
     n_qkvz = layer.in_proj_qkvz.weight.shape[0]
-    # 零拷贝 strided 切片:ordering 函数内部的 view 仅拆分末维(E101)
+    # 零拷贝 strided 切片:下游只做切分/纯维度 view(E101)
     mixed_qkvz = fused[:, :n_qkvz]
     ba = fused[:, n_qkvz:]
 
-    query, key, value, z, b, a = layer.fix_query_key_value_ordering(mixed_qkvz, ba)
-    query, key, value = map(
-        lambda x: rearrange(x, "l p d -> l (p d)"), (query, key, value)
-    )
-    mixed_qkv = torch.cat((query, key, value), dim=-1)
+    if getattr(layer, "gqa_interleaved_layout", False):
+        query, key, value, z, b, a = layer.fix_query_key_value_ordering(mixed_qkvz, ba)
+        query, key, value = map(
+            lambda x: rearrange(x, "l p d -> l (p d)"), (query, key, value)
+        )
+        mixed_qkv = torch.cat((query, key, value), dim=-1)
+    else:
+        # Qwen3.5:权重已是 [q, k, v, z] / [b, a] 顺序,与上游 forward_cuda 同构
+        qkv_size = (layer.key_dim * 2 + layer.value_dim) // layer.tp_size
+        z_size = layer.value_dim // layer.tp_size
+        mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
+        z = z.reshape(z.size(0), -1, layer.head_v_dim)
+        b, a = layer.split_ba(ba)
+        b = b.contiguous()
+        a = a.contiguous()
 
     core_attn_out = torch.zeros(
         (num_tokens, layer.num_v_heads // layer.tp_size, layer.head_v_dim),

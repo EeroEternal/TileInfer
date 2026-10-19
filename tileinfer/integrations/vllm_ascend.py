@@ -1825,9 +1825,13 @@ def install_gdn_proj_fusion() -> bool:
     from tileinfer.kernels.gdn.proj_fusion import fused_forward_cuda
 
     cls_stats = TileInferDecodeAttention._stats
-    _original = _gdn_cls.forward_cuda
+    # 挂点必须落在**实际被调用的** forward 上:本栈 vllm-ascend 的
+    # patch_qwen3_5 把 ``QwenGatedDeltaNetAttention.forward`` 换成了
+    # ``AscendGatedDeltaNetAttention.forward``(gdn.py:67),该类直接内联了
+    # in_proj 段、从不调用 ``forward_cuda`` —— 旧挂点因此恒不触发(在役计数 0)。
+    _original = _gdn_cls.forward
 
-    def _forward_cuda(self, hidden_states, output):
+    def _forward(self, hidden_states, output):
         if ops_enabled("gdnproj"):
             try:
                 if fused_forward_cuda(self, hidden_states, output):
@@ -1842,7 +1846,7 @@ def install_gdn_proj_fusion() -> bool:
                 )
         return _original(self, hidden_states, output)
 
-    _gdn_cls.forward_cuda = _forward_cuda
+    _gdn_cls.forward = _forward
     _gdn_cls._tileinfer_gdnproj_installed = True
     _GDN_PROJ_INSTALLED = True
     logger.info("TileInfer GDN in_proj fusion dispatch installed (H32, TILEINFER_OPS governs)")
@@ -1880,11 +1884,13 @@ def install_gdn_proj_reorder() -> bool:
     from tileinfer.kernels.gdn.reorder import fused_forward_reordered
 
     cls_stats = TileInferDecodeAttention._stats
-    # _original 是安装时刻的 forward_cuda:gdnproj 先装时即 H32 包装(回落链
+    # 挂点同 H32:必须落在实际被调用的 ``forward`` 上(本栈 patch_qwen3_5 用
+    # AscendGatedDeltaNetAttention.forward 覆盖了基类,forward_cuda 不被调用)。
+    # _original 是安装时刻的 forward:gdnproj 先装时即 H32 包装(回落链
     # H34→H32→原实现);单独安装时即原实现。
-    _original = _gdn_cls.forward_cuda
+    _original = _gdn_cls.forward
 
-    def _forward_cuda(self, hidden_states, output):
+    def _forward(self, hidden_states, output):
         if ops_enabled("gdnreorder"):
             try:
                 if fused_forward_reordered(self, hidden_states, output):
@@ -1899,7 +1905,7 @@ def install_gdn_proj_reorder() -> bool:
                 )
         return _original(self, hidden_states, output)
 
-    _gdn_cls.forward_cuda = _forward_cuda
+    _gdn_cls.forward = _forward
     _gdn_cls._tileinfer_gdnreorder_installed = True
     _GDN_REORDER_INSTALLED = True
     logger.info(
@@ -1922,9 +1928,11 @@ def install_gdn_small_fusion() -> bool:
     3. ``vllm_ascend.ops.gdn.l2norm_fwd`` 配对融合包装,q/k 为同一连续缓冲相邻区
        (seq_len==1)时一次内核,与两次调用数值等价(逐行归一与分组无关)。
 
-    全部按 ``ops_enabled("gdnsmall")`` 每步读取,异常回退原实现;三处全部就绪才
-    安装(部分失败整体放弃,不产生半接管态);须在引擎构建前安装(install() 时序,
-    同 gdnproj 先例)。
+    全部按 ``ops_enabled("gdnsmall")`` 每步读取,异常回退原实现。
+    ``npu_causal_conv1d_custom`` 是 CANN 自定义算子,由 ``ASCEND_CUSTOM_OPP_PATH`` 在
+    引擎初始化期加载,常晚于本插件的 install() —— 因此采用**部分安装 + 惰性补装**:
+    rearrange / l2norm 立即生效,conv1d 包装在首次 GDN forward 时若算子已就绪再补上。
+    须在引擎构建前安装(install() 时序,同 gdnproj 先例)。
     """
     global _GDN_SMALL_INSTALLED
     if _GDN_SMALL_INSTALLED:
@@ -1949,31 +1957,83 @@ def install_gdn_small_fusion() -> bool:
 
     _orig_l2 = getattr(_gdn_mod, "l2norm_fwd", None)
     if _orig_conv is None or _orig_l2 is None:
-        logger.warning(
-            "TileInfer GDN small fusion not installed: npu_causal_conv1d_custom="
-            f"{_orig_conv is not None}, l2norm_fwd={_orig_l2 is not None}"
+        # npu_causal_conv1d_custom 是 CANN 自定义算子,由 ASCEND_CUSTOM_OPP_PATH 在
+        # 引擎初始化期加载,可能晚于本插件的 install()(插件在 platform 注册阶段运行)。
+        # 此时不做"整体放弃",而是只装可用的部分,并留一个惰性重试钩子:第一次
+        # GDN forward 时若算子已就绪,再补齐 conv1d 包装。
+        if _orig_l2 is None:
+            logger.warning(
+                "TileInfer GDN small fusion not installed: l2norm_fwd missing "
+                f"(npu_causal_conv1d_custom={_orig_conv is not None})"
+            )
+            return False
+        _install_gdnsmall_partial(_gdn_cls, _gdn_mod, _ns, _orig_l2)
+        logger.info(
+            "TileInfer GDN small fusion partially installed (rearrange + l2norm); "
+            "conv1d op not registered yet, will retry lazily on first GDN forward"
         )
-        return False
+        return True
 
+    _install_gdnsmall_partial(_gdn_cls, _gdn_mod, _ns, _orig_l2, _orig_conv)
+
+
+def _install_gdnsmall_partial(
+    gdn_cls, gdn_mod, conv_ns, orig_l2, orig_conv=None
+) -> None:
+    """装上 H35 的可装部分:rearrange + l2norm 恒装;conv1d 仅在算子已注册时装。
+
+    CANN 自定义算子 ``npu_causal_conv1d_custom`` 由 ``ASCEND_CUSTOM_OPP_PATH`` 在引擎
+    初始化期加载,可能晚于插件 install()。若此时缺失,先在 GDN forward 上挂一个一次性
+    重试:首次调用时若算子就绪则补装 conv1d 包装(其余两项已生效,不影响正确性)。
+    """
     from tileinfer.kernels.gdn import small_ops
 
+    global _GDN_SMALL_INSTALLED
     cls_stats = TileInferDecodeAttention._stats
     small_ops._stats_sink = lambda name: cls_stats.__setitem__(
         name, cls_stats.get(name, 0) + 1
     )
-    small_ops._orig_conv = _orig_conv
-    small_ops._orig_l2norm = _orig_l2
-    small_ops._conv_ns = _ns
-    _gdn_cls._tileinfer_rearrange_orig = _gdn_cls.__dict__["rearrange_mixed_qkv"]
-    _gdn_cls.rearrange_mixed_qkv = small_ops.cat_free_rearrange
-    setattr(_ns, "npu_causal_conv1d_custom", small_ops.make_conv1d_wrapper(_orig_conv))
-    _gdn_mod.l2norm_fwd = small_ops.make_l2norm_wrapper(_orig_l2)
-    _gdn_cls._tileinfer_gdnsmall_installed = True
-    _GDN_SMALL_INSTALLED = True
-    logger.info(
-        "TileInfer GDN small fusion dispatch installed (H35, TILEINFER_OPS governs)"
-    )
-    return True
+    small_ops._orig_l2norm = orig_l2
+    small_ops._conv_ns = conv_ns
+    if orig_conv is not None:
+        small_ops._orig_conv = orig_conv
+
+    if getattr(gdn_cls, "_tileinfer_rearrange_orig", None) is None:
+        gdn_cls._tileinfer_rearrange_orig = getattr(gdn_cls, "rearrange_mixed_qkv", None)
+    if gdn_cls._tileinfer_rearrange_orig is not None:
+        gdn_cls.rearrange_mixed_qkv = small_ops.cat_free_rearrange
+    gdn_mod.l2norm_fwd = small_ops.make_l2norm_wrapper(orig_l2)
+
+    if orig_conv is not None and conv_ns is not None:
+        setattr(conv_ns, "npu_causal_conv1d_custom", small_ops.make_conv1d_wrapper(orig_conv))
+        gdn_cls._tileinfer_gdnsmall_installed = True
+        _GDN_SMALL_INSTALLED = True
+        logger.info(
+            "TileInfer GDN small fusion dispatch installed (H35, TILEINFER_OPS governs)"
+        )
+        return
+
+    # conv1d 算子尚未注册:挂一次性重试钩子(包装最外层 forward,成功即自摘)。
+    _prev_forward = gdn_cls.forward
+    _retry_state = {"done": False}
+
+    def _forward_with_conv_retry(self, hidden_states, output):
+        if not _retry_state["done"]:
+            _retry_state["done"] = True
+            ns = getattr(torch.ops, "_C_ascend", None)
+            conv = getattr(ns, "npu_causal_conv1d_custom", None) if ns is not None else None
+            if conv is not None:
+                small_ops._orig_conv = conv
+                small_ops._conv_ns = ns
+                setattr(ns, "npu_causal_conv1d_custom", small_ops.make_conv1d_wrapper(conv))
+                gdn_cls._tileinfer_gdnsmall_installed = True
+                _GDN_SMALL_INSTALLED = True
+                logger.info(
+                    "TileInfer GDN small fusion conv1d wrapper installed lazily (H35)"
+                )
+        return _prev_forward(self, hidden_states, output)
+
+    gdn_cls.forward = _forward_with_conv_retry
 
 
 _SAMPLER_TOPK_INSTALLED = False

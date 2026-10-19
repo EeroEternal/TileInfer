@@ -262,10 +262,12 @@ def test_install_gdn_proj_reorder_wiring():
 
     from tileinfer.integrations.vllm_ascend import install_gdn_proj_reorder
 
-    original = cls.forward_cuda
+    original = cls.forward
     assert install_gdn_proj_reorder() is True
     assert getattr(cls, "_tileinfer_gdnreorder_installed", False)
-    assert cls.forward_cuda is not original
+    # 挂点=forward(不是 forward_cuda):本栈 vllm-ascend patch_qwen3_5 已用
+    # AscendGatedDeltaNetAttention.forward 覆盖基类,forward_cuda 不再被调用。
+    assert cls.forward is not original
     assert install_gdn_proj_reorder() is True  # 幂等
     assert getattr(cls, "_tileinfer_gdnproj_installed", False) is not None
     # 独立失败缓存命名,与 H32 互不可见(契约:对象级属性缺省)

@@ -128,7 +128,10 @@ def test_build_fused_weight_guards():
     fused = build_fused_inproj_weight(make_layer())
     assert fused is not None and torch.equal(fused, torch.cat([w_qkvz, w_ba], 0))
 
-    assert build_fused_inproj_weight(make_layer(gqa_interleaved_layout=False)) is None
+    # Qwen3.5 布局(gqa_interleaved_layout=False)同样可融合:权重 cat 后按段切回,
+    # 本模型(Qwen3.6-35B-A3B)走这条分支。
+    qwen35 = build_fused_inproj_weight(make_layer(gqa_interleaved_layout=False))
+    assert qwen35 is not None and torch.equal(qwen35, torch.cat([w_qkvz, w_ba], 0))
     assert build_fused_inproj_weight(make_layer(tp_size=2)) is None
     assert build_fused_inproj_weight(make_layer(quant_config=object())) is None
     assert build_fused_inproj_weight(make_layer(in_proj_ba=None)) is None
@@ -141,12 +144,12 @@ def test_build_fused_weight_guards():
 
 
 def test_failed_guard_is_cached():
-    layer = types.SimpleNamespace(  # 守卫失败:非 interleaved
+    layer = types.SimpleNamespace(  # 守卫失败:ba 权重 K 维不匹配
         gqa_interleaved_layout=False,
         tp_size=1,
         quant_config=None,
         in_proj_qkvz=types.SimpleNamespace(weight=torch.randn(12288, HIDDEN)),
-        in_proj_ba=types.SimpleNamespace(weight=torch.randn(64, HIDDEN)),
+        in_proj_ba=types.SimpleNamespace(weight=torch.randn(64, HIDDEN * 2)),
     )
     x = torch.randn(M, HIDDEN)
     out = torch.empty_like(x)
@@ -154,6 +157,41 @@ def test_failed_guard_is_cached():
     assert getattr(layer, "_tileinfer_fused_inproj_failed", False) is True
     assert fused_forward_cuda(layer, x, out) is False  # 第二次直接短路
     assert getattr(layer, "_tileinfer_fused_inproj", None) is None
+
+
+def test_qwen35_layout_fused_slices_match_separate():
+    """Qwen3.5 布局(gqa_interleaved_layout=False,本模型):融合 GEMM 的两段输出
+    与两次独立 GEMM 逐位相同——即融合不改变下游消费的张量内容。"""
+    layer = _ordering_layer()
+    layer.gqa_interleaved_layout = False
+    layer.key_dim = HK * DK
+    layer.value_dim = HV * DV
+    layer.num_v_heads = HV
+    layer.head_v_dim = DV
+    layer.tp_size = 1
+    layer.disable_tp_for_ba_proj = False
+
+    w_qkvz, w_ba = _interleaved_weights(13)
+    fused_w = torch.cat([w_qkvz, w_ba], dim=0)
+    x = torch.randn(M, HIDDEN)
+
+    y_qkvz = x @ w_qkvz.T
+    y_ba = x @ w_ba.T
+    y_fused = x @ fused_w.T
+
+    n_qkvz = w_qkvz.shape[0]
+    assert torch.equal(y_fused[:, :n_qkvz], y_qkvz)
+    assert torch.equal(y_fused[:, n_qkvz:], y_ba)
+
+    # 上游 Qwen3.5 分支的切分语义(与 fused_forward_cuda 的 else 分支同构)
+    qkv_size = (layer.key_dim * 2 + layer.value_dim) // layer.tp_size
+    z_size = layer.value_dim // layer.tp_size
+    mk_sep, z_sep = y_qkvz.split([qkv_size, z_size], dim=-1)
+    mk_fus, z_fus = y_fused[:, :n_qkvz].split([qkv_size, z_size], dim=-1)
+    assert torch.equal(mk_sep, mk_fus)
+    assert torch.equal(z_sep, z_fus)
+    assert torch.equal(layer.split_ba(y_ba)[0], layer.split_ba(y_fused[:, n_qkvz:])[0])
+    assert torch.equal(layer.split_ba(y_ba)[1], layer.split_ba(y_fused[:, n_qkvz:])[1])
 
 
 @pytest.mark.npu

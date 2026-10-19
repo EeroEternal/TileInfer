@@ -61,7 +61,15 @@ def reorder_rows_plan(num_k_heads: int, num_v_heads: int, head_k_dim: int,
 
 
 def build_reordered_inproj_weight(layer: torch.nn.Module) -> torch.Tensor | None:
-    """构建终序 fused 权重;守卫(继承 H32)或形状不符返回 None。"""
+    """构建终序 fused 权重;守卫(继承 H32)或形状不符返回 None。
+
+    仅支持 ``gqa_interleaved_layout=True``(Qwen3-Next):行重排 plan 是按
+    "qkvz/ba 各自按 k-head 组交错"的 checkpoint 序推导的。Qwen3.5 布局
+    (``False``,本模型 Qwen3.6-35B-A3B)的权重已是 ``[q|k|v|z]``/``[b|a]`` 段序,
+    没有可消除的 ordering 拷贝 —— 此时返回 None,由 H32 路径接管即可。
+    """
+    if not getattr(layer, "gqa_interleaved_layout", False):
+        return None
     base = build_fused_inproj_weight(layer)
     if base is None:
         return None
