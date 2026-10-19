@@ -3,15 +3,15 @@
 背景(E41/E46/E47/E63/D57):TI prefill 内核单位功效率随 KV 上下文线性劣化
 (aiv_vec_ratio=0.96、同功线性扩展),C8 饱和下 8K/16K 场景吞吐仅 0.213x/0.121x,
 split 路线(ktp=64)亦无增益(0.226x/0.130x)。D57-① 把 KV 上下文超阈的 prefill 步
-交还原生 FIA(decode 接管不受影响),env ``TILEINFER_PREFILL_MAX_CTX``(token,
-0=默认关闭,行为零变化)。
+交还原生 FIA(decode 接管不受影响),env ``TILEINFER_PREFILL_MAX_CTX``(token;
+H59 起**默认 4096** 即启用,显式 0 关闭)。
 
 锁定契约:
   1. 决策纯函数 ``_prefill_ctx_shunt``:阈值关闭(<=0)恒 False;空页表恒 False;
      严格大于才分流(等于阈值不算超阈);页数按 KERNEL_PAGE_SIZE=128 换算;
   2. 模块状态:``_PREFILL_STATS`` 计数器在位(在役探针 prefill_long_skips 视图);
      ``_PREFILL_SKIP_GUARD`` 初始空(分流步其余层的短路键);
-  3. env 旋钮默认 0(默认部署行为零变化);
+  3. env 旋钮默认 4096(H59);显式 0 = 关闭,恢复旧行为;
   4. metrics 合并语义:dump 视图含 prefill_long_skips 键(空进程静默守卫不受影响,
      该键不参与静默判定)。
 """
@@ -35,10 +35,29 @@ pytestmark = pytest.mark.skipif(not _HAVE_MOD, reason="vllm_ascend integration u
 
 
 def test_shunt_disabled_by_default_and_zero_threshold():
-    # 阈值 <=0(含默认 0)恒不分流——默认部署行为零变化
-    assert mod._PREFILL_MAX_CTX == 0 or isinstance(mod._PREFILL_MAX_CTX, int)
+    # H59:默认值由 0 改为 4096(见 vllm_ascend.py 的 H59 注释与 E238-2 证据)。
+    # 阈值 <=0 仍表示"关闭",显式 0 可恢复旧行为。
+    assert isinstance(mod._PREFILL_MAX_CTX, int)
+    assert mod._PREFILL_MAX_CTX == 4096, "H59:默认应启用 shunt(4096 token)"
     assert mod._prefill_ctx_shunt([999999], 0) is False
     assert mod._prefill_ctx_shunt([999999], -1) is False
+
+
+def test_h59_default_shunts_long_context_only():
+    """H59 契约:默认阈值下,≤4K 走 TI 内核、>4K 交还 FIA。
+
+    依据 E238-2:未开 shunt 时 8K/16K TTFT 慢 1.53x/1.71x,而 ITL 已领先
+    9.2%/13.6% —— decode 接管是正收益,唯一负项是长 prefill。
+    """
+    th = mod._PREFILL_MAX_CTX
+    assert th == 4096
+    # 短/中上下文:仍由 TI 内核接管(不 shunt)
+    assert mod._prefill_ctx_shunt([1], th) is False
+    assert mod._prefill_ctx_shunt([32], th) is False    # 32*128 == 4096
+    # 长上下文:交还 FIA
+    assert mod._prefill_ctx_shunt([33], th) is True     # 33*128 == 4224
+    assert mod._prefill_ctx_shunt([64], th) is True     # 8192
+    assert mod._prefill_ctx_shunt([128], th) is True    # 16384
 
 
 def test_shunt_empty_pages_never_shunts():

@@ -204,9 +204,15 @@ _PREFILL_KV_TILE_PAGES = int(__import__("os").environ.get("TILEINFER_PREFILL_KV_
 # 上下文线性劣化(E46 aiv_vec_ratio=0.96/mac=0.02 + E47 同功线性扩展),C8 饱和下 8K/16K
 # 场景整体吞吐仅 0.213x/0.121x(E41),split 路线亦无增益(E63);把 KV 上下文(按内核页
 # 128 token 粒度上取整)超过该阈值的 prefill 步交还 vLLM 原生 FIA 路径——decode 接管
-# (P8 已在役)不受影响。0 = 关闭(默认,行为零变化);决策零新增同步(读的 pages_host
-# 是共享构建链本来就要算的量)。
-_PREFILL_MAX_CTX = int(__import__("os").environ.get("TILEINFER_PREFILL_MAX_CTX", "0") or 0)
+# (P8 已在役)不受影响。决策零新增同步(读的 pages_host 是共享构建链本来就要算的量)。
+#
+# H59:默认值由 0 改为 4096。E238-2 的 P0 重锚实测:未开 shunt 时 8K/16K 的 TTFT 为
+# 1592/3146ms,而 FIA 为 1040/1836ms(慢 1.53x/1.71x),TPOT 被拖成 −28.87%/−70.29%;
+# 与此同时 ITL 已领先 9.2%/13.6%,说明 decode 接管是正收益、唯一的负项就是长 prefill。
+# 阈值 4096 与历次 A/B(h43/h51 链)基座一致:≤4K 仍走 TI 内核(短上下文单位功效率
+# 尚可,且其 unpack/schedule 已按 H52 去 D2H),>4K 交还 FIA。
+# 显式 `TILEINFER_PREFILL_MAX_CTX=0` 可恢复旧行为(全走 TI 内核)。
+_PREFILL_MAX_CTX = int(__import__("os").environ.get("TILEINFER_PREFILL_MAX_CTX", "4096") or 0)
 
 #: D57-① 在役探针计数(被分流回 FIA 的 prefill 步数;metrics dumper 合并输出)。
 _PREFILL_STATS: Dict[str, int] = {"prefill_long_skips": 0}
@@ -483,6 +489,36 @@ def prefill_step(
             _refuse("tile bound", max_tiles, PREFILL_MAX_TILES)
             return False
 
+        # H59-②:长上下文 shunt 提前到**页表展开之前**。
+        #
+        # 原实现把 D57-① 的决策放在 ``_expand_page_table`` + ``ragged_from_page_table_device``
+        # 之后,只为读 ``pages_host`` —— 但被分流的步根本用不到这些结果,等于每个长 prefill
+        # 步都白付一次页表展开(含一次 D2H)。这里改用 ``seq_lens`` 直接估算上限:
+        # 内核页数 = ceil(seq_len / KERNEL_PAGE_SIZE),与页表推导出的值**同界且不更小**
+        # (页表可能因稀疏/尾部留空给出更小的 real page count),因此:
+        #   - 若估算已 <= 阈值 → 真实值只会更小 → 必不分流,可安全继续走 TI 内核;
+        #   - 若估算 > 阈值 → 保守分流(宁可多分流,也不在长上下文用慢内核)。
+        # ``seq_lens`` 已在设备上且每步本来就要读,这里只多一次 tiny D2H,与旧实现同量级,
+        # 但把整条页表展开从被分流步的关键路径上摘掉。
+        _ctx_pages_upper = None
+        if _PREFILL_MAX_CTX > 0:
+            _seq_host = seq_lens[:num_reqs].to(torch.int64).cpu().tolist()
+            _ctx_pages_upper = [
+                -(-int(s) // KERNEL_PAGE_SIZE) for s in _seq_host
+            ]
+            if _prefill_ctx_shunt(_ctx_pages_upper, _PREFILL_MAX_CTX):
+                _PREFILL_STATS["prefill_long_skips"] = (
+                    _PREFILL_STATS.get("prefill_long_skips", 0) + 1
+                )
+                if step_id is not None:
+                    _PREFILL_SKIP_GUARD = (step_id, num_reqs, int(query.shape[0]))
+                _refuse(
+                    "ctx shunt (early)",
+                    max(_ctx_pages_upper) * KERNEL_PAGE_SIZE,
+                    _PREFILL_MAX_CTX,
+                )
+                return False
+
         from tileinfer.metadata import ragged_from_page_table_device
         from tileinfer.plan import plan_query_tiles_from_host
         from tileinfer.kernels.attention.paged_decode_ascend950 import declared_pool_cap
@@ -514,15 +550,16 @@ def prefill_step(
         # per layer, and went through plan_query_tiles' per-row ``.item()`` storm on top).
         pages_host = (meta.kv_indptr[1:] - meta.kv_indptr[:-1]).to(torch.int64).cpu().tolist()
 
-        # D57-①(W1 收尾):长上下文 prefill 步分流回退 FIA。决策在共享面构建之后、
-        # split 规划/形状登记之前——同一步其余层走顶部短路,一步只付一次页表展开。
+        # D57-① 的决策已前移到 H59-②(页表展开之前)。这里保留一次兜底复查:
+        # 早期用 ``seq_lens`` 估的是**上界**,若页表给出的 real page count 反而更大
+        # (理论上不该发生,防御性保留),仍按真实值再判一次;正常路径不会命中。
         if _prefill_ctx_shunt(pages_host, _PREFILL_MAX_CTX):
             _PREFILL_STATS["prefill_long_skips"] = (
                 _PREFILL_STATS.get("prefill_long_skips", 0) + 1
             )
             if step_id is not None:
                 _PREFILL_SKIP_GUARD = (step_id, num_reqs, int(query.shape[0]))
-            _refuse("ctx shunt", max(pages_host) * KERNEL_PAGE_SIZE, _PREFILL_MAX_CTX)
+            _refuse("ctx shunt (post-expand)", max(pages_host) * KERNEL_PAGE_SIZE, _PREFILL_MAX_CTX)
             return False
 
         # H19: split-KV prefill.  ``TILEINFER_PREFILL_KV_TILE_PAGES`` splits every q-block tile
