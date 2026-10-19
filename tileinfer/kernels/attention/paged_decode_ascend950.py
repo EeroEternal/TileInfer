@@ -2316,18 +2316,40 @@ def forward_prefill(
         .contiguous()
     )
 
-    q_packed = torch.zeros((num_tiles * kv_heads, br, dim), dtype=q.dtype, device=q.device)
+    # P3 padded tiles (q_len == 0, seq_id -> trash row) carry no query rows; they stay zero in
+    # ``q_packed`` and are skipped on unpack.  Everything the kernel sees stays shape-static.
+    #
+    # Pack/unpack are index-driven instead of per-tile Python loops: the old form did
+    # ``nonzero().tolist()`` + 3 ``.item()`` per tile (a D2H sync each) + one slice launch per
+    # (tile, kv_head).  At L=8192 that is ~256 tiles → ~1.5k syncs and ~2k launches on every
+    # prefill call, which the TTFT budget cannot afford.  The schedule tensors are already on
+    # the device, so both directions become one vectorized gather/scatter with **zero** D2H.
+    num_slots = num_tiles * kv_heads
+    rows_per_req = max_qo_len * group
+    dev = q.device
+    # Flat row index of each packed slot's first row inside ``q_flat`` ([batch, kv_heads, rows, dim]).
+    seq_ids64 = schedule.seq_ids.to(device=dev, dtype=torch.int64)
+    q_off64 = schedule.q_offsets.to(device=dev, dtype=torch.int64)
+    q_len64 = schedule.q_lens.to(device=dev, dtype=torch.int64)
+    head_ids = torch.arange(kv_heads, dtype=torch.int64, device=dev)
+    src_row = (seq_ids64 * kv_heads).unsqueeze(1) * rows_per_req + q_off64.unsqueeze(1)
+    src_row = src_row + head_ids.unsqueeze(0) * rows_per_req  # [num_tiles, kv_heads]
+    row_ar = torch.arange(br, dtype=torch.int64, device=dev)
+    src = src_row.unsqueeze(2) + row_ar  # [num_tiles, kv_heads, br]
+    valid = (
+        row_ar.view(1, 1, br) < q_len64.view(num_tiles, 1, 1)
+    ).expand(num_tiles, kv_heads, br)  # [num_tiles, kv_heads, br]
+
+    total_rows = q_flat.numel() // max(dim, 1)
+    # Rows past a request's live count (and every row of a padded tile) may address beyond
+    # ``q_flat``; clamp so the gather stays in bounds and mask them to zero right after.
+    src_flat = src.clamp(0, max(total_rows - 1, 0)).reshape(-1)
+    valid_flat = valid.reshape(-1)
+    gathered = q_flat.view(-1, dim).index_select(0, src_flat).reshape(num_slots, br, dim)
+    # Padded rows read an arbitrary neighbour row; mask them back to zero (the kernel's RowThr
+    # already masks them, this keeps the buffer contract "padding is zero").
+    q_packed = gathered.masked_fill(~valid_flat.view(num_slots, br, 1), 0).contiguous()
     out_packed = torch.empty_like(q_packed)
-    seq_ids_host = schedule.seq_ids.to(torch.int64)
-    # P3 padded tiles (q_len == 0, seq_id -> trash row) carry no query rows: skip them here and
-    # in the unpack loop below.  Everything the kernel sees stays shape-static.
-    live = schedule.q_lens.to(torch.int64) > 0
-    for tile in torch.nonzero(live).flatten().tolist():
-        b = int(seq_ids_host[tile].item())
-        q_off = int(schedule.q_offsets[tile].item())
-        rows = int(schedule.q_lens[tile].item())
-        for bh in range(kv_heads):
-            q_packed[tile * kv_heads + bh, :rows] = q_flat[b, bh, q_off : q_off + rows]
 
     indices = meta.kv_indices.to(torch.int32)
     # Declared ABI capacity (covers the real pool; see declared_pool_cap): kv_indices padding,
@@ -2428,13 +2450,16 @@ def forward_prefill(
         out_packed,
     )
 
+    # Unpack is the exact inverse of the pack above: one masked scatter per prefill call instead
+    # of ``nonzero`` + per-tile ``.item()`` + one slice launch per (tile, kv_head).
     out_flat = torch.zeros_like(q_flat)
-    for tile in torch.nonzero(live).flatten().tolist():
-        b = int(seq_ids_host[tile].item())
-        q_off = int(schedule.q_offsets[tile].item())
-        rows = int(schedule.q_lens[tile].item())
-        for bh in range(kv_heads):
-            out_flat[b, bh, q_off : q_off + rows] = out_packed[tile * kv_heads + bh, :rows]
+    flat_out = out_packed.reshape(num_slots, br, dim)
+    dst_flat = out_flat.view(-1, dim)
+    dst_flat.index_copy_(
+        0,
+        src_flat[valid_flat],
+        flat_out.reshape(-1, dim)[valid_flat],
+    )
 
     result = (
         out_flat.view(batch, kv_heads, max_qo_len, group, dim)
