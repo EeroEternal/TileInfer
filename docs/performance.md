@@ -1486,3 +1486,36 @@ record_function 块,JSONL 落盘;diag 开销验证 +0.2%(9.677 vs 9.66,噪声内
   → FG event 同步四场景全零增益,E261 判决加严(sync 非可回收成分)。
 - 工程 3 文件:`tileinfer/integrations/step_diag.py`(新)+ install() 挂钩 +
   `tests/test_step_diag.py`(11 用例 CPU 绿);契约=默认关零行为变化、双侧可用。
+
+## 基座勘误与 capture8×multistream 互斥定谳(2026-10-20 iter-203,E266/E268)
+
+### 勘误:h65 系采集 multistream(H31)未生效
+h65_anchor.sh 及 h63_clean/h65d/h66 系 serve 未传 `--additional-config`,而
+`multistream_overlap_shared_expert` 仅能经 additional_config 开启(ascend_config.py:139,
+无 env fallback)⇒ E254-E265 全部 serve 实际 ms-off。双侧对称同缺,TI−FIA 相对结论
+(H63/H65/H66)不受影响;绝对基线偏慢 c1 ~2.7%/c8 ~1.1%(h65ms 反测)。此后权威 A/B
+双侧一律显式带 ADDCFG(如需 ms-on 口径)并 grep serve log 生效打印。
+
+### capture8 与 multistream 互斥(h65ms 双侧 A/B,32 prompts 权威口径)
+| 基座 | c1 TPOT p50 | c8 TPOT p50 |
+|---|---|---|
+| capture8 + ms-off(h65,权威基座) | 9.66 | 11.88 |
+| capture8 + ms-on | **8.995(−6.89%)** | **16.70(+40.58% 崩)** |
+| capture16 + ms-on(E98) | −2.28% | −1.70%(c8≈14.79) |
+- 模式:bucket1 图 ms-on 大赚、bucket8 图 ms-on 结构性冲突、bucket16(E98)正常。
+- 结论:capture8(H64,c8 +25%)与 multistream(H31,c1 −2.3%)互斥;**权威基座维持
+  capture8+ms-off**。c1-only 部署可选 capture8+ms-on 变体(非默认)。
+
+### H41(E+1 shared expert 融合)gate 关闭判决
+ms-on 有效形态反测 shared 串行段上界 0.665ms/步(c1);E+1 融合消除该段但 GMM 工作量
++12.5%(c1 +0.28ms)→ 净上界 ≈0.38ms/步 < 0.5ms 立项门槛;sglang #40350 同型同 TP
+反面证据与上游 #18927/#18902 revert 警示不变 ⇒ H41 维持 registered 不立项。
+
+### H66 c1 设备链归因判决(iter-203,E268)
+双侧 kineto 对差(h66 ti Σkernel 9.415ms/步=100.5% 闭合设备链 vs h62 fia 同配置参照):
+- TI−FIA 差集中:**batch-1 decode attention 主核 ~0.34ms/步**(TI main_kernel 0.472 vs
+  FIA vendor paged attention 0.133)+ 胶水 datamove +0.083 + norm +0.012;
+- dense_gemm/moe_gmm/gdn 大核族全部零差(±0.007)——kernel 计层面 TI=FIA;
+- 端到端设备链差 0.86ms 的余项 ~0.42ms=图内气泡/同步(可回收性未证)。
+判决:归因 proven(≤2 域);单点可削面 0.44ms < 0.5ms 门槛 → 不立消除假设;
+attention 主核 batch-1 劣势登记 **H67 候选**(c1 缺口抓手,H28/dense 后启动)。
