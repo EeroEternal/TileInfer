@@ -1281,3 +1281,46 @@ E238-2 的 P0 重锚显示:8K/16K 的 TTFT 为 1592/3146ms,而 FIA 为 1040/1836
 - 预期(待 H51 窗口实测):16384 TTFT 3146 → ~1836ms(−42%),TPOT 117.5 → ~78ms 转正;
   8K 同理;≤4K 短场景行为不变(仍在 TI 内核),decode 的 ITL 优势完整保留。
 - 判据:8K/16K ΔTPOT ≥ +15%,短场景 ΔTPOT 在 ±3% 内,`prefill_long_skips > 0`。
+
+## H60 prefill 解包尾部省一次全量搬运(2026-10-19)
+
+### H60.1 问题
+`forward_prefill` 的收尾原本是:
+
+```python
+result = out_flat.view(...).permute(...).reshape(...).contiguous()  # 全量拷贝 #1
+if out is not None:
+    out.copy_(result)                                                # 全量拷贝 #2
+    return out
+return result
+```
+
+调用方(引擎路径)几乎总是传入 `out`,于是每次 prefill 都要做两次整块搬运。
+以 16384 输入、`kv_heads×group×dim` 计,这是与 token 数成正比的纯带宽开销,直接进 TTFT。
+
+### H60.2 改动
+保留 `permute` 的 strided 视图,只在**真正需要物化**时才拷贝:
+
+```python
+result = out_flat.view(...).permute(...)          # 视图,零拷贝
+if out is not None:
+    out.copy_(result.reshape(...))                # 一次,直落调用方缓冲
+    return out
+return result.reshape(...).contiguous()           # 无 out 时才物化
+```
+
+正确性:`permute` 只改 strides;`(kv_heads, q_pos, group) → (qo_heads, q_pos)` 的
+`reshape` 本就要求物化,`copy_` 按其逻辑形状逐元素读取,与旧路径结果相同。
+
+### H60.3 契约
+`test_h60_unpack_tail_contract`(纯 CPU 静态检查)锁定:
+- 有 `out` 时 `copy_` 直接吃 strided view,**不得**先 `contiguous()` 到临时变量;
+- 无 `out` 时仍保留 `contiguous()` 兜底(调用方要求连续张量)。
+prefill 全族 **41 项 + 9 项**通过(含设备数值等价 3 项)。
+
+### H60.4 与 H52 的关系
+H52 消除了**同步**开销(O(tiles) 次 D2H),H60 消除了**带宽**开销(1 次全量搬运)。
+两者叠加后,`forward_prefill` 的 host 侧只剩:
+- 1 次 D2H(与 `qo_host` 合并的 `seq_lens`,见 H59-②);
+- 2 次向量化 gather/scatter(`index_select` + `index_copy_`);
+- 1 次结果搬运(有 `out` 时)。
