@@ -149,9 +149,15 @@ def _patch_model_runner() -> list[str]:
     )
     _wrap_timed(mrv.NPUModelRunner, "sample_tokens", "sample_worker")
     _wrap_timed(mrv.NPUModelRunner, "_update_full_graph_params_if_needed", "upd")
+    # H69-②(iter-205):prep 内部分解——E264 判 prep=1.126ms 为最大 host 暴露单段
+    # (<1.5ms 门槛),但其内部构成未分解;"prepare input" 块两大子步独立记账,
+    # 残差 = prep − prep_upd − prep_inputs。默认关,零在役影响。
+    _wrap_timed(mrv.NPUModelRunner, "_update_states", "prep_upd")
+    _wrap_timed(mrv.NPUModelRunner, "_prepare_inputs", "prep_inputs")
     mrv.record_function_or_nullcontext = _diag_record_function
     return ["NPUModelRunner.execute_model", "NPUModelRunner.sample_tokens",
-            "NPUModelRunner._update_full_graph_params_if_needed", "record_function_or_nullcontext"]
+            "NPUModelRunner._update_full_graph_params_if_needed", "record_function_or_nullcontext",
+            "NPUModelRunner._update_states", "NPUModelRunner._prepare_inputs"]
 
 
 def _patch_acl_graph() -> list[str]:
