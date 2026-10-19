@@ -53,6 +53,10 @@ class _FakeLaunch:
 
 @pytest.fixture()
 def env(monkeypatch):
+    # H61 终审后 _PREFILL_MAX_CTX 默认 1(全量交还 FIA),默认档下 prefill_step 对
+    # kv>128 的步在 usable 判定之前即 shunt,本组共享面契约永远不会触达内核。
+    # 测试期关闭阈值(显式 0 = 全 TI 接管),结束由 monkeypatch 自动还原。
+    monkeypatch.setattr(va, "_PREFILL_MAX_CTX", 0)
     monkeypatch.setattr(va.PrefillShapeManager, "usable", staticmethod(lambda spec: True))
     fake = _FakeLaunch(heads=8, dim=32)
     import tileinfer.kernels.attention.paged_decode_ascend950 as paged

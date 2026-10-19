@@ -45,6 +45,13 @@ from tileinfer.testing.reference import reference_attention
 from tileinfer.utils import is_npu_available
 
 try:  # pragma: no cover
+    from tileinfer.integrations import vllm_ascend as _va_mod
+
+    _HAVE_VA = True
+except Exception:  # pragma: no cover - CPU 机器无 vllm_ascend 依赖时跳过
+    _HAVE_VA = False
+
+try:  # pragma: no cover
     import tilelang.ascend  # noqa: F401
 
     _HAVE_ASCEND950 = True
@@ -187,8 +194,14 @@ def _canonical_ready(tiles: int) -> bool:
         ([500, 129, 37], [100, 129, 1], "mixed-append-decode-row"),  # t=17 → T=32,批 3→5
     ],
 )
-def test_prefill_quantized_numerics(kv_lens, qo_lens, label):
+def test_prefill_quantized_numerics(kv_lens, qo_lens, label, monkeypatch):
     """量化 canonical 变体(q_len=0 死 tile + trash 行)服务的步骤数值必须对齐参考。"""
+    if _HAVE_VA:
+        # H61 终审后 _PREFILL_MAX_CTX 默认 1(全量交还 FIA),默认档下 prefill_step 对
+        # kv=300 恒 shunt → served 恒 False,本测的接管等待永不满足。测试期把阈值
+        # 关闭(显式 0 = 恢复全 TI 接管),结束由 monkeypatch 自动还原。
+        monkeypatch.setattr(_va_mod, "_PREFILL_MAX_CTX", 0)
+
     seed = abs(hash(label)) % 1000
     deadline = time.time() + 900  # 冷缓存时一次 canonical 编译 ~110s
     got = None
@@ -200,8 +213,11 @@ def test_prefill_quantized_numerics(kv_lens, qo_lens, label):
     assert got is True, f"{label}: canonical 变体编译后仍未接管"
 
 
-def test_prewarm_prefill_ladder_covers_first_seen_shape():
+def test_prewarm_prefill_ladder_covers_first_seen_shape(monkeypatch):
     """prewarm ladder 后:任意 ladder 内形状 usable() 即真;首见形状首步立即接管(<5s)。"""
+    if _HAVE_VA:
+        # H61 默认档下 prefill_step 对 kv=397 恒 shunt(同 test_prefill_quantized_numerics)。
+        monkeypatch.setattr(_va_mod, "_PREFILL_MAX_CTX", 0)
     instance = TileInferDecodeAttention(
         num_heads=HEADS,
         num_kv_heads=KVH,

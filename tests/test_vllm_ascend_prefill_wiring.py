@@ -32,6 +32,13 @@ from tileinfer.testing.reference import reference_attention
 from tileinfer.utils import is_npu_available
 
 try:  # pragma: no cover
+    from tileinfer.integrations import vllm_ascend as _va_mod
+
+    _HAVE_VA = True
+except Exception:  # pragma: no cover - CPU 机器无 vllm_ascend 依赖时跳过
+    _HAVE_VA = False
+
+try:  # pragma: no cover
     import tilelang.ascend  # noqa: F401
 
     _HAVE_ASCEND950 = True
@@ -140,8 +147,14 @@ def _run_case(kv_lens: list, qo_lens: list, seed: int):
         ([200, 37, 77], [1, 37, 5], "mixed-decode-row"),
     ],
 )
-def test_prefill_step_numerics(kv_lens, qo_lens, label):
+def test_prefill_step_numerics(kv_lens, qo_lens, label, monkeypatch):
     """首调触发后台编译(返回 False/FIA),该形状就绪后数值必须对齐参考。"""
+    if _HAVE_VA:
+        # H61 终审后 _PREFILL_MAX_CTX 默认 1(全量交还 FIA),默认档下 prefill_step 对
+        # kv>128 恒 shunt → served 恒 None,接管等待永不满足。测试期关闭阈值
+        # (显式 0 = 全 TI 接管),结束由 monkeypatch 自动还原。
+        monkeypatch.setattr(_va_mod, "_PREFILL_MAX_CTX", 0)
+
     seed = abs(hash(label)) % 1000
     deadline = time.time() + 600  # 每个新形状一次后台编译(约 90-120 s)
     got = None
