@@ -2452,6 +2452,10 @@ def forward_prefill(
 
     # Unpack is the exact inverse of the pack above: one masked scatter per prefill call instead
     # of ``nonzero`` + per-tile ``.item()`` + one slice launch per (tile, kv_head).
+    #
+    # ``out_flat`` must start zeroed: rows past a request's ``q_len`` (and all rows of padded
+    # requests) are never written by the scatter below, and the caller treats unwritten rows as
+    # padding.  Allocating with ``zeros_like`` is the cheapest way to guarantee that contract.
     out_flat = torch.zeros_like(q_flat)
     flat_out = out_packed.reshape(num_slots, br, dim)
     dst_flat = out_flat.view(-1, dim)
@@ -2461,16 +2465,17 @@ def forward_prefill(
         flat_out.reshape(-1, dim)[valid_flat],
     )
 
-    result = (
-        out_flat.view(batch, kv_heads, max_qo_len, group, dim)
-        .permute(0, 1, 3, 2, 4)
-        .reshape(batch, num_qo_heads, max_qo_len, dim)
-        .contiguous()
-    )
+    # ``out_flat`` is [batch, kv_heads, max_qo_len*group, dim] with (q_pos, head) packed per KV
+    # head; un-permute to [batch, qo_heads, max_qo_len, dim].  The permute is a strided view, so
+    # the final ``contiguous()`` is a real copy -- but it writes straight into the caller's
+    # ``out`` buffer when one is supplied, avoiding a second full-size temporary.
+    result = out_flat.view(batch, kv_heads, max_qo_len, group, dim).permute(0, 1, 3, 2, 4)
     if out is not None:
-        out.copy_(result)
+        out.copy_(
+            result.reshape(batch, num_qo_heads, max_qo_len, dim)
+        )
         return out
-    return result
+    return result.reshape(batch, num_qo_heads, max_qo_len, dim).contiguous()
 
 
 def plan_prefill_split_ctx(
