@@ -1760,9 +1760,21 @@ def install_gdn_chunk_wu() -> bool:
             prebuilt_meta = _build_gdn_chunk_meta(
                 tuple(int(x) for x in cu_seqlens.to(torch.int64).tolist()),
                 cu_seqlens.device, g.shape[2])
-        if (not enabled) or cu_seqlens is None or get_pcp_group().world_size > 1 \
+
+        def _pcp_world_size() -> int:
+            """PCP 组未初始化(库级/测试进程)时按单 rank 语义取 1(vllm 断言版本会崩)。
+
+            get_pcp_group() 仅用于 ">1 则回退原链"的分流判定;PCP 缺失只出现在
+            无 worker 的进程(测试/纯库调用),那里 world_size 恒 1,语义等价。
+            """
+            try:
+                return get_pcp_group().world_size
+            except AssertionError:  # noqa: BLE001 - "prefill context parallel group is not initialized"
+                return 1
+
+        if (not enabled) or cu_seqlens is None or _pcp_world_size() > 1 \
                 or q.shape[1] > _gdnwu_max_tokens():
-            if enabled and cu_seqlens is not None and get_pcp_group().world_size <= 1:
+            if enabled and cu_seqlens is not None and _pcp_world_size() <= 1:
                 # 开关开着但形状超阈值:计一次"长度分流跳过"(在役探针可见分流真的发生)
                 cls_stats["gdn_wu_long_skips"] = cls_stats.get("gdn_wu_long_skips", 0) + 1
             return _original_fwd(q, k, v, g, beta, scale, initial_state, output_final_state,

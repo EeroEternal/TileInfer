@@ -52,14 +52,30 @@ def _init_once():
     _cf.mark_vllm_ascend_C_loaded()
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.distributed import init_distributed_environment, initialize_model_parallel
+    from vllm.distributed import parallel_state as _ps
 
-    try:
-        init_distributed_environment(world_size=1, rank=0, local_rank=0,
-                                     distributed_init_method="env://")
-        with set_current_vllm_config(VllmConfig()):
-            initialize_model_parallel(tensor_model_parallel_size=1)
-    except Exception:  # noqa: BLE001 - 套件内已初始化(gdn_wu 设备测试先行)时忽略
-        pass
+    # D141 后 wiring 类测试经 install 链提前拉起 worker patch 家族,distributed
+    # 全局态可能已部分建立(world/TP/PCP 各步独立探测补齐,不再整体 try/except
+    # —— 整体吞错会把 PCP 缺失掩盖成后续 get_pcp_group 断言崩)。
+    with set_current_vllm_config(VllmConfig()):
+        try:
+            if getattr(_ps, "_WORLD", None) is None:
+                init_distributed_environment(world_size=1, rank=0, local_rank=0,
+                                             distributed_init_method="env://")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if getattr(_ps, "_TP", None) is None:
+                initialize_model_parallel(tensor_model_parallel_size=1)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if getattr(_ps, "_PCP", None) is None and getattr(_ps, "_WORLD", None) is not None:
+                _ps._PCP = _ps.init_model_parallel_group(
+                    [[0]], _ps.get_world_group().local_rank, None, group_name="pcp"
+                )
+        except Exception:  # noqa: BLE001
+            pass
 
 
 @pytest.fixture(autouse=True)
