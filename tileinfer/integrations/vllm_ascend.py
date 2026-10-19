@@ -213,12 +213,14 @@ _PREFILL_KV_TILE_PAGES = int(__import__("os").environ.get("TILEINFER_PREFILL_KV_
 # 尚可,且其 unpack/schedule 已按 H52 去 D2H),>4K 交还 FIA。
 # 显式 `TILEINFER_PREFILL_MAX_CTX=0` 可恢复旧行为(全走 TI 内核)。
 #
-# 注意(E238-2 的 TTFT 逐场景数据):TI 自研 prefill 内核在**所有五个实测场景都慢于
-# FIA**(128/128 −1.2%、128/512 −11.7%、8K −53.2%、16K −71.3%),只是幅度不同。
-# 因此 4096 是**保守值**(只切除大亏的部分,保留小亏);若窗口实测确认短场景也稳定
-# 落后,可把该值下调(例如 512)甚至设为极小值让 prefill 全部交还 FIA —— 这不需要
-# 改代码,只调 env。`prefill_long_skips` 计数用于确认分流确实在役。
-_PREFILL_MAX_CTX = int(__import__("os").environ.get("TILEINFER_PREFILL_MAX_CTX", "4096") or 0)
+# H61 终审判决(E244,2026-10-19 同会话三档 A/B):TI 自研 prefill 内核在**所有实测
+# 场景都慢于 FIA**(E238-2 TTFT:128/128 −1.2% ~ 16K −71.3%);MAX_CTX ∈ {0,4096,1}
+# 三档 ×5 场景实测,c1 档(=1,全交还 FIA)对 4096 档 TPOT ±0.0~1.9%、吞吐 +0.3~+2.1%
+# (全部 5 场景名义最高)、短场景 TTFT −16~−21%。按 H61.3 预登记判据
+# 「选总吞吐最高档;1 与 4096 无显著差异则取 1(更简单、无维护面)」→ **默认 1**。
+# 恢复 TI prefill:显式 `TILEINFER_PREFILL_MAX_CTX=4096`(H59 档)或 `=0`(全 TI)。
+# `prefill_long_skips` 计数用于确认分流确实在役。
+_PREFILL_MAX_CTX = int(__import__("os").environ.get("TILEINFER_PREFILL_MAX_CTX", "1") or 0)
 
 #: D57-① 在役探针计数(被分流回 FIA 的 prefill 步数;metrics dumper 合并输出)。
 _PREFILL_STATS: Dict[str, int] = {"prefill_long_skips": 0}
