@@ -951,3 +951,288 @@ view 仅做末维拆分,对非连续张量合法,E101),下游 rearrange/cat 拷�
 **A/B 结果**:(待 h32_wait_chain 门控链跑完填入)
 
 **结论**:(待 A/B)
+
+## H43 棒:SIMD softmax 权威口径单变量 A/B PASS——长场景 TPOT -50~67%/吞吐 +93~188%,短场景持平(2026-10-19 iter-192,E236/E237)
+
+**机制**:`TILEINFER_SIMD_SOFTMAX=1` 把 decode/split/prefill 内核逐页 online softmax 从
+SIMT reducer 形态换成 packed `T.simd.*` 形态(paged_decode_ascend950.py,设备数值等价
+由 `tests/test_tilelang_ascend950_decode.py` off/on 各 25 用例+`benchmarks/probes/
+simd_softmax_*_device.py` 保证);内核级自述 decode shape ~2.6x(E116)。
+
+**判据**:8K/16K ITL/TPOT 改善 ≥5%、短场景 |Δ|<3%、双侧 fallbacks=0
+(h43_summarize.py;A/B 唯一差异=该环境变量,双侧同图模式 FULL_DECODE_ONLY、
+同 TILEINFER_OPS/分带 D97 最优配置)。
+
+**完整 A/B(off=11:28 会话 3 场景+13:32 补跑 2 场景;on=13:23 会话 5 场景;
+双侧 10/10 json completed=32 failed=0,metrics fallbacks=0 capture=40)**:
+
+| 场景 | TPOT(ms) off→on | ΔTPOT | ITL Δ | 吞吐 off→on | Δ吞吐 |
+|---|---|---|---|---|---|
+| 128x128_c1 | 9.65→9.44 | +2.20% | +2.14% | 96.0→96.1 | +0.07% |
+| 128x128_c8 | 14.99→15.04 | -0.36% | -0.43% | 459.1→415.9 | -9.40%* |
+| 128x512_c8 | 15.55→15.12 | +2.77% | +2.84% | 495.3→509.1 | +2.78% |
+| 8192x128_c8 | 191.35→96.53 | **+49.55%** | +42.84% | 34.2→66.0 | **+92.73%** |
+| 16384x128_c8 | 584.71→194.30 | **+66.77%** | +56.92% | 11.6→33.3 | **+187.55%** |
+
+VERDICT: PASS(脚本内置判据:长场景最小改善 42.84% ≥5%,短场景最大劣化 0.36% <3%)。
+
+*c8 吞吐 -9.40% 跨会话波动澄清(iter-192 复查):同会话双臂复跑(13:45-13:50,
+r2)=off TPOT 16.29/吞吐 415.3 vs on TPOT 16.36/吞吐 425.3 → **on 吞吐 +2.39%、
+TPOT +0.39%(不劣化)**;off 臂自身跨会话吞吐 459.1(11:29)→415.3(13:47)波动
+-9.5%,与 r1 差值同量级 → r1 的 -9.40% 为会话间机器状态波动,非 SIMD softmax 劣化;
+两次对照 TPOT 均持平(+0.34%/+0.39%),判决维持 PASS。
+
+**接入口径(D92.3 单变量保护)**:代码默认值**保持 off**——在役下游链 off 基座
+依赖「无该变量=off」语义,默认翻转将破坏 h45/h46/h47/h48/h49 等棒的双侧单变量;
+接入方式=「当前最优配置」含 `TILEINFER_SIMD_SOFTMAX=1`(D97 口径),后终权威口径
+验收跑分显式携带,环境变量保留为回退通道。
+
+**对 30% 总目标的贡献**:16384x128_c8 吞吐 +187.55%(11.6→33.3 tok/s)、
+8192x128_c8 吞吐 +92.73%,远超单域 30% 门槛;短场景(c1/c8/512)持平。
+
+**注意(口径更正)**:本节的 off/on 两侧同时开启了 `gdnproj/gdnsmall/greedy/gdnreorder`
+四个 opt-in(见 `.agent_loop/run/h43_baseline.sh:47`),而这四项**各自的 A/B 尚未出数**
+(H32 off 臂启动失败、H34/H37 等窗超时、H35 六次无窗)。因此本节的绝对数字含这些未验证项
+的未知贡献,只能作为「SIMD 单变量差值」使用;在 H51-E3 leave-one-out 归因完成前,
+不得把它们写成 proven。
+
+## H52 prefill 打包/解包去 D2H(实现完成,设备验证待窗口)
+
+**问题(源码审查发现,E235-7)**:`forward_prefill` 的 Q 打包与结果解包是逐 tile 的 Python
+循环:每 tile 一次 `torch.nonzero(live).flatten().tolist()` + 3 次 `.item()`(各自一次 D2H
+同步),再加 `num_tiles × kv_heads` 次切片赋值发射。L=8192 时约 256 个 live tile
+→ **~1.5k 次设备同步 + ~2k 次发射**,每个 prefill call 付一次,直接进 TTFT。
+
+**改动**(`tileinfer/kernels/attention/paged_decode_ascend950.py` `forward_prefill`):
+调度三元组(`seq_ids/q_offsets/q_lens`)本就在设备上,因此打包改为一次
+`index_select`(设备侧 gather)+ `masked_fill`(padding 行归零),解包改为一次
+`index_copy_`(masked scatter)。越界行先 `clamp` 再 mask,保证 gather 不越界。
+**零 D2H**,发射次数从 O(tiles×heads) 降到 O(1)。数学与旧实现逐元素等价:
+- 行索引 = `(seq_id × kv_heads + kv_head) × (max_qo_len × group) + q_offset + r`;
+- `valid = r < q_len`(padding tile 的 `q_len==0` 天然全掩,与旧 `live` 跳过等价)。
+
+**已验证**:设备数值 `tests/test_vllm_ascend_prefill_wiring.py` **3/3 通过**
+(prefill-no-cache / chunked-append+fresh / mixed-decode-row 三形态),说明打包/解包
+索引语义与旧实现一致。
+
+**待验证(H51 窗口)**:中上下文(1K-4K)TTFT 改善幅度。注意 8K/16K prefill 已被
+`TILEINFER_PREFILL_MAX_CTX=4096` shunt 回 FIA,本项收益面是 **shunt 阈值以下**的 prefill
+步骤,不在长场景口径内。
+
+## H53 H42-③ 页流水微基准的编译失败根因(环境,已修)
+
+**现象**:`h44_probe`(H42-② 页循环成本矩阵)在编译期失败,报
+`asc_pack_to_high / asc_pack_to_low / asc_storealign_pack_quarter / asc_set_gm2l1_nz_para /
+asc_load_l2_cache_mode` 未声明。
+
+**根因**:不是内核逻辑,而是**链脚本没 `source .agent_loop/run/env.sh`**——tilelang 因此
+退回系统 `cann-9.1.1`,其 `simd_inst.h` / codegen 不含 9.3 才有的这些 intrinsic。
+与 D26 记录的历史坑完全同型。
+
+**修复**:`h44_wait_chain.sh`、`h46_wait_chain.sh`、`h33_wait_chain.sh`、
+`h33v2_wait_chain.sh` 四处补 `source .agent_loop/run/env.sh`。
+
+**验证**:修复后在 9.3 工具链下
+`build_decode_kernel(..., pipeline=True)` **编译通过**(此前必失败),
+`TILEINFER_SIMD_SOFTMAX=1` 的 plain 内核同样编译通过。这意味着 H42-②/③ 的微基准
+此前从未真正跑过,其"未出数"是环境问题而非性能结论。
+
+## H58 待实现项的作用域盘点:几乎全是 decode,与当前最大缺口(prefill)错配
+
+**背景**:H57 的 P0 重锚显示 decode 已领先(ITL +9.2%/+13.6%),唯一负项是 prefill
+(TTFT 慢 1.53x/1.71x)。逐项核实剩余待实现项的作用域后,发现一个结构性错配。
+
+| 待实现项 | 作用域 | 代码依据 | 对当前缺口的贡献 |
+|---|---|---|---|
+| E1 capture size=8 | **decode** | cudagraph batch 桶只覆盖 decode 图;c8 不再 padding 到 16 | 间接(降低 c8 的 batch padding 税) |
+| E2 ktp 分带重扫 | **decode** | `kv_tile_pages` 仅用于 decode 的 split-KV(`paged_decode_ascend950.py:1297`);prefill 走另一条 path | 无 |
+| H33 L2 缺口 | **decode** | HYPOTHESES 标题即「decode GEMM in-engine vs 微基准 1.4-1.7x」,小 M = decode | 无 |
+| E3 opt-in 归因(gdnproj/gdnsmall/greedy/gdnreorder) | **decode** | GDN decode 路径 + 采样阶段 | 无 |
+| H52 prefill D2H 向量化 | **prefill** | `forward_prefill` 的打包/解包 | **有(唯一直接项)** |
+| H42-②/③ 页流水 | **prefill**(shunt 阈值以下) | per-page 成本矩阵用于 prefill 内核 | 有 |
+
+**结论**:
+1. 队列里 6 项中只有 2 项(prefill D2H、H42 页流水)作用于 prefill,且 H42 只覆盖
+   shunt 阈值(4096)以下的中上下文。
+2. 真正影响 8K/16K TTFT 的,**目前队列里没有任何已立项的抓手**。
+3. 因此下一步必须**新立 prefill 专项假设**,而不是继续消化 decode 侧队列。
+
+**建议的 prefill 攻坚路径**(按证据成本排序):
+1. **先 profile 定位**(零代码,一次窗口):用 `p_prof_side.sh` 的双窗采集
+   (窗1 = 8192 输入/4 输出/C=8,prefill 主导)对比 TI vs FIA 的
+   `op_statistic.csv`,找出 prefill 段占比最高的算子。工具链已就绪且本轮修好了
+   其自匹配 bug。
+2. **对照 H52 实测**:同一次 profile 即可读出 prefill D2H 相关主机段占比,
+   判断 4400 次 prefill_calls 里主机同步还剩多少。
+3. **若定位到 GDN conv1d/recurrent**:prefill 走 Triton/FLA 路径
+   (`qwen_gdn_linear_attn.py:228` 日志「Using Triton/FLA GDN prefill kernel」),
+   与 decode 的 custom op 不同,需单独优化。
+4. **若定位到 attention prefill 内核**:H42-②/③ 的页流水与 SIMD 内核可扩展到大 shape。
+
+**方法论提醒**:TPOT 在 `output=128` 的场景被 TTFT 主导
+(`TPOT ≈ (TTFT + ITL×127)/128`),因此「ITL 领先」不能抵消「TTFT 落后」。
+后续所有长上下文场景的判据应以 **TTFT 和 ITL 分列**呈现,不能只看 TPOT。
+
+## H57 设备端到端首次跑通:vendor 算子包 9.1→9.2 修复 + P0 重锚结果(2026-10-19 18:00-19:23)
+
+### H57.1 阻塞 5 小时的真因:CANN 自定义算子包的编译版本不匹配
+
+现象:所有 serve 在 `Capturing CUDA graphs (decode, FULL)` 阶段崩溃:
+```
+RuntimeError: call aclnnCausalConv1d failed
+Invalid_Argument(EZ0026): Parameter activation_mode of CausalConv1d has incorrect value.
+Reason: only supports "silu" or "none".
+```
+
+排查轨迹(每条都验证过):
+1. 不是 TileInfer 改动——`TILEINFER_VLLM=0`(完全不加载插件)**同样崩溃**;
+   临时 `git stash` 回滚全部 4 个源码改动后**仍然崩溃**;
+2. 不是 kill 缓存——`torch_compile_cache` 备份清空后仍复现;
+3. 不是 CANN 版本——`.work/cann930` 与 `/home/dlb/Ascend/install/cann-9.3.0`
+   的 `libopapi.so` **md5 完全相同**;
+4. 不是 LD_PRELOAD——`unset LD_PRELOAD` 后同样崩溃;
+5. 不是 cudagraph 模式——`FULL_DECODE_ONLY` 与默认 `FULL_AND_PIECEWISE` 都崩。
+
+**真因**:`vllm_ascend/_cann_ops_custom/vendors/custom_transformer/version.info` 写的是
+`custom_opp_compiler_version=9.1.0` —— 这个 vendor 自定义算子包是用 **CANN 9.1** 编译的,
+其 `aclnnCausalConv1d` 接受 `activation_mode: int`(1=silu);但在 CANN 9.3 运行时下,
+内置 `CausalConv1d` tiling 要求**字符串** `"silu"`/`"none"`,签名不兼容 → Invalid_Argument。
+
+成功对照:dlb 的 `/home/dlb/vllm-ascend`(源码可编辑安装)使用
+`custom_opp_compiler_version=9.2.0` 的 vendor 包(404952B vs 我们的 400808B),
+其 serve 正常启动。
+
+**修复**:把 dlb 的 9.2 vendor 包覆盖到本栈(原 9.1 版备份为 `custom_transformer.bak_910`)。
+覆盖后:
+- `Application startup complete` ✅
+- `CausalConv1d` 报错 0 条 ✅
+- TileInfer 探针:`fallbacks=0, capture_calls=40, ready_plans=6,
+  ktp_policy={1:16,2:16,4:32,8:128}` ✅
+
+### H57.2 H51-E4 P0 重锚(TI 当前最优 vs FIA,2026-10-19 18:11-19:09,同会话背靠背)
+
+配置:TI = `TILEINFER_OPS=decode,prefill,greedy` + `SIMD_SOFTMAX=1` + ktp 分带
+`1:16,2:16,4:32,8:128` + multistream;FIA = `TILEINFER_VLLM=0`。
+两侧 `cudagraph_mode=FULL_AND_PIECEWISE`,capture `[1,4,16,32]`,32 请求全绿。
+
+| 场景 | TI TPOT | FIA TPOT | ΔTPOT | TI 吞吐 | FIA 吞吐 | Δ吞吐 | TI TTFT | FIA TTFT |
+|---|---|---|---|---|---|---|---|---|
+| 128x128_c1 | 9.44 | 8.53 | **−10.59%** | 98.8 | 107.4 | −8.05% | 105.2 | 103.9 |
+| 128x128_c8 | 15.05 | 18.31 | **+17.81%** | 480.1 | 184.8 | **+159.77%** | 210.7 | 200.8 |
+| 128x512_c8 | 15.13 | 18.45 | **+18.00%** | 514.6 | 434.5 | +18.46% | 223.2 | 199.8 |
+| 8192x128_c8 | 52.11 | 40.44 | **−28.87%** | 124.1 | 162.1 | −23.46% | 1592.4 | 1039.6 |
+| 16384x128_c8 | 117.50 | 69.00 | **−70.29%** | 56.4 | 72.0 | −21.70% | 3146.2 | 1836.4 |
+
+(ΔTPOT = (FIA−TI)/FIA,正值 = TI 更快)
+
+**关键解读(必须成对看 ITL 与 TTFT)**:
+
+| 场景 | TI ITL | FIA ITL | ITL 结论 | TI TTFT | FIA TTFT | TTFT 结论 |
+|---|---|---|---|---|---|---|
+| 8192 | **16.95** | 18.66 | **TI 快 9.2%** | 1592 | 1040 | TI 慢 53% |
+| 16384 | **19.09** | 22.10 | **TI 快 13.6%** | 3146 | 1836 | TI 慢 71% |
+
+→ **TileInfer 的 decode 内核确实更快(ITL 领先 9–14%),但 prefill 慢 1.5–1.7 倍,
+把 TPOT 整体拉负。** 这是本轮最重要的定量结论:**优化重心必须转向 prefill**。
+
+### H57.3 排除假设:prefill shunt 不是长场景 TTFT 慢的原因
+
+原假设:`TILEINFER_PREFILL_MAX_CTX=4096` 把长 prefill shunt 回 FIA,shunt 本身有开销。
+实测(`TILEINFER_PREFILL_MAX_CTX=0` 关闭 shunt,其余逐字相同):
+
+| 场景 | shunt=4096 TTFT | shunt=0 TTFT | 差 | shunt=4096 TPOT | shunt=0 TPOT |
+|---|---|---|---|---|---|
+| 8192x128_c8 | 1592.4 | 1607.7 | +1.0% | 52.11 | 52.76 |
+| 16384x128_c8 | 3146.2 | 3428.0 | +9.0% | 117.50 | 116.42 |
+
+→ shunt 开关对 TTFT 几乎无影响(甚至关闭略差),**瓶颈在 prefill 本体**,
+不在分流策略。原假设推翻。
+
+### H57.4 本轮结论与下一步
+
+1. **首胜**:短并发场景 TI 已明显领先 —— c8 TPOT +17.81%、吞吐 +159.77%(FIA 在该场景
+   有异常,需复测确认);128x512_c8 +18.00%/+18.46%。
+2. **待解**:长场景 TTFT 慢 1.5–1.7 倍是当前最大缺口。ITL 已领先,说明只要把 prefill
+   拉到 FIA 水平,长场景 TPOT 即可转正(理论值:16384 若 TTFT=FIA,TPOT 从 117.5 → ~78)。
+3. **c1 场景小幅落后(−10.59%)**:单请求无并发摊薄,decode 优势不足以覆盖固定开销。
+4. 下一步优先级:**prefill 路径攻坚**(H52 的 D2H 向量化已在代码里,需实测其 TTFT 收益;
+   以及 H42-②/③ 的 per-page 成本矩阵用于定位 prefill 内核瓶颈)。
+
+## H56 三个 opt-in 在役从未生效(挂点/守卫缺陷,已修)——H32/H34/H35 数据全部作废重跑
+
+**这是本轮最重要的发现**:H32(gdnproj)/H34(gdnreorder)/H35(gdnsmall)三项此前所有
+"已实现、待 A/B"的表述都建立在一个错误前提上——它们**在役一次都没执行过**。
+
+证据(2026-10-19,`serve_h43simd_on.log` + metrics):
+
+| 项 | 现象 | 根因 |
+|---|---|---|
+| H32 gdnproj | `gdnproj_calls=0`(off/on 双侧) | 挂点包的是 `QwenGatedDeltaNetAttention.forward_cuda`;而 vllm-ascend `patch_qwen3_5.py:207` 把 `forward` 换成了 `AscendGatedDeltaNetAttention.forward`(gdn.py:67),该类**内联** in_proj 段、从不调用 `forward_cuda` |
+| H34 gdnreorder | `gdnreorder_calls=0` | 同一挂点问题;另 `reorder_rows_plan` 只按 interleaved 布局推导,本模型 `gqa_interleaved_layout=False` |
+| H35 gdnsmall | 启动即打印 `not installed: npu_causal_conv1d_custom=False` | `npu_causal_conv1d_custom` 是 CANN 自定义算子,由 `ASCEND_CUSTOM_OPP_PATH` 在引擎初始化期加载,晚于插件 `install()`;旧代码要求"三处全就绪否则整体放弃" |
+| H36 greedy | 安装成功,但计数未验证 | 守卫含 `max_num_logprobs is not None` 等 9 项,需在窗口内以 `greedy_fast_calls` 实测确认 |
+
+**另有一个布局缺口**:`build_fused_inproj_weight` 要求 `gqa_interleaved_layout=True`
+(Qwen3-Next),而 Qwen3.6-35B-A3B 是 `False`(Qwen3.5 布局,`qwen3_5.py:142`)——
+即使挂点正确,守卫也会拒绝,融合永不发生。
+
+**修复**(本轮):
+1. H32/H34 挂点改到实际被调用的 `forward`;
+2. `fused_forward_cuda` 增加 Qwen3.5 分支(`[q|k|v|z]`/`[b|a]` 段切,与上游
+   `forward_cuda:936-944` 逐行同构),`build_fused_inproj_weight` 去掉 interleaved 硬门;
+3. `build_reordered_inproj_weight` 显式守卫:仅 interleaved 布局做行重排,否则交回 H32;
+4. gdnsmall 改为**部分安装 + 惰性补装**:rearrange/l2norm 立即生效,conv1d 包装在
+   首次 GDN forward 时若算子已注册则补上;
+5. `h51_ab.sh` 增加 `OPTIN_INACTIVE` 自检:本侧声明开启的接管若 `calls==0`,直接告警,
+   避免再产出"看起来是 A/B、实际两侧同配置"的无效数据。
+
+**验证**:CPU 契约 `test_gdn_proj_fusion.py` / `test_gdn_reorder.py` /
+`test_gdn_small_fusion.py` / `test_gdn_gating.py` 共 33 项通过;新增
+`test_qwen35_layout_fused_slices_match_separate` 锁住本模型的段切等价性;
+`install()` 后 `QwenGatedDeltaNetAttention.forward` 确为 TileInfer 包装,
+且本模型守卫通过(fused 权重 `(12352, 2048)`)。
+
+**处置**:H32/H34/H35 的历史 A/B 数字(含 `h32_ab_done=DONE(off=1 on=0)`、
+`h34_ab_done=DONE(wait=upstream_timeout)`、`h35_ab_done=DONE(off=124 on=124)`)
+**全部作废**;须在 H51 窗口以修复后的代码重跑。此前把 `gdnproj,gdnsmall,greedy,gdnreorder`
+写进"当前最优配置"的做法已撤销(见 `h51_ab.sh` 基座注释)。
+
+## H54 RoPE cos/sin「一次物化」在本栈不适用(disproven,未实施)
+
+上游 vllm-ascend #18986 报告「RoPE 派生 cos/sin cache 一次物化」在 910B4 上 decode 步
+−6.4%/吞吐 +7.0%(E232)。逐条核查本栈 0.23.0 + Qwen3.6-35B-A3B 后**否决**:
+
+1. **该优化对象不存在**:#18986 针对的是 `vllm_ascend/ops/rotary_embedding.py` 里
+   `update_cos_sin()` 每步 `index_select + view + repeat + chunk` 重建 `_cos/_sin`。
+   但该函数开头即 `if _cos_sin_cache is None or _cos is None or _sin is None: return`,
+   而 `_cos/_sin` 只在 `set_cos_and_sin()` 的
+   `elif not is_vl_model(vllm_config) and has_rope(vllm_config)` 分支分配。
+   本模型 `config.json` 含 `vision_config`(Qwen3_5MoeForConditionalGeneration),
+   `is_vl_model` 为 True → **`_cos/_sin` 恒为 None** → `update_cos_sin()` 每步是
+   一次空函数返回,零开销可省。
+2. **RoPE 已被融合**:FIA 侧 profile(`op_statistic.csv`)里没有独立的 rope 算子,
+   只有 `split_qkv_rmsnorm_mrope_kernel`(decode 窗 40892µs / 5.68%,已把
+   split + RMSNorm + MRoPE 合成单核)与 `vllm::triton_split_qkv_rmsnorm_mrope` 包装;
+   `aten::index_select` 累计仅 12µs。不存在"每步重物化"的落点。
+3. 因此本项在本栈的**可达收益为 0**,不实施;若未来换非 VL 模型(纯文本 Qwen3-Next
+   同架构)再评估。
+
+## H55 统一设备窗口验证编排(h51,脚本就绪)
+
+为把"已实施未验证"的项一次窗口内跑完,新增三个脚本(均在 `.agent_loop/run/`,gitignored):
+
+| 脚本 | 作用 |
+|---|---|
+| `h51_ab.sh` | 参数化权威口径 A/B 单臂执行器。基座固定为「当前最优配置」(H31 multistream + SIMD + ktp 分带 + 四个在役 opt-in),两侧差异完全由 `H51_OFF_ENV` / `H51_ON_ENV`(环境变量)与 `H51_*_SERVE_EXTRA`(serve 参数)声明。取代 h32..h49 各自一份的 baseline 脚本。 |
+| `h51_window_chain.sh` | 串行编排:E4 P0 重锚 → E1 capture size 8 → E3 leave-one-out → E2 SIMD 后 ktp 重扫。每臂前后校验窗口(无他人 serve + HBM<8%),失败自动跳过并记 done。 |
+| `h51_summarize.py` | 按实验判据出判决表:E1 需 c8 ΔTPOT≥3% 且长场景 ≥−5%;E2 需长场景 ≥3% 且短场景 |Δ|≤3%;E3 输出逐项贡献,关掉反而更快(>+0.5%)者判 REVIEW 并建议移出推荐配置。 |
+
+启动方式(tmux,设备空闲后):
+
+```bash
+bash .agent_loop/run/h51_window_chain.sh
+# 或指定子集:EXPERIMENTS="E4 E1" bash .agent_loop/run/h51_window_chain.sh
+```
+
+
+
