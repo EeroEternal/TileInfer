@@ -212,6 +212,12 @@ _PREFILL_KV_TILE_PAGES = int(__import__("os").environ.get("TILEINFER_PREFILL_KV_
 # 阈值 4096 与历次 A/B(h43/h51 链)基座一致:≤4K 仍走 TI 内核(短上下文单位功效率
 # 尚可,且其 unpack/schedule 已按 H52 去 D2H),>4K 交还 FIA。
 # 显式 `TILEINFER_PREFILL_MAX_CTX=0` 可恢复旧行为(全走 TI 内核)。
+#
+# 注意(E238-2 的 TTFT 逐场景数据):TI 自研 prefill 内核在**所有五个实测场景都慢于
+# FIA**(128/128 −1.2%、128/512 −11.7%、8K −53.2%、16K −71.3%),只是幅度不同。
+# 因此 4096 是**保守值**(只切除大亏的部分,保留小亏);若窗口实测确认短场景也稳定
+# 落后,可把该值下调(例如 512)甚至设为极小值让 prefill 全部交还 FIA —— 这不需要
+# 改代码,只调 env。`prefill_long_skips` 计数用于确认分流确实在役。
 _PREFILL_MAX_CTX = int(__import__("os").environ.get("TILEINFER_PREFILL_MAX_CTX", "4096") or 0)
 
 #: D57-① 在役探针计数(被分流回 FIA 的 prefill 步数;metrics dumper 合并输出)。
