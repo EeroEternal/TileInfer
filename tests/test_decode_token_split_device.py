@@ -12,6 +12,8 @@ CPU 契约(tests/test_decode_token_split.py)锁调度语义;本文件锁**设备
 
 from __future__ import annotations
 
+import os
+
 import pytest
 import torch
 
@@ -104,7 +106,24 @@ def _oracle(q, k_cache, v_cache, meta, batch, indptr, last_page_len, page_size):
     ).float()
 
 
-@pytest.mark.parametrize("simd", [True, False], ids=["simd", "nosimd"])
+@pytest.mark.parametrize(
+    "simd",
+    [
+        pytest.param(True, id="simd"),
+        # E315:非 SIMD 变体编译挂死(E295 定谳,verify 全量口径 2026-10-21 首次踩实:
+        # build_split_kernel 卡 AscendPassPipelineBody);守卫与
+        # test_tilelang_ascend950_decode.py 同一开关,升级后置 0 复开。
+        pytest.param(
+            False,
+            id="nosimd",
+            marks=pytest.mark.skipif(
+                os.environ.get("TILEINFER_SKIP_SPLIT_COMPILE_HANG", "1").strip().lower()
+                not in ("0", "false"),
+                reason="tilelang 0.1.15 非 SIMD split codegen 挂死(E295/E315),升级后重开",
+            ),
+        ),
+    ],
+)
 def test_h67_single_page_token_split_matches_oracle(monkeypatch, simd):
     """1 页 128 token:页级 split=1(plain),token 级 tps=32 切 4 tile(merge)——都对上 oracle。"""
     monkeypatch.setenv("TILEINFER_ALLOW_SPLIT_KV", "1")
