@@ -20,8 +20,8 @@ LIMIT = %(limit)d
 
 k = tilelang.compile(fused_sample_tl(V, B, do_sample=False, _stage_limit=LIMIT), out_idx=None)
 print("[st] compiled", flush=True)
-torch.manual_seed(0)
-logits = torch.randn(B, V, dtype=torch.float32, device=DEV)
+g = torch.Generator(device="cpu").manual_seed(0)
+logits = (torch.randn(B, V, generator=g) * 3.0).to(torch.float32).to(DEV)
 temps = torch.ones(B, dtype=torch.float32, device=DEV)
 tp = torch.ones(B, dtype=torch.float32, device=DEV)
 tk = torch.zeros(B, dtype=torch.int32, device=DEV)
