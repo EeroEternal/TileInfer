@@ -156,10 +156,18 @@ def _weight_holder(owner):
     return None
 
 
+_DISPATCHER_BUMPED = {"e": None}
+
+
 def _bump_dispatcher_expert_num(owner_e: int) -> int:
     """折叠后 id=E 越界:npu_moe_init_routing(E309 实证)会把越界 token 丢弃
     (counts sum < rows ⇒ GMM 错乱)。comm 方法单例在层 __init__ 期构造(expert_num
-    按值捕获),PWAL 折叠晚于它 ⇒ 对已构造单例补升 expert_num E→E+1。"""
+    按值捕获),PWAL 折叠晚于它 ⇒ 对已构造单例补升 expert_num E→E+1。
+
+    单例跨层共享 ⇒ 全局一次性幂等(首层补升后其余层 no-op 即成功)。
+    """
+    if _DISPATCHER_BUMPED["e"] == owner_e:
+        return 1
     try:
         from vllm_ascend.ops.fused_moe import moe_comm_method as mcm
 
@@ -172,8 +180,13 @@ def _bump_dispatcher_expert_num(owner_e: int) -> int:
             if isinstance(cur, int) and cur == owner_e:
                 td.num_experts_local = owner_e + 1
                 bumped += 1
+        if bumped:
+            _DISPATCHER_BUMPED["e"] = owner_e
+            print(f"[H28] dispatcher expert_num bumped {owner_e}->{owner_e + 1} "
+                  f"on {bumped} singleton(s)", flush=True)
         return bumped
-    except Exception:  # pragma: no cover - 优化不得影响在役路径
+    except Exception as exc:  # pragma: no cover - 优化不得影响在役路径
+        print(f"[H28] dispatcher bump failed: {exc}", flush=True)
         return 0
 
 
@@ -215,6 +228,8 @@ def _fold_weights(owner) -> bool:
         _STATS["fold_skipped"] += 1
         return False
     _STATS["fold_layers"] += 1
+    print(f"[H28] folded shared expert into layer id={id(owner):#x} "
+          f"E+1={w13.shape[0] + 1} (E300 注入面;层内共享单例补升幂等)", flush=True)
     return True
 
 
@@ -271,6 +286,10 @@ def _wrap_shared_forward(orig_shared_forward):
     def shared_forward_impl(self, hidden_states, router_logits):
         if not (_enabled() and getattr(self, "_tileinfer_fold_done", False)):
             return orig_shared_forward(self, hidden_states, router_logits)
+        if not getattr(self, "_tileinfer_ctx_seen", False):
+            self._tileinfer_ctx_seen = True
+            print(f"[H28] shared_forward_impl ctx armed on folded layer "
+                  f"id={id(self):#x} (forward 链触达)", flush=True)
         _ensure_gate_extended(self)
         _set_ctx(self)
         try:
@@ -313,6 +332,10 @@ def _wrap_select_experts(orig_select_experts):
             ids, ws = append_shared_column(
                 topk_ids, topk_weights, owner._tileinfer_fold_expert_id, gate_logit, dtype
             )
+            if _STATS["fold_forward"] == 0:
+                print(f"[H28] first append: logits{tuple(logits.shape)} "
+                      f"ids{tuple(ids.shape)} expert_id={owner._tileinfer_fold_expert_id}",
+                      flush=True)
             _STATS["fold_forward"] += 1
             return ws, ids
         except Exception:  # pragma: no cover - 优化不得影响在役路径
