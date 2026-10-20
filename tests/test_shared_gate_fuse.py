@@ -209,6 +209,46 @@ def test_h73_install_must_not_require_load_weights():
     )
 
 
+def test_h73_init_binds_expert_gate_by_signature():
+    """``expert_gate`` 必须按签名绑定获取,不能只读 ``kwargs``。
+
+    ``Qwen2MoeMLP.__init__`` 的 ``expert_gate`` 是第 6 个位置参数。vLLM 目前用关键字
+    调用,但上游若改成位置传参,只读 ``kwargs`` 会**静默漏融合**(不报错、不生效,
+    指标恒为 0——与 H56 踩过的"挂点从未生效"同类)。
+    """
+    src = inspect.getsource(mod._make_mlp_init)
+    assert "bind(" in src, "必须按签名 bind 取参,不能只读 kwargs"
+    assert 'kwargs.get("expert_gate"' not in src, "不得只从 kwargs 取 expert_gate"
+
+    # 行为验证:位置传参也能拿到 expert_gate / intermediate_size / prefix
+    calls = {}
+
+    class _Gate(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(1, 8))
+
+    def fake_init(self, hidden_size, intermediate_size, hidden_act,
+                  quant_config=None, reduce_results=True, expert_gate=None,
+                  is_sequence_parallel=False, prefix=""):
+        calls.update(
+            hidden=hidden_size, inter=intermediate_size,
+            gate=expert_gate, prefix=prefix,
+        )
+        self.down_proj = torch.nn.Identity()
+        self.act_fn = torch.nn.Identity()
+        self.gate_up_proj = torch.nn.Identity()
+
+    wrapped = mod._make_mlp_init(fake_init)
+    gate = _Gate()
+    obj = torch.nn.Module()
+    # 全位置传参(模拟上游改签名后的调用)
+    wrapped(obj, 8, 16, "silu", None, True, gate, False, "layers.0.mlp")
+    assert calls["gate"] is gate
+    assert calls["inter"] == 16
+    assert calls["prefix"] == "layers.0.mlp"
+
+
 # ---------------------------------------------------------------- 5. 回退纪律
 
 

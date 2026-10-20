@@ -41,6 +41,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 
@@ -84,13 +85,23 @@ def is_installed() -> bool:
 def _make_mlp_init(orig_init):
     """包装 ``Qwen2MoeMLP.__init__``:有多余的 expert_gate 时把列并进 gate_up。
 
-    注意:改结构后**必须**同时改 ``load_weights`` 的映射(见 :func:`install`),
-    否则 checkpoint 里独立的 ``shared_expert_gate.weight`` 无处可去。
+    权重落点见 :func:`_patch_linear_pwal` —— 本栈 ``Qwen2MoeMLP`` **没有**
+    ``load_weights``,checkpoint 里独立的 ``shared_expert_gate.weight`` 由模型级
+    ``named_parameters()`` 映射到保留的 ``expert_gate`` 模块上,再在 NZ 转换前
+    搬进 fused 末行。
     """
 
-    def __init__(self, hidden_size, intermediate_size, hidden_act, *args, **kwargs):
-        expert_gate = kwargs.get("expert_gate", None)
-        orig_init(self, hidden_size, intermediate_size, hidden_act, *args, **kwargs)
+    # `Qwen2MoeMLP.__init__` 的签名:vLLM 目前全用关键字调用,但上游随时可能改成
+    # 位置传参;只读 kwargs 会在那种情况下**静默漏融合**(不报错、不生效)。
+    # 这里按实际签名 bind 取值,两种调用方式都正确。
+    _sig = inspect.signature(orig_init)
+
+    def __init__(self, *args, **kwargs):
+        bound = _sig.bind(self, *args, **kwargs)
+        bound.apply_defaults()
+        expert_gate = bound.arguments.get("expert_gate", None)
+        hidden_size = bound.arguments.get("hidden_size", 0)
+        orig_init(self, *args, **kwargs)
         if not _enabled() or expert_gate is None:
             return
         try:
@@ -108,9 +119,10 @@ def _make_mlp_init(orig_init):
                 )
                 return
 
-            qc = kwargs.get("quant_config", None)
-            sp = kwargs.get("is_sequence_parallel", False)
-            prefix = kwargs.get("prefix", "")
+            qc = bound.arguments.get("quant_config", None)
+            sp = bound.arguments.get("is_sequence_parallel", False)
+            prefix = bound.arguments.get("prefix", "")
+            intermediate_size = bound.arguments["intermediate_size"]
             fused = MergedColumnParallelLinear(
                 hidden_size,
                 [intermediate_size] * 2 + [1],
@@ -121,8 +133,7 @@ def _make_mlp_init(orig_init):
             )
             self.gate_up_proj = fused
             # 保留原模块:checkpoint 里的 `...mlp.shared_expert_gate.weight` 仍按原
-            # 参数名落到这里(本栈 `Qwen2MoeMLP` 没有 `load_weights`,权重由模型级
-            # `named_parameters()` 直接映射),首次 forward 再搬进 fused 末行。
+            # 参数名落到这里,由 `_bind_one_layer` 在 NZ 转换前搬进 fused 末行。
             self.expert_gate = expert_gate
             self._tileinfer_gate_fused = True
             self._tileinfer_gate_bound = False

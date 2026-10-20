@@ -1708,14 +1708,55 @@ GEMM 每列独立,拼接不改变任何列的结果 → **逐位等价**(由测�
 ⇒ 崩溃来自**结构改造**(NZ 后的错位写),不是融合算术。
 dryrun 数据已改名 `bench_results/h73_dryrun_on_*`,不与正式 A/B 混用。
 
-契约同步加固(`tests/test_shared_gate_fuse.py`,11 项):
+契约同步加固(`tests/test_shared_gate_fuse.py`,12 项):
 - 新增「install() 不得依赖 `Qwen2MoeMLP.load_weights`」回归锁;
 - 新增「必须挂 `_shared_experts_part2`」锁;
 - 新增「绑定必须在 NZ 转换前 + NZ 张量必须拒绝绑定 + 只绑一次」锁;
-- 新增「`fused[..., :-1]` 必须 `.contiguous()` 再喂 `npu_swiglu`」锁(H68-a 同型陷阱)。
+- 新增「`fused[..., :-1]` 必须 `.contiguous()` 再喂 `npu_swiglu`」锁(H68-a 同型陷阱);
+- 新增「`expert_gate` 必须按签名 bind 取参」锁 + 位置传参行为验证。
 
-**状态**:实现缺陷已全部修复,契约 11 项绿;**性能判决仍待窗口**(off 臂已出
-c1 9.694/c8 11.971/512_c8 11.995/8K 36.65/16K 65.18,on 臂待重跑)。
+### 第四处缺陷:只读 kwargs 会静默漏融合(2026-10-20 自查,已修)
+
+`_make_mlp_init` 原本用 `kwargs.get("expert_gate")` 取参,但 `expert_gate` 是
+`Qwen2MoeMLP.__init__` 的**第 6 个位置参数**。vLLM 目前全用关键字调用,所以能工作;
+一旦上游改成位置传参,融合会**静默失效**(不报错、指标恒 0)——这正是 H56 踩过的
+"挂点从未生效"同型缺陷。已改为 `inspect.signature(orig_init).bind(...)` 取参,
+关键字/位置两种调用都正确,并有行为测试锁定。
+
+同时修正了 `_make_mlp_init` 的过时文档串(它还在说"必须同时改 `load_weights`",
+而那条路径早已删除)。
+
+**状态**:实现缺陷已全部修复,契约 12 项绿;**off 臂 5/5 已出**(9.700/11.964/11.995/
+36.788/65.287,与 14:21 那次逐项一致);**on 臂 17:43-17:46 已出(32/32 全 200)——
+判决 PASS,见下节**。
+
+### H73 设备 A/B 判决:PASS(2026-10-20 17:4x,E299)
+
+on 臂(`TILEINFER_SHARED_GATE_FUSE=1`,17:43-17:46,32/32 全 200)vs off 臂
+(17:17-17:20,32/32 全绿,与 14:21 会话逐项差 <0.4% ⇒ 基座无漂移):
+
+| 场景 | TPOT off | TPOT on | dTPOT | 吞吐 off | 吞吐 on | dthr | 判定 |
+|---|---|---|---|---|---|---|---|
+| 128x128_c1 | 9.700 | 9.598 | **-1.05%** | 96.6 | 98.0 | +1.54% | **PASS(c1 主判据 ≥1%)** |
+| 128x128_c8 | 11.964 | 11.909 | -0.46% | 593.8 | 598.2 | +0.74% | OK |
+| 128x512_c8 | 11.995 | 11.938 | -0.47% | 647.1 | 651.2 | +0.64% | OK |
+| 8192x128_c8 | 36.788 | 36.646 | -0.39% | 175.2 | 175.9 | +0.36% | OK |
+| 16384x128_c8 | 65.287 | 65.497 | +0.32% | 98.2 | 98.2 | -0.00% | OK(噪声内) |
+
+- c1 主判据 dTPOT -1.03%~-1.06%(与 14:21 off 基线比 -1.06%,与同会话 off 比
+  -1.05%),达标;与 E269 预估(发射税 ~100µs/步 = c1 TPOT 2.8%)量级相符——
+  差值说明图模式 host 预发射吸收了一部分(E286 同机理)。
+- **融合生效的反证链**:旧缺陷②(part2 未挂)的症状是 ON 臂全 500(EZ0009);
+  本轮 5 场景 32/32 全 200 ⇒ part2 已挂、2I+1 结构改造数学正确。
+- **installed_hits=0 的定性**:shared_gate_fuse 的 `getLogger(__name__)` 无 handler,
+  install() 的 INFO 在 serve 进程走 root(lastResort 只出 WARNING+)⇒ 日志静默。
+  **功能无缺陷,可观测性问题**;后续判定安装改用契约探针/metrics,不 grep 日志。
+- 单变量核查:on 臂 serve 17:41:52 启动,加载的是 17:23 加固版 shared_gate_fuse;
+  off 臂 17:17 启动,加载 17:0x 版——两者仅差 `inspect.signature` 加固(纯取参方式,
+  行为等价、零性能面);H74 内核形态改动(17:45/17:49)晚于两臂 ⇒ **A/B 单变量成立**。
+
+**终态**:H73 proven(保守门槛);`TILEINFER_SHARED_GATE_FUSE` 建议在 c1 敏感部署
+开启(默认关不变)。相对 30% 总目标贡献 ~1%(c1 TPOT)。
 
 ### H73 首轮 A/B 中观察到的口径问题(已修脚本)
 
@@ -1808,6 +1849,87 @@ plain 已贴带宽顶,**H67 的"并行度不足"只在 c1/b1 成立**,不能外�
   而新版 npu-smi 把 HBM 拆成 `HBM Usage Rate(%)`/`HBM Capacity(MB)` 两行,`$3` 解析
   出 `|` → `[ "|" -lt 26214 ]` 恒假 → **空等 8 小时 188 轮**。已改用 `-t usages`
   的 key:value 格式并做数值校验(实测 5243MB,判据正常触发)。
+
+---
+
+## H74 DeepInfer 对标梳理(2026-10-20 iter-209,仅调研不实现)
+
+DeepSeek 于 2026-10-20 开源 [DeepInfer](https://github.com/deepseek-ai/DeepInfer)
+(Apache-2.0),**明确支持 Huawei Ascend 950 NPU,且内核用 TileLang 写**——与我们同栈。
+已 sparse-clone 到 `/tmp/deepinfer_probe` 逐文件核对。
+
+### 最有价值的发现:他们全员用 `T.Persistent`,我们全是 `T.serial`
+
+`deepinfer/model_executor/layers/tilelang_ops/asc/` 共 **26 个**算子文件,统计如下
+(`persistent` = `T.Persistent` 出现次数,`pipelined` = stage 相关行数):
+
+```
+sampler.py                  persistent=7  pipelined=14
+load_paged_kv_cache.py      persistent=3  pipelined=8
+get_kv_index.py             persistent=3  pipelined=11
+prepare_v4_decode_metadata  persistent=2  pipelined=18
+swa_index.py                persistent=1  pipelined=2
+fused_sample.py             persistent=1  pipelined=6
+...
+```
+
+**每一个**算子都是这个骨架:
+
+```python
+cores = tile_kernels.get_num_vec_cores()
+with T.Kernel(cores) as pid:
+    T.annotate_buffer_versions({buf: stages})        # 新版 API
+    for task in T.Persistent([...], cores, pid, group_size=1, num_stages=stages):
+        ...                                          # 每个核连续吃多个 task,跨 task 流水
+```
+
+而我们的 `tileinfer/kernels/attention/paged_decode_ascend950.py`:
+
+```python
+for p in T.serial(num_pages):        # 纯串行,0 个 Persistent,0 个 stage
+```
+
+**版本核对(本地实测)**:tilelang `0.1.15`,`T.Persistent` **存在**,
+`num_stages` 参数**生效**(源码 docstring:"The number of pipeline stages for double
+buffering. If 0, pipeline is disabled.");`T.annotate_buffer_versions` **不存在**
+(更新版 API),但 `T.Persistent(..., num_stages=N)` 是等效入口。
+
+**这条恰好解释了 H42-③ 的失败与 DeepInfer 的从容**:我们手写双缓冲
+(`paged_decode_pipeline`)是在**手工摆 buffer + 手工发预取**,而编译器本来就提供了
+`num_stages` 这个正式入口。手写路线被 E296 判 disproven,不等于"流水无收益",
+而是"手工实现这条路走错了"。
+
+### 其余可借鉴项(按与我们靶面的相关度排序)
+
+| DeepInfer 文件 | 机制 | 我们的对应物 | 可借鉴度 |
+|---|---|---|---|
+| `get_kv_index.py` / `kv_index_cat.py` | Persistent+SIMD 做页索引展开/拼接 | `_expand_page_table` + ragged 三段重建(每步都跑) | **高** |
+| `load_paged_kv_cache.py` | 页式 KV 加载 + FP4/FP8 量化 + block 32/64 | `_sub_pages` / `pool_view` | 中(量化暂不需要) |
+| `fused_sample.py` (673 行) | temperature+softmax+top-p+top-k+采样**单核融合** | H36 只做 greedy 跳过 cast | **高** |
+| `swa_index.py` (62 行) | `T.SimdVF` + `T.simd.vsel` 窗口索引 | 我们 `T.simd.*` 的用法样板 | 中(写法参考) |
+| `fused_transform.py` (899 行) | norm+rope+hadamard+cast+store_kv 五合一 | H32/H34/H35 分散小算子 | **低**(见下) |
+
+### 明确不可借鉴
+
+- **FlashMLA / DeepGEMM / DeepEP**:MLA 架构专用。我们是 Qwen 的 GQA,内核不通用。
+- **SWA bounded replay**(`YOCO_PREFILL_TRUNCATION_MODE=compact`):依赖 DeepSeek V4
+  的 provider/consumer 分层(`yoco_boundary_layer_idx`),在边界层把历史 token 切掉
+  只喂 consumer 层。Qwen 无此结构,没有对应插点。
+- **MTP/DSpark 投机解码**:需要模型自带 draft head,当前 Qwen3.6 部署未启用。
+- **异步调度**:DeepInfer 用 C++ (`csrc/engine/scheduler.hpp`) 实现,但我们已在
+  **H50** 证实 "vLLM 的 `async_scheduling` 默认已开",这不是新杠杆。
+- **`fused_transform` 的融合思路**:我们 H68-a 已实测——融合后 strided slice 喂
+  conv1d 走 AscendC 慢路径,引擎面 **+16.1% 恶化**。DeepInfer 能做到是因为其下游是
+  MLA(无 conv1d),不能直接照搬。
+
+### 建议(待裁决,本轮不实现)
+
+1. **用 `T.Persistent(num_stages=2~4)` 重构 `paged_decode_ascend950` 的页循环**——
+   这是唯一能解释"同栈、同硬件,DeepInfer 能贴带宽而我们 897 GB/s"的结构差异。
+   注意:H42-③ 已证明 b8 场景 plain 已接近带宽顶,所以收益应主要在
+   **c1/b1 短上下文**(那里 grid 只有 2 blocks,正是 H67 的靶面)。
+2. `_expand_page_table` + ragged 重建的 Persistent 化(每步固定税)。
+3. H36 升级为 kernel 级融合采样(参考 `fused_sample.py` 的分块 + 双 CDF 设计)。
 
 ---
 
