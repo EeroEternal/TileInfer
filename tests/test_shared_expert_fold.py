@@ -241,6 +241,58 @@ def test_gate_extension_lazy_and_once():
     assert owner.gate.weight_fp32 is first  # 二次调用不再更换对象(capture 安全)
 
 
+def test_select_wrapper_plain_logits_gemv_fallback():
+    """非 internal router(在役 Qwen3.6 形态):logits [M,E] 原样透传 + expert_gate
+    GEMV 现算门控(E310:扩列判据改用 fold_expert_id,降级分支真正可达)。"""
+    owner = _FakeMoe()
+    fold._fold_weights(owner)  # expert_id = 8
+    owner._tileinfer_fold_ext = False  # gate 未扩列
+
+    calls = {}
+
+    def gate_forward(hidden):
+        calls["hidden_shape"] = tuple(hidden.shape)
+        return (torch.tensor([[1.5]]), None)
+
+    owner._shared_experts.expert_gate = gate_forward
+
+    def orig_select(*args, **kwargs):
+        assert tuple(kwargs["router_logits"].shape) == (1, 8)  # 原形态透传不切片
+        return torch.tensor([[0.9, 0.1]]), torch.tensor([[2, 5]])
+
+    sel = fold._wrap_select_experts(orig_select)
+    fold._CTX.owner = owner
+    try:
+        ws, ids = sel(
+            hidden_states=torch.randn(1, 3), router_logits=torch.randn(1, 8), num_experts=8
+        )
+    finally:
+        fold._CTX.owner = None
+    assert calls["hidden_shape"] == (1, 3)
+    assert ids.shape == (1, 3) and int(ids[0, 2]) == 8
+    expect = float(torch.sigmoid(torch.tensor(1.5)))
+    assert abs(float(ws[0, 2]) - expect) < 1e-6
+    assert fold.stats()["fold_forward"] == 1
+
+
+def test_select_wrapper_passthrough_shape_mismatch():
+    """列数既非 E 也非 E+1:透传且不计数(E310 双态判据的负例)。"""
+    owner = _FakeMoe()
+    fold._fold_weights(owner)
+
+    def orig_select(*args, **kwargs):
+        return torch.tensor([[1.0]]), torch.tensor([[3]])
+
+    sel = fold._wrap_select_experts(orig_select)
+    fold._CTX.owner = owner
+    try:
+        ws, ids = sel(router_logits=torch.randn(1, 5), num_experts=8)
+    finally:
+        fold._CTX.owner = None
+    assert ids.shape == (1, 1)
+    assert fold.stats()["fold_forward"] == 0
+
+
 def test_install_idempotent_and_gates_off():
     assert fold.is_installed() is False
     r1 = fold.install()

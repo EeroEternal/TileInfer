@@ -304,7 +304,14 @@ def _wrap_shared_forward(orig_shared_forward):
 
 
 def _wrap_select_experts(orig_select_experts):
-    """select_experts 包装:折叠层上切片扩列 logits,追加恒选专家与 sigmoid 门控。"""
+    """select_experts 包装:折叠层上追加恒选专家与 sigmoid 门控。
+
+    双形态(E310 定谳):
+    - internal router(gate.weight_fp32 扩列):logits [M, E+1] → 切片 [M, E] + 免费门控列;
+    - 非 internal(Qwen3.6 在役:router_logits 由模型外部 gate 产出,无扩列):
+      logits [M, E] 原样透传,门控经 shared expert 的 expert_gate GEMV 现算
+      (原语义 ``sigmoid(expert_gate(h)) * shared_out``,0_23_0 L355-357)。
+    """
 
     _DIAG = {"entry": 0, "pass": 0}
 
@@ -319,7 +326,11 @@ def _wrap_select_experts(orig_select_experts):
                       f"kw={sorted(kwargs)[:6]}", flush=True)
             return orig_select_experts(*args, **kwargs)
         num_experts = kwargs.get("num_experts")
-        if num_experts is None or logits.shape[1] != num_experts + 1:
+        n_cols = int(logits.shape[1])
+        eid = getattr(owner, "_tileinfer_fold_expert_id", None)
+        extended = eid is not None and n_cols == eid + 1
+        plain = eid is not None and n_cols == eid
+        if not (extended or plain):
             if _DIAG["pass"] < 3:
                 _DIAG["pass"] += 1
                 print(f"[H28] select passthrough(shape): logits{tuple(logits.shape)} "
@@ -329,10 +340,10 @@ def _wrap_select_experts(orig_select_experts):
             import torch
 
             kwargs = dict(kwargs)
-            kwargs["router_logits"] = logits[:, :num_experts]
+            kwargs["router_logits"] = logits[:, :num_experts] if extended else logits
             topk_weights, topk_ids = orig_select_experts(*args, **kwargs)
             dtype = topk_weights.dtype
-            gate_logit = logits[:, num_experts:]
+            gate_logit = logits[:, num_experts:] if extended else None
             if not getattr(owner, "_tileinfer_fold_ext", False):
                 # 扩列 gate 权重的拼接在首个 forward 前完成;未扩列则 GEMV 降级。
                 gate_logit = None
@@ -348,8 +359,8 @@ def _wrap_select_experts(orig_select_experts):
             )
             if _STATS["fold_forward"] == 0:
                 print(f"[H28] first append: logits{tuple(logits.shape)} "
-                      f"ids{tuple(ids.shape)} expert_id={owner._tileinfer_fold_expert_id}",
-                      flush=True)
+                      f"ids{tuple(ids.shape)} expert_id={owner._tileinfer_fold_expert_id} "
+                      f"extended={extended}", flush=True)
             _STATS["fold_forward"] += 1
             return ws, ids
         except Exception:  # pragma: no cover - 优化不得影响在役路径
