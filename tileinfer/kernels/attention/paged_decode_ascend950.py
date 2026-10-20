@@ -598,9 +598,6 @@ def paged_decode_ascend950(
     return main
 
 
-_KERNEL_CACHE: dict = {}
-
-
 def paged_decode_split(
     batch: int,
     kv_heads: int,
