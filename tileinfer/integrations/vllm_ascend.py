@@ -2314,6 +2314,14 @@ def start_metrics_dumper() -> bool:
                 # H21 在役探针:A/B 侧断言"策略确实在役"用(策略缺失/为空即配置未生效)。
                 # 放在静默守卫之后:空进程不得因它而开始写文件。
                 stats["ktp_policy"] = getattr(cls, "_policy_view", None)
+                # H28 在役探针:折叠层保持/接管计数(A/B 侧断言"折叠确实在役"用;
+                # 空视图进程 fold_layers=0 不影响静默守卫——EngineCore 有其他非零计数)。
+                try:
+                    from .shared_expert_fold import stats as _fold_stats
+
+                    stats.update(_fold_stats())
+                except Exception:  # noqa: BLE001 - metrics must never break serving
+                    pass
                 tmp = f"{path}.tmp"
                 with open(tmp, "w", encoding="utf-8") as handle:
                     json.dump(stats, handle)
@@ -2400,6 +2408,16 @@ def install(raise_on_failure: bool = True) -> bool:
             install_shared_gate_fuse()
         except Exception as exc:  # noqa: BLE001 - 优化模块不得影响在役路径
             logger.warning("TileInfer shared gate fuse not installed: %s", exc)
+        # H28 shared expert 恒选 E+1 折叠(E300 注入面定谳):显式 opt-in
+        # (TILEINFER_SHARED_EXPERT_FOLD=1,默认关=零行为变化)。类级包装须在
+        # 模型构建前挂好(init 登记从属关系→PWAL 前置折叠);与 H73 同权重链,
+        # 权重形态互认(fold 侧剔除 H73 融合的 gate 行),A/B 口径下单变量分别验证。
+        try:
+            from .shared_expert_fold import install as install_shared_expert_fold
+
+            install_shared_expert_fold()
+        except Exception as exc:  # noqa: BLE001 - 优化模块不得影响在役路径
+            logger.warning("TileInfer shared expert fold not installed: %s", exc)
         # H70-b GDN 元数据 builder 稳态 memo 化(E285):显式 opt-in
         # (TILEINFER_GDN_META_MEMO=1,默认关=零行为变化),翻转 env + 重启即回退。
         try:
