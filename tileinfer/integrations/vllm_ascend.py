@@ -222,6 +222,13 @@ _PREFILL_KV_TILE_PAGES = int(__import__("os").environ.get("TILEINFER_PREFILL_KV_
 # `prefill_long_skips` 计数用于确认分流确实在役。
 _PREFILL_MAX_CTX = int(__import__("os").environ.get("TILEINFER_PREFILL_MAX_CTX", "1") or 0)
 
+# H72:prefill 的 query 块大小(内核 M tile 行数,影响 grid = num_tiles × kv_heads)。
+# 0 = 自适应:上下文 <= PREFILL_SHORT_CTX 时用 64(短序列 occupancy 不足,翻倍 tile 数),
+# 否则 128。显式正整数则固定该值(便于单变量 A/B)。上限 128 由内核 assert 约束。
+_PREFILL_BLOCK_Q = int(__import__("os").environ.get("TILEINFER_PREFILL_BLOCK_Q", "0") or 0)
+# 自适应分界(token):<= 该值的 prefill 步视为"短序列",降 block_q 提并行度。
+_PREFILL_SHORT_CTX = int(__import__("os").environ.get("TILEINFER_PREFILL_SHORT_CTX", "1024") or 0)
+
 #: D57-① 在役探针计数(被分流回 FIA 的 prefill 步数;metrics dumper 合并输出)。
 _PREFILL_STATS: Dict[str, int] = {"prefill_long_skips": 0}
 #: 被分流步的守卫 (step_id, num_reqs, num_tokens):同一步的其余层快速短路,免重复构建
@@ -498,7 +505,29 @@ def prefill_step(
             if sum(qo_host) > int(query.shape[0]):
                 _refuse("qo sum exceeds tokens", sum(qo_host), int(query.shape[0]))
                 return False
-        max_tiles = sum((q * group + 127) // 128 for q in qo_host)
+        # H72:短序列 prefill 的 occupancy 自适应。
+        #
+        # 内核 grid = num_tiles × kv_heads,而 num_tiles = Σ ceil(qo_len_b·group / block_q)。
+        # 本模型 group=8、kv_heads=2,block_q=128 时:
+        #   q=128×b=1 → 16 blocks;q=128×b=8 → 128 blocks;q=512×b=8 → 512 blocks。
+        # 短序列(尤其 c1)的 block 数远低于 950 的可用核数,并行度不足;而 E46 画像显示
+        # 内核是 aiv_vec 0.96 / aic_mac 0.02 的逐页串行向量链,**不是**访存或 cube 瓶颈,
+        # 因此"加 block"是这个形状下唯一可动的方向。
+        #
+        # 缩小 block_q 让每个 tile 的 query 行数减半、tile 数翻倍(BR=block_q 仍在
+        # assert BR<=128 内,32 也是合法值)。只在**短上下文**启用:长上下文本身已被
+        # H59 交还 FIA,且那里 tile 数已足够,缩小 block_q 只会增加每 tile 的固定开销。
+        #
+        # 默认按阈值自动选:PREFILL_SHORT_CTX(=1024)以下的步用 block_q=64,其余 128。
+        # 显式 `TILEINFER_PREFILL_BLOCK_Q` 可覆盖(0=自适应,其它=固定值,便于 A/B)。
+        _max_ctx_tokens = max(_seq_host) if _seq_host else 0
+        if _PREFILL_BLOCK_Q > 0:
+            block_q = _PREFILL_BLOCK_Q
+        elif _max_ctx_tokens <= _PREFILL_SHORT_CTX:
+            block_q = 64
+        else:
+            block_q = 128
+        max_tiles = sum((q * group + block_q - 1) // block_q for q in qo_host)
         if max_tiles == 0 or max_tiles > PREFILL_MAX_TILES:
             _refuse("tile bound", max_tiles, PREFILL_MAX_TILES)
             return False
@@ -589,7 +618,8 @@ def prefill_step(
             # counts per q-block).
             splits_per_req = [max(1, -(-p // ktp) + 1) for p in pages_host]
             split_tiles = sum(
-                ((q * group + 127) // 128) * s for q, s in zip(qo_host, splits_per_req)
+                ((q * group + block_q - 1) // block_q) * s
+                for q, s in zip(qo_host, splits_per_req)
             )
             if split_tiles <= PREFILL_MAX_TILES:
                 kernel_tiles_split = _next_pow2(split_tiles)
@@ -615,7 +645,7 @@ def prefill_step(
                     kernel_batch=kernel_batch,
                     kernel_tiles=kernel_tiles_split,
                     kv_heads=num_kv_heads,
-                    block_q=128,
+                    block_q=block_q,
                     max_qo_tokens=max(qo_host),
                     page_size=KERNEL_PAGE_SIZE,
                     indices=indices_cap,
@@ -636,7 +666,7 @@ def prefill_step(
             KERNEL_PAGE_SIZE,
             pool_pages,
             kernel_tiles,
-            128,
+            block_q,
             dtype_name,
         ) + ((split_ms,) if split_ctx is not None else ())
         if not PrefillShapeManager.usable(spec):
@@ -647,7 +677,7 @@ def prefill_step(
                 [q * group for q in qo_host],
                 pages_host,
                 device=device,
-                block_q=128,
+                block_q=block_q,
                 load_balance=False,
             )
             if kernel_tiles != schedule.num_tiles:
@@ -659,6 +689,7 @@ def prefill_step(
             "group": group,
             "qo_host": qo_host,
             "max_qo": max(qo_host),
+            "block_q": block_q,
             "kernel_batch": kernel_batch,
             "meta": meta,
             "schedule": None if split_ctx is not None else schedule,
@@ -717,7 +748,7 @@ def prefill_step(
             shared["schedule"],
             shared["qo_dev"],
             group=group,
-            block_q=128,
+            block_q=shared["block_q"],
             kernel_batch=shared["kernel_batch"],
         )
     # Unpack [batch, H, max_qo, D] -> [num_tokens, H, D] with the engine's layout.
