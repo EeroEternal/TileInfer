@@ -368,3 +368,22 @@ oracle 在 dim=128(SIMD)PASS);CANN 9.1.1 头文件不匹配为环境事实。
   `.agent_loop/run/h67_toksplit_bench.py` 已留档,tilelang 升级后一键复跑。
 - npu 标记套件临时轮换 `-k "not nosimd"`(D159-3),vendor 修复后应去除。
 - 设备级脚本一律走 `.agent_loop/run/*_launch.sh` 启动器(内 source env.sh)。
+
+## KI-8 H77 dense NN 预排副本的权重更新流限制(H77 opt-in 域,iter-223 源码审查登记)
+
+### 现象/限制
+
+`tileinfer/integrations/dense_nn.py` 的 NN 预排副本 `w_nn`(加载期 `weight.t().contiguous()`,
+dense_nn.py:122)是独立 tensor:若权重在 serve 生命周期内被外部原位更新
+(RL 训练循环 `weight.data.copy_` 类流程),副本不会同步,apply 走 `torch.matmul(x, w_nn)`
+(dense_nn.py:129)将使用陈旧权重。
+
+### 适用域
+
+推理 serve 场景权重仅加载一次,不受影响;仅 RL/在线权重更新流 + `TILEINFER_DENSE_NN=1`
+同时成立时触发。默认关闭(opt-in),在役路径零影响。
+
+### Mitigation
+
+启用 RL 更新流的部署不得开启 `TILEINFER_DENSE_NN`;若需共存,须在权重更新回调后重建
+`w_nn`(重跑 `_shim_layer` 前先还原 quant_method.apply)。
