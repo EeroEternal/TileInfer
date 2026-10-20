@@ -1771,6 +1771,44 @@ E283 记录的"发射税节省被 array_equal 比较 / numpy / H2D 成本抵消"
 - on 臂(`TILEINFER_PAGE_PIPELINE=1`)两次进场都被外部 ww/reef 栈挤掉,未能出数;
 - **判据不变**:8K/16K TPOT 或 ITL 改善 ≥5%,短场景 |Δ|≤3%,`fallbacks=0`/`capture=40`。
 
+### H42-③ 假设被微基准推翻(E296,2026-10-20 设备实测)
+
+`h42_page_cost_bench.py` 在**生产配置**(`TILEINFER_SIMD_SOFTMAX=1`)下跑通完整矩阵:
+
+| 场景 | plain ktp=0 | split128 | split32 | split16 |
+|---|---|---|---|---|
+| b8 × 8K | **0.598 ms / 897.5 GB/s** | 0.652 / 823.4 | 0.770 / 696.9 | 1.026 / 523.1 |
+| b8 × 16K | **1.166 ms / 921.2 GB/s** | 1.247 / 860.8 | 1.220 / 880.2 | 1.484 / 723.5 |
+| b8 × 1 tok | **0.107 ms** | 0.132 | — | 0.585 |
+
+三点结论:
+
+1. **plain 路径已达 897–921 GB/s**,接近 HBM 峰值(公开 paged MQA decode 上界
+   2006 GB/s 的一半,但那是不同 cache 布局/更小 head_dim 的对照)。H42-③ 立项时
+   引用的"每页 ~30 µs vs 带宽下界 2.5 µs = 12x 余量"是 **SIMD softmax 之前**的老
+   数据;**加上 SIMD 后余量已基本消失**。
+2. **所有 ktp 切分都是负收益**(8K: 0.652/0.770/1.026 vs 0.598;16K 同型)。
+   额外的并行度换来的 merge 开销与重复 K/V 读取超过了收益。
+3. **split32/split16 出现数值误差** `err=0.047/0.091`(split128 为 0.0000)。
+   这是**独立于性能的缺陷**:多 split 路径在 >1 split/请求 时精度不达标,须先
+   查清才能考虑启用。
+
+⇒ **H42-③ 判决:disproven**。`TILEINFER_PAGE_PIPELINE` 保持默认关,不再投入设备窗口。
+新的瓶颈定位回到 **H67**(c1 短上下文 grid 仅 2 blocks),但注意:上表 b8 场景
+plain 已贴带宽顶,**H67 的"并行度不足"只在 c1/b1 成立**,不能外推到 b8。
+
+### 附带修好的两个探针/脚本缺陷
+
+- `h42_pipeline_bench.py`:`q_pad` 在 CPU 上分配后 `.to(npu)` → tilelang 报
+  `allocator anchor has the wrong device type; expected: 1, got: 12`;同时该探针只
+  导入 `tileinfer.kernels.*` 子模块,未触发包根的设备解析。两处已修(直接在 NPU 上
+  分配 + 显式导入 `tileinfer` 包根),但**该探针的判定已被 page_cost 数据取代**,
+  不再需要它出数。
+- `h42pp_wait_chain.sh`:窗口判据用 `npu-smi info | awk '/HBM-Usage/ {print $3}'`,
+  而新版 npu-smi 把 HBM 拆成 `HBM Usage Rate(%)`/`HBM Capacity(MB)` 两行,`$3` 解析
+  出 `|` → `[ "|" -lt 26214 ]` 恒假 → **空等 8 小时 188 轮**。已改用 `-t usages`
+  的 key:value 格式并做数值校验(实测 5243MB,判据正常触发)。
+
 ---
 
 ## H67 batch-1 decode attention 主核:取证棒就绪(2026-10-20 iter-208)

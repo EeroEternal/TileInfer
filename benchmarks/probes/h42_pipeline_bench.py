@@ -26,6 +26,10 @@ import torch
 import torch_npu  # noqa: F401
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+# 必须导入包根:它会经由 `tileinfer.utils.resolve_device` 完成 torch_npu 后端注册与
+# 当前设备绑定。只导入 `tileinfer.kernels...` 子模块时,tilelang 编译出的内核会被
+# 当成 CPU target,调用即报 "allocator anchor has the wrong device type; expected: 1, got: 12"。
+import tileinfer  # noqa: F401
 from tileinfer.kernels.attention.paged_decode_ascend950 import (
     build_decode_kernel,
     declared_pool_cap,
@@ -36,6 +40,11 @@ DT = torch.bfloat16
 KVH, GROUP, PAGE, DIM = 8, 4, 128, 256
 WIDTH_PAGES = 256
 ITERS = 30
+
+# tilelang 的 tvm_ffi 适配器会读 `torch.npu.current_device()` 当 allocator anchor 的
+# device type;不显式设置时它会退回 CPU(device type 12),于是内核调用直接报
+#   "allocator anchor has the wrong device type; expected: 1, got: 12"
+torch.npu.set_device(DEV)
 
 
 def make_meta(lens, pool_pages, seed=0):
@@ -66,9 +75,12 @@ def run_case(label, lens):
     # padded Q ABI: [batch, kv_heads * BR, dim], first `group` rows of each KV head valid (ki1 模板)
     BR = max(32, ((GROUP + 31) // 32) * 32)
     q = (torch.randn(batch, KVH * GROUP, DIM, generator=g) * 0.2).to(torch.float32)
-    q_pad = torch.zeros(batch, KVH * BR, DIM, dtype=torch.float32)
-    q_pad.view(batch, KVH, BR, DIM)[:, :, :GROUP] = q.view(batch, KVH, GROUP, DIM)
-    q_pad = q_pad.to(DT).to(DEV)
+    # 注意:必须在 NPU 上直接分配。曾写成 `torch.zeros(..., dtype=float32)`(CPU)再 `.to(DEV)`,
+    # tilelang 的 allocator anchor 会拿 CPU device type(12)去比 NPU(1)而拒绝执行:
+    #   RuntimeError: main: allocator anchor has the wrong device type; expected: 1, got: 12
+    q_pad = torch.zeros(batch, KVH * BR, DIM, dtype=torch.float32, device=DEV)
+    q_pad.view(batch, KVH, BR, DIM)[:, :, :GROUP] = q.view(batch, KVH, GROUP, DIM).to(DEV)
+    q_pad = q_pad.to(DT)
 
     plain = build_decode_kernel(
         batch=batch, kv_heads=KVH, group=GROUP, dim=DIM, page_size=PAGE,
