@@ -1583,3 +1583,110 @@ prep 块(vendor model_runner_v1 L2027-2269)全归账画像:
 
 - **VERDICT: H71 disproven(TPOT 杠杆)**——memo 生效但理论 0.38ms host 削减仅兑现 ~0.03ms TPOT(衰减 ~10x);与 E283 第一批(三手法中性)互证:**c1 decode 步长设备侧 bound,prep host 块与上一步设备执行 overlap,host 削减仅在超窗口时计入 TPOT**。
 - prep 域全部已测手法对 c1 TPOT 均中性 ⇒ c1 host 域正式排除;剩余在役可执行线 = W1-D57-② prefill 内核重写;30% 总目标移交 FINAL TEMPORARY 评估(c8 已达标 −34.0%,c1 缺口=设备域 vendor 同水平+host 非临界)。
+
+## H72 短序列 prefill occupancy 自适应(2026-10-20 iter-208)
+
+### 问题
+H61 三档实测(同一批数据)给出 TI prefill 内核相对 FIA 的**纯劣势**:
+
+| 场景 | TI 内核 TTFT | 交还 FIA | 劣势 |
+|---|---|---|---|
+| 128x128_c1 | 103.4 | 92.4 | **+11.85%** |
+| 128x128_c8 | 227.9 | 186.8 | **+22.01%** |
+| 128x512_c8 | 218.2 | 191.3 | **+14.04%** |
+
+短场景稳定慢 12-22%,与长场景 53-71% 同向,但幅度小得多——说明**不是同一机理**。
+
+### 归因:并行度不足
+内核 grid = `num_tiles × kv_heads`,`num_tiles = Σ ceil(qo_len · group / block_q)`。
+本模型 `num_attention_heads=16`、`num_key_value_heads=2` → `group=8`、`kv_heads=2`:
+
+| 场景 | num_tiles | **grid blocks** |
+|---|---|---|
+| q=128, b=1 | 8 | **16** |
+| q=128, b=8 | 64 | 128 |
+| q=512, b=8 | 256 | 512 |
+| q=8192, b=8 | 4096 | 8192 |
+
+c1 只有 **16 个 block**,远低于 950 可用核数。配合 E46 画像
+(`aiv_vec_ratio=0.96`、`aic_mac_ratio=0.02`、MTE≈0——逐页串行向量链,
+非访存非 cube 瓶颈),"加 block"是该形状下唯一可动方向。
+
+### 实现
+- 新增 `TILEINFER_PREFILL_BLOCK_Q`(0=自适应 / 正整数=固定值,便于单变量 A/B)
+- 新增 `TILEINFER_PREFILL_SHORT_CTX`(默认 1024)
+- 上下文 ≤ 1024 的 prefill 步用 `block_q=64`(tile 数翻倍),否则 128
+- `block_q` 统一参与 **tile 数计算 / shape spec / schedule 规划 / split 规划** 四处,
+  并存入 `shared` 跨层复用
+
+一致的四处是硬约束:任一处用不同值,编译变体与内存布局就会失配。测试
+(`test_vllm_ascend_prefill_block_q.py`)逐行扫描源码,禁止残留 `block_q=128` 硬编码
+——它在实现时确实抓出了 split 分支遗漏的一处 `127) // 128`。
+
+### 状态
+契约 33 项通过。设备验证待窗口(预期短场景 TPOT ≥3%、长场景 |Δ|≤3%)。
+**翻案条件**:若 16 blocks 其实已饱和(单 block 时间随 grid 线性变化),
+说明 occupancy 非主因,应转 H42-③ 的内核效率方向。
+
+---
+
+## H73 shared_expert_gate 发射合并(2026-10-20 iter-208,opt-in)
+
+### 问题:4 KB 权重花 100 µs
+E269 的 dense 逐形状记账指出一个极端浪费点:
+
+```
+shared_expert_gate = ReplicatedLinear(hidden=2048, out=1)   # 40 层
+E269 实测:100 µs/步(c1 TPOT 的 2.8%),权重 4 KB,effBW ≈ 0.00
+纯带宽需求 = 4 KB / 1.6 TB/s = 0.0025 µs
+```
+
+**99.9% 是发射税**,单位权重成本 2.5 µs / 4 KB,是全部 271 次发射里最贵的一次。
+
+上游同构:ROCm `#56789` 记录 `(1,K) skinny GEMM` 占 decode step **13.7%**。
+本仓库 EVIDENCE:2026 曾判定「950PR 无 skinny 缺失问题,零行动」——该判定被
+E269 的 950 实测数字推翻。
+
+### 为什么这次能立住(H68-a / H69 都失败了)
+| 已证否路线 | 失败根因 | H73 是否受影响 |
+|---|---|---|
+| **H68-a**(GDN qkvz+ba) | 融合输出以 strided slice 喂 conv1d,走 AscendC 慢路径(引擎 +16~17%) | **否**:下游是 SiluAndMul / sigmoid / 逐元素乘,**无 conv1d** |
+| **H69**(router+shared_gate+gate_up) | 三族分属不同层,需跨 FusedMoE 边界重构,且 shared 族已有 separate-stream overlap | **否**:同在 `Qwen2MoeMLP` 内,只合并一对 |
+
+### 方案
+`Qwen2MoeMLP.forward` 中 `expert_gate(x)` 与 `gate_up_proj(x)` 的**输入完全相同**:
+
+```python
+# 原:两次发射
+gate_up, _ = self.gate_up_proj(x)      # hidden → 2I
+out = self.act_fn(gate_up)
+out, _ = self.down_proj(out)
+out = F.sigmoid(self.expert_gate(x)[0]) * out   # hidden → 1   ← 单独一发
+
+# 融合:一次发射
+# MerkedColumnParallelLinear.output_sizes: [I, I] → [I, I, 1]
+fused, _ = self.gate_up_proj(x)        # hidden → 2I + 1
+gate_up, gate_logit = fused[..., :-1], fused[..., -1:]
+out = F.sigmoid(gate_logit) * self.down_proj(self.act_fn(gate_up))[0]
+```
+
+GEMM 每列独立,拼接不改变任何列的结果 → **逐位等价**(由测试锁定)。
+
+### 实现与开关
+`tileinfer/integrations/shared_gate_fuse.py`:
+- 包装 `Qwen2MoeMLP.__init__`(改结构,仅当 gate 单输出且无 bias)
+- 包装 `load_weights`(checkpoint 里 gate 权重仍是独立前缀,必须接住并搬进第 3 段
+  ——这是本方案唯一的正确性风险点)
+- 包装 `forward`(一次 GEMM + 切分,任何异常回退原实现)
+
+| 开关 | 作用 |
+|---|---|
+| `TILEINFER_SHARED_GATE_FUSE=1` | 启用(默认关 = 零行为变化) |
+| `TILEINFER_SHARED_GATE_FUSE_DRYRUN=1` | 只记日志不改结构(部署前自检) |
+
+### 状态
+契约 8 项通过(含逐位列等价 + 端到端语义等价两项核心数值验证)。
+判据:**c1 TPOT ≥1%**(取低于理论 2.8% 的保守门槛,因图模式可能已在 host 侧
+预发射吸收,同 E286 的 prep 域 ~10x 衰减机理)。c8 |Δ|≤3%。
+**翻案条件**:实测无收益 → 归档为负面结果,并在 docs 记录"图模式 host 预发射
+已吸收该发射"这一结论。
