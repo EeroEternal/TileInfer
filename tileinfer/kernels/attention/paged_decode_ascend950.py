@@ -768,11 +768,26 @@ def paged_decode_split(
                             p_ub[r, c] = T.Cast(dtype, s_ub[r, c])
                 else:
                     limit = T.if_then_else(start + p + 1 < req_pages, BC, kv_last_page_len[b])
+                    # H67 token 窗口(非 SIMD 分支同样必须生效,否则开 token_split 而不开
+                    # SIMD softmax 会算出错误结果):与上面 SIMD 分支同一套 lo/hi 换算,
+                    # 且 hi 已 clamp 到 limit,故 `c < hi` 覆盖原 `c < limit`。
+                    base = (start + p) * BC
+                    lo = tok_start - base
+                    lo = T.if_then_else(lo > 0, lo, 0)
+                    hi = tok_start + tok_len - base
+                    hi = T.if_then_else(hi < limit, hi, limit)
+                    hi = T.if_then_else(hi < 0, 0, hi)
                     with T.SimtVF(threads=threads):
                         s_frag = T.alloc_fragment((ROWS, BC), accum)
                         for r, c in T.Parallel(ROWS, BC):
                             s_frag[r, c] = T.if_then_else(
-                                c < limit, s_ub[r, c] * T.float32(scale), T.float32(-1e30)
+                                c < hi,
+                                T.if_then_else(
+                                    c >= lo,
+                                    s_ub[r, c] * T.float32(scale),
+                                    T.float32(-1e30),
+                                ),
+                                T.float32(-1e30),
                             )
                         row_max = T.alloc_reducer((ROWS,), accum, op="max")
                         T.reducer_init(row_max)

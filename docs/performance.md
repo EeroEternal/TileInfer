@@ -1691,6 +1691,40 @@ GEMM 每列独立,拼接不改变任何列的结果 → **逐位等价**(由测�
 **翻案条件**:实测无收益 → 归档为负面结果,并在 docs 记录"图模式 host 预发射
 已吸收该发射"这一结论。
 
+### H73 设备首验:实现链三处致命缺陷(2026-10-20 E293,全部已修)
+
+首轮设备 A/B 直接暴露了三个**实现级**问题——融合此前从未真正跑起来过,
+契约测试锁的都是"看起来对"的静态结构。三处按发现顺序记录:
+
+| # | 现象 | 根因 | 修复 |
+|---|---|---|---|
+| ① | serve 日志 `shared gate fuse not installed: type object 'Qwen2MoeMLP' has no attribute 'load_weights'` | 本栈 `Qwen2MoeMLP` **没有** `load_weights`(权重由模型级 `stacked_params_mapping` + `named_parameters()` 映射);`install()` 无条件访问该属性抛 AttributeError,被调用方吞成一条 warning | 删掉该包装,`install()` 不再依赖它 |
+| ② | ON 臂请求全 500,`npu_swiglu` 报 `Invalid_Argument_Tensor_Shape [2048, 1025]`(split 轴必须偶数) | shared expert 在本栈走 vllm-ascend 的 `AscendFusedMoE._shared_experts_part1/part2`(拆成 gate_up GEMM / 激活+down_proj+gate 两段做 overlap),**不调用** `Qwen2MoeMLP.forward`;只挂 forward 时融合出的 2I+1 列被整块喂进激活 | 增挂 `_shared_experts_part2`(两个实现文件 `fused_moe.py` / `fused_moe_0_23_0.py` 都挂) |
+| ③ | ON 臂 serve 启动成功后**首个请求即静默杀死 EngineCore**(无 traceback) | 绑定点在首次 forward:此时 `AscendUnquantizedLinearMethod.process_weights_after_loading` 已把 `gate_up_proj.weight` 转成 FRACTAL_NZ;对 NZ 张量按 `[-1:, :]` 切片早已不是"最后一行",就地拷贝写坏内存 | 绑定前移到 `UnquantizedLinearMethod.process_weights_after_loading` **入口**;兜底路径显式拒绝 `ndim != 2` |
+
+判别证据(③):同一 `h73_ab.sh` 用 `H73_DRYRUN=1`(只记日志、不改结构)跑 ON 臂,
+**5/5 场景 32/32 全绿**(c1 9.694 / c8 11.983 / 512_c8 11.998 / 8K 36.688 / 16K 66.037,
+与 OFF 臂逐项差 <0.4%);关掉 dryrun 的真实改造臂则在首个请求崩溃。
+⇒ 崩溃来自**结构改造**(NZ 后的错位写),不是融合算术。
+dryrun 数据已改名 `bench_results/h73_dryrun_on_*`,不与正式 A/B 混用。
+
+契约同步加固(`tests/test_shared_gate_fuse.py`,11 项):
+- 新增「install() 不得依赖 `Qwen2MoeMLP.load_weights`」回归锁;
+- 新增「必须挂 `_shared_experts_part2`」锁;
+- 新增「绑定必须在 NZ 转换前 + NZ 张量必须拒绝绑定 + 只绑一次」锁;
+- 新增「`fused[..., :-1]` 必须 `.contiguous()` 再喂 `npu_swiglu`」锁(H68-a 同型陷阱)。
+
+**状态**:实现缺陷已全部修复,契约 11 项绿;**性能判决仍待窗口**(off 臂已出
+c1 9.694/c8 11.971/512_c8 11.995/8K 36.65/16K 65.18,on 臂待重跑)。
+
+### H73 首轮 A/B 中观察到的口径问题(已修脚本)
+
+`vllm bench serve` 在**全部请求失败**时仍返回 `rc=0`,原 `h73_ab.sh` 只按 rc 记日志,
+导致 EngineCore 被外部栈挤死后整臂白跑(两轮如此)。已改为:
+①按 json 的 `completed/failed` 判有效;②每个 case 后探活,serve 已死即中止重试;
+③臂结束时 `all_ok=1` 才写 done。这个修正对后续所有 A/B 脚本都适用。
+
+
 ## 勘误:H49 并未"被 E283 覆盖"(2026-10-20 iter-208)
 
 此前文档与轮次记录中出现过一个错误结论:「H49(slot_mapping triton→numpy 宿主削减)
@@ -1717,6 +1751,25 @@ E283 记录的"发射税节省被 array_equal 比较 / numpy / H2D 成本抵消"
 
 **调用点改动**(让 model_runner 真的传参)仍留待设备窗口,不在未做引擎验证时
 修改 vendor 调用点。
+
+---
+
+## H42-③ 双缓冲页流水:off 臂基线已出,on 臂待窗(2026-10-20 E295)
+
+`h42c_ab.sh` 的 off 臂(权威基座:capture8 + SIMD softmax + ktp 分带 + `MAX_CTX=1`)
+5/5 场景 32/32 有效(14:21-14:24,同会话):
+
+| 场景 | TPOT(ms) | 吞吐(tok/s) |
+|---|---|---|
+| 128x128_c1 | 9.697 | 96.9 |
+| 128x128_c8 | 11.971 | 593.5 |
+| 128x512_c8 | 11.995 | 647.4 |
+| 8192x128_c8 | 36.650 | 175.8 |
+| 16384x128_c8 | 65.183 | 98.5 |
+
+- 与 H73 off 臂(9.694/11.971/11.995/36.65/65.18)逐项一致 → 基座可复现,无漂移;
+- on 臂(`TILEINFER_PAGE_PIPELINE=1`)两次进场都被外部 ww/reef 栈挤掉,未能出数;
+- **判据不变**:8K/16K TPOT 或 ITL 改善 ≥5%,短场景 |Δ|≤3%,`fallbacks=0`/`capture=40`。
 
 ---
 
@@ -1835,10 +1888,27 @@ c1 @ 128 token → pages = 1 → 无论 ktp 调到 1，splits 恒为 1
 
 **全量回归 263 项通过。**
 
+### H67 实现缺陷:token 窗口只在 SIMD 分支生效(2026-10-20 E294,已修)
+
+自查发现 `paged_decode_split` 的 token 窗口 `[lo, hi)` 只写在
+`_simd_softmax_enabled()` 分支里;非 SIMD 的 softmax 分支仍用原来的
+`c < limit` 掩码,**完全忽略 token_starts/token_lens**。后果:
+
+- 同时开 `token_split` + 关 SIMD softmax → 每个 split 都算全量 KV,
+  再被 merge 加权 —— **结果错误且不报错**(最坏的一类缺陷);
+- 默认路径(`token_split=False`)不受影响,所以既有 263 项回归全绿。
+
+修复:非 SIMD 分支补同一套 `lo/hi` 换算,`c < hi && c >= lo`;
+`hi` 先 clamp 到 `limit`,因此 `c < hi` 严格覆盖原 `c < limit`(逐位一致)。
+
+**教训**:实现"双分支内核"的新语义时,必须两个分支同时改;
+本轮契约测试只覆盖调度层(planner),不覆盖内核分支,所以漏检。
+后续 H67 设备数值验证须显式跑 **SIMD on/off 两组**。
+
 ### 状态与下一步
 **默认关闭**(`token_split=False`)。启用前必须按序完成:
 
 1. `h67_bench.py` 判别实验(确认并行度主导而非内核效率)
-2. 数值验证(token 分块 vs 页级/单遍 oracle,含尾页、跨页、ragged)
+2. 数值验证(token 分块 vs 页级/单遍 oracle,含尾页、跨页、ragged,**SIMD on/off 两组**)
 3. 引擎 A/B,门槛:**短场景 attention 主核 ≥1.5x 且 8K 不劣化**
 4. 达标后接入集成层(按 bucket 选 `tokens_per_split`)

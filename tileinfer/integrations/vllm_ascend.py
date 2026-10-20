@@ -1311,7 +1311,14 @@ class TileInferDecodeAttention:
 
         br = padded_rows(self.group_size)
         q_pad: torch.Tensor = state["q_pad"]
-        q_pad.view(bucket, self.num_kv_heads, br, self.head_size)[:, :, : self.group_size].copy_(
+        # Only the live rows are written: ``q_pad`` is bucket-sized while ``query`` carries
+        # ``num_reqs <= bucket`` rows, and ``copy_`` cannot broadcast 24 -> 32 (this crashed
+        # graph capture with EZ1007/161002).  Padding rows stay at their ``torch.zeros``
+        # initialisation, and the kernel never reads them (their tables are zeroed above,
+        # their len=1 points at page 0, and the read-back below only takes ``[:num_reqs]``).
+        q_pad.view(bucket, self.num_kv_heads, br, self.head_size)[
+            :num_reqs, :, : self.group_size
+        ].copy_(
             query[:num_reqs]
             .to(self.dtype)
             .reshape(num_reqs, self.num_kv_heads, self.group_size, self.head_size)

@@ -51,6 +51,7 @@ _STATS: dict[str, int] = {
     "shared_gate_fuse_modules": 0,  # 被改造成三段 gate_up 的 MLP 数
     "shared_gate_fuse_forward": 0,  # 走融合 forward 的次数
     "shared_gate_fuse_skipped": 0,  # 因条件不满足而跳过(保留原路径)的次数
+    "shared_gate_fuse_bound": 0,  # 已把独立 gate 权重搬进 fused 末行的模块数
 }
 
 
@@ -119,17 +120,40 @@ def _make_mlp_init(orig_init):
                 prefix=f"{prefix}.gate_up_proj",
             )
             self.gate_up_proj = fused
-            # 保留原模块:load_weights 用它接住 `...shared_expert_gate.weight`,
-            # 再搬进 fused 的第 3 段(见 _copy_gate_into_fused)。
+            # 保留原模块:checkpoint 里的 `...mlp.shared_expert_gate.weight` 仍按原
+            # 参数名落到这里(本栈 `Qwen2MoeMLP` 没有 `load_weights`,权重由模型级
+            # `named_parameters()` 直接映射),首次 forward 再搬进 fused 末行。
             self.expert_gate = expert_gate
             self._tileinfer_gate_fused = True
+            self._tileinfer_gate_bound = False
             self._tileinfer_gate_hidden = hidden_size
             _STATS["shared_gate_fuse_modules"] += 1
+            _FUSED_MLPS.append(self)
+            # 惰性挂 part2:此刻模型正在构建,fused_moe 必然已导入且注册完成;
+            # 在插件 install() 早期主动 import 它会打乱注册顺序。
+            _patch_ascend_shared_parts()
         except Exception:  # pragma: no cover - 任何异常都退回原结构
             _STATS["shared_gate_fuse_skipped"] += 1
             logger.warning("H73: shared gate fuse skipped for %s", kwargs.get("prefix", "?"))
 
     return __init__
+
+
+def _bind_gate_row(module) -> bool:
+    """查询/兜底绑定:仅在权重仍是 2-D ND 时才允许就地拷贝。
+
+    **正常路径是 NZ 转换前**(见 :func:`_patch_linear_pwal`)。这里只处理
+    "钩子没触发"的兜底:一旦权重已被转成 FRACTAL_NZ(ndim != 2),
+    按 ``[-1:, :]`` 切片已不是"最后一行",绝不能拷贝,直接返回 False
+    让 forward 走原实现(数值仍正确,只是不省那一次发射)。
+    """
+    if getattr(module, "_tileinfer_gate_bound", False):
+        return True
+    w = getattr(getattr(module, "gate_up_proj", None), "weight", None)
+    if w is None or w.data.ndim != 2:
+        return False
+    _bind_one_layer(module)
+    return bool(getattr(module, "_tileinfer_gate_bound", False))
 
 
 def _make_mlp_forward(orig_forward):
@@ -141,8 +165,14 @@ def _make_mlp_forward(orig_forward):
         try:
             import torch.nn.functional as F
 
+            if not _bind_gate_row(self):
+                return orig_forward(self, x)
             fused, _ = self.gate_up_proj(x)  # [..., 2I + 1]
-            gate_up = fused[..., :-1]
+            # `fused[..., :-1]` 的行 stride 是 2I+1 → 非连续。vendor 的
+            # `npu_swiglu` 是 AscendC 算子,非连续输入会走慢路径(H68-a 的同一坑)。
+            # decode 时行数只有 1-8,这里的连续化是 KB 级 D2D 拷贝,远小于省下的
+            # 一次瘦 GEMV 发射(100 µs/步)。
+            gate_up = fused[..., :-1].contiguous()
             gate_logit = fused[..., -1:]
             out = self.act_fn(gate_up)
             out, _ = self.down_proj(out)
@@ -156,36 +186,37 @@ def _make_mlp_forward(orig_forward):
     return forward
 
 
-def _make_mlp_load_weights(orig_load_weights):
-    """包装 ``Qwen2MoeMLP.load_weights``:接受独立的 ``shared_expert_gate.weight``。
+def _make_part2(orig_part2):
+    """包装 ``AscendFusedMoE._shared_experts_part2``。
 
-    原实现只认 ``gate_up_proj`` / ``down_proj`` 两个前缀;融合后 gate 的权重
-    仍以原前缀出现在 checkpoint 里,这里把它**暂存**下来,等 load 结束时
-    由 :func:`_copy_gate_into_fused` 搬进 fused 的第 3 段。
+    这是本栈 shared expert 的**实际执行路径**(vllm-ascend 把共享专家拆成
+    part1=gate_up GEMM、part2=激活+down_proj+gate 三步,以支持流水 overlap),
+    它**不调用** ``Qwen2MoeMLP.forward``。只挂 forward 会让融合后的 2I+1 列
+    直接进 ``npu_swiglu`` → 非法形状(实测 ``[2048, 1025]``,EZ0009)。
     """
 
-    def load_weights(self, weights):
-        pending_gate = None
-        rest = []
-        for name, w in weights:
-            if name.endswith("expert_gate.weight") or name.endswith("shared_expert_gate.weight"):
-                pending_gate = w
-            else:
-                rest.append((name, w))
-        result = orig_load_weights(self, rest) if rest else None
-        if pending_gate is not None and getattr(self, "_tileinfer_gate_fused", False):
-            try:
-                import torch
+    def _shared_experts_part2(self, hidden_states, shared_gate_up):
+        mlp = getattr(self, "_shared_experts", None)
+        if not getattr(mlp, "_tileinfer_gate_fused", False):
+            return orig_part2(self, hidden_states, shared_gate_up)
+        try:
+            import torch.nn.functional as F
 
-                with torch.no_grad():
-                    self.gate_up_proj.weight[-1:, :].copy_(
-                        pending_gate.reshape(1, -1).to(self.gate_up_proj.weight.dtype)
-                    )
-            except Exception:  # pragma: no cover
-                logger.warning("H73: failed to place fused gate column")
-        return result
+            if not _bind_gate_row(mlp):
+                return orig_part2(self, hidden_states, shared_gate_up)
+            # 非连续切片不得直接喂 AscendC 激活(见 _make_mlp_forward 的同款注释)。
+            gate_up = shared_gate_up[..., :-1].contiguous()
+            gate_logit = shared_gate_up[..., -1:]
+            shared_act = mlp.act_fn(gate_up)
+            out, _ = mlp.down_proj(shared_act)
+            out = F.sigmoid(gate_logit) * out
+            _STATS["shared_gate_fuse_forward"] += 1
+            return out
+        except Exception:  # pragma: no cover
+            _STATS["shared_gate_fuse_skipped"] += 1
+            return orig_part2(self, hidden_states, shared_gate_up)
 
-    return load_weights
+    return _shared_experts_part2
 
 
 def install() -> bool:
@@ -201,11 +232,95 @@ def install() -> bool:
 
     Qwen2MoeMLP.__init__ = _make_mlp_init(Qwen2MoeMLP.__init__)
     Qwen2MoeMLP.forward = _make_mlp_forward(Qwen2MoeMLP.forward)
-    Qwen2MoeMLP.load_weights = _make_mlp_load_weights(Qwen2MoeMLP.load_weights)
+    # 注意:本栈的 `Qwen2MoeMLP` **没有** `load_weights`(权重由模型级
+    # `stacked_params_mapping` + `named_parameters()` 映射)。旧实现在这里无条件
+    # 访问 `Qwen2MoeMLP.load_weights` 会抛 AttributeError,而 install() 的调用方
+    # 把异常吞成一条 warning —— 结果融合从未安装(H73 首次设备 A/B 由此作废)。
+    _patch_linear_pwal()
+    _patch_ascend_shared_parts()
     _INSTALLED = True
     logger.info(
         "TileInfer shared_gate fuse installed (H73, governed by TILEINFER_SHARED_GATE_FUSE; "
         "dryrun=%s)", _dryrun(),
     )
     return True
+
+
+def _bind_one_layer(module) -> None:
+    """把某层 fused gate_up 的末行填成独立 gate 的权重(NZ 转换前调用)。"""
+    if not getattr(module, "_tileinfer_gate_fused", False):
+        return
+    if getattr(module, "_tileinfer_gate_bound", False):
+        return
+    try:
+        import torch
+
+        gate_w = module.expert_gate.weight
+        with torch.no_grad():
+            module.gate_up_proj.weight[-1:, :].copy_(gate_w.reshape(1, -1))
+        module._tileinfer_gate_bound = True
+        _STATS["shared_gate_fuse_bound"] += 1
+    except Exception:  # pragma: no cover
+        logger.warning("H73: failed to bind fused gate row")
+
+
+def _patch_linear_pwal() -> None:
+    """在 ``UnquantizedLinearMethod.process_weights_after_loading`` 入口完成绑定。
+
+    vllm-ascend 的 ``AscendUnquantizedLinearMethod`` 在此方法里把权重转 FRACTAL_NZ;
+    绑定必须在其**之前**发生,否则按 ``[-1:, :]`` 切片已不再是"最后一行"。
+    """
+    try:
+        from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+        orig = UnquantizedLinearMethod.process_weights_after_loading
+        if getattr(orig, "_tileinfer_wrapped", False):
+            return
+
+        def process_weights_after_loading(self, layer, *args, **kwargs):
+            # layer 是 MergedColumnParallelLinear;其父模块是 Qwen2MoeMLP。
+            # 这里直接在该 linear 上注册钩子拿不到父模块,故用反向遍历:
+            # 绑定只按 "本层 gate_up 是否已融合" 判断,与父模块无关。
+            _bind_for_linear(layer)
+            return orig(self, layer, *args, **kwargs)
+
+        process_weights_after_loading._tileinfer_wrapped = True
+        UnquantizedLinearMethod.process_weights_after_loading = process_weights_after_loading
+    except Exception:  # pragma: no cover - 优化模块不得影响在役路径
+        logger.warning("H73: failed to patch linear process_weights_after_loading")
+
+
+_FUSED_MLPS: list = []
+
+
+def _bind_for_linear(layer) -> None:
+    """若 ``layer`` 是某个融合 MLP 的 gate_up,则在其 NZ 转换前完成绑定。"""
+    for mlp in _FUSED_MLPS:
+        if getattr(mlp, "gate_up_proj", None) is layer:
+            _bind_one_layer(mlp)
+            return
+
+
+def _patch_ascend_shared_parts() -> None:
+    """给 vllm-ascend 的 ``AscendFusedMoE`` 挂 part2 包装(shared expert 的真路径)。
+
+    两个实现文件并存(``fused_moe.py`` / ``fused_moe_0_23_0.py``),在役版本以
+    导入顺序决定;两者都有 ``_shared_experts_part2`` 就都挂,缺一个不影响另一个。
+    """
+    for mod_name in (
+        "vllm_ascend.ops.fused_moe.fused_moe_0_23_0",
+        "vllm_ascend.ops.fused_moe.fused_moe",
+    ):
+        try:
+            module = __import__(mod_name, fromlist=["AscendFusedMoE"])
+            cls = getattr(module, "AscendFusedMoE", None)
+            if cls is None or not hasattr(cls, "_shared_experts_part2"):
+                continue
+            if getattr(cls._shared_experts_part2, "_tileinfer_wrapped", False):
+                continue
+            wrapped = _make_part2(cls._shared_experts_part2)
+            wrapped._tileinfer_wrapped = True
+            cls._shared_experts_part2 = wrapped
+        except Exception:  # pragma: no cover - 优化模块不得影响在役路径
+            logger.warning("H73: failed to patch %s shared-expert part2", mod_name)
 

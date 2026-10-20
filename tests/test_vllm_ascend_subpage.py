@@ -107,3 +107,39 @@ def test_pad_batch_on_expanded_metadata():
     # 填充请求必须合法:1 个子页、1 个有效 token(否则 softmax 分母为 0)
     assert int(padded.kv_indptr[4]) - int(padded.kv_indptr[3]) == 1
     assert int(padded.kv_last_page_len[3]) == 1
+
+
+def test_query_staging_slice_must_bound_live_rows():
+    """``q_pad`` staging 的目标切片必须带 ``[:num_reqs]``(回归锁)。
+
+    2026-10-20 设备崩溃(CANN ``aclnnInplaceCopy`` / EZ1007 / 161002):
+    ``q_pad.view(bucket, ...)[:, :, :group].copy_(query[:num_reqs]...)`` 只对**源**限了行数,
+    目标是 bucket 行。``copy_`` 不能把 24 行广播到 32 行 → 只要 ``num_reqs != bucket``
+    (例如 24 vs 32,图捕获阶段就会发生)必崩。此前只在 num_reqs 恰为桶边界(8/32)时跑过,
+    所以长期未暴露。
+
+    这里用纯 CPU 张量复现形状语义:无切片必失败,有切片成功且 padding 行保持为零。
+    """
+    bucket, n, kv, br, g, d = 32, 24, 2, 8, 8, 256
+    q_pad = torch.zeros(bucket, kv * br, d)
+    query = torch.randn(n, kv * g, d)
+
+    def stage(bound_live_rows: bool):
+        tgt = q_pad.view(bucket, kv, br, d)
+        tgt = tgt[:n, :, :g] if bound_live_rows else tgt[:, :, :g]
+        tgt.copy_(query.reshape(n, kv, g, d))
+
+    with pytest.raises(RuntimeError):
+        stage(False)
+    stage(True)
+    assert bool((q_pad.view(bucket, kv, br, d)[n:] == 0).all()), "padding 行必须保持为零"
+
+    # 源码层锁:integration 的 staging 必须对目标切片限行
+    import inspect
+
+    from tileinfer.integrations import vllm_ascend as vs
+
+    src = inspect.getsource(vs.TileInferDecodeAttention.run)
+    assert "[:num_reqs, :, : self.group_size]" in src, (
+        "q_pad staging 的目标切片漏了 [:num_reqs]"
+    )

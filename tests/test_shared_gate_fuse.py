@@ -133,12 +133,80 @@ def test_h73_shape_guard_logic():
 # ---------------------------------------------------------------- 4. 权重迁移
 
 
-def test_h73_load_weights_handles_gate_prefix():
-    """独立的 shared_expert_gate.weight 必须被识别并搬进 fused 第 3 段。"""
-    src = inspect.getsource(mod._make_mlp_load_weights)
-    assert "shared_expert_gate.weight" in src
-    assert "expert_gate.weight" in src
-    assert "gate_up_proj.weight[-1:, :]" in src, "必须写到 fused 的最后一列"
+def test_h73_bind_must_happen_before_nz_conversion():
+    """绑定必须在权重转 FRACTAL_NZ **之前**完成。
+
+    2026-10-20 设备实测:惰性在首次 forward 绑定,此时 vllm-ascend 已把
+    ``gate_up_proj.weight`` 转成 NZ(ndim != 2),``[-1:, :]`` 不再是"最后一行",
+    就地拷贝直接写坏内存 → EngineCore 静默死亡。dryrun(不改结构)臂则 5/5 正常,
+    证明崩溃来自结构改造而非融合算术。
+    """
+    install_src = inspect.getsource(mod.install)
+    assert "_patch_linear_pwal" in install_src, "必须在 install 期挂 NZ 前钩子"
+
+    pwal_src = inspect.getsource(mod._patch_linear_pwal)
+    assert "process_weights_after_loading" in pwal_src
+    assert "_bind_for_linear" in pwal_src
+
+    # 兜底路径必须拒绝在 NZ(ndim != 2)张量上切片
+    bind_src = inspect.getsource(mod._bind_gate_row)
+    assert "ndim != 2" in bind_src, "NZ 张量上绝不能按行切片拷贝"
+
+    # 无 NZ 时正常绑定,且只绑一次
+    torch.manual_seed(5)
+    hidden, inter = 8, 4
+
+    class _Gate(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.randn(1, hidden) * 0.05)
+
+    holder = torch.nn.Module()
+    holder.expert_gate = _Gate()
+    holder.gate_up_proj = torch.nn.Module()
+    holder.gate_up_proj.weight = torch.nn.Parameter(torch.zeros(2 * inter + 1, hidden))
+    holder._tileinfer_gate_fused = True
+    holder._tileinfer_gate_bound = False
+    mod._FUSED_MLPS.append(holder)
+    try:
+        mod._bind_for_linear(holder.gate_up_proj)
+        assert holder._tileinfer_gate_bound is True
+        assert torch.equal(
+            holder.gate_up_proj.weight.data[-1:, :], holder.expert_gate.weight.data
+        )
+        holder.gate_up_proj.weight.data[-1:, :].zero_()
+        mod._bind_for_linear(holder.gate_up_proj)
+        assert torch.count_nonzero(holder.gate_up_proj.weight.data[-1:, :]) == 0, "不得重复拷贝"
+    finally:
+        mod._FUSED_MLPS.remove(holder)
+
+    # NZ 形态(ndim=4)必须拒绝兜底绑定
+    class _Nz(torch.nn.Module):
+        pass
+
+    nz = _Nz()
+    nz.weight = torch.nn.Parameter(torch.zeros(1, 1, 16, 16))
+    nz_holder = torch.nn.Module()
+    nz_holder.expert_gate = _Gate()
+    nz_holder.gate_up_proj = nz
+    nz_holder._tileinfer_gate_fused = True
+    nz_holder._tileinfer_gate_bound = False
+    assert mod._bind_gate_row(nz_holder) is False, "NZ 张量必须拒绝绑定"
+
+
+def test_h73_install_must_not_require_load_weights():
+    """回归锁定:install() 不得无条件访问 ``Qwen2MoeMLP.load_weights``。
+
+    旧实现直接取该属性;本栈类无此方法 → AttributeError 被上层吞成 warning,
+    融合**从未安装**(2026-10-20 设备 serve 日志实证)。这使 H73 首次 A/B 作废。
+    """
+    src = inspect.getsource(mod.install)
+    code = "\n".join(
+        line for line in src.splitlines() if not line.lstrip().startswith("#")
+    )
+    assert "Qwen2MoeMLP.load_weights =" not in code, (
+        "install() 不得依赖 Qwen2MoeMLP.load_weights(本栈不存在该方法)"
+    )
 
 
 # ---------------------------------------------------------------- 5. 回退纪律
@@ -149,6 +217,31 @@ def test_h73_fallback_on_exception():
     src = inspect.getsource(mod._make_mlp_forward)
     assert "except Exception" in src
     assert "orig_forward(self, x)" in src
+
+
+def test_h73_fused_slice_must_be_contiguous():
+    """``fused[..., :-1]`` 的行 stride 是 ``2I+1``(非连续),不得直接喂 vendor 激活。
+
+    H68-a 的教训:融合输出以 strided slice 喂 AscendC 算子会走慢路径,把收益吃光。
+    这里必须显式 ``contiguous()`` 后再进 ``SiluAndMul``(npu_swiglu)。
+    """
+    src = inspect.getsource(mod._make_mlp_forward)
+    assert "fused[..., :-1].contiguous()" in src, "融合切分后必须连续化再喂 npu_swiglu"
+
+
+def test_h73_must_patch_ascend_shared_part2():
+    """shared expert 在 vllm-ascend 里走 part1/part2,**不调用** Qwen2MoeMLP.forward。
+
+    只挂 forward 时 part2 会把融合后的 2I+1 列直接喂 ``npu_swiglu``,实测抛
+    ``Invalid_Argument_Tensor_Shape [2048, 1025]``(split 轴必须是偶数)。
+    因此必须同时包装 ``AscendFusedMoE._shared_experts_part2``。
+    """
+    src = inspect.getsource(mod._make_part2)
+    assert "_shared_experts_part2" in src
+    assert "shared_gate_up[..., :-1].contiguous()" in src
+
+    install_src = inspect.getsource(mod.install)
+    assert "_patch_ascend_shared_parts" in install_src, "install() 必须挂 part2 包装"
 
 
 def test_h73_install_is_idempotent():

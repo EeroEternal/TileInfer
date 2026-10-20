@@ -1,5 +1,56 @@
 # Known issues and post-mortems
 
+## KI-6 — `q_pad` staging: target slice missed `[:num_reqs]` (resolved 2026-10-20)
+
+**Status:** resolved · **Lesson:** when a padded buffer's *source* is bounded but its *target*
+is not, the bug hides until `num_reqs != bucket` — i.e. exactly at the first non-bucket-aligned
+batch, which in practice is graph capture.
+
+### Symptom
+
+EngineCore died silently right after graph capture, with only a CANN log line (no Python
+traceback):
+
+```
+[aclnn_copy.cpp:62] The size of tensor self [32, 2, 8, 256] must match
+                    the size of tensor src [24, 2, 8, 256]
+[aclnn_copy.cpp:117] errno[561000] ... EZ1007 / 161002
+```
+
+### Root cause
+
+`TileInferDecodeAttention.run` staged the padded query like this:
+
+```python
+q_pad.view(bucket, kv_heads, br, head)[:, :, :group].copy_(   # target: bucket rows
+    query[:num_reqs].reshape(num_reqs, ...)                   # source: num_reqs rows
+)
+```
+
+Only the **source** was bounded. `copy_` cannot broadcast 24 rows onto 32, so any step whose
+`num_reqs` is not exactly a bucket value (24 vs 32) raised. It had never been exercised because
+earlier runs only hit bucket boundaries (8 / 32).
+
+Note the backend's own staging (`attention/backends/tilelang_ascend950.py`) is self-consistent
+— both sides use `batch` — and is *skipped* when the integration already staged into the same
+buffer, so the integration copy is the only writer and the bug surfaced there.
+
+### Fix
+
+Bound the target as well:
+
+```python
+q_pad.view(bucket, kv_heads, br, head)[:num_reqs, :, :group].copy_(...)
+```
+
+Safe because `q_pad` is `torch.zeros`-allocated (padding rows stay 0), padding rows' table
+columns are zeroed every step, their `len=1` points at page 0, and the read-back only takes
+`[:num_reqs]`.
+
+**Regression lock:** `tests/test_vllm_ascend_subpage.py::test_query_staging_slice_must_bound_live_rows`
+reproduces the shape failure on CPU and scans the source for the bounded target slice.
+
+
 ## PM-1 — "kernel memory corruption" that was a bad gather index (resolved)
 
 **Status:** resolved · **Lesson:** on Ascend, an out-of-range *gather* index is not a fault — it
