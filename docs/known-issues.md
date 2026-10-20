@@ -382,7 +382,8 @@ oracle 在 dim=128(SIMD)PASS);CANN 9.1.1 头文件不匹配为环境事实。
 2. **测试守卫**:触发真实 split 编译的用例默认跳过(env `TILEINFER_SKIP_SPLIT_COMPILE_HANG=1`
    默认,置 0 强制跑):decode 测试 9 个 split 参数(matches_reference×4/declared_cap×1/
    full_split_plan×4)+ offline probes 的 `test_decode_split_simd_softmax_gate`(自
-   `test_decode_simd_softmax_gate` 拆出,其余 9 项编译断言保留覆盖)。翻案条件=tilelang
+   `test_decode_simd_softmax_gate` 拆出,其余 9 项编译断言保留覆盖)+ token-split 设备测试
+   的两个 nosimd 参数(74d6f53/后续提交,verify 全量口径实测踩实)。翻案条件=tilelang
    升级后置 0 复跑(h67_toksplit_bench.py 一键复测)。
 3. **套件恢复链**(run/recover_i231.sh):h77 gate(oracle+四轴微基准)→h33v3 探针→
    h33_l2hint 基准→重挂双套件→条件挂 h77_ab.sh。
