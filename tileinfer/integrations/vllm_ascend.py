@@ -2408,6 +2408,16 @@ def install(raise_on_failure: bool = True) -> bool:
             install_shared_gate_fuse()
         except Exception as exc:  # noqa: BLE001 - 优化模块不得影响在役路径
             logger.warning("TileInfer shared gate fuse not installed: %s", exc)
+        # H76 fused_sample(移植 deepseek/DeepInfer):把 temperature+softmax+
+        # top-p/top-k 阈值+采样融成一个 kernel,省掉全词表 sort。
+        # 显式 opt-in(TILEINFER_OPS 含 sampling),且守卫跳过全 greedy 批次
+        # (那种场景 H36 的快路径更轻)。必须在采样器构造前装。
+        try:
+            from .fused_sample import install_fused_sample
+
+            install_fused_sample()
+        except Exception as exc:  # noqa: BLE001 - 优化模块不得影响在役路径
+            logger.warning("TileInfer fused_sample not installed: %s", exc)
         # H28 shared expert 恒选 E+1 折叠(E300 注入面定谳):显式 opt-in
         # (TILEINFER_SHARED_EXPERT_FOLD=1,默认关=零行为变化)。类级包装须在
         # 模型构建前挂好(init 登记从属关系→PWAL 前置折叠);与 H73 同权重链,
