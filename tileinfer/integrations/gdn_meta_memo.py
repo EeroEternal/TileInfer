@@ -117,42 +117,47 @@ def install_gdn_meta_memo() -> bool:
 
     orig_build = AscendGDNAttentionMetadataBuilder.build
 
-    def _build(
-        bself: Any,
-        common_prefix_len: int = 0,
-        common_attn_metadata: Any = None,
-        **extra: Any,
-    ):
+    def _build(bself: Any, *args: Any, **kwargs: Any):
+        # 全位置透传签名:build 存在 5 位置入参调用点(捕获期 dummy_run),
+        # 只按名/位提取所需(cm 与 spec 入参),其余原样转发。
         global _hits, _misses, _pass
+        cm = kwargs.get("common_attn_metadata")
+        if cm is None and len(args) >= 2:
+            cm = args[1]
+        spec_a = kwargs.get("num_accepted_tokens")
+        if spec_a is None and len(args) >= 3:
+            spec_a = args[2]
+        spec_b = kwargs.get("num_decode_draft_tokens_cpu")
+        if spec_b is None and len(args) >= 4:
+            spec_b = args[3]
         slot = id(bself)
-        if extra.get("num_accepted_tokens") is not None or extra.get("num_decode_draft_tokens_cpu") is not None:
+        if spec_a is not None or spec_b is not None:
             # spec 步会覆写 spec/持久缓冲:清槽防 stale 命中。
             _pass += 1
             _cache.pop(slot, None)
-            return orig_build(bself, common_prefix_len, common_attn_metadata, **extra)
+            return orig_build(bself, *args, **kwargs)
         if getattr(bself.vllm_config.cache_config, "mamba_cache_mode", "none") != "none":
             _pass += 1
             _cache.pop(slot, None)
-            return orig_build(bself, common_prefix_len, common_attn_metadata, **extra)
+            return orig_build(bself, *args, **kwargs)
         runner = getattr(_tls, "runner", None)
-        slot = id(bself)
-        if runner is None or common_attn_metadata is None:
+        if runner is None or cm is None:
             _pass += 1
             _cache.pop(slot, None)
-            return orig_build(bself, common_prefix_len, common_attn_metadata, **extra)
-        key = _memo_key(runner, common_attn_metadata)
+            return orig_build(bself, *args, **kwargs)
+        key = _memo_key(runner, cm)
         if key is None:
             # prefill/混合/捕获期步:重建会覆写持久缓冲,旧缓存对象一并失效。
             _misses += 1
             _cache.pop(slot, None)
-            return orig_build(bself, common_prefix_len, common_attn_metadata, **extra)
+            return orig_build(bself, *args, **kwargs)
         cached = _cache.get(slot)
         if cached is not None and cached[0] == key:
             _hits += 1
             _maybe_log()
             return cached[1]
         _misses += 1
-        out = orig_build(bself, common_prefix_len, common_attn_metadata, **extra)
+        out = orig_build(bself, *args, **kwargs)
         _cache[slot] = (key, out)
         return out
 
