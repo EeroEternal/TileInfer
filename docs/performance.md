@@ -2345,3 +2345,39 @@ oracle 2/2 → 微基准 geomean 1.188x ≥1.0x → opt-in → 权威 A/B PASS �
 `TILEINFER_SHARED_EXPERT_FOLD=1` 计入 TI 侧当前最优配置(权威口径后续 A/B 均含)。
 战略记账:c8 对 FIA 原始基线 18.01→11.65 = **−35.3%**(≥30% 保持);c1 对 FIA 锚点
 8.766 仍 +8.2% 落后(batch-1 弱点),为 30% 总目标唯一残余缺口。
+
+## H77 dense b1 大形状权重物理预排 NT→NN(2026-10-21 iter-215,实现落地等设备门槛)
+
+机制(E297 立论):c1 档 dense GEMV(MMV3 族)是最大单一设备域(E267:3.532ms/步,
+37.5%)。E255 微基准×E269 引擎逐形交叉:qkvz[2048→12288]/attn_qkv[2048→9216]/
+o_proj[4096→2048] 三大形状引擎内有效带宽 1.30/1.28/0.94TB/s vs 微基准流式
+1.62-1.65TB/s——引擎缺口 1.24-1.3x,聚合 ~450μs/步 ≈ c1 设备链 4.8%。已排除轴:
+换后端(E255 matmul 视图 0.877-1.047 全败)、NZ 布局(E42/E100 零收益,且
+weight_nz_mode=2 引擎启动 abort、默认=1 bf16 不转 NZ ⇒ 在役权重实态 ND-NT)。
+未测正证据轴=E100 的 **ND 物理连续 NN 布局**(w_nn=[K,N],x@w_nn):M=16 微基准
+out_proj/attn_qkv +11%,M=1 与引擎内从未测过。
+
+实现(opt-in,默认关=零行为变化):
+- `tileinfer/integrations/dense_nn.py`:PWAL 基类钩子(UnquantizedLinearMethod.
+  process_weights_after_loading,与 H73 各自独立 marker 互不吞包装)→ 形状族识别
+  (12288×2048=qkvz/9216×2048=attnqkv/2048×4096=oproj,与 H28/H73 域零交集)→
+  加载期一次 `w.t().contiguous()` 预排 + 实例级 quant_method.apply 替换:
+  `x.shape[0]≤TILEINFER_DENSE_NN_MAXM(默认 16,E100 证据域)` 走 matmul NN,
+  否则回落原 apply(prefill 大 M 保持 NT)。TP≠1 全族跳过(RowParallel apply 含
+  all-reduce,直替破坏通信语义)。
+- 开关:`TILEINFER_DENSE_NN`(1=三族全开,亦可 qkvz,attnqkv,oproj 子集)/
+  `TILEINFER_DENSE_NN_MAXM`/`TILEINFER_DENSE_NN_DRYRUN`。HBM 代价 ≈+2.55GB
+  (三族预排副本;可子集降档)。
+- 在役探针:metrics dumper 并入 dense_nn_modules/forward/fallback(ON 臂判据
+  dense_nn_forward>0)。
+
+验证状态:
+- CPU 契约 14 项绿(tests/test_dense_nn.py:门控/形状族/预排数值/shim 语义/
+  wrapper 链与 H73 marker 独立性);
+- 设备数值 oracle(tests/test_dense_nn_device.py,M∈{1,8}×三族 vs F.linear NT
+  TOL 2e-2 + 大 M 回落逐位一致)与四轴微基准(`h77_nn_bench.py`:
+  nt_nd/nn_nd/nz_eng/lin_nz,HBM-cold 流式口径,门槛=任一大形状 M=1 NN/NT
+  ≥1.05x 且 allclose)——**等设备窗口**(哨兵 h77_gate_chain.sh 已武装,随
+  iter-214 npu 套件退出自动补跑);
+- 微基准门槛通过后才进权威 A/B(`h77_ab.sh`,基座=capture8+fold,唯一变量
+  DENSE_NN;判据 c1 TPOT ≥−1%,其余 |Δ|≤3%)。

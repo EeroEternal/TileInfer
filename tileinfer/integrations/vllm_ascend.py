@@ -2287,6 +2287,16 @@ def start_metrics_dumper() -> bool:
                 stats = dict(getattr(cls, "_stats", {}))
                 # D57-①:prefill 侧计数(长上下文分流)独立于类状态,合并进同一视图。
                 stats.update(_PREFILL_STATS)
+                # H77 dense_nn 计数(在役探针面):仅在有模块被 shim 时并入,
+                # ON 臂 A/B 以 dense_nn_forward>0 判定路径真实生效。
+                try:
+                    from .dense_nn import stats as _dense_nn_stats
+
+                    _dnn = _dense_nn_stats()
+                    if _dnn.get("dense_nn_modules", 0):
+                        stats.update(_dnn)
+                except Exception:
+                    pass
                 stats["ready_plans"] = len(getattr(cls, "_plans", {}))
                 marker = getattr(cls, "_marker", None)
                 stats["kernel_markers"] = int(marker.item()) if marker is not None else -1
@@ -2436,6 +2446,16 @@ def install(raise_on_failure: bool = True) -> bool:
             install_gdn_meta_memo()
         except Exception as exc:  # noqa: BLE001 - 优化模块不得影响在役路径
             logger.warning("TileInfer gdn meta memo not installed: %s", exc)
+        # H77 dense b1 大形状权重物理预排 NT→NN(E297:E255×E269 引擎缺口 1.24-1.3x,
+        # E100 NN 微基准 +11% 轴):显式 opt-in(TILEINFER_DENSE_NN=1 或形状族子集,
+        # 默认关=零行为变化)。挂 PWAL 基类钩子,权重加载期一次预排;微基准门槛
+        # (h77_nn_bench M=1 ≥1.05x)通过前不得进权威 A/B。
+        try:
+            from .dense_nn import install as install_dense_nn
+
+            install_dense_nn()
+        except Exception as exc:  # noqa: BLE001 - 优化模块不得影响在役路径
+            logger.warning("TileInfer dense nn not installed: %s", exc)
         # GDN gating 接管为**显式 opt-in**(E21/D29:引擎内 A/B 无收益、TTFT +2~9%,不进默认
         # 路径;TILEINFER_OPS 显式含 gdn 时才安装)。decode/prefill 维持缺省全开;moe 同为
         # 显式 opt-in(H27/D70:内核线 ≥1.0x 门槛通过前不进默认路径)。
