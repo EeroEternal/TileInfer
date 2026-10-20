@@ -1690,3 +1690,55 @@ GEMM 每列独立,拼接不改变任何列的结果 → **逐位等价**(由测�
 预发射吸收,同 E286 的 prep 域 ~10x 衰减机理)。c8 |Δ|≤3%。
 **翻案条件**:实测无收益 → 归档为负面结果,并在 docs 记录"图模式 host 预发射
 已吸收该发射"这一结论。
+
+## 勘误:H49 并未"被 E283 覆盖"(2026-10-20 iter-208)
+
+此前文档与轮次记录中出现过一个错误结论:「H49(slot_mapping triton→numpy 宿主削减)
+已被 `prep_fastpath.py` 覆盖,且 E283 已判净收益≈0,故不再实现」。**该结论错误。**
+
+### 两者数据来源不同
+
+| | `prep_fastpath._slotmap_cpu_fast`(现有) | H49 原补丁(#19033 最小子集) |
+|---|---|---|
+| positions 来源 | `runner.input_batch.num_computed_tokens_cpu[...] + runner.query_pos.np` **重算** | 调用方直传 `positions_np`(`_prepare_inputs` 内已算好) |
+| 依赖 | 需 `_prepare_inputs` 包装注入 threadlocal `runner` | 无 |
+| pad 区 | 按 n 变化懒刷新(fill PAD) | 调用方给精确切片,无需刷新 |
+
+现有实现比原补丁**多做了三件事**:threadlocal 读写、positions 重算、pad 懒刷新。
+E283 记录的"发射税节省被 array_equal 比较 / numpy / H2D 成本抵消",恰好可以由
+这三点解释——**被证否的是"该实现方式",不是"该优化方向"**。
+
+### 处置
+已在 `compute_slot_mapping` 增加 `positions_cpu` / `query_start_loc_cpu` 可选入参与
+`_slotmap_from_cpu_args` 直接路径(优先于 runner 路径),公式与
+`_compute_slot_mapping_kernel` 的 CP==1 分支逐项同构、逐位等价。
+契约 11 项通过(新增 4 项:直接路径 vs oracle 逐位一致 / 优先于 runner / CP 门控让位 /
+公式逐项核对)。提交 `1cbc224`。
+
+**调用点改动**(让 model_runner 真的传参)仍留待设备窗口,不在未做引擎验证时
+修改 vendor 调用点。
+
+---
+
+## H67 batch-1 decode attention 主核:取证棒就绪(2026-10-20 iter-208)
+
+### 已知归因(E268/E266,双侧 kineto 对差)
+TI c1 的 attention 主核(`main_kernel`,tilelang 自研)单步 **0.472 ms × 19.9 发射**;
+FIA 的 attention 族合计 **0.133 ms** → **单步差约 0.34 ms**,是 c1 缺口的最大单点。
+另 datamove **+0.083 ms**(q_pad / output 胶水)为第二项。
+
+H66 当时因「可削面 0.44ms < 0.5ms 立项门槛」未立消除假设,登记为 H67 候选。
+但该门槛是**当时的优先级判据**(前提是还有更高优先级的项),不是"无法优化"的证明。
+在 c1 已成为唯一负项的现在,前提已不成立(见 D144-3)。
+
+### 取证棒
+`.agent_loop/run/h67_bench.py`(等窗执行,不改在役代码):
+- 真实形状扫描:ctx ∈ {128, 512, 2048, 8192} × ktp ∈ {0, 16, 32, 64, 128}
+- 与 SDPA 参照对照,得到每档 ratio
+
+**预登记判据**:
+| ratio | 判决 |
+|---|---|
+| ≤ 1.5 | **H67 立项**(存在明确消除路径) |
+| ≥ 2.5 | **H67 关闭**(内核已达该架构上限,缺口应归因到 vendor 专用指令) |
+| 中间区 | 记录最优配置,作为 H42-③ 双缓冲的补充靶面 |
