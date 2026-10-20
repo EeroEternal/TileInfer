@@ -14,6 +14,8 @@ CPU 机器上后端仍可 lower(不跑设备),故本测试不标 npu;但若后�
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 # 后端可 lower(仅编译期,不上设备)才跑;缺工具链自动跳过。
@@ -26,6 +28,17 @@ except Exception:  # pragma: no cover
     _HAVE_LOWER = False
 
 pytestmark = pytest.mark.skipif(not _HAVE_LOWER, reason="tilelang ascend lower 不可用")
+
+# tilelang 0.1.15 vendor pathology(E295/E315):`paged_decode_split` 编译在
+# AscendPassPipelineBody 挂死(E315:compile-only 探针与设备套件两个独立进程同时复现,
+# 3.9h+/2h25m+ 零进展)。vendor 修复前默认跳过该内核的编译断言(其余 decode/prefill
+# 内核编译正常,保留覆盖);翻案条件=tilelang 升级后置
+# TILEINFER_SKIP_SPLIT_COMPILE_HANG=0 复跑。
+_SKIP_SPLIT = pytest.mark.skipif(
+    os.environ.get("TILEINFER_SKIP_SPLIT_COMPILE_HANG", "1").strip().lower()
+    not in ("0", "false"),
+    reason="tilelang 0.1.15 paged_decode_split codegen 挂死(E295/E315),升级后重开",
+)
 
 
 def test_simd_softmax_lowers_to_vector_intrinsics():
@@ -105,6 +118,10 @@ def test_decode_simd_softmax_gate():
     默认关闭时内核不含 ``vcmax``(与改造前一致);置 1 时含 SIMD 归约内在函数。两路径都必须在
     CPU 上可 lower。设备等价由 ``tests/test_tilelang_ascend950_decode.py``(off/on 各 25 用例)
     与 ``benchmarks/probes/simd_softmax_*_device.py`` 共同保证。
+
+    E315 拆分:``paged_decode_split`` 的两处编译断言(L123/L159)因 tilelang 0.1.15 病态
+    挂死抽到 ``test_decode_split_simd_softmax_gate``(守卫跳过);本测试保留其余全部编译
+    断言(decode/prefill × off/on + prefill split/head/frontier)。
     """
     import os
 
@@ -118,14 +135,8 @@ def test_decode_simd_softmax_gate():
         assert K._simd_softmax_enabled() is False
         src_off = compile_kernel_source(K.paged_decode_ascend950(**spec), target="ascend")
         assert "vcmax" not in src_off, "默认路径不应含 SIMD 归约内在函数"
-        sspec = dict(batch=3, kv_heads=2, group=8, dim=128, page_size=128, num_pages_cap=16,
-                     num_tiles=4, max_splits=2, threads=128)
-        s_off = compile_kernel_source(K.paged_decode_split(**sspec), target="ascend")
-        assert "vcmax" not in s_off, "split 默认路径不应含 SIMD 归约内在函数"
         pspec = dict(batch=1, kv_heads=2, group=8, dim=128, page_size=128, num_pages_cap=16,
                      num_tiles=4, threads=128)
-        sspec_prefill = dict(batch=1, kv_heads=2, group=8, dim=128, page_size=128,
-                             num_pages_cap=16, num_tiles=4, max_splits=2, threads=128)
         p_off = compile_kernel_source(K.paged_prefill_ascend950(**pspec), target="ascend")
         assert "vcmax" not in p_off, "prefill 默认路径不应含 SIMD 归约内在函数"
 
@@ -135,11 +146,6 @@ def test_decode_simd_softmax_gate():
         for op in ("vci", "vcmps", "vsel", "vcmax", "vmax", "vcadd", "vadd", "vexp"):
             assert op in src_on, f"T5 decode SIMD 路径未降到 {op}"
 
-        # split kernel: same gate + same SIMD softmax (per-tile online over `plen` pages).
-        s_on = compile_kernel_source(K.paged_decode_split(**sspec), target="ascend")
-        for op in ("vcmps", "vcmax", "vcadd", "vexp"):
-            assert op in s_on, f"T5 split SIMD 路径未降到 {op}"
-
         # prefill main kernel: causal + tail mask via two chained vsel (vcmp on kv_pos).
         p_on = compile_kernel_source(K.paged_prefill_ascend950(**pspec), target="ascend")
         for op in ("vcmps", "vcmp", "vcmax", "vcadd", "vexp", "vadds"):
@@ -147,6 +153,8 @@ def test_decode_simd_softmax_gate():
 
         # prefill split / head / frontier: same gate, same SIMD softmax.  split + frontier carry the
         # causal mask; head carries only the scalar tail mask.
+        sspec_prefill = dict(batch=1, kv_heads=2, group=8, dim=128, page_size=128,
+                             num_pages_cap=16, num_tiles=4, max_splits=2, threads=128)
         for name, sp in (
             ("prefill_split", K.paged_prefill_split_ascend950),
             ("prefill_head", K.paged_prefill_split_head_ascend950),
@@ -155,6 +163,37 @@ def test_decode_simd_softmax_gate():
             on = compile_kernel_source(sp(**sspec_prefill), target="ascend")
             for op in ("vcmps", "vcmax", "vcadd", "vexp"):
                 assert op in on, f"T5 {name} SIMD 路径未降到 {op}"
+    finally:
+        os.environ.pop("TILEINFER_SIMD_SOFTMAX", None)
+        if saved is not None:
+            os.environ["TILEINFER_SIMD_SOFTMAX"] = saved
+
+
+@_SKIP_SPLIT
+def test_decode_split_simd_softmax_gate():
+    """E315 抽分:``paged_decode_split`` 的 off/on 编译断言(tilelang 0.1.15 病态挂死)。
+
+    与 ``test_decode_simd_softmax_gate`` 同一契约,只覆盖 decode split 内核;守卫见模块头。
+    """
+    import os
+
+    from tilelang.tools.compile_only import compile_kernel_source
+    import tileinfer.kernels.attention.paged_decode_ascend950 as K
+
+    sspec = dict(batch=3, kv_heads=2, group=8, dim=128, page_size=128, num_pages_cap=16,
+                 num_tiles=4, max_splits=2, threads=128)
+    saved = os.environ.pop("TILEINFER_SIMD_SOFTMAX", None)
+    try:
+        assert K._simd_softmax_enabled() is False
+        s_off = compile_kernel_source(K.paged_decode_split(**sspec), target="ascend")
+        assert "vcmax" not in s_off, "split 默认路径不应含 SIMD 归约内在函数"
+
+        os.environ["TILEINFER_SIMD_SOFTMAX"] = "1"
+        assert K._simd_softmax_enabled() is True
+        # split kernel: same gate + same SIMD softmax (per-tile online over `plen` pages).
+        s_on = compile_kernel_source(K.paged_decode_split(**sspec), target="ascend")
+        for op in ("vcmps", "vcmax", "vcadd", "vexp"):
+            assert op in s_on, f"T5 split SIMD 路径未降到 {op}"
     finally:
         os.environ.pop("TILEINFER_SIMD_SOFTMAX", None)
         if saved is not None:

@@ -41,6 +41,21 @@ pytestmark = [
     pytest.mark.skipif(not _HAVE_ASCEND950, reason="tilelang.ascend (>=0.1.15) not importable"),
 ]
 
+# tilelang 0.1.15 vendor pathology(E295/E315):`paged_decode_split` 内核编译在
+# AscendPassPipelineBody 挂死(E295:dim=256/token-split 17min+ 不收敛;E315:dim=128
+# plain split 在两个独立进程分别 2h25m+/3.9h+ 无进展)。vendor 修复前默认跳过触发
+# 真实 split 编译的用例(其余 plain/merge/prefill 编译不受影响,E315 缓存时间线)。
+# 翻案条件:tilelang 升级修复该 pass 后置 TILEINFER_SKIP_SPLIT_COMPILE_HANG=0 复跑
+# (h67_toksplit_bench.py 已装备一键复测)。
+_SPLIT_COMPILE_HANG = (
+    os.environ.get("TILEINFER_SKIP_SPLIT_COMPILE_HANG", "1").strip().lower()
+    not in ("0", "false")
+)
+_SKIP_SPLIT = pytest.mark.skipif(
+    _SPLIT_COMPILE_HANG,
+    reason="tilelang 0.1.15 paged_decode_split codegen 挂死(E295/E315),升级后重开",
+)
+
 DTYPE = torch.bfloat16
 TOL = 3e-2  # bf16 vs the fp32 torch reference
 
@@ -137,14 +152,14 @@ def _case(batch, kv_heads, group, page_size, dim, kv_lens, seed=0, kv_tile_pages
         (2, 2, 8, [128, 256], "ragged batch", 0, 128),
         (1, 1, 32, [256], "group == M tile", 0, 128),
         # split-KV: 32 pages -> 4 tiles, the tail lands in the last split
-        (1, 2, 8, [4000], "split-KV, 4 tiles", 8, 128),
+        pytest.param(1, 2, 8, [4000], "split-KV, 4 tiles", 8, 128, marks=_SKIP_SPLIT),
         # split-KV across several ragged requests (different split counts per request)
-        (2, 2, 8, [4096, 1024], "split-KV, ragged", 8, 128),
+        pytest.param(2, 2, 8, [4096, 1024], "split-KV, ragged", 8, 128, marks=_SKIP_SPLIT),
         # split-KV with the *serving* GQA config (32 qo / 8 kv heads -> group 4): this is the
         # KI-1 regression case - the merge kernel's GM staging used to fault with a vector-core
         # exception for group 4 (sub-32-byte PartLse row) while group 8 passed
-        (1, 8, 4, [4096], "split-KV, serving group 4", 16, 128),
-        (2, 8, 4, [4096, 512], "split-KV, group 4 ragged", 16, 128),
+        pytest.param(1, 8, 4, [4096], "split-KV, serving group 4", 16, 128, marks=_SKIP_SPLIT),
+        pytest.param(2, 8, 4, [4096, 512], "split-KV, group 4 ragged", 16, 128, marks=_SKIP_SPLIT),
         # head_dim 256 (Qwen3.5/3.6 full-attention layers): non-power-of-two pool on purpose,
         # it is the regression case for the kernel's quantized page-capacity binding
         (1, 2, 8, [128], "d256 one full page", 0, 256),
@@ -231,7 +246,10 @@ def test_kernel_cache_keys_ignore_exact_pool_size(monkeypatch, builder, extra):
         assert len(K._KERNEL_CACHE) == before + 2  # manual-out is a distinct artifact
 
 
-@pytest.mark.parametrize("kv_tile_pages", [0, 8])
+@pytest.mark.parametrize(
+    "kv_tile_pages",
+    [pytest.param(0), pytest.param(8, marks=_SKIP_SPLIT)],
+)
 def test_declared_cap_beyond_pool_is_exact(monkeypatch, kv_tile_pages):
     """Device binding regression: a 5-page pool served by kernels compiled for cap=64."""
     monkeypatch.setenv("TILEINFER_POOL_CAP", "64")
@@ -283,10 +301,14 @@ def test_page_pipeline_spec_and_cache_key(monkeypatch):
 @pytest.mark.parametrize(
     "batch,kv_heads,group,dim,width_pages,kv_tile_pages,kv_lens,label",
     [
-        (2, 8, 4, 128, 8, 2, [260, 130], "full plan, ragged lens, empty tail splits"),
-        (2, 8, 4, 128, 8, 2, [1, 128], "full plan, near-empty batch"),
-        (1, 8, 4, 128, 16, 4, [513], "full plan, partial last split"),
-        (4, 8, 4, 128, 16, 4, [2050, 1024, 129, 1], "full plan, serving-config skew"),
+        pytest.param(2, 8, 4, 128, 8, 2, [260, 130], "full plan, ragged lens, empty tail splits",
+                     marks=_SKIP_SPLIT),
+        pytest.param(2, 8, 4, 128, 8, 2, [1, 128], "full plan, near-empty batch",
+                     marks=_SKIP_SPLIT),
+        pytest.param(1, 8, 4, 128, 16, 4, [513], "full plan, partial last split",
+                     marks=_SKIP_SPLIT),
+        pytest.param(4, 8, 4, 128, 16, 4, [2050, 1024, 129, 1], "full plan, serving-config skew",
+                     marks=_SKIP_SPLIT),
     ],
 )
 def test_full_split_plan_clamps_to_real_pages(

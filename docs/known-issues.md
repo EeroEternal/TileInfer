@@ -369,6 +369,24 @@ oracle 在 dim=128(SIMD)PASS);CANN 9.1.1 头文件不匹配为环境事实。
 - npu 标记套件临时轮换 `-k "not nosimd"`(D159-3),vendor 修复后应去除。
 - 设备级脚本一律走 `.agent_loop/run/*_launch.sh` 启动器(内 source env.sh)。
 
+### E315 增补(iter-231,2026-10-21)——病态面扩展与测试守卫
+
+1. **病态面扩展**:dim=128 plain split(`paged_decode_split`)的测试/gate 规格同样挂死——
+   两个独立进程同时复现:CPU 套件 `test_offline_lower_probes.py::test_decode_simd_softmax_gate`
+   的 compile-only(L123)3.9h+ 零进展;NPU 套件 `test_tilelang_ascend950_decode.py::
+   test_paged_decode_matches_reference` 经 `finalize_plan→build_split_kernel`(paged_decode_
+   ascend950.py:1031)2h25m+ 零进展;py-spy 双栈同卡 `AscendPassPipelineBody`(pipeline.py:83)。
+   上文"dim=128 split ~3min 可完成"的结论仅对当时间测的那一规格成立,不是规格族通则。
+   **在役不受影响**:tl_cache_950 编译时间线显示 10-20 17:00-22:00(h75/gen4 A/B 窗)
+   40+ 产物(含 split 域)正常产出,E313 权威 A/B 正常完成——病态仅限测试侧规格。
+2. **测试守卫**:触发真实 split 编译的用例默认跳过(env `TILEINFER_SKIP_SPLIT_COMPILE_HANG=1`
+   默认,置 0 强制跑):decode 测试 9 个 split 参数(matches_reference×4/declared_cap×1/
+   full_split_plan×4)+ offline probes 的 `test_decode_split_simd_softmax_gate`(自
+   `test_decode_simd_softmax_gate` 拆出,其余 9 项编译断言保留覆盖)。翻案条件=tilelang
+   升级后置 0 复跑(h67_toksplit_bench.py 一键复测)。
+3. **套件恢复链**(run/recover_i231.sh):h77 gate(oracle+四轴微基准)→h33v3 探针→
+   h33_l2hint 基准→重挂双套件→条件挂 h77_ab.sh。
+
 ## KI-8 H77 dense NN 预排副本的权重更新流限制(H77 opt-in 域,iter-223 源码审查登记)
 
 ### 现象/限制

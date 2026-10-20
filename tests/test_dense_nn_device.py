@@ -11,6 +11,8 @@ from __future__ import annotations
 import pytest
 import torch
 
+from tileinfer.utils import is_npu_available
+
 try:
     from tileinfer.integrations import dense_nn as dn
 
@@ -18,7 +20,13 @@ try:
 except Exception:  # pragma: no cover
     _HAVE_MOD = False
 
-pytestmark = pytest.mark.skipif(not _HAVE_MOD, reason="dense_nn module unavailable")
+# E315(iter-231):补 npu 标记——文件内张量在 device="npu" 上创建,属设备测试;
+# 缺标记导致 gate 链 `-m npu` 全量滤选(rc=5),且 CPU 套件会误收集并触碰设备。
+pytestmark = [
+    pytest.mark.npu,
+    pytest.mark.skipif(not is_npu_available(), reason="no Ascend NPU available"),
+    pytest.mark.skipif(not _HAVE_MOD, reason="dense_nn module unavailable"),
+]
 
 SHAPES = [(12288, 2048, "qkvz"), (9216, 2048, "attnqkv"), (2048, 4096, "oproj")]
 
