@@ -406,3 +406,25 @@ dense_nn.py:122)是独立 tensor:若权重在 serve 生命周期内被外部原�
 
 启用 RL 更新流的部署不得开启 `TILEINFER_DENSE_NN`;若需共存,须在权重更新回调后重建
 `w_nn`(重跑 `_shim_layer` 前先还原 quant_method.apply)。
+
+## KI-9 torch.profiler with_stack 在 torch_npu 下不产出 python 调用栈(iter-235 实测)
+
+### 现象
+
+`torch.profiler.profile(with_stack=True, record_shapes=True)` 在 torch 2.10+torch_npu
+2.10.post4(CANN 9.3)组合下,导出的 chrome trace 不含 `Call stack` 字段
+(23GB trace 实测 grep 计数=0),`key_averages(group_by_stack_n=8)` 的 stack 恒为空。
+capture 期算子到 torch 源的栈级归因因此不可用,E327 的 H47 归因改走静态源码路径。
+
+### 附带事实
+
+- vLLM 0.23 V1 默认多进程架构下,主进程 profiler 完全看不到 EngineCore 子进程算子
+  (top-30 全为客户端侧个位数计数微操作);`VLLM_ENABLE_V1_MULTIPROCESSING=0`
+  单进程模式可让 capture 期执行留在本进程,arg_utils.py:1556 为官方支持路径。
+- 单进程探针收尾可能 rc=134(SIGABRT,profiler 大 trace 析构段),数据已完整落盘,
+  不影响取证产物有效性。
+
+### 影响域
+
+仅影响进程内画像类探针的栈级归因;在役 serve/内核/集成路径零影响。
+翻案条件:torch_npu 升级修复 with_stack 后,需要栈级归因的探针一键重跑即可。

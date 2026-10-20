@@ -2424,3 +2424,67 @@ v2 机制(同一假设的零分支实现,`dense_nn.py` 全量重写):
   iter-214 npu 套件退出自动补跑);
 - 微基准门槛通过后才进权威 A/B(`h77_ab.sh`,基座=capture8+fold,唯一变量
   DENSE_NN;判据 c1 TPOT ≥−1%,其余 |Δ|≤3%)。
+
+## H47 图模式拷贝链:关闭(可达性,2026-10-21 iter-235,E327)
+
+取证(iter-235,capture 期探针两轮):
+- v1(多进程默认)暴露 V1 架构盲区:EngineCore 为子进程,主进程 profiler 仅见客户端侧
+  6 计数微操作 → 修复=`VLLM_ENABLE_V1_MULTIPROCESSING=0` 单进程模式(vllm 0.23 官方
+  支持路径),capture 期算子栈落进主进程;取证口径对齐在役最优基座
+  (capture8 `cudagraph_capture_sizes=[1,4,8,32]` + c8 权威并发);
+- 出数:capture 期 `aten::copy_` 43902 次/9227ms、`aten::slice` 59086 次/74.8ms、
+  `vllm::unified_attention_with_output` 190 次/2960ms、dynamo 全图编译 44 次
+  (`fullgraph_capture` 1.6s)——拷贝链为 capture/compile 期高频 host 操作,
+  与 E128 设备侧 240 次/步 replay 口径互为表里;
+- `with_stack=True` 在 torch_npu/profiler 组合下不产出 Call stack(23GB trace 实测
+  grep=0),python 栈级归因不可用(KI-9 记档),改走静态源码路径。
+
+判决(三重证据,**closed**):
+1. **份额量化**:拷贝链主体为 vendor 图模式共性行为(TI 240 vs FIA 216 次/步,E128);
+   TI 独有面=10 层 full-attn×2 次 copy_(q_pad 入 pad + out_pad→out 写回,
+   tilelang_ascend950.py:329-349)≈20-24 次/步,全消 ~50-58μs/步 ≈ TPOT 0.3%,
+   远低于预登记「Slice ≥50% 削减→≥1.5%」门槛;
+2. **共享面口径红线**:大头(~90%)位于 vllm 主仓文件(qwen3_next.py:416
+   `torch.empty_like`+`output=` 写回 + runner bucket 填充),修改将同步作用于 FIA
+   基线臂,污染「vs vLLM 原始路径」权威口径;
+3. **带宽顶**:E291 已判 TI 胶水拷贝链 0.083ms 反推 4.93TB/s,近峰值无税可回收。
+- **VERDICT: 不可达关闭**(机制存在但 TI opt-in 域内数学不可达);
+  翻案条件=vendor 上游自行消除写回拷贝,或共享面口径经用户裁决变更。
+
+## 全域瓶颈证明汇总(系统级专项终止条件 b)素材,c1 唯一残余缺口)
+
+30% 大账现状(权威口径 vs vLLM 原始昇腾算子路径,E258 重锚+H28/H73/H79 入役后):
+| 场景 | TPOT 变化 | 吞吐变化 | 判定 |
+|---|---|---|---|
+| 128x128_c8 | **−34~−35.3%** | +45.9% | **≥30% 达标** |
+| 128x512_c8 | −34.4% | +49.5% | 达标 |
+| 8192x128_c8 | −12% | 改善 | 不劣化 ✓(改善) |
+| 16384x128_c8 | −5.9% | 改善 | 不劣化 ✓(改善) |
+| 128x128_c1 | 9.42 vs 8.766(+7.5%) | 落后 | **不达,证据链判不可达** |
+
+c1 全域攻击面终态(每域均穷尽取证):
+| 域 | 终态判决 | 证据 |
+|---|---|---|
+| dense b1 GEMV | H79 兑现 ~90μs;其余族 NN 化证否;后端不可解三重互证 | E321/E324/E143/E144/E255 |
+| MoE | H28 兑现(−2~2.4%);域上限 8.6%,19 尝试归档 | E313/D81/§13 |
+| attention decode | token-split closed(编译病态)/页 split 净负/head-split 机理否决/双缓冲+流水 disproven | E295/E296/E325-1 |
+| attention 胶水 | 0.083ms@4.93TB/s 近带宽顶 | E291 |
+| 拷贝链(图模式) | 共享面口径红线+独有面 0.3% 不可达 | E327(本轮) |
+| GDN | decode E20 封死;prefill H10 TEMPORARY;vendor AscendC 域 | E20/E134-2 |
+| host prep | H65/H70/H71 disproven;period=设备链,host 全遮盖 | E265/E280-E286 |
+| sync/FG event | replay 排空=设备必要时间;FG event 四场景零增益 | E257/E261/E263 |
+| 图内气泡 | 0.42ms 不可分解 | E276 |
+| prefill(W1) | D57-① shunt 兑现 0.754x/0.758x;字面重写 <0.2% 上限;残值=栈升级外部依赖 | E300/D147/D160 |
+| capture 桶 | capture8 已入役(c8 −22% 域) | E251/E258 |
+| 采样 | greedy 权威口径;topk opt-in 保留 | E138-5 |
+
+复调研台账:vllm/vllm-ascend/sglang/flashinfer 四仓 Atom 增量连续 70+ 轮零可映射
+(最新 E323/E325,SINCE 进位 vllm 22:06:55Z/flashinfer 22:03:21Z/sglang 22:03:47Z/
+vllm-ascend 13:28:14Z),相邻领域(cannbench 算子库/CANN 869 opapi 枚举/编译器 pass/
+调度策略/图优化/L2 hint/预取)均有专项取证档(E131/E132/E141/E143/E100/E33/H37/H39/H43)。
+
+**结论**:c8 分量 ≥30% 达标且全场景不劣化;c1 分量要求 TI 设备链比 vendor 原生路径
+快 35%+(TI 9.368 vs FIA 8.512ms),而全部 12 个攻击域的终态证据均指向「与厂商算子
+同水平或消除路径不可达」,已兑现优化(capture8/H28/H61/H73/H79/split-KV/SIMD/shunt)
+全部入役后 c1 仍 +7.5%。按任务书终止条件 b),系统级专项以 FINAL TEMPORARY 收口,
+交用户裁决。

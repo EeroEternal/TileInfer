@@ -10,6 +10,10 @@ import sys
 
 os.environ.setdefault("VLLM_NO_USAGE_STATS", "1")
 os.environ.setdefault("VLLM_DO_NOT_TRACK", "1")
+# V1 多进程架构下 EngineCore 是子进程,主进程 profiler 抓不到 capture 期算子
+# (iter-235 首挂实测:top-30 全为客户端侧 6 计数微操作)→ 单进程模式让 capture
+# 期执行留在本进程,profiler 栈才可见。
+os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
 OUT_DIR = os.environ.get(
     "H47_PROF_DIR", "/home/userlist/zxs/TileInfer/.agent_loop/run/h47_capture_prof"
@@ -54,9 +58,10 @@ def main() -> int:
             max_num_seqs=32,
             trust_remote_code=True,
             additional_config={"multistream_overlap_shared_expert": True},
+            cudagraph_capture_sizes=[1, 4, 8, 32],  # 在役 capture8 基座(E251/D142-2)
         )
         sp = SamplingParams(temperature=0, max_tokens=4, ignore_eos=True)
-        prompts = ["hello " + str(i) for i in range(16)]  # 触发 bs16 桶 decode
+        prompts = ["hello " + str(i) for i in range(8)]  # c8 权威口径 → bucket=8 图形态
         llm.generate(prompts, sp)
 
     os.makedirs(OUT_DIR, exist_ok=True)
