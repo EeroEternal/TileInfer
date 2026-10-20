@@ -1958,6 +1958,34 @@ for p in T.Pipelined(num_pages, num_stages=sw_pipeline):
 - **没有任何一档超过 1.01x**;stages=2 在 b8×8K 还有 11% 回归。
 - 短形状零税(0.0563 vs 0.0564),E61 红线通过。
 
+数值与边界的设备契约另有 17 项(`tests/test_sw_pipeline_device.py`),覆盖单页请求、
+ragged batch、tail 页、head_dim=256 的 D-split,断言是 `torch.equal`(**逐位**,
+不是"小于容差"),全绿。
+
+### 为什么没做引擎级 A/B(以及为什么它本来就分辨不出来)
+
+尝试过(`.agent_loop/run/h74_ab.sh`),但两次都被外部栈污染而作废:
+- s0 臂 19:14–19:20 出数:c1 8.779 / c8 16.673 / 8K 39.904 / 16K 68.770;
+- 与权威基线(9.700 / 11.964 / 36.788 / 65.287)比,**偏差 −9.5% ~ +39.4%**——
+  远超任何可接受的单变量偏离,该窗口已被外部 serve 污染,数据已删除;
+- 根因:外部权威栈(port 8000)会自动重启,退出后残留显存不立即释放,
+  我们启动时只看到 43.6 GiB 空闲 < 0.9×110.72 GiB 需求,`Engine core init failed`。
+
+更关键的是**分辨力**问题——就算拿到干净窗口也测不出来:
+
+```
+case              TPOT ms  kernel ms  占比   stages=2 折算到端到端
+b1 × 128 (c1)       9.70     0.0190   0.20%        0.02%
+b8 × 8192          36.79     0.5879   1.60%        0.18%
+b8 × 16384         65.29     1.1070   1.70%        0.19%
+```
+
+attention 主核只占 TPOT 的 **0.2%~1.7%**;流水最坏影响 11%,折算到端到端仅
+**0.02%~0.19%**,比引擎 A/B 的噪声底(约 ±0.5%)还小一个量级。
+
+⇒ 以**内核级微基准**为判决依据是恰当的,不必再投引擎窗口。这一点也反过来验证了
+H42-③ 的 disproven 判决:那条路即使实现正确,端到端最多也只有 ~0.2% 的量级。
+
 ### 为什么无效(与 DeepInfer 的真实差异)
 
 DeepInfer 的 `T.Persistent` 本质是**任务摊平器**:固定 `num_cores` 个核轮流吃
@@ -2184,7 +2212,23 @@ shared 串行链整体 bypass(`_forward_shared_experts` 返回零张量,合加�
 
 验证状态:CPU 契约 12 项绿(纯函数数学/折叠时序/扩列降级/bypass/install 幂等);
 相关集成回归(shared_gate_fuse+optin_gate)18 项绿。
-**未完成(等设备窗)**:残留待审四项(w13_weight_list 条件分支/合加点/eplb 恒等/
-非 internal router fallback)→ oracle 数值 → 微基准(融合 ≥1.0x aclnn 分解路径,
-裁决②门槛)→ opt-in 权威 A/B(c1/c8 主判据,短场景 |Δ|<3%,图模式端到端)。
+
+设备链(iter-209,提交 d084bd2):
+- **install 接线补齐**:fold.install() 挂进集成 install()(显式 opt-in,默认关);
+  metrics dumper 合并 fold_layers/fold_forward/fold_skipped(在役探针判据,E299-3:
+  模块 logger 无 handler,安装判定不靠 grep 日志)。
+- **残留四项审查(E300-5 定谳)**:a) `w13_weight_list` 仅在 fused_mc2+dynamic_eplb
+  创建(fused_moe.py L129-134),在役配置不触发,免扩 list;b) 合加点=bypass 返回
+  zeros,合加语义不变;c) eplb/tid2eid:TP1/EPLB-off 下恒等(tid2eid=None 通道),
+  sglang #39580(EPLB rebalance 输出错乱)反向佐证——EPLB+fold 组合未来须重审;
+  d) 非 internal router:GEMV 降级路径保留(`_tileinfer_fold_ext` 未置位时走
+  `expert_gate(hidden)`)。
+- **设备 oracle 2/2 绿**(m∈{1,8,32},TOL 3e-2):折叠 grouped(E+1) vs 分解路径,
+  GMM 用在役原语(moe_mlp unquant 链同参);gate 扩列契约过。
+- **微基准门槛 PASS**:`h28_fold_bench.py` 200 iters 流水口径——b1 **1.400x** /
+  b8 **1.117x** / b32 **1.072x** / b128 1.038x,**decode geomean 1.188x ≥1.0x**(H28 线门槛)。
+  产物 `.agent_loop/run/h28_fold_bench.json`。
+
+**未完成(进行中)**:opt-in 权威 A/B(h75_ab.sh,off=权威基座/on=+FOLD 单变量,
+5 场景矩阵,判据 c1 ≥1% 且短场景 |Δ|<3%、8K/16K 劣化 <5%、探针 fold_layers≥40)。
 红线:E199/E200 计数语义(不得双重拆分)。预期收益:TPOT −5~7%(立项上界 5-8%)。
