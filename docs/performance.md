@@ -2167,3 +2167,24 @@ c1 @ 128 token → pages = 1 → 无论 ktp 调到 1，splits 恒为 1
 2. 数值验证(token 分块 vs 页级/单遍 oracle,含尾页、跨页、ragged,**SIMD on/off 两组**)
 3. 引擎 A/B,门槛:**短场景 attention 主核 ≥1.5x 且 8K 不劣化**
 4. 达标后接入集成层(按 bucket 选 `tokens_per_split`)
+
+## H28 shared expert 恒选 E+1 折叠(iter-210 实现,等窗验证)
+
+机制:shared expert(gate_up+swiglu+down ≈1.2ms/步串行 dense 链,E79/E91)折叠进
+routed grouped 路径作第 E+1 号恒选专家;sigmoid(gate_logit) 门控折叠进 topk_weights
+末列;gate_logit 经 router gate 权重扩 1 行免费产出。开关 `TILEINFER_SHARED_EXPERT_FOLD`
+(默认关=零行为变化),`TILEINFER_SHARED_EXPERT_FOLD_DRYRUN` 自检。
+
+实现面(E300 vendor 审查):在役 BF16/TP1,multistream 被 vendor `platform.py:32`
+硬编码关闭 ⇒ 重叠路线作废,折叠为唯一主路线。三注入点:
+①`AscendUnquantizedFusedMoEMethod.process_weights_after_loading` 前置拼接(NZ/pad 前,
+H73 形态剔除 gate 末行);②模块级 `select_experts` 包装(renorm 后追加列,门控语义
+独立于 routed renorm);③gate 扩列在首个 forward(warmup,先于 capture)懒完成。
+shared 串行链整体 bypass(`_forward_shared_experts` 返回零张量,合加语义不变)。
+
+验证状态:CPU 契约 12 项绿(纯函数数学/折叠时序/扩列降级/bypass/install 幂等);
+相关集成回归(shared_gate_fuse+optin_gate)18 项绿。
+**未完成(等设备窗)**:残留待审四项(w13_weight_list 条件分支/合加点/eplb 恒等/
+非 internal router fallback)→ oracle 数值 → 微基准(融合 ≥1.0x aclnn 分解路径,
+裁决②门槛)→ opt-in 权威 A/B(c1/c8 主判据,短场景 |Δ|<3%,图模式端到端)。
+红线:E199/E200 计数语义(不得双重拆分)。预期收益:TPOT −5~7%(立项上界 5-8%)。
