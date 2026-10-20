@@ -2353,6 +2353,14 @@ def install(raise_on_failure: bool = True) -> bool:
             install_prep_fastpath()
         except Exception as exc:  # noqa: BLE001 - 优化模块不得影响在役路径
             logger.warning("TileInfer prep fastpath not installed: %s", exc)
+        # H70-b GDN 元数据 builder 稳态 memo 化(E285):显式 opt-in
+        # (TILEINFER_GDN_META_MEMO=1,默认关=零行为变化),翻转 env + 重启即回退。
+        try:
+            from .gdn_meta_memo import install_gdn_meta_memo
+
+            install_gdn_meta_memo()
+        except Exception as exc:  # noqa: BLE001 - 优化模块不得影响在役路径
+            logger.warning("TileInfer gdn meta memo not installed: %s", exc)
         # GDN gating 接管为**显式 opt-in**(E21/D29:引擎内 A/B 无收益、TTFT +2~9%,不进默认
         # 路径;TILEINFER_OPS 显式含 gdn 时才安装)。decode/prefill 维持缺省全开;moe 同为
         # 显式 opt-in(H27/D70:内核线 ≥1.0x 门槛通过前不进默认路径)。

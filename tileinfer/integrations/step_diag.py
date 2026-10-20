@@ -31,8 +31,24 @@ UniProcExecutor):
     prep_ids     NPUModelRunner._prepare_input_ids
     prep_prevpos NPUModelRunner._compute_prev_positions
     prep_attnstate NPUModelRunner._build_attn_state
-    bt_commit    BlockTable.commit_block_table (H2D)
-    bt_slotmap   BlockTable.compute_slot_mapping (triton launch)
+     bt_commit    BlockTable.commit_block_table (H2D)
+     bt_slotmap   BlockTable.compute_slot_mapping (triton launch)
+     三批(iter-207,H70-b:_build_attention_metadata 0.532ms 内部分解):
+     fa_build     AscendAttentionMetadataBuilder.build (full-attn 组元数据)
+     gdn_build    AscendGDNAttentionMetadataBuilder.build (GDN 组元数据)
+     bam_init     AscendCommonAttentionMetadata.__init__ (cm_base 构造)
+     enc_lens     NPUModelRunner._get_encoder_seq_lens (每组一次)
+     build_attn_meta 总量 −(fa+gdn+bam+enc) = 组循环胶水(copy(cm_base)、
+     _get_block_table_and_slot_mapping×N、dict 写入),由分析脚本归账。
+     四批(iter-207,H70-b:gdn_build 0.377ms 内部归账,E285):
+     gdn_treat    _treat_single_token_prefills_with_state_as_decodes
+     gdn_bt       mamba_get_block_table_tensor (gdn_attn_builder 域内查找)
+     gdn_pad      _pad_non_spec_decode_graph_inputs (fill+D2D×3)
+     gdn_meta     GDNAttentionMetadata.__init__ (数据类构造)
+     gdn_att_p    _attach_non_spec_prefill_metadata
+     gdn_att_s    _attach_spec_decode_metadata
+     gdn_att_d    _attach_non_spec_decode_metadata
+     gdn_ctx      CommonAttentionMetadata.compute_num_computed_tokens
  Events are batched (flush every 64 records) to keep diagnostic self-overhead
  low; _flush_pending() drains on atexit.
 """
@@ -251,6 +267,41 @@ def _patch_prep_stubs() -> list[str]:
     return patched
 
 
+def _patch_bam_stubs() -> list[str]:
+    """H70-b(iter-207):三批 stub——_build_attention_metadata 内部分解。
+    E282-1:该段 0.532ms/步为 prep 域最大未分解单点;源码审查定位候选=
+    FA/GDN builder.build、cm_base 数据类构造、每组 encoder_seq_lens。
+    全部诊断包装,默认关。"""
+    patched: list[str] = []
+    import vllm_ascend.worker.model_runner_v1 as mrv
+
+    if hasattr(mrv.NPUModelRunner, "_get_encoder_seq_lens"):
+        _wrap_timed(mrv.NPUModelRunner, "_get_encoder_seq_lens", "enc_lens")
+        patched.append("NPUModelRunner._get_encoder_seq_lens")
+    try:
+        from vllm_ascend.attention.attention_v1 import AscendAttentionMetadataBuilder
+
+        _wrap_timed(AscendAttentionMetadataBuilder, "build", "fa_build")
+        patched.append("AscendAttentionMetadataBuilder.build")
+    except Exception as exc:
+        logger.warning("step_diag: fa_build wrap failed: %s", exc)
+    try:
+        from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionMetadataBuilder
+
+        _wrap_timed(AscendGDNAttentionMetadataBuilder, "build", "gdn_build")
+        patched.append("AscendGDNAttentionMetadataBuilder.build")
+    except Exception as exc:
+        logger.warning("step_diag: gdn_build wrap failed: %s", exc)
+    try:
+        from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
+
+        _wrap_timed(AscendCommonAttentionMetadata, "__init__", "bam_init")
+        patched.append("AscendCommonAttentionMetadata.__init__")
+    except Exception as exc:
+        logger.warning("step_diag: bam_init wrap failed: %s", exc)
+    return patched
+
+
 def _wrap_module_attr(module: Any, attr: str, seg: str) -> bool:
     fn = getattr(module, attr, None)
     if fn is None or not callable(fn):
@@ -269,6 +320,48 @@ def _wrap_module_attr(module: Any, attr: str, seg: str) -> bool:
         pass
     setattr(module, attr, wrapper)
     return True
+
+
+def _patch_gdn_stubs() -> list[str]:
+    """H70-b 四批(iter-207):gdn_build 内部归账(E285:三批判决
+    gdn_build 0.377ms 为 build_attn_meta 主体)。模块级函数挂 gdn_attn_builder
+    模块 globals(build() 域内查找),方法挂类。全部诊断包装,默认关。"""
+    patched: list[str] = []
+    try:
+        import vllm_ascend.ops.gdn_attn_builder as gab
+
+        if _wrap_module_attr(gab, "_treat_single_token_prefills_with_state_as_decodes", "gdn_treat"):
+            patched.append("gdn_attn_builder._treat_single_token_prefills_with_state_as_decodes")
+        if _wrap_module_attr(gab, "mamba_get_block_table_tensor", "gdn_bt"):
+            patched.append("gdn_attn_builder.mamba_get_block_table_tensor")
+        cls = gab.AscendGDNAttentionMetadataBuilder
+        for attr, seg, name in (
+            ("_pad_non_spec_decode_graph_inputs", "gdn_pad", "GDNBuilder._pad_non_spec_decode_graph_inputs"),
+            ("_attach_non_spec_prefill_metadata", "gdn_att_p", "GDNBuilder._attach_non_spec_prefill_metadata"),
+            ("_attach_spec_decode_metadata", "gdn_att_s", "GDNBuilder._attach_spec_decode_metadata"),
+            ("_attach_non_spec_decode_metadata", "gdn_att_d", "GDNBuilder._attach_non_spec_decode_metadata"),
+        ):
+            if hasattr(cls, attr):
+                _wrap_timed(cls, attr, seg)
+                patched.append(name)
+    except Exception as exc:
+        logger.warning("step_diag: gdn stubs failed: %s", exc)
+    try:
+        from vllm.v1.attention.backend import CommonAttentionMetadata
+
+        if hasattr(CommonAttentionMetadata, "compute_num_computed_tokens"):
+            _wrap_timed(CommonAttentionMetadata, "compute_num_computed_tokens", "gdn_ctx")
+            patched.append("CommonAttentionMetadata.compute_num_computed_tokens")
+    except Exception as exc:
+        logger.warning("step_diag: gdn_ctx wrap failed: %s", exc)
+    try:
+        from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+
+        _wrap_timed(GDNAttentionMetadata, "__init__", "gdn_meta")
+        patched.append("GDNAttentionMetadata.__init__")
+    except Exception as exc:
+        logger.warning("step_diag: gdn_meta wrap failed: %s", exc)
+    return patched
 
 
 def _patch_acl_graph() -> list[str]:
@@ -299,7 +392,8 @@ def install_step_diag() -> bool:
         return False
 
     ok: list[str] = []
-    for patch_fn in (_patch_engine_core, _patch_model_runner, _patch_prep_stubs, _patch_acl_graph):
+    for patch_fn in (_patch_engine_core, _patch_model_runner, _patch_prep_stubs,
+                     _patch_bam_stubs, _patch_gdn_stubs, _patch_acl_graph):
         try:
             ok.extend(patch_fn())
         except Exception as exc:

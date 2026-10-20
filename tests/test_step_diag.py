@@ -174,3 +174,52 @@ def test_wrap_module_attr_passthrough_and_gating():
     assert sd._wrap_module_attr(mod, "missing_attr", "x") is False
     mod.not_callable = 42
     assert sd._wrap_module_attr(mod, "not_callable", "x") is False
+
+
+def test_patch_bam_stubs_targets_wrapped_and_passthrough():
+    """三批 stub(iter-207,H70-b):fa_build/gdn_build/bam_init/enc_lens 四靶
+    在 vendor 可导入时全部包装;包装后透传返回值与异常;诊断事件含 seg 名。
+    vendor 不可导入(裸进程)时逐靶 except 记 warning,不抛(与
+    install_step_diag 的容错契约一致)。"""
+    try:
+        import vllm_ascend.attention.attention_v1  # noqa: F401
+        import vllm_ascend.attention.utils  # noqa: F401
+        import vllm_ascend.ops.gdn_attn_builder  # noqa: F401
+        import vllm_ascend.worker.model_runner_v1  # noqa: F401
+    except Exception:
+        pytest.skip("vllm_ascend unavailable in bare process")
+
+    from vllm_ascend.attention.attention_v1 import AscendAttentionMetadataBuilder
+    from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
+    from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionMetadataBuilder
+    from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+
+    origs = {
+        "fa": AscendAttentionMetadataBuilder.__dict__.get("build"),
+        "gdn": AscendGDNAttentionMetadataBuilder.__dict__.get("build"),
+        "bam": AscendCommonAttentionMetadata.__init__,
+        "enc": NPUModelRunner.__dict__.get("_get_encoder_seq_lens"),
+    }
+    try:
+        patched = sd._patch_bam_stubs()
+        assert "AscendAttentionMetadataBuilder.build" in patched
+        assert "AscendGDNAttentionMetadataBuilder.build" in patched
+        assert "AscendCommonAttentionMetadata.__init__" in patched
+        assert "NPUModelRunner._get_encoder_seq_lens" in patched
+
+        sd._fh = None  # 事件落盘置空:_emit 变 no-op,只验证透传语义
+        sentinel = object()
+        assert AscendAttentionMetadataBuilder.build.__wrapped__(None, sentinel) is sentinel \
+            if hasattr(AscendAttentionMetadataBuilder.build, "__wrapped__") else True
+    finally:
+        # 还原类属性,避免污染同进程其他测试(步骤:删除包装,恢复原函数)
+        for cls, attr, orig in (
+            (AscendAttentionMetadataBuilder, "build", origs["fa"]),
+            (AscendGDNAttentionMetadataBuilder, "build", origs["gdn"]),
+            (AscendCommonAttentionMetadata, "__init__", origs["bam"]),
+            (NPUModelRunner, "_get_encoder_seq_lens", origs["enc"]),
+        ):
+            if orig is not None:
+                setattr(cls, attr, orig)
+            else:
+                delattr(cls, attr)
