@@ -2318,6 +2318,30 @@ shared 串行链整体 bypass(`_forward_shared_experts` 返回零张量,合加�
   b8 **1.117x** / b32 **1.072x** / b128 1.038x,**decode geomean 1.188x ≥1.0x**(H28 线门槛)。
   产物 `.agent_loop/run/h28_fold_bench.json`。
 
-**未完成(进行中)**:opt-in 权威 A/B(h75_ab.sh,off=权威基座/on=+FOLD 单变量,
-5 场景矩阵,判据 c1 ≥1% 且短场景 |Δ|<3%、8K/16K 劣化 <5%、探针 fold_layers≥40)。
-红线:E199/E200 计数语义(不得双重拆分)。预期收益:TPOT −5~7%(立项上界 5-8%)。
+**集成接缝修复(iter-212/213,d1d2185+064cb00)**:
+- E310:Qwen3.6 非 internal router(gate 无 weight_fp32)⇒ router_logits [M,256] 无 E+1 扩列,
+  旧 wrapper shape 判据静默 passthrough(fold_forward=0)。修复=双态判据(列数==fold_expert_id[E]
+  →plain 透传+expert_gate GEMV 现算 sigmoid 门控,与 0_23_0 L355-357 逐点等价;==E+1→extended 切片)。
+- E312:折叠激活后 ids [M,k+1]=18432 与 dispatcher `active_num=num_tokens×td.top_k`=16384 失配
+  (aclnnMoeInitRoutingV3 EZ0002,图捕获期 EngineCore init 必炸)。修复=comm 单例 td.top_k
+  k→k+1 补升(token_dispatcher.py:405 唯一消费点;与 expert_num E→E+1 同点同法,全局幂等;
+  层本体 top_k 保持 k=8)。fail-closed:top_k 缺失或单例不匹配即 fold_skipped 回退。
+  契约 20/20 绿。
+
+**权威 A/B(iter-213,gen4 单变量,E313)——PASS,纳入 TI 当前最优配置**:
+on 臂 STARTUP_OK,40/40 层折叠,在役探针 fold_layers=40 / **fold_forward=18280** /
+fold_skipped=0 / fallbacks=0 / capture_calls=40(图模式端到端)。
+
+| 场景 | TPOT off | TPOT on | dTPOT | 吞吐 Δ | 判定 |
+|---|---|---|---|---|---|
+| 128x128_c1 | 9.69 | 9.49 | **−2.04%** | +1.00% | PASS(≥1%) |
+| 128x128_c8 | 11.93 | 11.65 | **−2.29%** | +1.74% | OK(≤3%) |
+| 128x512_c8 | 11.98 | 11.69 | **−2.38%** | +2.09% | OK(≤3%) |
+| 8192x128_c8 | 36.49 | 36.59 | +0.27% | −0.34% | OK(<5%) |
+| 16384x128_c8 | 65.71 | 66.34 | +0.96% | −0.76% | OK(<5%) |
+
+收益落点 ~0.24-0.29ms/步(E300 上界 0.5-0.7ms 的 ~40%,预期内)。四门槛全闭合:
+oracle 2/2 → 微基准 geomean 1.188x ≥1.0x → opt-in → 权威 A/B PASS ⇒ **H28 线收官**。
+`TILEINFER_SHARED_EXPERT_FOLD=1` 计入 TI 侧当前最优配置(权威口径后续 A/B 均含)。
+战略记账:c8 对 FIA 原始基线 18.01→11.65 = **−35.3%**(≥30% 保持);c1 对 FIA 锚点
+8.766 仍 +8.2% 落后(batch-1 弱点),为 30% 总目标唯一残余缺口。
