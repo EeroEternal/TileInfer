@@ -1408,6 +1408,24 @@ capture=40/fallbacks=0/kernel_markers=74030/prefill_long_skips=432):
   基本关闭,主缺口转移至 c1 场景**(当前对 FIA −9.4%,E243-4)。
 - 数据:`bench_results/h51_E1_{off,on}_*.json`(2026-10-19 22:50-23:03,gitignored)。
 
+### H64 落地缺口(2026-10-20 iter-208,E287):参数已判 proven 但执行器未携带
+
+D135 要求"后续所有权威口径 A/B 的双侧 serve 一律带 `--cudagraph-capture-sizes
+"1 4 8 32"`",但核查发现 **h51 链的通用执行器 `h51_ab.sh` 实际没有携带**——
+只有 `h65_anchor.sh` / `h65ms_anchor.sh` / `h65d_diag_c1.sh` 等少数脚本带。
+
+后果:凡用 `h51_ab.sh` 跑的臂(E1/E2/E3)实际用默认档 `[1,4,16,32]`,c8 请求落
+bucket=16 图、每步 8 实 + 8 pad。这解释了 E238-2(c8 TPOT 15.05) 与 E251(11.69)
+之间约 22% 的差距——**两者不是同一 capture 档**,不可直接比较。
+
+已修正:执行器补 `CAPTURE_EXTRA`,**仅 TI 臂**携带(与 `h65_anchor.sh` 一致;
+FIA 臂保持 vLLM 原生默认档,代表原生基线不应被增强);同时把该执行器的
+`TILEINFER_PREFILL_MAX_CTX` 默认由 4096 改为 **1**(对齐 E244/H61 与权威基座),
+启动日志增 `maxctx=` / `capture=` 字段便于事后核验臂配置。
+
+验证脚本 `h64_verify.sh`(三臂 fia/ti16/ti8)已就绪,但本轮设备被外部栈长期占用
+(EngineCore 静默退出,见 E288),三臂未能出数——待窗口补测。
+
 ## H50 dense-A 线判决:GEMV 亲和路径无一点 ≥1.1x,A 线关闭(2026-10-19 iter-200,E255)
 
 h50_dense_bench.py(E172 修正形状,M∈{1,8}×9 形状,HBM-cold 流式口径,设备实测):
