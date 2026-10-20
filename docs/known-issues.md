@@ -336,3 +336,35 @@ intuition that a benchmark harness should be leaner than a full server (EVIDENCE
 `os._exit(exitstatus)` 硬退出,跳过解释器终结期析构——pytest 真实退出码保住,abort 消失。
 CPU 套件与不载该 .so 的设备套件零影响。裸进程场景(手动 python -i 载 vllm 后退出)仍会
 踩中,属上游修复范畴;若上游修复,可移除该钩子复验。
+
+## KI-?(E295,iter-214)tilelang 0.1.15 split 内核 pass 病态 + 设备脚本 CANN 环境依赖
+
+### Symptom
+
+1. **裸 shell(系统 CANN 9.1.1)下任何 tilelang Ascend 内核编译必败**:`bisheng` 报
+   `use of undeclared identifier 'asc_pack_to_high'/'asc_pack_to_low'/
+   'asc_storealign_pack_quarter'` 与 `asc_set_gm2l1_nz_para`/`asc_load_l2_cache_mode`
+   不匹配(tilelang 0.1.15 头文件按 9.2+/930 API 写)。在役全链经
+   `.agent_loop/run/env.sh` 走 `.work/cann930`,不受影响;任何**独立设备脚本**
+   (微基准/探针)必须 `source .agent_loop/run/env.sh`,否则必败。
+2. **split-KV 内核(含 token 窗口,H67)在 dim=256 真实形状编译病态**:卡
+   `tilelang/ascend/pipeline.py:83 AscendPassPipelineBody`(TVM pass pipeline)
+   17min+ 不出 bisheng 子进程(100% 单线程 CPU);非 SIMD 变体(`TILEINFER_SIMD_SOFTMAX=0`)
+   300s+ 同挂(faulthandler 栈证)。对照:dim=128 split 编译 ~3min 可完成;
+   decode 内核 dim=256 仅 1-2min ⇒ 仅 split+token 窗口内核触发,vendor 编译器域。
+3. ABI 呈现注意:独立调用 `build_decode_kernel` 后必须按在役 `forward()` 口径传参
+   (`pool_view` declared-cap 视图 + `kv_indices` 补零到 cap),直接传实际页数张量报
+   `violates packed ABI constraint`。
+
+### Root cause / attribution
+
+vendor tilelang 0.1.15(`.venv` 内)Ascend pass pipeline 对 split 内核特定形状的
+编译期病态(疑似死循环/指数爆炸 pass),与 TileInfer 内核逻辑无关(token-split 数值
+oracle 在 dim=128(SIMD)PASS);CANN 9.1.1 头文件不匹配为环境事实。
+
+### Mitigation
+
+- H67 线阻断性关闭(HYPOTHESES H67 判决,E295);复测脚本
+  `.agent_loop/run/h67_toksplit_bench.py` 已留档,tilelang 升级后一键复跑。
+- npu 标记套件临时轮换 `-k "not nosimd"`(D159-3),vendor 修复后应去除。
+- 设备级脚本一律走 `.agent_loop/run/*_launch.sh` 启动器(内 source env.sh)。
