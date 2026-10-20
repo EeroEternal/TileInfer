@@ -1789,3 +1789,56 @@ FIA attention 族 **0.133 ms/步** → 单步差 ~0.34 ms。
 q copy 0.08MB/步 + out copy 0.33MB/步 = 0.41MB/步,按 0.083ms 反推 **4.93 TB/s**
 (接近峰值),不是发射税。`out_pad` 的 br=32 行中仅 group=8 行有效(4x 冗余),
 但切片后 `copy_` 已是最小搬运,优化空间 <0.02ms。
+
+## H67 实现:token 级 decode split(2026-10-20 iter-208)
+
+### 为什么分带(ktp)解决不了 c1
+`TILEINFER_KV_TILE_PAGES_POLICY` 按 **bucket** 分带,而 c1 的约束在 **width(页数)** 维度:
+
+```
+splits = ceil(pages / ktp)
+c1 @ 128 token → pages = 1 → 无论 ktp 调到 1，splits 恒为 1
+→ grid = 1 tile × 2 kv_heads = 2 blocks
+```
+
+用 E64 波次模型核算:
+
+| ctx | pages | ktp=1 | ktp=2 | ktp=4 | ktp=8 | ktp=16 | ktp=32 |
+|---|---|---|---|---|---|---|---|
+| **128** | **1** | 1t | 1t | 1t | 1t | 1t | 1t |
+| 512 | 4 | 4t | 2t | 1t | 1t | 1t | 1t |
+| 2048 | 16 | 16t | 8t | 4t | 2t | 1t | 1t |
+
+**分带调的是"每刀切多宽",但这里只有 1 页可切。** 必须改切分粒度。
+
+### 实现
+1. **调度器** `plan_decode_tiles_token_split`:按 `tokens_per_split` 个 token 切块,
+   每块记录 `token_starts/token_lens` 及其覆盖的页范围。
+2. **内核** `paged_decode_split`:页循环内把 token 窗口换算成页内 `[lo, hi)`,
+   施加到 softmax 掩码(越界置 -1e30)。
+3. **等价性**:未启用时 `tok_start=0, tok_len=page_lens*page_size`
+   → `lo=0, hi=BC`,与旧版**逐位一致**(由构造保证,非测试保证)。
+
+### 效果
+| 场景 | 页级 split | token 级(32/块) |
+|---|---|---|
+| c1 @ 128 token(1 页) | 1 tile、**grid 2** | **4 tiles、grid 8** |
+| c1 @ 512 token(4 页) | 1 tile、grid 2 | **16 tiles、grid 32** |
+
+### 契约(8 项,`tests/test_decode_token_split.py`)
+- `tokens_per_split == page_size` 时与页级切分(ktp=1)tile 数**一致**(回归基线)
+- 1 页场景可切出 4 个 tile(核心用例)
+- tile 数 ≈ `ceil(total / tokens_per_split)`
+- 各 tile 的 token 窗口**互不重叠且并集完整**
+- 每个 tile 的页范围**包含**其窗口所需的所有页
+- 多请求独立切分 / 拒绝非法参数 / 空输入
+
+**全量回归 263 项通过。**
+
+### 状态与下一步
+**默认关闭**(`token_split=False`)。启用前必须按序完成:
+
+1. `h67_bench.py` 判别实验(确认并行度主导而非内核效率)
+2. 数值验证(token 分块 vs 页级/单遍 oracle,含尾页、跨页、ragged)
+3. 引擎 A/B,门槛:**短场景 attention 主核 ≥1.5x 且 8K 不劣化**
+4. 达标后接入集成层(按 bucket 选 `tokens_per_split`)
