@@ -2384,6 +2384,15 @@ def install(raise_on_failure: bool = True) -> bool:
             install_prep_fastpath()
         except Exception as exc:  # noqa: BLE001 - 优化模块不得影响在役路径
             logger.warning("TileInfer prep fastpath not installed: %s", exc)
+        # H73 shared_expert_gate 发射合并(E269:c1 100µs/步,权重仅 4KB,纯发射税):
+        # 显式 opt-in(TILEINFER_SHARED_GATE_FUSE=1,默认关=零行为变化)。
+        # 必须在**模型构建期**之前装(它改的是 Qwen2MoeMLP 的结构与权重映射)。
+        try:
+            from .shared_gate_fuse import install as install_shared_gate_fuse
+
+            install_shared_gate_fuse()
+        except Exception as exc:  # noqa: BLE001 - 优化模块不得影响在役路径
+            logger.warning("TileInfer shared gate fuse not installed: %s", exc)
         # H70-b GDN 元数据 builder 稳态 memo 化(E285):显式 opt-in
         # (TILEINFER_GDN_META_MEMO=1,默认关=零行为变化),翻转 env + 重启即回退。
         try:
