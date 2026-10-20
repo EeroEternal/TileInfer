@@ -1546,3 +1546,22 @@ prep 块(vendor model_runner_v1 L2027-2269)全归账画像:
 负面结果遗产。E281 上游 PR#19033(−7.3%)收益经本轮剥离确认非 prep 域三手法主体。
 
 **prep 域剩余抓手 = build_attn_meta 0.532ms/步(H70 第二批,待三批 stub 分解)**。
+
+## H70-b/H71 取证与判决:_build_attention_metadata=gdn_build 主体(0.377ms)定谳,GDN 元数据 memo TPOT 中性,prep host 域 TPOT 杠杆排除(2026-10-20 iter-207,E285/E286)
+
+### 取证(三批/四批 step_diag 桩,默认关)
+- 三批(c1 稳态 4277 步,桩开销≈0):`build_attn_meta` 0.532ms 内部 = **gdn_build 0.377(60%)** + 组循环胶水 0.214(copy(cm_base)×4 组+bt 重取)+ fa_build 0.030 + bam_init/enc_lens 0.008(Qwen3.6 hybrid 3 GDN 组+1 full 组;3 GDN builder × build/步)。
+- 四批(gdn_build 内部):pad 0.129(fill+D2D×3)+ att_d 0.088 + treat 0.062 + ctx 0.048 + split/胶水残差 0.159。
+
+### H71 实现(GDN 元数据稳态 memo,opt-in `TILEINFER_GDN_META_MEMO=1`,默认关)
+- 纯 decode 稳态(无 spec、mamba_cache_mode=none)下 GDN builder build 输出内容仅由请求集+qsl+purity 决定,逐步重算为冗余税;按全 CPU 侧键 `(req_ids, num_reqs, num_actual_tokens, attn_state, purity)` memo,任一前置破坏清槽重建(prefill 重建覆写持久缓冲,stale 命中=写错行,契约测试锁定)。
+- 全量 pytest 绿;提交 b29fd01/bcaa4ed(后者修捕获期 5 位置入参调用点)。
+
+### 配对 A/B 判决(h71ab,同会话 OFF→ON,32 prompts 权威)
+| 场景 | OFF TPOT p50 | ON TPOT p50 | Δ | 吞吐 Δ |
+|---|---|---|---|---|
+| c1 (128/128,C=1) | 9.6321 | 9.5991 | **−0.34%** | +0.37% |
+| c8 (128/128,C=8) | 11.9004 | 11.8867 | **−0.11%** | +0.12% |
+
+- **VERDICT: H71 disproven(TPOT 杠杆)**——memo 生效但理论 0.38ms host 削减仅兑现 ~0.03ms TPOT(衰减 ~10x);与 E283 第一批(三手法中性)互证:**c1 decode 步长设备侧 bound,prep host 块与上一步设备执行 overlap,host 削减仅在超窗口时计入 TPOT**。
+- prep 域全部已测手法对 c1 TPOT 均中性 ⇒ c1 host 域正式排除;剩余在役可执行线 = W1-D57-② prefill 内核重写;30% 总目标移交 FINAL TEMPORARY 评估(c8 已达标 −34.0%,c1 缺口=设备域 vendor 同水平+host 非临界)。
