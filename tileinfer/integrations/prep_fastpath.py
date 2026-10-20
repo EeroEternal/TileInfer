@@ -158,6 +158,33 @@ def _patch_bt_slotmap(BlockTable: type, mrv: Any) -> Optional[str]:
                 return orig(self, num_reqs, query_start_loc, positions, *args, **kwargs)
 
         runner = getattr(_tls, "runner", None)
+        # ---- H49 优先路径 B:复用 runner 在 _prepare_inputs 里**已经算好**的数组 ----
+        #
+        # model_runner_v1.py 第 913 行已经把 positions 写进 ``self._positions_np_buf``:
+        #     positions_np = self._positions_np_buf[:total]
+        #     np.add(num_computed_tokens_cpu[req_indices], query_pos.np[:n], out=positions_np)
+        # 而 ``cu_num_tokens`` 是同一段的 query_start_loc 前缀和。
+        # 因此这里**不需要任何重算**,直接读这两块 CPU 缓冲即可 —— 与 H49 原补丁
+        # (#19033 b688ed1cb1 最小子集,调用方直传 positions_np/query_start_loc.np)
+        # 在数据来源上等价,同时保持"不改 vendor 调用点"的纪律。
+        if (
+            runner is not None
+            and self.pcp_world_size == 1
+            and self.dcp_world_size == 1
+            and self.block_table.np.shape[0] == self.max_num_reqs
+            and (getattr(self, "kernel_sizes", None) is None or self.kernel_sizes[0] == self.block_size)
+        ):
+            pos_buf = getattr(runner, "_positions_np_buf", None)
+            qsl_buf = getattr(getattr(runner, "query_start_loc", None), "np", None)
+            if pos_buf is not None and qsl_buf is not None:
+                try:
+                    n = int(qsl_buf[num_reqs])
+                    _slotmap_from_cpu_args(self, num_reqs, pos_buf[:n], qsl_buf[: num_reqs + 1])
+                    return None
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("prep_fastpath slotmap runner-buffer fallback: %s", exc)
+                    return orig(self, num_reqs, query_start_loc, positions, *args, **kwargs)
+
         if (
             runner is None
             or self.pcp_world_size != 1

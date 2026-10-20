@@ -381,3 +381,88 @@ def test_h49_direct_path_formula_matches_kernel():
         bt[1, 1] * bs + 127,
     ]
     assert got.tolist() == expect
+
+
+# ------------------------------------------- H49 路径 B:复用 runner 已算好的 CPU 缓冲
+#
+# model_runner_v1._prepare_inputs 第 913 行已把 positions 写进 self._positions_np_buf
+# (np.add(num_computed_tokens_cpu[req_indices], query_pos.np, out=positions_np)),
+# query_start_loc.np 前缀和同段可得。路径 B 直接读这两块,不重算 —— 与 H49 原补丁
+# (调用方直传 positions_np)数据来源等价,但不改 vendor 调用点。
+
+
+class _FakeRunnerWithBuffers(_FakeRunner):
+    """带 _positions_np_buf / query_start_loc 的 runner(模拟 model_runner 真实形态)。"""
+
+    def __init__(self, num_reqs, sched, num_computed, rows, cols, block_size=128):
+        super().__init__(num_reqs, sched, num_computed, rows, cols, block_size)
+        n = int(sum(sched))
+        # 与真实实现同一算法:num_computed[req] + query_pos
+        req_of_token = np.repeat(np.arange(num_reqs, dtype=np.int64), np.array(sched))
+        self._positions_np_buf = (
+            self.num_computed[req_of_token] + self.query_pos.np[:n]
+        ).astype(np.int32)
+        self.query_start_loc = type(
+            "B", (), {"np": np.concatenate([[0], np.cumsum(sched)]).astype(np.int32)}
+        )()
+
+
+def test_h49_runner_buffer_path_matches_oracle():
+    """路径 B:直接读 runner 已算好的 buffer,结果与 oracle 逐位一致。"""
+    from tileinfer.integrations import prep_fastpath as pf_mod
+
+    PAD = -1
+    rows, cols, bs = 4, 8, 128
+    fake_cls = type("BT", (), {"compute_slot_mapping": _FakeSlotSelf._orig_compute})
+    pf_mod._patch_bt_slotmap(
+        fake_cls,
+        type("M", (), {"NPUModelRunner": type("R", (), {"_prepare_inputs": _fake_prepare})}),
+    )
+
+    for num_reqs, sched in ((1, [1]), (3, [1, 1, 1]), (2, [2, 3])):
+        self = _FakeSlotSelf(rows, cols, bs)
+        for r in range(rows):
+            self.block_table.np[r, :] = np.arange(100 * r, 100 * r + cols, dtype=np.int32)
+
+        computed = [128 * 2 + 5 * r for r in range(num_reqs)]
+        runner = _FakeRunnerWithBuffers(num_reqs, sched, computed, rows, cols, bs)
+        pf_mod._tls.runner = runner
+        try:
+            ret = fake_cls.compute_slot_mapping(self, num_reqs, None, None)
+        finally:
+            pf_mod._tls.runner = None
+
+        assert ret is None, "路径 B 应正常返回(不回退)"
+        expect = _oracle_slotmap(
+            self.block_table.np, bs, num_reqs, sched, computed, runner.query_pos.np
+        )
+        n = int(sum(sched))
+        assert np.array_equal(self.slot_mapping.np[:n], expect)
+        assert self.slot_mapping.copies == 1
+        assert int(self.slot_mapping.gpu[n : self.max_num_batched_tokens].min()) == PAD
+        assert self.fallbacks == 0
+
+
+def test_h49_runner_buffer_path_preferred_when_buffers_present():
+    """有 _positions_np_buf 时优先路径 B:即便 num_scheduled_tokens.np 坏掉也不该回退。"""
+    from tileinfer.integrations import prep_fastpath as pf_mod
+
+    rows, cols, bs = 4, 8, 128
+    fake_cls = type("BT", (), {"compute_slot_mapping": _FakeSlotSelf._orig_compute})
+    pf_mod._patch_bt_slotmap(
+        fake_cls,
+        type("M", (), {"NPUModelRunner": type("R", (), {"_prepare_inputs": _fake_prepare})}),
+    )
+    self = _FakeSlotSelf(rows, cols, bs)
+    for r in range(rows):
+        self.block_table.np[r, :] = np.arange(100 * r, 100 * r + cols, dtype=np.int32)
+
+    runner = _FakeRunnerWithBuffers(1, [1], [256], rows, cols, bs)
+    runner.num_scheduled_tokens.np = None  # 慢路径会因此抛异常
+    pf_mod._tls.runner = runner
+    try:
+        fake_cls.compute_slot_mapping(self, 1, None, None)
+    finally:
+        pf_mod._tls.runner = None
+
+    assert self.fallbacks == 0, "路径 B 优先,不应退回慢路径"
