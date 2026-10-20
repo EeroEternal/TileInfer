@@ -271,11 +271,14 @@ def _ensure_gate_extended(owner) -> None:
         gate = owner.gate
         w = getattr(gate, "weight_fp32", None)
         if w is None or w.dim() != 2:
+            print(f"[H28] gate extension skipped: weight_fp32={type(w)} dim="
+                  f"{getattr(w, 'dim', lambda: -1)()}", flush=True)
             return
         row = owner._shared_experts.expert_gate.weight.data.reshape(1, -1).to(dtype=w.dtype)
         new_w = torch.cat([w.data, row], dim=0).contiguous()
         gate.weight_fp32 = torch.nn.Parameter(new_w, requires_grad=False)
         owner._tileinfer_fold_ext = True
+        print(f"[H28] gate extended {tuple(w.shape)}->{tuple(new_w.shape)}", flush=True)
     except Exception:  # pragma: no cover - 降级为 GEMV 路径
         logger.warning("H28: gate weight extension failed; gate_logit falls back to GEMV")
 
@@ -303,13 +306,24 @@ def _wrap_shared_forward(orig_shared_forward):
 def _wrap_select_experts(orig_select_experts):
     """select_experts 包装:折叠层上切片扩列 logits,追加恒选专家与 sigmoid 门控。"""
 
+    _DIAG = {"entry": 0, "pass": 0}
+
     def select_experts(*args, **kwargs):
         owner = getattr(_CTX, "owner", None)
         logits = kwargs.get("router_logits")
         if owner is None or logits is None or logits.ndim != 2:
+            if owner is not None and _DIAG["entry"] < 2:
+                _DIAG["entry"] += 1
+                print(f"[H28] select passthrough(no logits): owner={owner is not None} "
+                      f"logits={type(logits)} args={len(args)} "
+                      f"kw={sorted(kwargs)[:6]}", flush=True)
             return orig_select_experts(*args, **kwargs)
         num_experts = kwargs.get("num_experts")
         if num_experts is None or logits.shape[1] != num_experts + 1:
+            if _DIAG["pass"] < 3:
+                _DIAG["pass"] += 1
+                print(f"[H28] select passthrough(shape): logits{tuple(logits.shape)} "
+                      f"num_experts={num_experts}", flush=True)
             return orig_select_experts(*args, **kwargs)
         try:
             import torch
