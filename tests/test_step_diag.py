@@ -41,6 +41,7 @@ def _isolated(monkeypatch, tmp_path):
     monkeypatch.setattr(sd, "_fh", None)
     monkeypatch.setattr(sd, "_step", 0)
     monkeypatch.setattr(sd, "_events", 0)
+    monkeypatch.setattr(sd, "_pending", [])
     monkeypatch.setattr(sd, "_t0", 0.0)
     yield
 
@@ -65,7 +66,7 @@ def test_timed_seg_emits_jsonl(monkeypatch, tmp_path):
         pass
     with sd._TimedSeg("graph"):
         pass
-    sd._fh.flush()
+    sd._flush_pending()
     lines = [json.loads(x) for x in out.read_text().splitlines()]
     assert [r["seg"] for r in lines] == ["prep", "graph"]
     for r in lines:
@@ -74,11 +75,37 @@ def test_timed_seg_emits_jsonl(monkeypatch, tmp_path):
         assert r["t"] >= 0.0 and r["step"] == 0
 
 
+def test_emit_batches_until_threshold(monkeypatch, tmp_path):
+    """事件批量落盘:<64 条滞留内存,≥64 条触发整批写入(iter-206)。"""
+    out = tmp_path / "diag.jsonl"
+    monkeypatch.setattr(sd, "_fh", open(out, "a", buffering=1))
+    for i in range(63):
+        sd._emit("prep", float(i))
+    assert out.read_text() == ""
+    assert len(sd._pending) == 63
+    sd._emit("prep", 63.0)
+    lines = out.read_text().splitlines()
+    assert len(lines) == 64
+    assert sd._pending == []
+
+
+def test_flush_pending_drains_partial(monkeypatch, tmp_path):
+    out = tmp_path / "diag.jsonl"
+    monkeypatch.setattr(sd, "_fh", open(out, "a", buffering=1))
+    sd._emit("exec", 1.0, ntok=2)
+    sd._flush_pending()
+    assert sd._pending == []
+    assert out.read_text().splitlines()[-1]  # 非空即已落盘
+    sd._flush_pending()  # 幂等:空缓冲不写不抛
+    sd._emit("noop", 1.0)  # _fh=None 场景已由 test_fh_none_is_noop 覆盖
+
+
 def test_emit_ntok_field(monkeypatch, tmp_path):
     out = tmp_path / "diag.jsonl"
     monkeypatch.setattr(sd, "_fh", open(out, "a", buffering=1))
     sd._emit("exec", 1.2345, ntok=8)
     sd._emit("exec", 2.0, ntok=None)
+    sd._flush_pending()
     lines = [json.loads(x) for x in out.read_text().splitlines()]
     assert lines[0]["ntok"] == 8
     assert "ntok" not in lines[1]
@@ -111,3 +138,39 @@ def test_fh_none_is_noop():
     assert sd._fh is None
     sd._emit("prep", 1.0)
     sd._emit("exec", 1.0, ntok=4)
+    sd._flush_pending()
+
+
+def test_patch_prep_stubs_failure_is_import_error():
+    """vendor model_runner_v1 裸进程不可导入(环形导入,仅在役可加载)——
+    _patch_prep_stubs 此时须抛 ImportError(由 install_step_diag 统一捕获记
+    warning),不得静默吞掉;在役激活面由 serve 日志 "step_diag ACTIVE" 探针覆盖。"""
+    import sys
+    import types
+
+    pytest.importorskip("vllm")
+    from vllm.v1.worker.block_table import BlockTable
+
+    assert hasattr(BlockTable, "commit_block_table")
+    fake = types.ModuleType("vllm_ascend.worker.model_runner_v1")
+    monkey_patch = pytest.MonkeyPatch()
+    monkey_patch.setitem(sys.modules, "vllm_ascend.worker.model_runner_v1", fake)
+    monkey_patch.setitem(sys.modules, "vllm_ascend.worker", types.ModuleType("vllm_ascend.worker"))
+    try:
+        with pytest.raises((ImportError, AttributeError)):
+            sd._patch_prep_stubs()
+    finally:
+        monkey_patch.undo()
+
+
+def test_wrap_module_attr_passthrough_and_gating():
+    """_wrap_module_attr:透传返回值,非可调用/缺失属性不包装。"""
+    import types
+
+    mod = types.ModuleType("fake_mrv")
+    mod.update_cos_sin = lambda positions: positions + 1
+    assert sd._wrap_module_attr(mod, "update_cos_sin", "cos_sin") is True
+    assert mod.update_cos_sin(1) == 2
+    assert sd._wrap_module_attr(mod, "missing_attr", "x") is False
+    mod.not_callable = 42
+    assert sd._wrap_module_attr(mod, "not_callable", "x") is False

@@ -19,12 +19,27 @@ UniProcExecutor):
     post         "post process" record_function block (inside exec)
     sample_worker NPUModelRunner.sample_tokens
     upd_out      Scheduler.update_from_output
-Gaps between engine_step period and the segment sum are engine-loop residual
-(busy loop, zmq send, frontend backpressure).
+ Gaps between engine_step period and the segment sum are engine-loop residual
+ (busy loop, zmq send, frontend backpressure).
+
+ Sub-segment stubs (iter-206, H70 取证; all diagnostic wrappers):
+    prep_upd     NPUModelRunner._update_states
+    prep_inputs  NPUModelRunner._prepare_inputs
+    prep_det     NPUModelRunner._determine_batch_execution_and_padding
+    cos_sin      model_runner_v1.update_cos_sin
+    snap_copy    model_runner_v1.copy_snapshot_to_gpu (clone+pin per call)
+    prep_ids     NPUModelRunner._prepare_input_ids
+    prep_prevpos NPUModelRunner._compute_prev_positions
+    prep_attnstate NPUModelRunner._build_attn_state
+    bt_commit    BlockTable.commit_block_table (H2D)
+    bt_slotmap   BlockTable.compute_slot_mapping (triton launch)
+ Events are batched (flush every 64 records) to keep diagnostic self-overhead
+ low; _flush_pending() drains on atexit.
 """
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import os
@@ -41,8 +56,18 @@ _lock = threading.Lock()
 _step = 0
 _t0 = 0.0
 _events = 0
+_pending: list[str] = []
 
 _SEG_MAP = {"prepare input": "prep", "forward": "fwd", "post process": "post"}
+
+
+def _flush_pending() -> None:
+    """把积压事件一次性写入(批量化降低诊断自开销,iter-206)。"""
+    if _fh is None or not _pending:
+        return
+    _fh.write("".join(_pending))
+    _pending.clear()
+    _fh.flush()
 
 
 def _emit(seg: str, ms: float, ntok: Optional[int] = None) -> None:
@@ -58,10 +83,10 @@ def _emit(seg: str, ms: float, ntok: Optional[int] = None) -> None:
     if ntok is not None:
         rec["ntok"] = ntok
     with _lock:
-        _fh.write(json.dumps(rec) + "\n")
+        _pending.append(json.dumps(rec) + "\n")
         _events += 1
-        if _events % 64 == 0:
-            _fh.flush()
+        if len(_pending) >= 64:
+            _flush_pending()
 
 
 class _TimedSeg:
@@ -160,6 +185,92 @@ def _patch_model_runner() -> list[str]:
             "NPUModelRunner._update_states", "NPUModelRunner._prepare_inputs"]
 
 
+def _patch_prep_stubs() -> list[str]:
+    """H70(iter-206):prep 块内部子段 stub 二批——残差 0.709ms 与
+    _prepare_inputs 0.512ms 的内部构成独立记账。全部诊断包装,透传语义,
+    默认关(TILEINFER_STEP_DIAG!=1 时 install_step_diag 不调用本函数)。
+
+    注意:运行时 BlockTable 是 vllm_ascend.worker.block_table 的自有实现
+    (hybrid 模型 MultiGroupBlockTable 委派其内部 BlockTable;E280 复盘:
+    包装 vllm 原版零事件),故以 vllm_ascend 版为准。"""
+    patched: list[str] = []
+    import vllm_ascend.worker.model_runner_v1 as mrv
+
+    # 残差候选:_determine_batch_execution_and_padding(dispatch/pad)
+    _wrap_timed(mrv.NPUModelRunner, "_determine_batch_execution_and_padding", "prep_det")
+    patched.append("NPUModelRunner._determine_batch_execution_and_padding")
+    # 残差候选:update_cos_sin(cos/sin 各一遍 index_select→view→repeat→chunk;
+    # E280 实测本模型全局 cache 未注册早退 0.6μs,保留记账作证)
+    if _wrap_module_attr(mrv, "update_cos_sin", "cos_sin"):
+        patched.append("model_runner_v1.update_cos_sin")
+    # 残差候选:mamba align 预处理与 attention 元数据构建(prep 块内 L2160/L2231)
+    _wrap_timed(mrv.NPUModelRunner, "_build_attention_metadata", "build_attn_meta")
+    patched.append("NPUModelRunner._build_attention_metadata")
+    try:
+        from vllm.v1.worker import mamba_utils
+
+        if _wrap_module_attr(mamba_utils, "preprocess_mamba", "mamba_pre"):
+            patched.append("mamba_utils.preprocess_mamba")
+        if _wrap_module_attr(mamba_utils, "stage_postprocess_inputs_to_gpu", "mamba_stage"):
+            patched.append("mamba_utils.stage_postprocess_inputs_to_gpu")
+    except Exception:
+        pass
+    # _prepare_inputs 内部:cp 快照(clone+pin_memory 每次)/input_ids/prev_pos/attn_state
+    if _wrap_module_attr(mrv, "copy_snapshot_to_gpu", "snap_copy"):
+        patched.append("model_runner_v1.copy_snapshot_to_gpu")
+    for attr, seg, name in (
+        ("_prepare_input_ids", "prep_ids", "NPUModelRunner._prepare_input_ids"),
+        ("_compute_prev_positions", "prep_prevpos", "NPUModelRunner._compute_prev_positions"),
+        ("_build_attn_state", "prep_attnstate", "NPUModelRunner._build_attn_state"),
+    ):
+        if hasattr(mrv.NPUModelRunner, attr):
+            _wrap_timed(mrv.NPUModelRunner, attr, seg)
+            patched.append(name)
+    # _prepare_inputs 内部:block_table 提交(H2D)与 triton slot_mapping 发射
+    # (vllm_ascend 自有 BlockTable;vllm 原版仅在非 ascend 路径兜底)
+    try:
+        import vllm_ascend.worker.block_table as asc_bt
+
+        for attr, seg, name in (
+            ("commit_block_table", "bt_commit", "AscendBlockTable.commit_block_table"),
+            ("compute_slot_mapping", "bt_slotmap", "AscendBlockTable.compute_slot_mapping"),
+        ):
+            if hasattr(asc_bt.BlockTable, attr):
+                _wrap_timed(asc_bt.BlockTable, attr, seg)
+                patched.append(name)
+    except Exception:
+        from vllm.v1.worker.block_table import BlockTable
+
+        for attr, seg, name in (
+            ("commit_block_table", "bt_commit", "BlockTable.commit_block_table"),
+            ("compute_slot_mapping", "bt_slotmap", "BlockTable.compute_slot_mapping"),
+        ):
+            if hasattr(BlockTable, attr):
+                _wrap_timed(BlockTable, attr, seg)
+                patched.append(name)
+    return patched
+
+
+def _wrap_module_attr(module: Any, attr: str, seg: str) -> bool:
+    fn = getattr(module, attr, None)
+    if fn is None or not callable(fn):
+        return False
+
+    def wrapper(*args: Any, **kwargs: Any):
+        t0 = time.perf_counter()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _emit(seg, (time.perf_counter() - t0) * 1000.0)
+
+    try:
+        wrapper.__name__ = getattr(fn, "__name__", attr)
+    except Exception:
+        pass
+    setattr(module, attr, wrapper)
+    return True
+
+
 def _patch_acl_graph() -> list[str]:
     from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
 
@@ -180,13 +291,15 @@ def install_step_diag() -> bool:
         _fh = open(path, "a", buffering=1)
         _t0 = time.perf_counter()
         _emit("diag_start", 0.0)
+        _flush_pending()
+        atexit.register(_flush_pending)
     except Exception as exc:
         logger.warning("step_diag: cannot open %s: %s", path, exc)
         _fh = None
         return False
 
     ok: list[str] = []
-    for patch_fn in (_patch_engine_core, _patch_model_runner, _patch_acl_graph):
+    for patch_fn in (_patch_engine_core, _patch_model_runner, _patch_prep_stubs, _patch_acl_graph):
         try:
             ok.extend(patch_fn())
         except Exception as exc:
