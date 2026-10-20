@@ -92,6 +92,18 @@ def _page_pipeline_enabled() -> bool:
     return os.environ.get("TILEINFER_PAGE_PIPELINE", "").strip() not in ("", "0", "false", "False")
 
 
+def _sw_pipeline_stages() -> int:
+    """H74: compiler-scheduled page-loop stages (``TILEINFER_SW_PIPELINE=N``, 0 = off).
+
+    Same cache-key discipline as :func:`_page_pipeline_enabled`: the value is passed as an
+    explicit spec argument so traces built under different depths can never mix.
+    """
+    try:
+        return max(0, int(os.environ.get("TILEINFER_SW_PIPELINE", "0") or 0))
+    except ValueError:
+        return 0
+
+
 def paged_decode_pipeline(
     batch: int,
     kv_heads: int,
@@ -325,6 +337,7 @@ def paged_decode_ascend950(
     dtype: str = "bfloat16",
     threads: int = 128,
     pipeline: bool = False,
+    sw_pipeline: int = 0,
 ):
     """Build the paged decode attention ``T.prim_func``.
 
@@ -350,6 +363,14 @@ def paged_decode_ascend950(
     double-buffered page-pipeline variant :func:`paged_decode_pipeline` instead — identical
     math, K/V L1 double-buffering so the next page's global→L1 copies overlap the current
     page's compute.  The flag is part of the caller's build spec, hence of the kernel cache key.
+
+    ``sw_pipeline=N`` (H74, opt-in via ``TILEINFER_SW_PIPELINE=N``) keeps this plain kernel but
+    turns its page loop into ``T.Pipelined(num_stages=N)`` so **the compiler** stages the
+    global→L1 K/V copies across iterations.  This is the approach DeepInfer's Ascend kernels
+    all use (``T.Persistent``/``T.Pipelined`` with ``num_stages``); the hand-written
+    double-buffer above (``pipeline=True``) was measured as a regression (E296), whereas the
+    compiler-scheduled form is not the same transformation.  ``0`` keeps the old serial loop
+    bit-for-bit.
     """
     if pipeline:
         return paged_decode_pipeline(
@@ -438,7 +459,15 @@ def paged_decode_ascend950(
             if _simd_softmax_enabled():
                 T.copy(kv_last_page_len[b : b + 1], ll_ub)  # stage global -> UB for SimdVF
 
-            for p in T.serial(num_pages):
+            # H74: deepseek/DeepInfer 的 Ascend 算子全部把页/任务循环写成
+            # `T.Persistent`/`T.Pipelined(..., num_stages=N)`,由**编译器**把 GM→L1 的
+            # K/V 拷贝排到上一轮计算之下。这里用同一手法替换纯串行页循环。
+            #
+            # `num_stages=0` 时 tilelang 明确不启用流水(docstring:"pipeline will not be
+            # enabled"),因此这一种写法同时覆盖"默认关闭"与"开启 N 阶段"两种情况,
+            # 不需要在 for 语句处写 Python 分支(eager builder 不允许把 frame 先赋给
+            # 变量再迭代,且局部函数体在重放时不可见)。
+            for p in T.Pipelined(num_pages, num_stages=sw_pipeline):
                 pid = kv_indices[kv_indptr[b] + p]
 
                 # ---- scores = Q @ K^T, then cube -> UB ----
@@ -1028,6 +1057,11 @@ def build_decode_kernel(**spec):
     pipeline = bool(spec.pop("pipeline", False))
     if pipeline:
         spec["pipeline"] = True
+    # H74: `sw_pipeline=0` 是默认(逐位等同旧版),不进 cache key——避免默认路径
+    # 因为多一个键而重复编译;非 0 值必须进 key,否则与串行版共享同一份产物。
+    sw_pipeline = int(spec.pop("sw_pipeline", 0) or 0)
+    if sw_pipeline > 0:
+        spec["sw_pipeline"] = sw_pipeline
     if spec.get("num_pages_cap") is not None:
         spec["num_pages_cap"] = declared_pool_cap(spec["num_pages_cap"])
     key = _cache_key("decode", spec) + ("manual" if out_manual else "auto",)

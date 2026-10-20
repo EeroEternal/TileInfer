@@ -1903,11 +1903,106 @@ buffering. If 0, pipeline is disabled.");`T.annotate_buffer_versions` **不存�
 
 | DeepInfer 文件 | 机制 | 我们的对应物 | 可借鉴度 |
 |---|---|---|---|
-| `get_kv_index.py` / `kv_index_cat.py` | Persistent+SIMD 做页索引展开/拼接 | `_expand_page_table` + ragged 三段重建(每步都跑) | **高** |
+| `get_kv_index.py` / `kv_index_cat.py` | Persistent+SIMD 做页索引展开/拼接 | `_expand_page_table` + ragged 三段重建(每步都跑) | 实测**不适用**(见 H74-②) |
 | `load_paged_kv_cache.py` | 页式 KV 加载 + FP4/FP8 量化 + block 32/64 | `_sub_pages` / `pool_view` | 中(量化暂不需要) |
-| `fused_sample.py` (673 行) | temperature+softmax+top-p+top-k+采样**单核融合** | H36 只做 greedy 跳过 cast | **高** |
+| `fused_sample.py` (673 行) | temperature+softmax+top-p+top-k+采样**单核融合** | H36 只做 greedy 跳过 cast | **高**(未实现) |
 | `swa_index.py` (62 行) | `T.SimdVF` + `T.simd.vsel` 窗口索引 | 我们 `T.simd.*` 的用法样板 | 中(写法参考) |
 | `fused_transform.py` (899 行) | norm+rope+hadamard+cast+store_kv 五合一 | H32/H34/H35 分散小算子 | **低**(见下) |
+
+---
+
+## H74 实现与判决:编译器页流水对 attention 主核无收益(2026-10-20)
+
+按上一节的梳理实现了第一项(**只实现 DeepInfer 仓涉及的优化,不动 agent_loop 的其它待办**)。
+
+### H74-① 实现:页循环 `T.serial` → `T.Pipelined(num_stages=N)`
+
+`tileinfer/kernels/attention/paged_decode_ascend950.py`:
+
+```python
+# 改前
+for p in T.serial(num_pages):
+# 改后
+for p in T.Pipelined(num_pages, num_stages=sw_pipeline):
+```
+
+开关 `TILEINFER_SW_PIPELINE=N`(默认 0)。三条实现约束都是踩出来的:
+
+1. **`num_stages=0` 天然等价串行**——tilelang 的 docstring 明确写
+   "If 0, pipeline is disabled",所以**一个写法覆盖开/关**。这样避开了 eager builder
+   的两个坑:
+   - 不能把 frame 先赋给变量再迭代(`TypeError: a TIR expression or buffer is not
+     iterable (got Var)`);
+   - 局部函数体在重放时不可见(`NameError: name 'page_body' is not defined`)。
+2. **`sw_pipeline=0` 不进 cache key**(默认路径不因多一个键而重复编译);
+   非 0 值必须进(否则流水版与串行版共用一个编译产物)。
+3. 开关从 env 一路透传:`_sw_pipeline_stages()` → backend → `build_decode_kernel`,
+   每一环都有契约锁(防"挂点从未生效",H56 同型)。
+
+契约:`tests/test_sw_pipeline_switch.py` 17 项(env 解析健壮性 / cache key 三种情况 /
+源码锁 / 接线锁);相关回归 46 项全绿。
+
+### H74-① 实测:阶段深度 0→16 全程无拐点
+
+`benchmarks/probes/h74_stage_sweep.py`(SIMD=1 生产配置,各档重复测两次取最小):
+
+| 场景 | stages=0 | 2 | 4 | 8 | 16 |
+|---|---|---|---|---|---|
+| b1 × 128 | 0.0190 ms | 0.0190 | 0.0190 | 0.0190 | 0.0190 |
+| b1 × 2048 | 0.0589 | 0.0589 | 0.0590 | 0.0589 | 0.0589 |
+| b1 × 8192 | 0.1872 | 0.1903 (0.98x) | 0.1876 | 0.1875 | 0.1873 |
+| b8 × 128 | 0.0563 | 0.0565 | 0.0563 | 0.0563 | 0.0564 |
+| b8 × 8192 | 0.5879 | 0.6575 (**0.89x**) | 0.5873 | 0.5901 | 0.5875 |
+
+- **数值全部 `err=0.0000`,逐位等价**——流水重排没有改变计算顺序语义。
+- **没有任何一档超过 1.01x**;stages=2 在 b8×8K 还有 11% 回归。
+- 短形状零税(0.0563 vs 0.0564),E61 红线通过。
+
+### 为什么无效(与 DeepInfer 的真实差异)
+
+DeepInfer 的 `T.Persistent` 本质是**任务摊平器**:固定 `num_cores` 个核轮流吃
+`domain` 里的多个 task。我们用 `T.Kernel(batch * kv_heads)` 已经把 grid 铺满,
+**每个 block 只处理一个 (batch, kv_head),页循环是 block 内的串行链**:
+
+```
+K copy → QK^T GEMM → softmax → P copy → V copy → PV GEMM
+```
+
+`k_l1` 既被本轮 K 拷贝写、又被本轮 QK^T 读,`v_l1` 同理——**跨迭代没有可重叠的
+独立数据流**,编译器即使加 stage 也找不到能提升的拷贝。这与 DeepInfer 的
+`load_paged_kv_cache`(纯拷贝任务,天然可流水)场景不同。
+
+⇒ **H74-① 判决:disproven(对 attention 主核)**。开关保留(默认关,零成本),
+但**不应启用**;也不再投入设备窗口。
+
+### H74-② 页索引 kernel 化:实测后判定不适用
+
+DeepInfer 用 `get_kv_index` 这类 Persistent 内核替换 Python 侧页表展开。先量化我们
+的 glue 成本(`benchmarks/probes/h74_glue_cost.py`,纯 torch,不启动引擎):
+
+| 环节 | c1(width=64) | c8(width=64) | c8(width=4096) |
+|---|---|---|---|
+| `_expand_page_table` | 0.07 µs | 0.05 µs | 27.5 µs |
+| `ragged_from_page_table_device` | **149.4 µs** | 148.9 µs | 189.6 µs |
+| 三段 ragged 重建(decode 内联版) | 42.4 µs | 42.3 µs | 41.8 µs |
+
+关键发现:`ragged_from_page_table_device` 的 149 µs **与 batch/width 完全无关**——
+它是 `masked_select()` 产生**动态形状**输出导致的固定 host 同步。但它只被
+**prefill** 路径调用(`vllm_ascend.py:571`),而该路径的代码注释已明确:
+
+> "Unlike decode, a prefill step always runs eager (never inside an ACLGraph capture),
+> so the host-side work here — per-request loops, `.item()` syncs, a `masked_select`
+> page-table walk — is acceptable"
+
+**decode 热路径(`TileInferDecodeAttention.run`)早已是固定形状 scatter**,没有这个开销。
+⇒ **H74-② 判决:不实现**(优化对象不在热路径上;做成内核只会多一次 launch 税)。
+
+### 未实现(留给后续,按价值排序)
+
+- `fused_sample.py` 的**单核融合采样**(temp+softmax+top-p/k+采样):对应 H36 的升级,
+  价值最高,但工作量也最大(673 行)。
+- `load_paged_kv_cache.py` 的 KV 量化路径:暂不需要(当前 bf16)。
+- `swa_index.py` 的 SIMD 写法:仅作参考。
 
 ### 明确不可借鉴
 

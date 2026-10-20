@@ -225,6 +225,7 @@ class TileLangAscend950Backend(AttentionBackend):
         else:
             from ...kernels.attention.paged_decode_ascend950 import (
                 _page_pipeline_enabled,
+                _sw_pipeline_stages,
                 build_decode_kernel,
             )
 
@@ -238,6 +239,7 @@ class TileLangAscend950Backend(AttentionBackend):
                 dtype=_TILELANG_DTYPE[plan.dtype],
                 out_manual=True,
                 pipeline=_page_pipeline_enabled(),
+                sw_pipeline=_sw_pipeline_stages(),
             )
             # Plan-owned staging for the plain path too (the split path already had it): padded
             # query, padded output and the metadata buffers the kernel actually reads.  Nothing is
