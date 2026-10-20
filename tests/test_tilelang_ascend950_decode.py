@@ -281,8 +281,11 @@ def test_page_pipeline_spec_and_cache_key(monkeypatch):
     assert len(K._KERNEL_CACHE) == before + 2
 
     # (c) plain key is unchanged by the refactor (no stale-invalidation surprise on upgrade).
+    # E315 布局更新:0c2483a 把 simd_softmax 折入排序项、out_manual 标签改为追加在尾
+    # (L1067)——本断言原先钉的是 H42-③ 时代布局;套件被 split 编译病态卡死从未跑到这里,
+    # 守卫放行后首次执行即暴露。当前契约=simd_softmax 显式入键 + manual/auto 尾标签。
     spec = dict(batch=8, kv_heads=4, group=8, dim=128, page_size=128, num_pages_cap=64, dtype="bfloat16")
-    key_plain = ("decode", "manual") + tuple(sorted(spec.items()))
+    key_plain = ("decode",) + tuple(sorted({**spec, "simd_softmax": False}.items())) + ("manual",)
     K._KERNEL_CACHE.clear()
     K.build_decode_kernel(**spec, out_manual=True)
     assert key_plain in K._KERNEL_CACHE
