@@ -2287,8 +2287,9 @@ def start_metrics_dumper() -> bool:
                 stats = dict(getattr(cls, "_stats", {}))
                 # D57-①:prefill 侧计数(长上下文分流)独立于类状态,合并进同一视图。
                 stats.update(_PREFILL_STATS)
-                # H77 dense_nn 计数(在役探针面):仅在有模块被 shim 时并入,
-                # ON 臂 A/B 以 dense_nn_forward>0 判定路径真实生效。
+                # H79 dense_nn 计数+物理探针(在役探针面):仅在有模块被换形时并入,
+                # ON 臂 A/B 以 dense_nn_stride_ok=modules 判定换形真实生效
+                # (E320:v1 forward 计数在 FULL graph decode 下恒 0,不可用)。
                 try:
                     from .dense_nn import stats as _dense_nn_stats
 
@@ -2446,10 +2447,11 @@ def install(raise_on_failure: bool = True) -> bool:
             install_gdn_meta_memo()
         except Exception as exc:  # noqa: BLE001 - 优化模块不得影响在役路径
             logger.warning("TileInfer gdn meta memo not installed: %s", exc)
-        # H77 dense b1 大形状权重物理预排 NT→NN(E297:E255×E269 引擎缺口 1.24-1.3x,
-        # E100 NN 微基准 +11% 轴):显式 opt-in(TILEINFER_DENSE_NN=1 或形状族子集,
-        # 默认关=零行为变化)。挂 PWAL 基类钩子,权重加载期一次预排;微基准门槛
-        # (h77_nn_bench M=1 ≥1.05x)通过前不得进权威 A/B。
+        # H79 dense b1 权重物理换形 weight-swap(E320 v1 shim 图模式旁路定谳后的
+        # 零分支重做;E321 stride 微基准 o_proj 全段 +14~17%,部署白名单=oproj):
+        # 显式 opt-in(TILEINFER_DENSE_NN=1 或形状族子集,默认关=零行为变化)。
+        # 挂 PWAL leaf 类后置钩子,权重加载期一次换形、图 capture 前定形;
+        # 微基准门槛(E321 M=1 ≥1.05x)已过,权威 A/B 判 c1 TPOT ≥−1%。
         try:
             from .dense_nn import install as install_dense_nn
 

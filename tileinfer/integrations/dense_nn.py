@@ -1,53 +1,63 @@
-"""H77 dense b1 大形状权重物理预排 NT→NN(opt-in,默认关)。
+"""H79 dense b1 权重物理预排 v2=weight-swap(opt-in,默认关;H77 v1 的机制重做)。
 
-背景(E297/E269/E255/E100):
-  c1 档 dense GEMV(MMV3 族)是最大单一设备域(3.532ms/步,37.5%)。E255×E269 交叉:
-  qkvz[2048→12288]/attn_qkv[2048→9216]/o_proj[4096→2048] 三大形状引擎内有效带宽
-  1.30/1.28/0.94TB/s,而同形状微基准流式 1.62-1.65TB/s——缺口 1.24-1.3x,聚合
-  ~450μs/步(≈c1 设备链 4.8%)。换后端(E255 matmul 视图 0.877-1.047 全败)与
-  NZ 布局(E42/E100 零收益;weight_nz_mode=2 引擎启动 abort)均已排除;
-  E100 M=16 微基准显示 **ND 物理连续 NN 布局**(w_nn=[K,N],forward=x@w_nn)
-  在 skinny-M 下比现役 NT 形态快 ~11%,且 M=1 从未测过——本模块把该轴搬进引擎。
+背景(E297/E269/E255/E100/E320):
+  c1 档 dense GEMV(MMV3 族)是最大单一设备域。E255×E269 交叉:三大形状引擎内
+  有效带宽缺口 1.24-1.3x;E100/H77 微基准 NN 连续布局在 skinny-M 下更快。
+  v1(H77)=实例级替换 quant_method.apply 为 python 闭包——E320 定谳:vllm 0.23
+  默认 cudagraph_mode=FULL_AND_PIECEWISE,FULL graph decode 全程不经 python,
+  shim 被整体旁路(forward=0),A/B 无效。
+  v2(H79)=同一假设的零分支实现:PWAL 期把 weight.data 物理替换为
+  ``w.t().contiguous().t()``(逻辑形状 [N,K] 不变、存储 [K,N] 连续,stride=(1,N)),
+  vendor apply(torch.ops.vllm.unquantized_gemm→F.linear)按 stride 自动走 NN
+  内核——零热路径分支、零 python 计数依赖,图 capture 前定形(地址稳定)。
 
-引擎事实(源码级):在役权重实态=ND [N,K](weight_nz_mode 默认=1,bf16 不转 NZ,
-  E43:mode=2 启动 abort);unquantized_gemm 本体=F.linear 包装
-  (vllm_ascend/ops/linear.py)。预排=加载期 PWAL 钩子内做一次
-  ``w_nn = weight.t().contiguous()`` 存层属性,实例级替换 quant_method.apply:
-  ``x.shape[0] <= TILEINFER_DENSE_NN_MAXM(默认 16)`` 走 ``torch.matmul(x, w_nn)``,
-  否则回落原 apply(prefill 大 M 保持 compute-optimal NT 路径)。
+E321 stride 敏感性微基准(h79_stride_bench,引擎精确链,HBM-cold):
+  o_proj[2048×4096]:M=1 x1.169 / M=8 x1.143 / M=128 x1.160(全段 +14~17%)
+  qkvz[12288×2048]:M=1 x0.919(M=1 段亏损,排除部署)
+  attn_qkv[9216×2048]:M=1 x1.038 / M=128 x0.876(M=128 亏损,排除部署)
+  ⇒ 部署白名单=oproj 单族(静态族粒度是图模式唯一安全面;M 级分支=v1 死路);
+  A/B 以 ``TILEINFER_DENSE_NN=oproj`` 挂载。o_proj 收益估计 ~80μs/步(c1 ≈−0.9%)。
+
+实现要点:
+  - 钩子双类同挂(leaf ``AscendUnquantizedLinearMethod``+core
+    ``UnquantizedLinearMethod``)且后置执行(orig 完成后再 swap)——leaf 末尾有
+    ``layer.weight.data = maybe_trans_nz(layer.weight.data)``(bf16 mode=1 恒等,
+    E43),swap 必须是最后写者;幂等 marker+stride 自愈复核兜底。
+  - 幂等:层属性 ``_tileinfer_dense_nn_swapped`` 标记;与 H73/H28 的 PWAL 包装
+    独立 marker,互不干扰。
+  - 生效探针(图模式可见面):stats() 惰性复核已换层 weight.data 的
+    shape/stride(1,N)——物理属性断言,不依赖任何 forward 计数。
 
 红线核对:
   - 不动 MoE 收官结论(不触碰 GroupedMatmul 路径);
-  - vendor 已最优(E255)的推翻走双侧证据:本模块仅在微基准门槛
-    (h77_nn_bench.py 任一大形状 M=1 ≥1.05x 且 allclose)通过后接入引擎 A/B;
-  - TP>1 时 RowParallel 的 apply 含 all-reduce、Column 的 N 已分片,matmul 直替
-    会破坏通信/分片语义 ⇒ 安装期强制 world_size==1,否则整族跳过。
-
-与 H28/H73 的关系:三族形状 (12288,2048)/(9216,2048)/(2048,4096) 与 H28 折叠族
-  shared gate_up/down([1024,2048]/[2048,512])及 H73 融合 gate_up(2I+1)零交集;
-  H73 与本模块共用的 PWAL 钩子各自独立包装(独立 marker),互不干扰。
+  - vendor 已最优(E255)的推翻走双侧证据:微基准门槛(E321 o_proj ≥1.05x)+
+    权威口径引擎 A/B(判据 c1 TPOT ≥−1%、其余 |Δ|≤3%);
+  - TP>1 时 RowParallel/Column 分片语义不改;安装期强制 world_size==1;
+  - HBM 增量:oproj 单族 40×16MB≈0.64GB。
 
 开关:
-  ``TILEINFER_DENSE_NN``            未设/0=关;1=all;qkvz,attnqkv,oproj 子集
-  ``TILEINFER_DENSE_NN_MAXM``       NN 路径的 M 上限(默认 16;E100 证据域)
-  ``TILEINFER_DENSE_NN_DRYRUN=1``   只记日志不实际替换(部署前自检)
+  ``TILEINFER_DENSE_NN``   未设/0=关;1=all(三族);qkvz,attnqkv,oproj 子集
+                           (部署推荐 oproj,E321 证据白名单)
+  ``TILEINFER_DENSE_NN_DRYRUN=1``  只记日志不实际替换(部署前自检)
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import weakref
 
 import torch
 
 logger = logging.getLogger(__name__)
 
 _INSTALLED = False
+_REGISTERED: list[weakref.ref] = []  # 已换层的弱引用(探针面)
 _STATS: dict[str, int] = {
-    "dense_nn_modules": 0,   # 已 shim 的线性层数
-    "dense_nn_forward": 0,   # 走 NN matmul 路径的次数
-    "dense_nn_fallback": 0,  # 超 MAXM 回落原 apply 的次数
-    "dense_nn_skipped": 0,   # 形状/条件不满足而跳过的次数
+    "dense_nn_modules": 0,    # 已物理换层的线性层数
+    "dense_nn_stride_ok": 0,  # 探针:stride/shape 仍为 NN 视图的层数
+    "dense_nn_stride_bad": 0, # 探针:被外部改动(如权重更新流)的层数
+    "dense_nn_skipped": 0,    # 形状/条件不满足而跳过的次数
 }
 
 # (N, K) -> family;形状在本模型内唯一(qkvz/attn qkv 是仅有的两个 K=2048 大 N 族,
@@ -77,14 +87,21 @@ def _dryrun() -> bool:
         "", "0", "false", "False")
 
 
-def _max_m() -> int:
-    try:
-        return max(1, int(os.environ.get("TILEINFER_DENSE_NN_MAXM", "16")))
-    except ValueError:
-        return 16
-
-
 def stats() -> dict[str, int]:
+    """计数 + 物理探针(惰性复核 stride;1Hz dumper 下 80 次属性读=纳秒级)。"""
+    ok = bad = 0
+    for ref in _REGISTERED:
+        layer = ref()
+        if layer is None:
+            continue
+        w = layer.weight.data
+        if w.ndim == 2 and tuple(w.shape) in _FAMILY_BY_SHAPE \
+                and tuple(w.stride()) == (1, w.shape[0]):
+            ok += 1
+        else:
+            bad += 1
+    _STATS["dense_nn_stride_ok"] = ok
+    _STATS["dense_nn_stride_bad"] = bad
     return dict(_STATS)
 
 
@@ -92,13 +109,24 @@ def is_installed() -> bool:
     return _INSTALLED
 
 
-def _shim_layer(layer) -> bool:
-    """对单个 Linear 层做 NN 预排 + apply 实例替换;返回是否生效。"""
+def _swap_layer(layer) -> bool:
+    """对单个 Linear 层做 weight 物理换形(存储 NN+逻辑 NT);返回是否生效。
+
+    幂等且自愈:已换层若 stride 仍为 (1,N) 直接跳过;若被后续权重处理改写
+    (如 NZ 转换路径),重新换形——保证 swap 是 PWAL 全链的最后写者。
+    """
     fams = _enabled_families()
     if not fams:
         return False
     w = getattr(layer, "weight", None)
-    if w is None or w.data.ndim != 2 or w.data.dtype not in (torch.bfloat16, torch.float16):
+    if w is None or w.data.ndim != 2:
+        return False
+    if getattr(layer, "_tileinfer_dense_nn_swapped", False):
+        if tuple(w.data.stride()) == (1, w.data.shape[0]):
+            return False  # 已换形且未被改写
+        logger.warning("H79: swapped weight clobbered, re-swapping %s",
+                       getattr(layer, "prefix", "?"))
+    if w.data.dtype not in (torch.bfloat16, torch.float16):
         _STATS["dense_nn_skipped"] += 1
         return False
     fam = _FAMILY_BY_SHAPE.get(tuple(w.data.shape))
@@ -108,32 +136,28 @@ def _shim_layer(layer) -> bool:
         # 带 bias 的形态不做(现模型三族均 bias=False);保持零风险面。
         _STATS["dense_nn_skipped"] += 1
         return False
-    qm = getattr(layer, "quant_method", None)
-    if qm is None or getattr(qm, "_tileinfer_dense_nn", False):
+    if getattr(layer, "quant_method", None) is None:
+        _STATS["dense_nn_skipped"] += 1
         return False
     if not _tp1():
         _STATS["dense_nn_skipped"] += 1
         return False
     if _dryrun():
-        logger.info("H77 dryrun: would preformat %s (%s)", fam,
+        logger.info("H79 dryrun: would weight-swap %s (%s)", fam,
                     getattr(layer, "prefix", "?"))
         return False
 
-    w_nn = w.data.t().contiguous()
-    orig_apply = qm.apply
-    maxm = _max_m()
-
-    def apply(layer_arg, x, bias=None, _w=w_nn, _orig=orig_apply, _maxm=maxm):
-        if x.shape[0] <= _maxm:
-            _STATS["dense_nn_forward"] += 1
-            return torch.matmul(x, _w)
-        _STATS["dense_nn_fallback"] += 1
-        return _orig(layer_arg, x, bias)
-
-    qm.apply = apply
-    qm._tileinfer_dense_nn = True
-    _STATS["dense_nn_modules"] += 1
+    # 存 [K,N] 连续、逻辑 [N,K] 视图(stride=(1,N));vendor F.linear 走 NN 内核。
+    w.data = w.data.t().contiguous().t()
+    layer._tileinfer_dense_nn_swapped = True
+    if not any(r() is layer for r in _REGISTERED):
+        _REGISTERED.append(weakref.ref(layer))
+        _STATS["dense_nn_modules"] += 1
     return True
+
+
+# 兼容别名(v1 命名;E320 起语义=swap)
+_shim_layer = _swap_layer
 
 
 def _tp1() -> bool:
@@ -146,8 +170,35 @@ def _tp1() -> bool:
         return True
 
 
+def _wrap_pwal(cls) -> bool:
+    """给指定 quant-method 类挂 PWAL 后置钩子;已包装返回 False。"""
+    orig = cls.process_weights_after_loading
+    if getattr(orig, "_tileinfer_dense_nn_wrapped", False):
+        return False
+
+    def process_weights_after_loading(self, layer, *args, **kwargs):
+        result = orig(self, layer, *args, **kwargs)
+        try:
+            _swap_layer(layer)
+        except Exception:  # pragma: no cover - 优化模块不得影响在役路径
+            _STATS["dense_nn_skipped"] += 1
+        return result
+
+    process_weights_after_loading._tileinfer_dense_nn_wrapped = True
+    # 留存包装前原函数,供测试/回滚恢复类属性(与 H73/H28 的 marker 语义独立)。
+    process_weights_after_loading._tileinfer_dense_nn_orig = orig
+    cls.process_weights_after_loading = process_weights_after_loading
+    return True
+
+
 def install() -> bool:
-    """挂 PWAL 基类钩子(权重加载后、NZ no-op 前后均可,ND 实态下与顺序无关)。"""
+    """挂 PWAL 后置钩子(权重加载后、图 capture 前;swap=最后写者)。
+
+    双类同挂:leaf ``AscendUnquantizedLinearMethod``(若可导入)与 core
+    ``UnquantizedLinearMethod``——引擎在役 qm 类两链证据(E320)均兼容,双挂+
+    幂等 marker 对任一实态都命中;leaf 链 mid-way 的 maybe_trans_nz 为 bf16
+    恒等(E43 mode=1),后置自愈复核兜底。
+    """
     global _INSTALLED
     if _INSTALLED:
         return True
@@ -156,28 +207,31 @@ def install() -> bool:
     try:
         from vllm.model_executor.layers.linear import UnquantizedLinearMethod
     except Exception:
-        logger.warning("H77 not installed: vllm linear unavailable")
+        logger.warning("H79 not installed: vllm linear unavailable")
         return False
+    classes = [UnquantizedLinearMethod]
+    try:
+        from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
 
-    orig = UnquantizedLinearMethod.process_weights_after_loading
-    if getattr(orig, "_tileinfer_dense_nn_wrapped", False):
-        _INSTALLED = True
-        return True
+        if AscendUnquantizedLinearMethod not in classes:
+            classes.append(AscendUnquantizedLinearMethod)
+    except Exception:
+        pass
 
-    def process_weights_after_loading(self, layer, *args, **kwargs):
+    wrapped_any = False
+    for cls in classes:
         try:
-            _shim_layer(layer)
+            wrapped_any |= _wrap_pwal(cls)
         except Exception:  # pragma: no cover - 优化模块不得影响在役路径
-            _STATS["dense_nn_skipped"] += 1
-        return orig(self, layer, *args, **kwargs)
-
-    process_weights_after_loading._tileinfer_dense_nn_wrapped = True
-    # 留存包装前原函数,供测试/回滚恢复类属性(与 H73 的 marker 语义独立)。
-    process_weights_after_loading._tileinfer_dense_nn_orig = orig
-    UnquantizedLinearMethod.process_weights_after_loading = process_weights_after_loading
+            logger.warning("H79 pwal wrap failed on %s", cls.__name__)
+    if not wrapped_any and not any(
+            getattr(c.process_weights_after_loading,
+                    "_tileinfer_dense_nn_wrapped", False) for c in classes):
+        return False
     _INSTALLED = True
     logger.info(
-        "TileInfer dense NN preformat installed (H77, TILEINFER_DENSE_NN; dryrun=%s)",
-        _dryrun(),
+        "TileInfer dense NN weight-swap installed (H79, TILEINFER_DENSE_NN; "
+        "cls=%s; dryrun=%s)",
+        "+".join(c.__name__ for c in classes), _dryrun(),
     )
     return True

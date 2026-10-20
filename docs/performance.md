@@ -2371,6 +2371,37 @@ out_proj/attn_qkv +11%,M=1 与引擎内从未测过。
 - 在役探针:metrics dumper 并入 dense_nn_modules/forward/fallback(ON 臂判据
   dense_nn_forward>0)。
 
+### H79 v2=weight-swap 重做(E320 v1 失败定谳,2026-10-21 iter-234)
+
+v1 引擎 A/B 判决无效(E320):on≈off 全场景 ±1.12% 噪声级,生效探针三重失守
+(installed_hits=0/dense_nn_forward=0/fallback=80=仅 prefill eager)——vllm 0.23
+默认 cudagraph_mode=FULL_AND_PIECEWISE,FULL graph decode 全程不经 python,
+实例级 qm.apply 闭包被整体旁路。**微基准 1.128x 与引擎 0 收益并存=集成层失败,
+不构成假设证否**。
+
+v2 机制(同一假设的零分支实现,`dense_nn.py` 全量重写):
+- PWAL 后置钩子(core+leaf 双类同挂:UnquantizedLinearMethod 与
+  AscendUnquantizedLinearMethod,独立 marker 互不吞包装;后置=orig 完成后再换形,
+  保证 swap 是 maybe_trans_nz(E43 bf16 恒等)之后的最后写者)→
+  weight.data 物理替换为 `w.t().contiguous().t()`(逻辑 [N,K] 不变、存储 [K,N]
+  连续、stride=(1,N))→ vendor apply(unquantized_gemm→F.linear)按 stride 自动
+  走 NN 内核。零热路径分支、零 python 计数依赖,图 capture 前定形(地址稳定);
+  幂等 marker+stride 自愈复核(被改写时重换形)。
+- E321 stride 敏感性微基准(h79_stride_bench,引擎精确链,HBM-cold 流式):
+  o_proj M=1/8/128 = **1.169/1.143/1.160**(全段 +14~17%)| qkvz M=1=0.919
+  (decode 段亏损)| attn_qkv M=128=0.876(prefill 段亏损)⇒ **部署白名单=oproj
+  单族**(静态族粒度是图模式唯一安全面;M 级分支=v1 死路),A/B 挂
+  `TILEINFER_DENSE_NN=oproj`。HBM 代价 ≈+0.64GB(40×16MB)。
+- 生效探针(图模式可见面):metrics dumper 并入 dense_nn_modules/stride_ok/
+  stride_bad(ON 臂判据 stride_ok=modules=40;v1 forward 计数面作废)。
+- 契约测试重写:CPU 14 项绿(门控/形状族/换形布局与数值/qm 零触碰/自愈/
+  双类链/探针面)+ 设备 oracle 6 项绿(M∈{1,8}×三族,stride 断言+allclose 2e-2)。
+- 权威 A/B(h79_ab.sh):基座=现役最优(capture8+SIMD+ktp 分带+H61+H28 fold),
+  唯一变量=`TILEINFER_DENSE_NN=oproj`;off 臂复用同日 h77_off 基线(D162 臂级
+  复用先例);判据 c1 TPOT ≥−1%,其余 |Δ|≤3%,短场景 |Δ|<3%。
+
+### H77 v1 原始实现存档(被 H79 v2 取代,2026-10-21 iter-215)
+
 验证状态:
 - CPU 契约 14 项绿(tests/test_dense_nn.py:门控/形状族/预排数值/shim 语义/
   wrapper 链与 H73 marker 独立性);
