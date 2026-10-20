@@ -257,3 +257,127 @@ def test_slotmap_exception_falls_back(monkeypatch):
     finally:
         pf_mod._tls.runner = None
     assert ret == "orig" and self.fallbacks == 1
+
+
+# ---------------------------------------------------------------- H49 直接路径
+#
+# H49(#19033 b688ed1cb1 最小子集)与"从 runner 重算"那条快路径的区别:
+# 调用方(model_runner._prepare_inputs)已算好 positions_np 与 query_start_loc.np,
+# 直接传进来即可 —— 不依赖 threadlocal runner、不重算 num_computed_tokens+query_pos。
+# 这两条路径必须给出**逐位相同**的 slot_mapping。
+
+
+def test_h49_direct_cpu_args_match_oracle():
+    """调用方传 CPU 数组时,结果与 oracle 逐位一致,且不依赖 threadlocal。"""
+    from tileinfer.integrations import prep_fastpath as pf_mod
+
+    PAD = -1
+    rows, cols, bs = 4, 8, 128
+    fake_cls = type("BT", (), {"compute_slot_mapping": _FakeSlotSelf._orig_compute})
+    pf_mod._patch_bt_slotmap(
+        fake_cls,
+        type("M", (), {"NPUModelRunner": type("R", (), {"_prepare_inputs": _fake_prepare})}),
+    )
+
+    for num_reqs, sched in ((1, [1]), (3, [1, 1, 1]), (2, [2, 3])):
+        self = _FakeSlotSelf(rows, cols, bs)
+        for r in range(rows):
+            self.block_table.np[r, :] = np.arange(100 * r, 100 * r + cols, dtype=np.int32)
+
+        # 构造调用方视角的 CPU 数组:positions 是全局 KV 位置,qsl 是前缀和
+        computed = [128 * 2 + 5 * r for r in range(num_reqs)]
+        positions = np.concatenate(
+            [computed[r] + np.arange(s, dtype=np.int32) for r, s in enumerate(sched)]
+        ).astype(np.int32)
+        qsl = np.concatenate([[0], np.cumsum(sched)]).astype(np.int32)
+        n = int(sum(sched))
+
+        pf_mod._tls.runner = None  # 关键:不提供 runner,证明走的是直接路径
+        try:
+            ret = fake_cls.compute_slot_mapping(
+                self, num_reqs, None, None,
+                positions_cpu=positions, query_start_loc_cpu=qsl,
+            )
+        finally:
+            pf_mod._tls.runner = None
+
+        assert ret is None, "直接路径应正常返回 None(不回退)"
+        expect = _oracle_slotmap(
+            self.block_table.np, bs, num_reqs, sched, computed,
+            np.concatenate([np.arange(s, dtype=np.int32) for s in sched]),
+        )
+        got = self.slot_mapping.np[:n]
+        assert np.array_equal(got, expect), (num_reqs, got, expect)
+        assert self.slot_mapping.copies == 1
+        assert int(self.slot_mapping.gpu[n : self.max_num_batched_tokens].min()) == PAD
+        assert self.fallbacks == 0
+
+
+def test_h49_direct_path_preferred_over_runner():
+    """同时具备 runner 与 CPU 数组时,必须走直接路径(它更省)。"""
+    from tileinfer.integrations import prep_fastpath as pf_mod
+
+    rows, cols, bs = 4, 8, 128
+    fake_cls = type("BT", (), {"compute_slot_mapping": _FakeSlotSelf._orig_compute})
+    pf_mod._patch_bt_slotmap(
+        fake_cls,
+        type("M", (), {"NPUModelRunner": type("R", (), {"_prepare_inputs": _fake_prepare})}),
+    )
+    self = _FakeSlotSelf(rows, cols, bs)
+    for r in range(rows):
+        self.block_table.np[r, :] = np.arange(100 * r, 100 * r + cols, dtype=np.int32)
+
+    # 给一个会"炸"的 runner:若误走 runner 路径,这里会抛错并计入 fallback
+    runner = _FakeRunner(1, [1], [0], rows, cols, bs)
+    runner.num_scheduled_tokens.np = None
+    pf_mod._tls.runner = runner
+
+    positions = np.array([256], dtype=np.int32)
+    qsl = np.array([0, 1], dtype=np.int32)
+    try:
+        fake_cls.compute_slot_mapping(
+            self, 1, None, None, positions_cpu=positions, query_start_loc_cpu=qsl
+        )
+    finally:
+        pf_mod._tls.runner = None
+
+    assert self.fallbacks == 0, "不应回退(直接路径优先)"
+
+
+def test_h49_direct_path_gate_on_pcp():
+    """CP 切分下直接路径必须让位原实现。"""
+    from tileinfer.integrations import prep_fastpath as pf_mod
+
+    rows, cols, bs = 4, 8, 128
+    fake_cls = type("BT", (), {"compute_slot_mapping": _FakeSlotSelf._orig_compute})
+    pf_mod._patch_bt_slotmap(
+        fake_cls,
+        type("M", (), {"NPUModelRunner": type("R", (), {"_prepare_inputs": _fake_prepare})}),
+    )
+    self = _FakeSlotSelf(rows, cols, bs)
+    self.pcp_world_size = 2  # 触发门控
+    ret = fake_cls.compute_slot_mapping(
+        self, 1, None, None,
+        positions_cpu=np.array([0], dtype=np.int32),
+        query_start_loc_cpu=np.array([0, 1], dtype=np.int32),
+    )
+    assert ret == "orig" and self.fallbacks == 1
+
+
+def test_h49_direct_path_formula_matches_kernel():
+    """公式逐项核对:slot = block_table[req, pos//bs] * bs + pos%bs。"""
+    bs, rows, cols = 128, 4, 8
+    bt = np.arange(rows * cols, dtype=np.int32).reshape(rows, cols)
+    positions = np.array([0, 1, 127, 128, 129, 255], dtype=np.int64)
+    req = np.array([0, 0, 0, 1, 1, 1], dtype=np.int64)
+    block_idx = positions // bs
+    got = bt[req, block_idx].astype(np.int64) * bs + positions % bs
+    expect = [
+        bt[0, 0] * bs + 0,
+        bt[0, 0] * bs + 1,
+        bt[0, 0] * bs + 127,
+        bt[1, 1] * bs + 0,
+        bt[1, 1] * bs + 1,
+        bt[1, 1] * bs + 127,
+    ]
+    assert got.tolist() == expect

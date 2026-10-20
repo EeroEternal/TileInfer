@@ -129,8 +129,34 @@ def _patch_bt_slotmap(BlockTable: type, mrv: Any) -> Optional[str]:
         query_start_loc: torch.Tensor,
         positions: torch.Tensor,
         *args: Any,
+        positions_cpu: Any = None,
+        query_start_loc_cpu: Any = None,
         **kwargs: Any,
     ):
+        # ---- H49 优先路径:调用方已给出 CPU 侧数组,无需 threadlocal、无需重算 ----
+        #
+        # H49 的原补丁(#19033 b688ed1cb1 最小子集)在 model_runner 调用点直接传入
+        # ``positions_np``(``_prepare_inputs`` 里第 913 行已算好)与
+        # ``query_start_loc.np``。这条路比下面"从 runner 重算"少做三件事:
+        #   ① 不依赖 _tls.runner(少一次 threadlocal 读写与包装层)
+        #   ② 不重算 num_computed_tokens + query_pos(少一次 numpy 加法与索引)
+        #   ③ 不需要 pad 懒刷新(调用方给的是精确切片)
+        # 判据门控与慢路径相同。
+        if (
+            positions_cpu is not None
+            and query_start_loc_cpu is not None
+            and self.pcp_world_size == 1
+            and self.dcp_world_size == 1
+            and self.block_table.np.shape[0] == self.max_num_reqs
+            and (getattr(self, "kernel_sizes", None) is None or self.kernel_sizes[0] == self.block_size)
+        ):
+            try:
+                _slotmap_from_cpu_args(self, num_reqs, positions_cpu, query_start_loc_cpu)
+                return None
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("prep_fastpath slotmap direct-cpu fallback: %s", exc)
+                return orig(self, num_reqs, query_start_loc, positions, *args, **kwargs)
+
         runner = getattr(_tls, "runner", None)
         if (
             runner is None
@@ -145,6 +171,36 @@ def _patch_bt_slotmap(BlockTable: type, mrv: Any) -> Optional[str]:
         except Exception as exc:  # noqa: BLE001 - fast path 失败必须回退原路径
             logger.warning("prep_fastpath slotmap fast path fallback: %s", exc)
             return orig(self, num_reqs, query_start_loc, positions, *args, **kwargs)
+
+    def _slotmap_from_cpu_args(self: Any, num_reqs: int, positions_cpu: Any, qsl_cpu: Any) -> None:
+        """H49 直接路径:用调用方给的 CPU 数组算 slot(与 triton 核同整数算术)。
+
+        公式逐项同构 ``_compute_slot_mapping_kernel`` 的 CP==1 分支:
+            slot = block_table[req, pos // bs] * bs + pos % bs
+        ``pos`` 是全局 KV 位置(调用方的 positions 已含 computed prefix)。
+        """
+        qsl = np.asarray(qsl_cpu[: num_reqs + 1], dtype=np.int64)
+        counts = qsl[1:] - qsl[:-1]
+        n = int(counts.sum())
+        if n == 0 or n > self.max_num_batched_tokens:
+            raise ValueError(f"unsupported token count {n}")
+        req_of_token = np.repeat(np.arange(num_reqs, dtype=np.int64), counts)
+        pos = np.asarray(positions_cpu[:n], dtype=np.int64)
+        block_idx = pos // self.block_size
+        blocks = self.block_table.np[req_of_token, block_idx].astype(np.int64)
+        np.add(
+            blocks * self.block_size,
+            pos - block_idx * self.block_size,
+            out=self.slot_mapping.np[:n],
+        )
+        self.slot_mapping.copy_to_gpu(n)
+        # 与 kernel 契约对齐:[n, max_num_batched_tokens) 填 PAD_ID(按 n 懒刷新)
+        from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+
+        last = getattr(self, "_ti_pad_n_direct", -1)
+        if last != n:
+            self.slot_mapping.gpu[n : self.max_num_batched_tokens].fill_(PAD_SLOT_ID)
+            self._ti_pad_n_direct = n
 
     def _slotmap_cpu_fast(self: Any, runner: Any, num_reqs: int) -> None:
         from vllm.v1.attention.backends.utils import PAD_SLOT_ID
