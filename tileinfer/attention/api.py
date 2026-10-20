@@ -91,6 +91,7 @@ class BatchAttention:
         window_left: int = -1,
         block_q: int = 128,
         kv_tile_pages: int = 0,
+        tokens_per_split: int = 0,
         load_balance: bool = True,
         k_cache: Optional[torch.Tensor] = None,
         v_cache: Optional[torch.Tensor] = None,
@@ -128,6 +129,7 @@ class BatchAttention:
             window_left,
             block_q,
             kv_tile_pages,
+            tokens_per_split,
             load_balance,
         )
         plan = self._plan_cache.get(cache_key)
@@ -153,6 +155,7 @@ class BatchAttention:
             window_left=window_left,
             block_q=block_q,
             kv_tile_pages=kv_tile_pages,
+            tokens_per_split=tokens_per_split,
             load_balance=load_balance,
             workspace_manager=self.workspace_manager,
         )

@@ -15,7 +15,14 @@ from typing import Dict, List, Optional, Tuple, Type
 import torch
 
 from ...metadata import AttentionMode, RaggedMetadata, detect_mode
-from ...plan import AttentionPlan, TileSchedule, WorkspaceManager, plan_decode_tiles, plan_query_tiles
+from ...plan import (
+    AttentionPlan,
+    TileSchedule,
+    WorkspaceManager,
+    plan_decode_tiles,
+    plan_decode_tiles_token_split,
+    plan_query_tiles,
+)
 
 __all__ = ["AttentionBackend", "register_backend", "get_backend", "list_backends", "build_plan"]
 
@@ -37,6 +44,7 @@ def build_plan(
     window_left: int = -1,
     block_q: int = 128,
     kv_tile_pages: int = 0,
+    tokens_per_split: int = 0,
     load_balance: bool = True,
     workspace_manager: Optional[WorkspaceManager] = None,
 ) -> AttentionPlan:
@@ -47,6 +55,11 @@ def build_plan(
     skewed batch spreads over the cores.  Only the decode path can merge splits today, so
     ``kv_tile_pages`` together with ``block_q > 1`` raises rather than silently producing wrong
     output.
+
+    ``tokens_per_split`` (H67) splits decode work by **token** rather than by KV page, so a
+    short request that occupies a single page can still spread over several tiles.  It implies
+    split-KV (a merge pass), so it is decode-only, and it is mutually exclusive with
+    ``kv_tile_pages``.
     """
     meta.validate()
     page_size = max(page_size, meta.page_size, 1)
@@ -72,15 +85,31 @@ def build_plan(
         detected = AttentionMode.PREFILL
 
     if detected is AttentionMode.DECODE:
-        schedule = plan_decode_tiles(
-            page_counts, block_q=1, kv_tile_pages=kv_tile_pages, load_balance=load_balance
-        )
+        if tokens_per_split > 0:
+            if kv_tile_pages > 0:
+                raise ValueError(
+                    "tokens_per_split and kv_tile_pages are two split granularities; pick one"
+                )
+            schedule = plan_decode_tiles_token_split(
+                qo_lens.tolist(),
+                meta.kv_lens.tolist(),
+                page_counts.tolist(),
+                device=device,
+                group=max(1, num_qo_heads // num_kv_heads),
+                page_size=page_size,
+                tokens_per_split=tokens_per_split,
+                load_balance=load_balance,
+            )
+        else:
+            schedule = plan_decode_tiles(
+                page_counts, block_q=1, kv_tile_pages=kv_tile_pages, load_balance=load_balance
+            )
         block_q_eff = 1
     else:
-        if kv_tile_pages > 0:
+        if kv_tile_pages > 0 or tokens_per_split > 0:
             raise NotImplementedError(
                 "KV-split scheduling with the merge step is currently implemented for decode "
-                "(block_q == 1) only; leave kv_tile_pages=0 for prefill/append"
+                "(block_q == 1) only; leave kv_tile_pages/tokens_per_split at 0 for prefill/append"
             )
         schedule = plan_query_tiles(
             qo_lens, page_counts, block_q=block_q, kv_tile_pages=0, load_balance=load_balance

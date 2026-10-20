@@ -961,9 +961,20 @@ def paged_decode_merge(
     return main
 
 
+def _cache_key(tag: str, spec: dict) -> tuple:
+    """Kernel cache key.
+
+    SIMD-softmax is read at *trace* time inside several kernel bodies (E116-era lesson:
+    anything that changes the emitted program must land in the cache key), so the opt-in
+    env flag is folded in here instead of leaving two env settings to silently share one
+    compiled artifact.
+    """
+    return (tag,) + tuple(sorted({**spec, "simd_softmax": _simd_softmax_enabled()}.items()))
+
+
 def build_merge_kernel(**spec):
     """Compile (and cache) the split-merge kernel."""
-    key = ("merge",) + tuple(sorted(spec.items()))
+    key = _cache_key("merge", spec)
     kernel = _KERNEL_CACHE.get(key)
     if kernel is None:
         kernel = tilelang.compile(
@@ -985,7 +996,7 @@ def build_split_kernel(**spec):
     """
     if spec.get("num_pages_cap") is not None:
         spec["num_pages_cap"] = declared_pool_cap(spec["num_pages_cap"])
-    key = ("split",) + tuple(sorted(spec.items()))
+    key = _cache_key("split", spec)
     kernel = _KERNEL_CACHE.get(key)
     if kernel is None:
         kernel = tilelang.compile(
@@ -1019,7 +1030,7 @@ def build_decode_kernel(**spec):
         spec["pipeline"] = True
     if spec.get("num_pages_cap") is not None:
         spec["num_pages_cap"] = declared_pool_cap(spec["num_pages_cap"])
-    key = ("decode", "manual" if out_manual else "auto") + tuple(sorted(spec.items()))
+    key = _cache_key("decode", spec) + ("manual" if out_manual else "auto",)
     kernel = _KERNEL_CACHE.get(key)
     if kernel is None:
         kernel = tilelang.compile(
@@ -1303,7 +1314,7 @@ def build_prefill_kernel(**spec):
     (quantized to the ABI's declared capacity, so the key is pool-agnostic)."""
     if spec.get("num_pages_cap") is not None:
         spec["num_pages_cap"] = declared_pool_cap(spec["num_pages_cap"])
-    key = ("prefill",) + tuple(sorted(spec.items()))
+    key = _cache_key("prefill", spec)
     kernel = _KERNEL_CACHE.get(key)
     if kernel is None:
         kernel = tilelang.compile(
@@ -2124,7 +2135,7 @@ def build_prefill_split_kernel(**spec):
     re: `num_pages_cap` (quantized to the ABI's declared capacity, key stays pool-agnostic)."""
     if spec.get("num_pages_cap") is not None:
         spec["num_pages_cap"] = declared_pool_cap(spec["num_pages_cap"])
-    key = ("prefill_split",) + tuple(sorted(spec.items()))
+    key = _cache_key("prefill_split", spec)
     kernel = _KERNEL_CACHE.get(key)
     if kernel is None:
         kernel = tilelang.compile(
@@ -2141,7 +2152,7 @@ def build_prefill_split_head_kernel(**spec):
     as :func:`build_prefill_split_kernel`."""
     if spec.get("num_pages_cap") is not None:
         spec["num_pages_cap"] = declared_pool_cap(spec["num_pages_cap"])
-    key = ("prefill_split_head",) + tuple(sorted(spec.items()))
+    key = _cache_key("prefill_split_head", spec)
     kernel = _KERNEL_CACHE.get(key)
     if kernel is None:
         kernel = tilelang.compile(
@@ -2158,7 +2169,7 @@ def build_prefill_split_frontier_kernel(**spec):
     contract as :func:`build_prefill_split_kernel`."""
     if spec.get("num_pages_cap") is not None:
         spec["num_pages_cap"] = declared_pool_cap(spec["num_pages_cap"])
-    key = ("prefill_split_frontier",) + tuple(sorted(spec.items()))
+    key = _cache_key("prefill_split_frontier", spec)
     kernel = _KERNEL_CACHE.get(key)
     if kernel is None:
         kernel = tilelang.compile(

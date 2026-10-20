@@ -103,6 +103,17 @@ class TileSchedule:
             kv_page_lens=self.kv_page_lens.to(device, non_blocking=non_blocking),
             split_ids=self.split_ids.to(device, non_blocking=non_blocking),
             split_counts=self.split_counts.to(device, non_blocking=non_blocking),
+            token_starts=(
+                None
+                if self.token_starts is None
+                else self.token_starts.to(device, non_blocking=non_blocking)
+            ),
+            token_lens=(
+                None
+                if self.token_lens is None
+                else self.token_lens.to(device, non_blocking=non_blocking)
+            ),
+            token_split=self.token_split,
             order=None if self.order is None else self.order.to(device, non_blocking=non_blocking),
             balanced=self.balanced,
         )

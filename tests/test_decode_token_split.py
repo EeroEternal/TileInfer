@@ -184,3 +184,43 @@ def test_h67_empty_input_returns_empty_schedule():
         page_size=PAGE, tokens_per_split=32,
     )
     assert sched.num_tiles == 0
+
+def test_h67_tokens_per_split_excludes_kv_tile_pages():
+    from tileinfer.metadata import RaggedMetadata
+    from tileinfer.attention.backends.base import build_plan
+
+    meta = RaggedMetadata(
+        kv_indptr=torch.tensor([0, 1], dtype=torch.int32),
+        kv_indices=torch.zeros(1, dtype=torch.int32),
+        kv_last_page_len=torch.ones(1, dtype=torch.int32),
+        page_size=1,
+        qo_indptr=torch.tensor([0, 1], dtype=torch.int32),
+    )
+    with pytest.raises(ValueError, match="pick one"):
+        build_plan(
+            backend="tilelang-ascend950",
+            meta=meta,
+            num_qo_heads=8,
+            num_kv_heads=1,
+            head_dim=8,
+            dtype=torch.float16,
+            device=torch.device("cpu"),
+            page_size=1,
+            kv_tile_pages=2,
+            tokens_per_split=4,
+        )
+
+
+def test_h67_schedule_to_preserves_token_fields():
+    """回归锁:TileSchedule.to() 必须搬运 token 字段(修复前静默丢失)。"""
+    from tileinfer.plan import TileSchedule
+
+    z = lambda n: torch.arange(n, dtype=torch.int32)  # noqa: E731
+    sch = TileSchedule(
+        seq_ids=z(2), q_offsets=z(2), q_lens=z(2), kv_page_starts=z(2), kv_page_lens=z(2),
+        split_ids=z(2), split_counts=torch.tensor([2, 2], dtype=torch.int32),
+        token_starts=z(2), token_lens=z(2), token_split=True,
+    )
+    out = sch.to(torch.device("cpu"))
+    assert out.token_starts is not None and out.token_lens is not None
+    assert out.token_split is True
