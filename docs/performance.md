@@ -1519,3 +1519,30 @@ ms-on 有效形态反测 shared 串行段上界 0.665ms/步(c1);E+1 融合消除
 - 端到端设备链差 0.86ms 的余项 ~0.42ms=图内气泡/同步(可回收性未证)。
 判决:归因 proven(≤2 域);单点可削面 0.44ms < 0.5ms 门槛 → 不立消除假设;
 attention 主核 batch-1 劣势登记 **H67 候选**(c1 缺口抓手,H28/dense 后启动)。
+
+## H70 prep 域 host 固定税削减·第一批判决(2026-10-20 iter-206,E280/E282/E283)
+
+### 取证(E280/E282,子段 stub 二批,c1 权威 8448 步,TPOT p50 9.660=diag 开销≈0)
+prep 块(vendor model_runner_v1 L2027-2269)全归账画像:
+
+| 段 | ms/步 | 说明 |
+|---|---|---|
+| prep_inputs | 0.549 | bt_commit 4发0.087+bt_slotmap triton 0.084+snap_copy 3发0.049+prep_ids 0.037+未归账小 H2D 族 0.278 |
+| **build_attn_meta** | **0.532** | **E277 残差悬案主体**(prep 块内 L2231,未分解) |
+| prep_upd | 0.057 | |
+| 杂项 | 0.13 | prep_det 0.027/async_state_update 0.020/tokens 列表 |
+| cos_sin | 0.0005 | 本模型全局 cache 未注册早退,手法判死 |
+
+### 第一批 A/B 判决(E283,配对三臂,同会话)
+| 臂 | c1 TPOT p50 | c8 TPOT p50 | 判决 |
+|---|---|---|---|
+| OFF(基线复现) | 9.6683(+0.09%) | 11.897(+0.14%) | 环境无漂移 |
+| fastpath 全开(commit+snap+slotmap) | 10.3306(+6.94%) | 12.6194(+6.22%) | **有害** |
+| commit+slotmap(snap 关) | 9.6665(+0.07%) | 11.9009(+0.18%) | 中性,净收益≈0 |
+
+**判决:H70 第一批 disproven**——bt_commit skip/bt_slotmap CPU fast path(PR#19033 同构手法)
+在役生效但发射税节省被 array_equal 比较/numpy/H2D 成本抵消;snap mirror(torch.npu.Event 门
++持久 pinned 镜像)单独有害,禁用。代码保留 opt-in(`TILEINFER_PREP_FASTPATH`,默认关)作
+负面结果遗产。E281 上游 PR#19033(−7.3%)收益经本轮剥离确认非 prep 域三手法主体。
+
+**prep 域剩余抓手 = build_attn_meta 0.532ms/步(H70 第二批,待三批 stub 分解)**。
