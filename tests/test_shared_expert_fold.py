@@ -20,6 +20,7 @@ def _reset():
     fold._INSTALLED = False
     fold._OWNER_REGISTRY.clear()
     fold._STATS.update(dict.fromkeys(fold._STATS, 0))
+    fold._DISPATCHER_BUMPED.update({"e": None, "k": None})
     old = {k: os.environ.get(k) for k in ("TILEINFER_SHARED_EXPERT_FOLD", "TILEINFER_SHARED_EXPERT_FOLD_DRYRUN")}
     yield
     for k, v in old.items():
@@ -111,11 +112,13 @@ class _FakeMoe:
         self._shared_experts.down_proj = type("L", (), {"weight": torch.nn.Parameter(torch.randn(3, 4))})()
         self._shared_experts.expert_gate = type("G", (), {"weight": torch.nn.Parameter(grow)})()
         self.gate = type("Gt", (), {"weight_fp32": torch.nn.Parameter(torch.randn(8, 3))})()
+        self.top_k = 8
         self._tileinfer_fold_done = False
 
 
 def test_fold_weights_concat_and_expert_id(monkeypatch):
     monkeypatch.setattr(fold, "_bump_dispatcher_expert_num", lambda e: 1)
+    monkeypatch.setattr(fold, "_bump_dispatcher_top_k", lambda k: 1)
     owner = _FakeMoe(fused_gate=True)
     assert fold._fold_weights(owner) is True
     # H73 形态剔 gate 行后 shared gate_up 仍 4 行;原 8 专家拼 1 → 9。
@@ -128,6 +131,7 @@ def test_fold_weights_concat_and_expert_id(monkeypatch):
 def test_fold_weights_direct_holder_023(monkeypatch):
     """0.23.0 形态:层本体持权重,折叠改写层本体,routed 子模块不动。"""
     monkeypatch.setattr(fold, "_bump_dispatcher_expert_num", lambda e: 1)
+    monkeypatch.setattr(fold, "_bump_dispatcher_top_k", lambda k: 1)
     owner = _FakeMoe(direct=True)
     assert fold._weight_holder(owner) is owner
     assert fold._fold_weights(owner) is True
@@ -138,6 +142,7 @@ def test_fold_weights_direct_holder_023(monkeypatch):
 def test_fold_weights_aborts_when_dispatcher_not_bumped(monkeypatch):
     """E309:expert_num 未补升 ⇒ 越界 id 被丢弃,折叠必须判失败不生效。"""
     monkeypatch.setattr(fold, "_bump_dispatcher_expert_num", lambda e: 0)
+    monkeypatch.setattr(fold, "_bump_dispatcher_top_k", lambda k: 1)
     owner = _FakeMoe(direct=True)
     assert fold._fold_weights(owner) is False
     assert fold.stats()["fold_skipped"] >= 1
@@ -159,6 +164,7 @@ def test_moe_init_registers_layer_and_routed():
 
 def test_quant_pwal_wraps_before_orig(monkeypatch):
     monkeypatch.setattr(fold, "_bump_dispatcher_expert_num", lambda e: 1)
+    monkeypatch.setattr(fold, "_bump_dispatcher_top_k", lambda k: 1)
     owner = _FakeMoe()
     fold._OWNER_REGISTRY[id(owner)] = owner
     calls = []
@@ -299,3 +305,51 @@ def test_install_idempotent_and_gates_off():
     if r1:  # vllm_ascend 在役时:幂等且状态可查
         assert fold.is_installed() is True
         assert fold.install() is True
+
+
+# ---------------------------------------------------------------- dispatcher top_k 补升(EZ0002)
+
+
+def _fake_mcm(monkeypatch, top_k, num_experts_local=256):
+    """向真实 moe_comm_method 单例表注入伪实现(CPU 可导入,单例表设备期才注册)。"""
+    class _TD:
+        def __init__(self):
+            self.top_k = top_k
+            self.num_experts_local = num_experts_local
+
+    td = _TD()
+    impl = type("I", (), {})()
+    impl.token_dispatcher = td
+    from vllm_ascend.ops.fused_moe import moe_comm_method as mcm
+
+    monkeypatch.setattr(mcm, "_MoECommMethods", {"topk": impl})
+    return td
+
+
+def test_bump_dispatcher_top_k_math_and_idempotent(monkeypatch):
+    td = _fake_mcm(monkeypatch, top_k=8)
+    assert fold._bump_dispatcher_top_k(8) == 1
+    assert td.top_k == 9
+    # 幂等:guard 命中即成功返回,不再重复补升
+    assert fold._bump_dispatcher_top_k(8) == 1
+    assert td.top_k == 9
+
+
+def test_bump_dispatcher_top_k_mismatch_noop(monkeypatch):
+    td = _fake_mcm(monkeypatch, top_k=4)
+    # 单例 top_k 与折叠层 k 不一致:不补升、返回 0(fail-closed)
+    assert fold._bump_dispatcher_top_k(8) == 0
+    assert td.top_k == 4
+    # 失败不落 guard,修正后可重试
+    assert fold._bump_dispatcher_top_k(4) == 1
+    assert td.top_k == 5
+
+
+def test_fold_weights_aborts_when_top_k_not_bumped(monkeypatch):
+    """EZ0002(iter-213):top_k 未补升 ⇒ active_num 失配,折叠必须判失败。"""
+    monkeypatch.setattr(fold, "_bump_dispatcher_expert_num", lambda e: 1)
+    monkeypatch.setattr(fold, "_bump_dispatcher_top_k", lambda k: 0)
+    owner = _FakeMoe()
+    assert fold._fold_weights(owner) is False
+    assert fold.stats()["fold_skipped"] == 1
+    assert fold.stats()["fold_layers"] == 0

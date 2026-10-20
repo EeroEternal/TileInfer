@@ -156,7 +156,40 @@ def _weight_holder(owner):
     return None
 
 
-_DISPATCHER_BUMPED = {"e": None}
+_DISPATCHER_BUMPED = {"e": None, "k": None}
+
+
+def _bump_dispatcher_top_k(owner_k: int) -> int:
+    """折叠后 topk 列 k→k+1:npu_moe_init_routing 的 ``active_num=num_tokens×td.top_k``
+    (token_dispatcher.py:405)按构造期 k 取值 ⇒ ids [M,k+1] 与 active_num M×k 失配
+    (EZ0002:16384 vs 18432,iter-213 on 臂 attempt3 实证)。对已构造单例补升
+    top_k k→k+1;层本体 self.top_k 保持 k(select_experts 仍选 k 个真实专家)。
+
+    单例跨层共享 ⇒ 全局一次性幂等。前置=H28 全层折叠:若存在未折叠层,其 ids [M,k]
+    与补升后 active_num M×(k+1) 失配 ⇒ 半开不可用(fail-closed)。
+    """
+    if _DISPATCHER_BUMPED["k"] == owner_k:
+        return 1
+    try:
+        from vllm_ascend.ops.fused_moe import moe_comm_method as mcm
+
+        bumped = 0
+        for impl in list(getattr(mcm, "_MoECommMethods", {}).values()):
+            td = getattr(impl, "token_dispatcher", None)
+            if td is None:
+                continue
+            cur = getattr(td, "top_k", None)
+            if isinstance(cur, int) and cur == owner_k:
+                td.top_k = owner_k + 1
+                bumped += 1
+        if bumped:
+            _DISPATCHER_BUMPED["k"] = owner_k
+            print(f"[H28] dispatcher top_k bumped {owner_k}->{owner_k + 1} "
+                  f"on {bumped} singleton(s)", flush=True)
+        return bumped
+    except Exception as exc:  # pragma: no cover - 优化不得影响在役路径
+        print(f"[H28] dispatcher top_k bump failed: {exc}", flush=True)
+        return 0
 
 
 def _bump_dispatcher_expert_num(owner_e: int) -> int:
@@ -225,6 +258,12 @@ def _fold_weights(owner) -> bool:
     bumped = _bump_dispatcher_expert_num(int(w13.shape[0]))
     if bumped == 0:
         # 路由计数未补升 ⇒ 越界 id 必被 init_routing 丢弃(E309),折叠无效即回退
+        _STATS["fold_skipped"] += 1
+        return False
+    owner_k = int(getattr(owner, "top_k", 0) or 0)
+    if owner_k <= 0 or _bump_dispatcher_top_k(owner_k) == 0:
+        # top_k 未补升 ⇒ active_num=num_tokens×k 与 ids [M,k+1] 失配
+        # (EZ0002 iter-213 实证),折叠无效即回退
         _STATS["fold_skipped"] += 1
         return False
     _STATS["fold_layers"] += 1
