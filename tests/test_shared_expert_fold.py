@@ -85,10 +85,17 @@ def test_extend_gate_weight():
 
 
 class _FakeMoe:
-    """模拟 AscendFusedMoE 的折叠相关面。"""
+    """模拟 AscendFusedMoE 的折叠相关面。
 
-    def __init__(self, fused_gate=False):
+    direct=True 模拟 0.23.0 在役结构(层本体持 w13_weight/w2_weight,pwals 以层本体
+    调用);direct=False 模拟非 0.23.0 分支(routed_experts 子模块持权重)。
+    """
+
+    def __init__(self, fused_gate=False, direct=False):
         self.routed_experts = type("R", (), {})()
+        if direct:
+            self.w13_weight = torch.nn.Parameter(torch.randn(8, 4, 3))
+            self.w2_weight = torch.nn.Parameter(torch.randn(8, 3, 4))
         self.routed_experts.w13_weight = torch.nn.Parameter(torch.randn(8, 4, 3))
         self.routed_experts.w2_weight = torch.nn.Parameter(torch.randn(8, 3, 4))
         self._shared_experts = type("M", (), {})()
@@ -107,7 +114,8 @@ class _FakeMoe:
         self._tileinfer_fold_done = False
 
 
-def test_fold_weights_concat_and_expert_id():
+def test_fold_weights_concat_and_expert_id(monkeypatch):
+    monkeypatch.setattr(fold, "_bump_dispatcher_expert_num", lambda e: 1)
     owner = _FakeMoe(fused_gate=True)
     assert fold._fold_weights(owner) is True
     # H73 形态剔 gate 行后 shared gate_up 仍 4 行;原 8 专家拼 1 → 9。
@@ -117,9 +125,42 @@ def test_fold_weights_concat_and_expert_id():
     assert fold.stats()["fold_layers"] == 1
 
 
-def test_quant_pwal_wraps_before_orig():
+def test_fold_weights_direct_holder_023(monkeypatch):
+    """0.23.0 形态:层本体持权重,折叠改写层本体,routed 子模块不动。"""
+    monkeypatch.setattr(fold, "_bump_dispatcher_expert_num", lambda e: 1)
+    owner = _FakeMoe(direct=True)
+    assert fold._weight_holder(owner) is owner
+    assert fold._fold_weights(owner) is True
+    assert owner.w13_weight.shape[0] == 9 and owner.w2_weight.shape[0] == 9
+    assert owner.routed_experts.w13_weight.shape[0] == 8  # 非 0.23 载体不被误改
+
+
+def test_fold_weights_aborts_when_dispatcher_not_bumped(monkeypatch):
+    """E309:expert_num 未补升 ⇒ 越界 id 被丢弃,折叠必须判失败不生效。"""
+    monkeypatch.setattr(fold, "_bump_dispatcher_expert_num", lambda e: 0)
+    owner = _FakeMoe(direct=True)
+    assert fold._fold_weights(owner) is False
+    assert fold.stats()["fold_skipped"] >= 1
+    assert fold.stats()["fold_layers"] == 0
+    # 权重已被替换但 owner 未置 done ⇒ 下次 PWAL 可重试;本断言锁定不置 done。
+    assert getattr(owner, "_tileinfer_fold_done", False) is False
+
+
+def test_moe_init_registers_layer_and_routed():
+    fold._OWNER_REGISTRY.clear()
+    calls = []
+    orig = lambda self, *a, **k: calls.append(self)
+    wrapped = fold._wrap_moe_init(orig)
+    owner = _FakeMoe(direct=True)
+    wrapped(owner)
+    assert fold._OWNER_REGISTRY[id(owner)] is owner
+    assert fold._OWNER_REGISTRY[id(owner.routed_experts)] is owner
+
+
+def test_quant_pwal_wraps_before_orig(monkeypatch):
+    monkeypatch.setattr(fold, "_bump_dispatcher_expert_num", lambda e: 1)
     owner = _FakeMoe()
-    fold._OWNER_REGISTRY[id(owner.routed_experts)] = owner
+    fold._OWNER_REGISTRY[id(owner)] = owner
     calls = []
     qm = type("QM", (), {})()
 
@@ -129,7 +170,7 @@ def test_quant_pwal_wraps_before_orig():
 
     qm.process_weights_after_loading = fold._wrap_quant_pwals(orig_pwals)
     os.environ["TILEINFER_SHARED_EXPERT_FOLD"] = "1"
-    qm.process_weights_after_loading(qm, owner.routed_experts)
+    qm.process_weights_after_loading(qm, owner)  # 0.23.0:pwals 以层本体调用
     assert calls == [True]
     assert owner.routed_experts.w13_weight.shape[0] == 9
 

@@ -124,13 +124,21 @@ _OWNER_REGISTRY: dict[int, object] = {}
 
 
 def _wrap_moe_init(orig_init):
-    """登记 AscendFusedMoE 实例与其 routed_experts 的从属关系(权重拼接期查表)。"""
+    """登记 AscendFusedMoE 实例与其权重载体的从属关系(权重拼接期查表)。
+
+    0.23.0 在役结构(E309 审查):AscendFusedMoE(FusedMoE 子类)本体即持有
+    w13_weight/w2_weight/quant_method/_shared_experts,pwals 以 layer=层本体调用;
+    非 0.23.0 分支则经 routed_experts 子模块。两键都登记,查表按 pwals 实参命中。
+    """
 
     def __init__(self, *args, **kwargs):
         orig_init(self, *args, **kwargs)
         try:
+            if getattr(self, "_shared_experts", None) is None:
+                return
+            _OWNER_REGISTRY[id(self)] = self
             routed = getattr(self, "routed_experts", None)
-            if routed is not None and getattr(self, "_shared_experts", None) is not None:
+            if routed is not None:
                 _OWNER_REGISTRY[id(routed)] = self
         except Exception:  # pragma: no cover
             pass
@@ -138,14 +146,48 @@ def _wrap_moe_init(orig_init):
     return __init__
 
 
+def _weight_holder(owner):
+    """0.23.0:层本体持权重;防御式回落 routed_experts 子模块。"""
+    if getattr(owner, "w13_weight", None) is not None:
+        return owner
+    routed = getattr(owner, "routed_experts", None)
+    if routed is not None and getattr(routed, "w13_weight", None) is not None:
+        return routed
+    return None
+
+
+def _bump_dispatcher_expert_num(owner_e: int) -> int:
+    """折叠后 id=E 越界:npu_moe_init_routing(E309 实证)会把越界 token 丢弃
+    (counts sum < rows ⇒ GMM 错乱)。comm 方法单例在层 __init__ 期构造(expert_num
+    按值捕获),PWAL 折叠晚于它 ⇒ 对已构造单例补升 expert_num E→E+1。"""
+    try:
+        from vllm_ascend.ops.fused_moe import moe_comm_method as mcm
+
+        bumped = 0
+        for impl in list(getattr(mcm, "_MoECommMethods", {}).values()):
+            td = getattr(impl, "token_dispatcher", None)
+            if td is None:
+                continue
+            cur = getattr(td, "num_experts_local", None)
+            if isinstance(cur, int) and cur == owner_e:
+                td.num_experts_local = owner_e + 1
+                bumped += 1
+        return bumped
+    except Exception:  # pragma: no cover - 优化不得影响在役路径
+        return 0
+
+
 def _fold_weights(owner) -> bool:
     """load 后、pad/NZ 前把 shared 权重拼进 routed 专家维 + gate 扩列。返回是否成功。"""
     import torch
 
     mlp = owner._shared_experts
-    routed = owner.routed_experts
-    w13 = routed.w13_weight.data
-    w2 = routed.w2_weight.data
+    holder = _weight_holder(owner)
+    if holder is None:
+        _STATS["fold_skipped"] += 1
+        return False
+    w13 = holder.w13_weight.data
+    w2 = holder.w2_weight.data
     if w13.dim() != 3 or w13.shape[0] < 1:
         _STATS["fold_skipped"] += 1
         return False
@@ -164,9 +206,14 @@ def _fold_weights(owner) -> bool:
     except ValueError:
         _STATS["fold_skipped"] += 1
         return False
-    routed.w13_weight = torch.nn.Parameter(new_w13, requires_grad=False)
-    routed.w2_weight = torch.nn.Parameter(new_w2, requires_grad=False)
+    holder.w13_weight = torch.nn.Parameter(new_w13, requires_grad=False)
+    holder.w2_weight = torch.nn.Parameter(new_w2, requires_grad=False)
     owner._tileinfer_fold_expert_id = w13.shape[0]  # 0-based,原 E 即新末位
+    bumped = _bump_dispatcher_expert_num(int(w13.shape[0]))
+    if bumped == 0:
+        # 路由计数未补升 ⇒ 越界 id 必被 init_routing 丢弃(E309),折叠无效即回退
+        _STATS["fold_skipped"] += 1
+        return False
     _STATS["fold_layers"] += 1
     return True
 
