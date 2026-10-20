@@ -35,9 +35,10 @@ from tileinfer.kernels.sampling.fused_sample import fused_sample_tl
 DEV = torch.device("npu", 0)
 torch.npu.set_device(DEV)
 
-# 用小词表跑冒烟(V=16384),真实 248320 只在大 batch 性能测试里用
+# 用小词表跑冒烟(V=16384),真实 248320 只在大 batch 性能测试里用。
+# batch=2 而非 4:编译产物规模与 batch 成正比,4 会 OOM(exit 137)。
 V = 16384
-B = 4
+B = 2
 TOL = 0.0  # greedy 必须逐位
 
 
@@ -59,10 +60,7 @@ def make_inputs(seed=0):
 
 
 def main():
-    print("[fs] 编译内核 ...", flush=True)
-    k_greedy = build(False)
-    k_sample = build(True)
-
+    # 每次只编译一个内核(两份同时驻留会把编译器内存打爆:实测 exit 137 OOM)。
     logits = make_inputs()
     temps = torch.ones(B, dtype=torch.float32, device=DEV)
     ones_p = torch.ones(B, dtype=torch.float32, device=DEV)
@@ -70,6 +68,8 @@ def main():
     seeds = torch.arange(B, dtype=torch.int64, device=DEV)
 
     # ---------- 判据 1:greedy 逐位等价 ----------
+    print("[fs] 编译 greedy 内核 ...", flush=True)
+    k_greedy = build(False)
     got = run(k_greedy, logits, temps, ones_p, zero_k, seeds)
     ref = torch.argmax(logits, dim=-1).to(torch.int32)
     same = torch.equal(got, ref)
@@ -80,6 +80,11 @@ def main():
         for r in diff[:3]:
             print(f"     row {r}: got {got[r].item()} (logit {logits[r, got[r]].item():.4f}) "
                   f"ref {ref[r].item()} (logit {logits[r, ref[r]].item():.4f})", flush=True)
+    del k_greedy
+    torch.npu.empty_cache()
+
+    print("[fs] 编译采样内核 ...", flush=True)
+    k_sample = build(True)
 
     # ---------- 判据 2:top-k 语义 ----------
     for k in (1, 4, 16):

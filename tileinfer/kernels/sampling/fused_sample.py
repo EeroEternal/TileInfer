@@ -157,10 +157,12 @@ def fused_sample_tl(vocab_size: int, batch: int, do_sample: bool, ub_cap: int = 
             bounds_ub = T.alloc_shared((4,), T.float32)  # [0]=lo [1]=hi
             quart_ub = T.alloc_shared((4,), T.float32)  # 三点分位
             sums_ub = T.alloc_shared((4,), T.float32)  # 本轮三点质量
-            cnt_ub = T.alloc_shared((4,), T.int32)  # 本轮三点数量
+            cnt_ub = T.alloc_shared((8,), T.int32)  # [0..2]=累计 [3..5]=本次中转
             tgt_ub = T.alloc_shared((4,), T.float32)  # [0]=质量目标 [1]=数量目标
             pick_ub = T.alloc_shared((4,), T.int32)
             done_ub = T.alloc_shared((4,), T.int32)
+            # 向量归约中转(SIMD 块只写这里,标量块从这里读,避免块内自读写竞争)
+            red_ub = T.alloc_shared((4,), T.float32)
 
             # ---------- 阶段 1:inv_t 与 row_max ----------
             with T.SimtVF(threads=1):
@@ -168,21 +170,26 @@ def fused_sample_tl(vocab_size: int, batch: int, do_sample: bool, ub_cap: int = 
                 st_ub[1] = T.float32(-1e38)
             for c in T.serial(n_chunks):
                 T.copy(logits[row, c * blk : (c + 1) * blk], vals_ub)
-                # 归约状态用 `alloc_local` 的可变 SIMD 寄存器(`MODE_MERGING` 的硬要求,
-                # 见编译器报错:"requires assignment to a mutable SIMD register")
+                # 归约状态用 `alloc_local` 的可变 SIMD 寄存器(`MODE_MERGING` 的硬要求)。
+                # 关键:本 SIMD 块**只读全局量、只写 red_ub**,不在块内读写 st_ub 自身
+                # —— 同一块内 `vld(st_ub)` + `vsts(st_ub)` 会让编译器把 barrier 提到
+                # 分支外,产生竞争(实测 device error 507035)。
                 with T.SimdVF():
                     full = T.simd.pset(32)
                     one = T.simd.pset(32, "PAT_VL1")
                     inv = T.simd.vld(st_ub[0], "BRC_B32")
                     acc = T.simd.alloc_local((1,), T.float32)
-                    acc[0] = T.simd.vld(st_ub[1], "BRC_B32")
+                    acc[0] = T.simd.vdup(-1e38, T.float32, full)
                     for g in T.serial(n_vec):
                         acc[0] = T.simd.vmax(
                             acc[0],
                             T.simd.vcmax(T.simd.vmul(T.simd.vld(vals_ub[g * _VL]), inv), full),
                             full,
                         )
-                    T.simd.vsts(st_ub[1], acc[0], one, "ONEPT_B32")
+                    T.simd.vsts(red_ub[0], acc[0], one, "ONEPT_B32")
+                # 标量域跨 chunk 合并
+                with T.SimtVF(threads=1):
+                    st_ub[1] = T.max(st_ub[1], red_ub[0])
 
             # ---------- 阶段 2:total = Σ e ----------
             with T.SimtVF(threads=1):
@@ -195,7 +202,7 @@ def fused_sample_tl(vocab_size: int, batch: int, do_sample: bool, ub_cap: int = 
                     inv = T.simd.vld(st_ub[0], "BRC_B32")
                     mx = T.simd.vld(st_ub[1], "BRC_B32")
                     acc = T.simd.alloc_local((1,), T.float32)
-                    acc[0] = T.simd.vld(st_ub[2], "BRC_B32")
+                    acc[0] = T.simd.vdup(0.0, T.float32, full)
                     for g in T.serial(n_vec):
                         acc[0] = T.simd.vadd(
                             acc[0],
@@ -204,7 +211,9 @@ def fused_sample_tl(vocab_size: int, batch: int, do_sample: bool, ub_cap: int = 
                             ),
                             full,
                         )
-                    T.simd.vsts(st_ub[2], acc[0], one, "ONEPT_B32")
+                    T.simd.vsts(red_ub[0], acc[0], one, "ONEPT_B32")
+                with T.SimtVF(threads=1):
+                    st_ub[2] = st_ub[2] + red_ub[0]
 
             # ---------- 阶段 3:三分位二分搜索阈值(exp 空间) ----------
             with T.SimtVF(threads=1):
@@ -249,6 +258,8 @@ def fused_sample_tl(vocab_size: int, batch: int, do_sample: bool, ub_cap: int = 
 
                 for c in T.serial(n_chunks):
                     T.copy(logits[row, c * blk : (c + 1) * blk], vals_ub)
+                    # 块内只读全局量(sum/quart)与本 chunk 数据,只写中转 red_ub;
+                    # 累加在随后的标量块里做(避免块内对 sums_ub 自读写)。
                     with T.SimdVF():
                         full = T.simd.pset(32)
                         one = T.simd.pset(32, "PAT_VL1")
@@ -263,12 +274,12 @@ def fused_sample_tl(vocab_size: int, batch: int, do_sample: bool, ub_cap: int = 
                         n0 = T.simd.alloc_local((1,), T.int32)
                         n1 = T.simd.alloc_local((1,), T.int32)
                         n2 = T.simd.alloc_local((1,), T.int32)
-                        a0[0] = T.simd.vld(sums_ub[0], "BRC_B32")
-                        a1[0] = T.simd.vld(sums_ub[1], "BRC_B32")
-                        a2[0] = T.simd.vld(sums_ub[2], "BRC_B32")
-                        n0[0] = T.simd.vld(cnt_ub[0], "BRC_B32")
-                        n1[0] = T.simd.vld(cnt_ub[1], "BRC_B32")
-                        n2[0] = T.simd.vld(cnt_ub[2], "BRC_B32")
+                        a0[0] = T.simd.vdup(0.0, T.float32, full)
+                        a1[0] = T.simd.vdup(0.0, T.float32, full)
+                        a2[0] = T.simd.vdup(0.0, T.float32, full)
+                        n0[0] = T.simd.vdup(0, T.int32, full)
+                        n1[0] = T.simd.vdup(0, T.int32, full)
+                        n2[0] = T.simd.vdup(0, T.int32, full)
                         onei = T.simd.vdup(1, T.int32, full)
                         for g in T.serial(n_vec):
                             e = T.simd.vexp(
@@ -283,12 +294,29 @@ def fused_sample_tl(vocab_size: int, batch: int, do_sample: bool, ub_cap: int = 
                             n0[0] = T.simd.vadd(n0[0], onei, h0, "MODE_MERGING")
                             n1[0] = T.simd.vadd(n1[0], onei, h1, "MODE_MERGING")
                             n2[0] = T.simd.vadd(n2[0], onei, h2, "MODE_MERGING")
-                        T.simd.vsts(sums_ub[0], a0[0], one, "ONEPT_B32")
-                        T.simd.vsts(sums_ub[1], a1[0], one, "ONEPT_B32")
-                        T.simd.vsts(sums_ub[2], a2[0], one, "ONEPT_B32")
-                        T.simd.vsts(cnt_ub[0], n0[0])
-                        T.simd.vsts(cnt_ub[1], n1[0])
-                        T.simd.vsts(cnt_ub[2], n2[0])
+                        T.simd.vsts(red_ub[0], a0[0], one, "ONEPT_B32")
+                        T.simd.vsts(red_ub[1], a1[0], one, "ONEPT_B32")
+                        T.simd.vsts(red_ub[2], a2[0], one, "ONEPT_B32")
+                        # 三个数量归约:统一落在 cnt_ub[3..5] 作中转(下一标量块读走)
+                        T.simd.vsts(
+                            cnt_ub[3],
+                            T.simd.vcvt(T.simd.vcadd(n0[0], full), T.int32, full, round="ROUND_Z"),
+                        )
+                        T.simd.vsts(
+                            cnt_ub[4],
+                            T.simd.vcvt(T.simd.vcadd(n1[0], full), T.int32, full, round="ROUND_Z"),
+                        )
+                        T.simd.vsts(
+                            cnt_ub[5],
+                            T.simd.vcvt(T.simd.vcadd(n2[0], full), T.int32, full, round="ROUND_Z"),
+                        )
+                    with T.SimtVF(threads=1):
+                        sums_ub[0] = sums_ub[0] + red_ub[0]
+                        sums_ub[1] = sums_ub[1] + red_ub[1]
+                        sums_ub[2] = sums_ub[2] + red_ub[2]
+                        cnt_ub[0] = cnt_ub[0] + cnt_ub[3]
+                        cnt_ub[1] = cnt_ub[1] + cnt_ub[4]
+                        cnt_ub[2] = cnt_ub[2] + cnt_ub[5]
 
                 # 收窄:取最大的仍满足 (质量目标 且 数量目标) 的分位点
                 with T.SimtVF(threads=1):
@@ -316,7 +344,7 @@ def fused_sample_tl(vocab_size: int, batch: int, do_sample: bool, ub_cap: int = 
                     mx = T.simd.vld(st_ub[1], "BRC_B32")
                     thr = T.simd.vld(bounds_ub[0], "BRC_B32")
                     acc = T.simd.alloc_local((1,), T.float32)
-                    acc[0] = T.simd.vld(st_ub[3], "BRC_B32")
+                    acc[0] = T.simd.vdup(0.0, T.float32, full)
                     for g in T.serial(n_vec):
                         e = T.simd.vexp(
                             T.simd.vsub(T.simd.vmul(T.simd.vld(vals_ub[g * _VL]), inv), mx)
@@ -324,70 +352,127 @@ def fused_sample_tl(vocab_size: int, batch: int, do_sample: bool, ub_cap: int = 
                         acc[0] = T.simd.vadd(
                             acc[0], e, T.simd.vcmp(e, thr, full, "ge"), "MODE_MERGING"
                         )
-                    T.simd.vsts(st_ub[3], acc[0], one, "ONEPT_B32")
+                    T.simd.vsts(red_ub[0], acc[0], one, "ONEPT_B32")
+                with T.SimtVF(threads=1):
+                    st_ub[3] = st_ub[3] + red_ub[0]
 
-            # ---------- 阶段 4b:选择 ----------
-            with T.SimtVF(threads=1):
-                st_ub[4] = T.float32(0.0)
-                st_ub[5] = T.float32(-1e38)
-                pick_ub[0] = 0
-                done_ub[0] = 0
-                if do_sample:
-                    T.rng_init(seed[row], 0)
-                    st_ub[6] = T.cast(T.rng_rand(), T.float32) / T.float32(4294967296.0) * st_ub[3]
-                else:
-                    st_ub[6] = T.float32(0.0)
-
-            for c in T.serial(n_chunks):
-                T.copy(logits[row, c * blk : (c + 1) * blk], vals_ub)
-                for g in T.serial(n_vec):
-                    # 该向量的 e(未命中置 0)写回 UB,并取 (和, 最大) 两个归约到 shared
+            # ---------- 阶段 4b:选择(greedy) ----------
+            # **必须无分支**:编译器会在 `if` 分支内读到 shared 时把 barrier 提到分支外
+            # (`[ThreadSync] Hoisting sync out of an if ... the race remains`),
+            # 导致数据竞争 → `device error type 3 / 507035`(2026-10-20 实测)。
+            # 因此:用一个"已确定"哨兵做掩码,全程 T.Select / SIMD 归约,不写 if。
+            if not do_sample:
+                with T.SimtVF(threads=1):
+                    st_ub[5] = T.float32(-1e38)  # best e
+                    pick_ub[0] = 0
+                for c in T.serial(n_chunks):
+                    T.copy(logits[row, c * blk : (c + 1) * blk], vals_ub)
                     with T.SimdVF():
                         full = T.simd.pset(32)
                         one = T.simd.pset(32, "PAT_VL1")
                         inv = T.simd.vld(st_ub[0], "BRC_B32")
                         mx = T.simd.vld(st_ub[1], "BRC_B32")
                         thr = T.simd.vld(bounds_ub[0], "BRC_B32")
-                        e = T.simd.vexp(
-                            T.simd.vsub(T.simd.vmul(T.simd.vld(vals_ub[g * _VL]), inv), mx)
-                        )
-                        hit = T.simd.vcmp(e, thr, full, "ge")
-                        em = T.simd.vsel(e, T.simd.vdup(0.0, T.float32, full), hit)
-                        T.simd.vsts(vals_ub[g * _VL], em)
-                        T.simd.vsts(
-                            sums_ub[0],
-                            T.simd.vdupv(T.simd.vcadd(em, full), full, "POS_LOWEST"),
-                            one,
-                            "ONEPT_B32",
-                        )
-                        T.simd.vsts(
-                            sums_ub[1],
-                            T.simd.vdupv(T.simd.vcmax(em, full), full, "POS_LOWEST"),
-                            one,
-                            "ONEPT_B32",
-                        )
+                        best = T.simd.alloc_local((1,), T.float32)
+                        best[0] = T.simd.vdup(-1e38, T.float32, full)
+                        # 逐向量:未命中置 -inf,取本块最大
+                        for g in T.serial(n_vec):
+                            e = T.simd.vexp(
+                                T.simd.vsub(T.simd.vmul(T.simd.vld(vals_ub[g * _VL]), inv), mx)
+                            )
+                            hit = T.simd.vcmp(e, thr, full, "ge")
+                            em = T.simd.vsel(e, T.simd.vdup(-1e38, T.float32, full), hit)
+                            T.simd.vsts(vals_ub[g * _VL], em)
+                            best[0] = T.simd.vmax(best[0], em, full)
+                        T.simd.vsts(red_ub[0], best[0], one, "ONEPT_B32")
                     with T.SimtVF(threads=1):
-                        if done_ub[0] == 0:
-                            if do_sample:
-                                if st_ub[4] + sums_ub[0] < st_ub[6]:
-                                    # 目标不在本向量:整段跳过(一次标量加法)
-                                    st_ub[4] = st_ub[4] + sums_ub[0]
-                                else:
-                                    # 目标在本向量内:逐 lane 扫 64 次
-                                    for lane in T.serial(_VL):
-                                        if done_ub[0] == 0:
-                                            st_ub[4] = st_ub[4] + vals_ub[g * _VL + lane]
-                                            if st_ub[4] >= st_ub[6]:
-                                                pick_ub[0] = c * blk + g * _VL + lane
-                                                done_ub[0] = 1
-                            else:
-                                # 贪心:取最大 e;同值取最小 token id(与原生 argmax 一致)
-                                if sums_ub[1] > st_ub[5]:
-                                    for lane in T.serial(_VL):
-                                        if vals_ub[g * _VL + lane] == sums_ub[1]:
-                                            st_ub[5] = sums_ub[1]
-                                            pick_ub[0] = c * blk + g * _VL + lane
-                                            break
+                        st_ub[5] = T.max(st_ub[5], red_ub[0])
+                # 第二遍:找第一个等于 best 的位置(同值取最小 token id)
+                with T.SimtVF(threads=1):
+                    done_ub[0] = 0
+                for c in T.serial(n_chunks):
+                    T.copy(logits[row, c * blk : (c + 1) * blk], vals_ub)
+                    with T.SimdVF():
+                        full = T.simd.pset(32)
+                        one = T.simd.pset(32, "PAT_VL1")
+                        inv = T.simd.vld(st_ub[0], "BRC_B32")
+                        mx = T.simd.vld(st_ub[1], "BRC_B32")
+                        thr = T.simd.vld(bounds_ub[0], "BRC_B32")
+                        bestv = T.simd.vld(st_ub[5], "BRC_B32")
+                        for g in T.serial(n_vec):
+                            e = T.simd.vexp(
+                                T.simd.vsub(T.simd.vmul(T.simd.vld(vals_ub[g * _VL]), inv), mx)
+                            )
+                            hit = T.simd.vcmp(e, thr, full, "ge")
+                            em = T.simd.vsel(e, T.simd.vdup(-1e38, T.float32, full), hit)
+                            T.simd.vsts(vals_ub[g * _VL], em)
+                    # 后处理:逐 lane 找匹配(此处在 SimtVF 内、不跨 SIMD 块读 shared)
+                    for g in T.serial(n_vec):
+                        with T.SimtVF(threads=1):
+                            for lane in T.serial(_VL):
+                                idx = c * blk + g * _VL + lane
+                                match = T.min(
+                                    done_ub[0] == 0,
+                                    vals_ub[g * _VL + lane] == st_ub[5],
+                                )
+                                pick_ub[0] = T.Select(match, idx, pick_ub[0])
+                                done_ub[0] = T.Select(match, 1, done_ub[0])
+
+            # ---------- 阶段 4c:选择(采样,逆 CDF) ----------
+            else:
+                # 同样的无分支纪律:把"是否命中"折叠成掩码布尔,不用 if 包 shared 读写。
+                with T.SimtVF(threads=1):
+                    T.rng_init(seed[row], 0)
+                    st_ub[6] = (
+                        T.cast(T.rng_rand(), T.float32)
+                        / T.float32(4294967296.0)
+                        * st_ub[3]
+                    )
+                    st_ub[4] = T.float32(0.0)  # run
+                    pick_ub[0] = 0
+                    done_ub[0] = 0
+                for c in T.serial(n_chunks):
+                    T.copy(logits[row, c * blk : (c + 1) * blk], vals_ub)
+                    for g in T.serial(n_vec):
+                        # 先算本向量的 e(未命中置 0)与向量和
+                        with T.SimdVF():
+                            full = T.simd.pset(32)
+                            one = T.simd.pset(32, "PAT_VL1")
+                            inv = T.simd.vld(st_ub[0], "BRC_B32")
+                            mx = T.simd.vld(st_ub[1], "BRC_B32")
+                            thr = T.simd.vld(bounds_ub[0], "BRC_B32")
+                            e = T.simd.vexp(
+                                T.simd.vsub(T.simd.vmul(T.simd.vld(vals_ub[g * _VL]), inv), mx)
+                            )
+                            hit = T.simd.vcmp(e, thr, full, "ge")
+                            em = T.simd.vsel(e, T.simd.vdup(0.0, T.float32, full), hit)
+                            T.simd.vsts(vals_ub[g * _VL], em)
+                            T.simd.vsts(
+                                red_ub[0],
+                                T.simd.vdupv(T.simd.vcadd(em, full), full, "POS_LOWEST"),
+                                one,
+                                "ONEPT_B32",
+                            )
+                        # 纯 Select 逻辑:不写 if,避免 barrier 提升
+                        with T.SimtVF(threads=1):
+                            ends = st_ub[4] + red_ub[0] >= st_ub[6]  # 目标落在本向量
+                            live = T.min(done_ub[0] == 0, ends)
+                            # 目标不在本向量:累加后继续
+                            st_ub[4] = T.Select(live, st_ub[4], st_ub[4] + red_ub[0])
+                            # 目标在本向量:逐 lane 找第一个跨过目标的位置
+                            for lane in T.serial(_VL):
+                                idx = c * blk + g * _VL + lane
+                                nxt = T.Select(
+                                    T.min(done_ub[0] == 0, live),
+                                    st_ub[4] + vals_ub[g * _VL + lane],
+                                    st_ub[4],
+                                )
+                                crossed = T.min(
+                                    done_ub[0] == 0, T.min(live, nxt >= st_ub[6])
+                                )
+                                pick_ub[0] = T.Select(crossed, idx, pick_ub[0])
+                                done_ub[0] = T.Select(crossed, 1, done_ub[0])
+                                st_ub[4] = T.Select(T.min(done_ub[0] == 0, live), nxt, st_ub[4])
 
             with T.SimtVF(threads=1):
                 out_tokens[row] = pick_ub[0]
