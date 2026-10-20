@@ -627,6 +627,8 @@ def paged_decode_split(
         page_starts: T.Tensor((num_tiles,), "int32"),
         page_lens: T.Tensor((num_tiles,), "int32"),
         tile_slots: T.Tensor((num_tiles,), "int32"),
+        token_starts: T.Tensor((num_tiles,), "int32"),
+        token_lens: T.Tensor((num_tiles,), "int32"),
         PartOut: T.Tensor((num_slots * kv_heads, BR, dim), dtype),
         PartLse: T.Tensor((num_slots * kv_heads * BR,), accum),
     ):
@@ -637,6 +639,11 @@ def paged_decode_split(
             start = page_starts[tile]
             plen = page_lens[tile]
             req_pages = kv_indptr[b + 1] - kv_indptr[b]
+            # H67 token 级切分:``token_starts/token_lens`` 只对**首尾两个 split** 非平凡。
+            # 页内偏移让同一页可以被多个 split 分摊——短上下文(1 页)因此也能切出
+            # 多个 tile,把 grid 从 2 blocks 提到可用核数量级。
+            tok_start = token_starts[tile]
+            tok_len = token_lens[tile]
             # One *full* plan serves any page-count distribution (graph capture pins the plan
             # while replay-time sequences grow): clamp this tile's page loop to the pages that
             # actually exist.  An emptied tile (start >= req_pages) skips the loop entirely and
@@ -702,9 +709,23 @@ def paged_decode_split(
                     T.gemm(qk_a, qk_b, qk_acc, transpose_B=True)
                 T.dual_copy(qk_acc, s_ub)
 
+                # H67:本 split 在**首页**可能从 tok_start 开始、在**尾页**可能提前结束。
+                # 两者都由 token_starts/token_lens 决定,只对本 tile 覆盖的边界页生效:
+                #   - 首页:p == 0 且 tok_start > 0 → 前面的 token 置 -1e30;
+                #   - 尾页:p == plen-1 且 tok_start+tok_len < 该页有效长度 → 后面置 -1e30。
+                # 页内 token 索引 c 的全局偏移是 start*BC + p*BC + c。
+                # 对未做 token 级切分的 tile(tok_start=0 且 tok_len 覆盖整段),
+                # 下面的下界恒为 0、上界恒为 BC,与旧行为逐位一致。
                 # only the request's *last* page can be partially filled, wherever the split puts it
                 if _simd_softmax_enabled():
                     limit = T.if_then_else(start + p + 1 < req_pages, BC, ll_ub[0])
+                    # token 窗口换算到本页内的 [lo, hi) 区间
+                    base = (start + p) * BC
+                    lo = tok_start - base
+                    lo = T.if_then_else(lo > 0, lo, 0)
+                    hi = tok_start + tok_len - base
+                    hi = T.if_then_else(hi < limit, hi, limit)
+                    hi = T.if_then_else(hi < 0, 0, hi)
                     with T.SimdVF():
                         for r in T.serial(ROWS):
                             idx0 = T.simd.vci(0, "int32", order="INC_ORDER")
@@ -713,8 +734,14 @@ def paged_decode_split(
                             a0 = T.simd.vmul(T.simd.vld(s_ub[r, 0], dist="NORM"), sc)
                             a1 = T.simd.vmul(T.simd.vld(s_ub[r, 64], dist="NORM"), sc)
                             neg = T.simd.vdup(T.float32(-1e30), "float32")
+                            # H67 token 窗口(仅 split 内核):lo 屏蔽本 split 之前的 token;上界取
+                            # min(limit, hi)。无 token 切分时 lo=0、hi=BC,与旧行为逐位一致。
+                            a0 = T.simd.vsel(a0, neg, T.simd.vcmps(idx0, lo, op="ge"))
+                            a1 = T.simd.vsel(a1, neg, T.simd.vcmps(idx1, lo, op="ge"))
                             a0 = T.simd.vsel(a0, neg, T.simd.vcmps(idx0, limit, op="lt"))
                             a1 = T.simd.vsel(a1, neg, T.simd.vcmps(idx1, limit, op="lt"))
+                            a0 = T.simd.vsel(a0, neg, T.simd.vcmps(idx0, hi, op="lt"))
+                            a1 = T.simd.vsel(a1, neg, T.simd.vcmps(idx1, hi, op="lt"))
                             pm = T.simd.vdupv(T.simd.vld(m_ub[r], dist="BRC_B32"), pos="POS_LOWEST")
                             nm = T.simd.vmax(pm, T.simd.vmax(T.simd.vcmax(a0), T.simd.vcmax(a1)))
                             nml = T.simd.vdupv(nm, pos="POS_LOWEST")
@@ -2232,6 +2259,13 @@ def forward_split(
             )
 
     _hook("before split")
+    # H67:token 级窗口。未启用时传全 0 起点 + 全量长度,内核走与原版逐位一致的路径。
+    if getattr(schedule, "token_split", False) and schedule.token_starts is not None:
+        tok_starts = schedule.token_starts.to(torch.int32)
+        tok_lens = schedule.token_lens.to(torch.int32)
+    else:
+        tok_starts = torch.zeros(num_tiles, dtype=torch.int32, device=q_pad.device)
+        tok_lens = schedule.kv_page_lens.to(torch.int32) * page_size
     split(
         q_pad,
         pool_view(k_cache, cap),
@@ -2243,6 +2277,8 @@ def forward_split(
         schedule.kv_page_starts.to(torch.int32),
         schedule.kv_page_lens.to(torch.int32),
         tile_slots,
+        tok_starts,
+        tok_lens,
         part_out,
         part_lse,
     )

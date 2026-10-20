@@ -34,6 +34,7 @@ __all__ = [
     "WorkspaceManager",
     "plan_query_tiles",
     "plan_decode_tiles",
+    "plan_decode_tiles_token_split",
     "lpt_order",
 ]
 
@@ -61,6 +62,13 @@ class TileSchedule:
     kv_page_lens: torch.Tensor  # [num_tiles] int32
     split_ids: torch.Tensor  # [num_tiles] int32
     split_counts: torch.Tensor  # [num_tiles] int32
+    #: H67 token 级窗口:本 tile 在请求内覆盖的 token 区间 [start, start+len)。
+    #: 仅当 ``token_split=True`` 时非平凡;否则恒为 ``(0, 全量)``,内核行为与旧版逐位一致。
+    #: 它让**同一 KV 页**可以被多个 tile 分摊——短上下文(1 页)因此也能切开,
+    #: 从而把 grid 从 ``batch × kv_heads`` 提到可用核数量级。
+    token_starts: Optional[torch.Tensor] = None  # [num_tiles] int32
+    token_lens: Optional[torch.Tensor] = None  # [num_tiles] int32
+    token_split: bool = False
     order: Optional[torch.Tensor] = None  # [num_tiles] int32, LPT dispatch order
     balanced: bool = False
 
@@ -273,6 +281,97 @@ def plan_query_tiles_from_host(
         kv_page_lens=torch.tensor(kv_lens, dtype=torch.int32, device=device),
         split_ids=torch.tensor(split_ids, dtype=torch.int32, device=device),
         split_counts=torch.tensor(split_counts, dtype=torch.int32, device=device),
+        balanced=load_balance,
+    )
+    schedule.order = lpt_order(schedule.work) if load_balance else torch.arange(
+        schedule.num_tiles, dtype=torch.int32, device=device
+    )
+    return schedule
+
+
+def plan_decode_tiles_token_split(
+    qo_lens: List[int],
+    seq_lens: List[int],
+    page_counts: List[int],
+    *,
+    device: torch.device,
+    group: int,
+    page_size: int,
+    tokens_per_split: int,
+    block_q: int = 128,
+    load_balance: bool = True,
+) -> TileSchedule:
+    """H67:与 :func:`plan_query_tiles` 同语义,但 split 粒度是 **token** 而非 KV 页。
+
+    动机(E291):decode split-KV 以页为单位切分,短上下文(1 页)永远只有 1 个 split,
+    grid 只剩 ``batch × kv_heads``(c1 = 2 blocks),并行度严重不足。本函数让同一页
+    可以被多个 tile 分摊——把一段 KV 按 ``tokens_per_split`` 个 token 切块,每块
+    记录 ``token_start/token_len`` 交给内核做页内窗口裁剪。
+
+    与页级切分的关系:
+      - ``tokens_per_split >= page_size`` 时行为与页级切分**完全一致**(此时 token 窗口
+        恰好对齐页边界,可用来做等价性回归);
+      - 更小的值才会让同一页被多个 tile 覆盖。
+
+    ``seq_lens`` 是该请求的**总 KV token 数**(不是 qo_len);causal mask 由内核对
+    每行单独应用,这里只按"可参与的 KV 范围"切块。为了让 GV 与页级版本可对照,
+    ``kv_page_starts/kv_page_lens`` 仍按这些 token 覆盖的页范围填写。
+    """
+    if tokens_per_split <= 0:
+        raise ValueError("tokens_per_split must be > 0")
+
+    seq_ids: List[int] = []
+    q_offsets: List[int] = []
+    q_lens: List[int] = []
+    kv_starts: List[int] = []
+    kv_lens: List[int] = []
+    split_ids: List[int] = []
+    split_counts: List[int] = []
+    tok_starts: List[int] = []
+    tok_lens: List[int] = []
+
+    for b, q_len in enumerate(qo_lens):
+        total = seq_lens[b] if b < len(seq_lens) else 0
+        pages = page_counts[b] if b < len(page_counts) else 0
+        if q_len <= 0 or total <= 0:
+            continue
+
+        # 按 token 切块;最后一块可能不满
+        chunks: List[tuple[int, int]] = []
+        for t0 in range(0, total, tokens_per_split):
+            chunks.append((t0, min(tokens_per_split, total - t0)))
+
+        for q_start in range(0, q_len, block_q):
+            for sid, (t0, tlen) in enumerate(chunks):
+                # 该 token 段覆盖的页范围
+                p0 = t0 // page_size
+                p1 = (t0 + tlen - 1) // page_size
+                p0 = min(p0, max(0, pages - 1))
+                plen = min(p1 - p0 + 1, max(0, pages - p0))
+                seq_ids.append(b)
+                q_offsets.append(q_start)
+                q_lens.append(min(block_q, q_len - q_start))
+                kv_starts.append(p0)
+                kv_lens.append(plen)
+                tok_starts.append(t0)
+                tok_lens.append(tlen)
+                split_ids.append(sid)
+                split_counts.append(len(chunks))
+
+    if not seq_ids:
+        return _empty_schedule(device)
+
+    schedule = TileSchedule(
+        seq_ids=torch.tensor(seq_ids, dtype=torch.int32, device=device),
+        q_offsets=torch.tensor(q_offsets, dtype=torch.int32, device=device),
+        q_lens=torch.tensor(q_lens, dtype=torch.int32, device=device),
+        kv_page_starts=torch.tensor(kv_starts, dtype=torch.int32, device=device),
+        kv_page_lens=torch.tensor(kv_lens, dtype=torch.int32, device=device),
+        split_ids=torch.tensor(split_ids, dtype=torch.int32, device=device),
+        split_counts=torch.tensor(split_counts, dtype=torch.int32, device=device),
+        token_starts=torch.tensor(tok_starts, dtype=torch.int32, device=device),
+        token_lens=torch.tensor(tok_lens, dtype=torch.int32, device=device),
+        token_split=True,
         balanced=load_balance,
     )
     schedule.order = lpt_order(schedule.work) if load_balance else torch.arange(
