@@ -19,7 +19,7 @@ def test_plan_real_vocab():
     """真实词表(V=248320)的分块必须能整除、且不超 UB 上限。"""
     p = fs.fused_sample_plan(248320, 8)
     assert 248320 % p["blk"] == 0
-    assert p["blk"] <= 16384
+    assert p["blk"] <= 8192
     assert p["blk"] % 64 == 0
     assert p["n_chunks"] == 248320 // p["blk"]
     assert p["n_vec"] == p["blk"] // 64
@@ -61,10 +61,13 @@ def test_plan_small_ub_cap_falls_back_to_64():
 
 def test_block_size_prefers_largest_divisor():
     """应尽量选大块(减少扫描轮数),而非随便一个小块。"""
-    assert fs._block_size(16384, 16384) == 16384
-    # 248320 = 12416 × 20;12416 是从 16384 往下递减 64 找到的第一个因子
-    assert fs._block_size(248320, 16384) == 12416
-    assert 248320 % 12416 == 0
+    assert fs._block_size(8192, 8192) == 8192
+    blk = fs._block_size(248320, 8192)
+    assert blk <= 8192 and blk % 64 == 0
+    assert 248320 % blk == 0
+    # 从 cap 往下搜的第一个因子(不能再大)
+    assert blk + 64 > 8192 or 248320 % (blk + 64) != 0
+    assert blk == 6208  # 248320 = 6208 × 40
 
 
 # ---------------------------------------------------------------- 常量

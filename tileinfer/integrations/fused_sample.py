@@ -98,8 +98,11 @@ def _has_real_sampling(md: Any) -> bool:
         if top_p is not None and bool((top_p < 1.0).any().item()):
             return True
         if top_k is not None:
+            # vLLM 语义:`top_k <= 0` 表示**不启用**,不是"取前 0 个"。
+            # (写成 `>= 0` 会把 top_k=0 误判为启用,导致全 greedy 批次被本内核
+            # 抢走,而那种场景 H36 更轻。)
             vocab = getattr(md, "vocab_size", 1 << 30)
-            if bool(((top_k >= 0) & (top_k < vocab)).any().item()):
+            if bool(((top_k > 0) & (top_k < vocab)).any().item()):
                 return True
         return False
     except Exception:  # noqa: BLE001

@@ -93,8 +93,14 @@ def _block_size(vocab_size: int, cap: int) -> int:
     return _VL
 
 
-def fused_sample_plan(vocab_size: int, batch: int, ub_cap: int = 16384) -> dict:
-    """分块规划(纯 host 算术,便于单测覆盖,不需要设备)。"""
+def fused_sample_plan(vocab_size: int, batch: int, ub_cap: int = 8192) -> dict:
+    """分块规划(纯 host 算术,便于单测覆盖,不需要设备)。
+
+    `ub_cap` 默认 **8192** 而不是 16384:16384 个 float32 = 64KB,会把 Ascend 的
+    UB 占满,再叠加 `st_ub`/`bounds_ub`/`quart_ub`/`sums_ub`/`cnt_ub`/`tgt_ub`
+    等标量缓冲后越界,运行时表现为 `device error type 3 / 507035`(2026-10-20 实测)。
+    8192(32KB)留出一半余量。
+    """
     if vocab_size < _VL or vocab_size % _VL != 0:
         raise ValueError(
             f"fused_sample 要求 vocab_size 必须是 {_VL} 的正整数倍,got {vocab_size}"
@@ -110,7 +116,7 @@ def fused_sample_plan(vocab_size: int, batch: int, ub_cap: int = 16384) -> dict:
     }
 
 
-def fused_sample_tl(vocab_size: int, batch: int, do_sample: bool, ub_cap: int = 16384):
+def fused_sample_tl(vocab_size: int, batch: int, do_sample: bool, ub_cap: int = 8192):
     """构建融合采样内核。
 
     参数
@@ -205,7 +211,7 @@ def fused_sample_tl(vocab_size: int, batch: int, do_sample: bool, ub_cap: int = 
                 tgt_ub[0] = T.max(T.float32(_MIN_PROB), top_p[row]) * st_ub[2]
                 tgt_ub[1] = T.cast(
                     T.Select(
-                        T.min(top_k[row] >= 0, top_k[row] < vocab_size),
+                        T.min(top_k[row] > 0, top_k[row] < vocab_size),
                         T.max(1, top_k[row]),
                         vocab_size,
                     ),

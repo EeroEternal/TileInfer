@@ -2027,10 +2027,99 @@ DeepInfer 用 `get_kv_index` 这类 Persistent 内核替换 Python 侧页表展�
 
 ### 未实现(留给后续,按价值排序)
 
-- `fused_sample.py` 的**单核融合采样**(temp+softmax+top-p/k+采样):对应 H36 的升级,
-  价值最高,但工作量也最大(673 行)。
 - `load_paged_kv_cache.py` 的 KV 量化路径:暂不需要(当前 bf16)。
 - `swa_index.py` 的 SIMD 写法:仅作参考。
+
+---
+
+## H76 fused_sample 移植(2026-10-20):它是什么
+
+上一节的第 ③ 项现在实现了。这一节解释它**到底在做什么**,以及为什么值得做。
+
+### 原生路径在做什么(vLLM Ascend 采样)
+
+```
+probs = softmax(logits)           # ① 全词表 float32 物料化, V≈248K
+sorted_probs, idx = probs.sort()  # ② O(V log V) 全量排序
+cumsum(sorted_probs)              # ③ 前缀和找 top-p 截断点
+sorted_probs[k-1]                 # ④ 第 k 大作 top-k 阈值
+multinomial(probs)                # ⑤ 再抽一次随机数
+```
+
+每一步都要把 248K 个 float32 在 HBM ↔ UB 之间搬一遍。**②的排序是最贵的**,
+但它的产出其实只有一个**标量阈值**——排在后面的顺序没人用。
+
+### DeepInfer 的做法:不排序,直接二分出那个阈值
+
+关键洞察:**top-p 和 top-k 都只是「按概率值切一刀」**。既然只要阈值,就不需要
+有序排列。
+
+于是它在值域上二分:
+
+```
+每轮: 取 [lo, hi] 的 1/4、1/2、3/4 三个点 (q0, q1, q2)
+       扫一遍全词表,同时统计三组:
+         (prob >= q0 的质量和, 数量)
+         (prob >= q1 的质量和, 数量)
+         (prob >= q2 的质量和, 数量)
+       根据结果把区间缩到 1/4
+16 轮 ≈ 4^-16 ≈ 2.3e-10 精度
+```
+
+**一轮扫描同时测三个点**,所以 16 轮只需要 16 遍扫描,却把区间缩小到 1/4^16。
+这比排序的 O(V log V) ≈ 248K × 18 ≈ 450 万次比较要省得多——虽然扫描多遍,
+但每遍是纯 SIMD 比较(64 lane 并行),没有排序的随机访存。
+
+还有一个坑:**阈值附近的同值项**。多个 token 概率完全相同时,top-p 的"切在
+哪里"会影响保留质量。DeepInfer 用「边界同值项配额 + 前缀扫描」精确控制保留
+几个。我们的移植用了更保守的策略(见下)。
+
+### 我们的移植:在 exp 空间搜索 + 简化同值处理
+
+**① 在 exp 空间搜索,省掉 248K 次除法。**
+
+令 `e_i = exp(x_i/temp − max)`,则 `p_i = e_i / total`。比较 `p_i >= q` 等价于
+`e_i >= q·total`。于是搜索区间固定为 `[MIN_PROB, 1.0]`,top-p 目标质量写成
+`top_p · total`——**全程零除法**。
+
+**② 累积用 `alloc_local` 可变寄存器。**
+
+tilelang 0.1.15 的两条硬约束(都是编译错误逼出来的):
+- `MODE_MERGING` 必须赋给可变 SIMD 寄存器(`alloc_local`),不能直接当 `vsts` 参数;
+- 向量不能在 `T.serial` 迭代间自赋值(`Immutable variable ... used outside its
+  defining region`)。
+
+**③ 选择阶段按向量归约 + 单向量内标量尾扫。**
+
+不做全词表标量循环(248K 次串行不可用):每 64-lane 向量先 `vcadd` 求和,
+目标不在本向量就整段跳过(一次标量加法);只有目标所在向量才逐 lane 扫 64 次。
+
+### 与 H36 的关系(互补,不是替代)
+
+| | H36(`greedy.py`) | H76(`fused_sample`) |
+|---|---|---|
+| 覆盖场景 | 全批 greedy(temperature=0) | 有 top-p/top-k 的真实采样 |
+| 做法 | **跳过** fp32 cast,直接 argmax | temp+softmax+阈值+采样**融成一个 kernel** |
+| 省掉什么 | 全词表 cast + 处理器链 | 全词表 `sort`(O(V log V)) |
+
+**守卫会让全 greedy 批次走 H36**(H36 更轻,连 softmax 都不做),只有真正存在
+`top_p < 1` 或 `top_k > 0` 的请求时才由本内核接管。
+
+### 实现状态
+
+- 内核:`tileinfer/kernels/sampling/fused_sample.py`(`do_sample=True/False`
+  两个分支**均已编译通过**);
+- 集成:`tileinfer/integrations/fused_sample.py`,7 条守卫 + 逐调用回退;
+- 契约:`tests/test_fused_sample.py`(13 项)+ `tests/test_fused_sample_integration.py`
+  (23 项),**36 项全绿**;
+- 设备数值验证:`benchmarks/probes/fused_sample_oracle.py`,预登记 4 条判据
+  (greedy 逐位 / top-k 语义 / 采样分布 / 边界),**待设备窗口**。
+
+### 一个必须说清的限制
+
+内核**不保证与原生 `multinomial` 逐个随机数相同**——随机数流实现不同,这种比较
+没有意义。验证走统计口径:大样本频率 vs 过滤后概率,以及阈值一致性。
+
 
 ### 明确不可借鉴
 
