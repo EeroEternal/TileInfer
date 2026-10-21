@@ -1084,6 +1084,7 @@ def paged_prefill_ascend950(
     block_q: int = 128,
     dtype: str = "bfloat16",
     threads: int = 128,
+    pv_single_pass: bool = False,
 ):
     """Paged **prefill / append** attention: causal, ragged, GQA, over a paged KV cache.
 
@@ -1124,6 +1125,17 @@ def paged_prefill_ascend950(
     assert BR <= 128, "one L0C tile holds BR x BC floats; keep block_q <= 128 at page_size 128"
     assert dim in (128, 256), "the Ascend 950 attention path is tuned for head_dim 128 or 256"
     assert page_size % 2 == 0
+
+    # H83-① PV single-pass (a compile-time constant: the branches below are resolved at build
+    # time, zero runtime cost).  ``D2`` stays the *QK* split (its single-pass is dead on L0
+    # capacity: qk_a + qk_b both exactly full); ``DPV`` is the PV split — ``D`` when the caller
+    # opts in on dim=256, which halves the per-page PV-side command count (gemm 2→1, pv_b copy
+    # 2→1, dual_copy 2→1, rescale/accumulate loop 2→1) at the cost of an exactly-full L0B
+    # (DPV·BC bf16 = 64KB) and L0C (BR·DPV fp32 = 128KB).  If the compiler rejects the
+    # exactly-full tiles, this axis is disproven and the rewrite falls back to the NZ K/V
+    # layout axis only.
+    D2 = min(D, 128)
+    DPV = D if (pv_single_pass and D > D2) else D2
 
     @T.prim_func
     def main(
@@ -1166,22 +1178,22 @@ def paged_prefill_ascend950(
             p_l1 = T.alloc_l1((BR, BC), dtype)
 
             # D-split, see paged_decode_ascend950: keeps L0A/L0B within capacity for dim=256.
-            D2 = min(D, 128)
+            # QK keeps the D2 split; PV uses DPV (== D under pv_single_pass, H83-①).
             qk_a = T.alloc_l0a((BR, D2), dtype)
             qk_b = T.alloc_l0b((BC, D2), dtype)
             pv_a = T.alloc_l0a((BR, BC), dtype)
-            pv_b = T.alloc_l0b((D2, BC), dtype)
+            pv_b = T.alloc_l0b((DPV, BC), dtype)
             qk_acc = T.alloc_l0c((BR, BC), accum)
-            pv_acc0 = T.alloc_l0c((BR, D2), accum)
-            if D > D2:
+            pv_acc0 = T.alloc_l0c((BR, DPV), accum)
+            if D > DPV:
                 pv_acc1 = T.alloc_l0c((BR, D2), accum)
 
             s_ub = T.alloc_shared((ROWS, BC), accum)
             p_ub = T.alloc_shared((ROWS, BC), dtype)
-            o_ub0 = T.alloc_shared((ROWS, D2), accum)
-            o_tmp0 = T.alloc_shared((ROWS, D2), accum)
-            out_ub0 = T.alloc_shared((ROWS, D2), dtype)
-            if D > D2:
+            o_ub0 = T.alloc_shared((ROWS, DPV), accum)
+            o_tmp0 = T.alloc_shared((ROWS, DPV), accum)
+            out_ub0 = T.alloc_shared((ROWS, DPV), dtype)
+            if D > DPV:
                 o_ub1 = T.alloc_shared((ROWS, D2), accum)
                 o_tmp1 = T.alloc_shared((ROWS, D2), accum)
                 out_ub1 = T.alloc_shared((ROWS, D2), dtype)
@@ -1200,7 +1212,7 @@ def paged_prefill_ascend950(
             T.fill(m_ub, T.float32(-1e30))
             T.fill(l_ub, T.float32(0))
             T.fill(o_ub0, T.float32(0))
-            if D > D2:
+            if D > DPV:
                 T.fill(o_ub1, T.float32(0))
             if _simd_softmax_enabled():
                 T.copy(kv_last_page_len[b : b + 1], ll_ub)
@@ -1212,7 +1224,7 @@ def paged_prefill_ascend950(
                 T.copy(q_l1[0:BR, 0:D2], qk_a)
                 T.copy(k_l1[0:BC, 0:D2], qk_b)
                 T.gemm(qk_a, qk_b, qk_acc, transpose_B=True, clear_accum=True)
-                if D > D2:
+                if D > DPV:
                     T.copy(q_l1[0:BR, D2:D], qk_a)
                     T.copy(k_l1[0:BC, D2:D], qk_b)
                     T.gemm(qk_a, qk_b, qk_acc, transpose_B=True)
@@ -1256,9 +1268,9 @@ def paged_prefill_ascend950(
                             T.simd.vsts(s_ub[r, 0], e0)
                             T.simd.vsts(s_ub[r, 64], e1)
                     with T.SimtVF(threads=threads):
-                        for r, d in T.Parallel(ROWS, D2):
+                        for r, d in T.Parallel(ROWS, DPV):
                             o_ub0[r, d] = o_ub0[r, d] * a_ub[r]
-                        if D > D2:
+                        if D > DPV:
                             for r, d in T.Parallel(ROWS, D2):
                                 o_ub1[r, d] = o_ub1[r, d] * a_ub[r]
                         for r, c in T.Parallel(ROWS, BC):
@@ -1300,9 +1312,9 @@ def paged_prefill_ascend950(
 
                         for r in T.Parallel(ROWS):
                             l_ub[r] = l_ub[r] * alpha[r] + partial[r]
-                        for r, d in T.Parallel(ROWS, D2):
+                        for r, d in T.Parallel(ROWS, DPV):
                             o_ub0[r, d] = o_ub0[r, d] * alpha[r]
-                        if D > D2:
+                        if D > DPV:
                             for r, d in T.Parallel(ROWS, D2):
                                 o_ub1[r, d] = o_ub1[r, d] * alpha[r]
                         for r, c in T.Parallel(ROWS, BC):
@@ -1311,31 +1323,31 @@ def paged_prefill_ascend950(
                 T.dual_copy(p_ub[0:ROWS, 0:BC], p_l1[0:BR, 0:BC])
                 T.copy(VCache[pid, 0:BC, bh, 0:D], v_l1[0:D, 0:BC], transpose=True)
                 T.copy(p_l1[0:BR, 0:BC], pv_a)
-                T.copy(v_l1[0:D2, 0:BC], pv_b)
+                T.copy(v_l1[0:DPV, 0:BC], pv_b)
                 T.gemm(pv_a, pv_b, pv_acc0, transpose_B=True, clear_accum=True)
-                if D > D2:
-                    T.copy(v_l1[D2:D, 0:BC], pv_b)
+                if D > DPV:
+                    T.copy(v_l1[DPV:D, 0:BC], pv_b)
                     T.gemm(pv_a, pv_b, pv_acc1, transpose_B=True, clear_accum=True)
                 T.dual_copy(pv_acc0, o_tmp0)
-                if D > D2:
+                if D > DPV:
                     T.dual_copy(pv_acc1, o_tmp1)
                 with T.SimtVF(threads=threads):
-                    for r, d in T.Parallel(ROWS, D2):
+                    for r, d in T.Parallel(ROWS, DPV):
                         o_ub0[r, d] = o_ub0[r, d] + o_tmp0[r, d]
-                    if D > D2:
+                    if D > DPV:
                         for r, d in T.Parallel(ROWS, D2):
                             o_ub1[r, d] = o_ub1[r, d] + o_tmp1[r, d]
 
             with T.SimtVF(threads=threads):
-                for r, d in T.Parallel(ROWS, D2):
+                for r, d in T.Parallel(ROWS, DPV):
                     out_ub0[r, d] = T.Cast(dtype, o_ub0[r, d] / l_ub[r])
-                if D > D2:
+                if D > DPV:
                     for r, d in T.Parallel(ROWS, D2):
                         out_ub1[r, d] = T.Cast(dtype, o_ub1[r, d] / l_ub[r])
 
-            T.dual_copy(out_ub0[0:ROWS, 0:D2], OutPacked[bx, 0:BR, 0:D2])
-            if D > D2:
-                T.dual_copy(out_ub1[0:ROWS, 0:D2], OutPacked[bx, 0:BR, D2:D])
+            T.dual_copy(out_ub0[0:ROWS, 0:DPV], OutPacked[bx, 0:BR, 0:DPV])
+            if D > DPV:
+                T.dual_copy(out_ub1[0:ROWS, 0:D2], OutPacked[bx, 0:BR, DPV:D])
 
     return main
 
@@ -2371,6 +2383,7 @@ def forward_prefill(
     dtype: str | None = None,
     out: torch.Tensor | None = None,
     kernel_batch: int | None = None,
+    pv_single_pass: bool = False,
 ) -> torch.Tensor:
     """Run paged prefill / append: packs ``Q`` into the kernel's tile layout, unpacks the result.
 
@@ -2526,6 +2539,7 @@ def forward_prefill(
         num_tiles=num_tiles,
         block_q=br,
         dtype=dtype,
+        pv_single_pass=pv_single_pass,
     )
     kernel(
         q_packed,

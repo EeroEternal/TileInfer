@@ -2616,3 +2616,32 @@ amax 与整头 amax 同分布,scale 粒度不改变 E4M3 三位尾数的舍入�
 分析先行);c) 放弃 KV 量化轴,L-B 稀疏选择为「读得少」唯一在途路径)。
 存证语义=expect_pass 守卫(uniform 反向断言),未来若回落 TOL 内测试即失败=重开信号;
 两轮穷尽(H82 iter-238+H84 iter-242/243)满足循环终止条件 b) 的 L-A 单线口径。
+
+## H83-① prefill PV 通路单 pass 化:dim=256 编译期判死——L0B 物理容量为硬约束,D2 split 是唯一可行形态(iter-244,E356/D176)
+
+H83 立项账(iter-240)判 PV 单 pass「恰满可行」;设备编译冒烟直接证伪:
+
+```
+Z3 loop scheduling failed: scope "shared.l0b" capacity 65536 is insufficient
+for minimum buffer usage 98304
+```
+
+| 量 | 现役 D2 split | 单 pass(H83-①) |
+|---|---|---|
+| L0B = qk_b + pv_b | 32KB + 32KB = **64KB 恰满** | 32KB + 64KB = **96KB > 64KB 拒** |
+| L0C = qk_acc + pv_acc | 64KB + 64KB = 128KB 恰满 | 64KB + 128KB = **192KB > 128KB 拒** |
+
+机理:立项账把 L0B 当 pv_b 独占(64KB 恰满),漏算同作用域 qk_b 并存——Z3 调度
+按最小并存合计且不做跨 buffer 生命周期合并,单 pass 在 dim=256 数学不可行。
+**现役 D2 split 正是 L0B/L0C 双恰满约束下的唯一可行形态**(发射税已是被约束
+最小化的形态,H83 预登记红线「编译失败→disproven,H80 退回仅 NZ K/V 布局轴」兑现)。
+
+处置:pv_single_pass 编译期分支保留(默认 False 零影响,存证基座);契约测试
+`tests/test_prefill_pv1pass_contract.py` 9/9 绿,smoke[256]/numeric 转
+pytest.raises 守卫(未来容量扩展/调度器支持生命周期合并使编译通过=测试失败=重开
+信号)。低优先翻案路径记档(不烧窗):gemm C 切片复用(L0C)+L0B 手工分段复用,
+依赖编译器对切片 gemm accum 的支持性取证。
+P-B 重写唯一在途实现面=**H80 NZ K/V 布局轴**(省 K 中转段+V transpose 税,发射数
+不变),份额定谳依赖 H58 profiler(A/B 域 blocked,E355);CPU 侧资产
+`tileinfer/kernels/attention/kv_nz_layout.py`(pack/unpack/直拷语义,CPU 契约 6 测
+全绿)已备。
