@@ -35,7 +35,9 @@ class _MD:
             setattr(self, k, v)
 
 
-def _logits(batch=2, vocab=V):
+def _logits(batch=integ.MIN_BATCH_FOR_FUSED_SAMPLE, vocab=V):
+    # 默认 batch 取门槛值:守卫要求 batch >= MIN_BATCH_FOR_FUSED_SAMPLE
+    # (设备实测交叉点,低于它融合更慢),专测门槛的用例自己传小 batch。
     return torch.randn(batch, vocab, dtype=torch.float32)
 
 
@@ -77,11 +79,20 @@ def test_rejects_non_contiguous():
 
 @pytest.mark.parametrize("vocab", [1000, 8192, 16320, 16384])
 def test_rejects_small_or_unaligned_vocab(vocab):
-    """vocab 必须 ≥16384 且是 64 的倍数。"""
-    logits = torch.randn(2, vocab, dtype=torch.float32)
+    """vocab 必须 ≥16384 且是 64 的倍数(batch 取门槛值,隔离 vocab 这一个变量)。"""
+    logits = torch.randn(integ.MIN_BATCH_FOR_FUSED_SAMPLE, vocab, dtype=torch.float32)
     md = _MD(vocab_size=vocab)
     expected = vocab >= 16384 and vocab % 64 == 0
     assert integ.fused_sample_applicable(logits, md, False) is expected
+
+
+def test_rejects_below_batch_threshold():
+    """batch 低于门槛必须回退:设备实测该区间融合更慢(batch=8 慢 2.9×)。"""
+    for batch in (1, 8, integ.MIN_BATCH_FOR_FUSED_SAMPLE - 1):
+        assert integ.fused_sample_applicable(_logits(batch), _MD(), False) is False
+    assert integ.fused_sample_applicable(
+        _logits(integ.MIN_BATCH_FOR_FUSED_SAMPLE), _MD(), False
+    ) is True
 
 
 def test_rejects_logprobs_request():

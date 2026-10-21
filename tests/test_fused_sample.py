@@ -75,9 +75,11 @@ def test_block_size_prefers_largest_divisor():
 
 def test_constants_sanity():
     assert fs.MIN_VOCAB_FOR_FUSED_SAMPLE == 16384
-    # 16 轮三分位二分 ≈ 4^-16 ≈ 2.3e-10,足以定位 float32 阈值
-    assert fs.MAX_SEARCH_ROUNDS == 16
-    assert 4.0 ** (-fs.MAX_SEARCH_ROUNDS) < 1e-9
+    # 32 轮三分位二分:搜索区间在位模式上跨约 2^31,每轮缩到 1/4。
+    # 16 轮只剩 2^31/4^16 ≈ 2^-1,阈值误差达 5%(实测保留集偏大);
+    # 32 轮 → 2^31/4^32 ≈ 2^-33,已低于 float32 分辨率。
+    assert fs.MAX_SEARCH_ROUNDS == 32
+    assert 2**31 / 4.0 ** fs.MAX_SEARCH_ROUNDS < 1.0
     assert fs._VL == 64
     assert math.isclose(fs._MIN_PROB, 2.0**-32)
 

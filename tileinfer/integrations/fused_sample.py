@@ -52,8 +52,15 @@ from ..kernels.sampling.fused_sample import (
 
 logger = logging.getLogger(__name__)
 
+#: 接管的 batch 下限。设备实测(2026-10-21,V=248320):
+#: 融合内核延迟与 batch 无关(恒 ~2.88ms),原生 sort+cdf 线性增长
+#: (batch=8 → 0.98ms,batch=32 → 4.44ms),交叉点约 20。
+#: 低于此值时融合更慢(8 时慢 2.9 倍),必须回退原生实现。
+MIN_BATCH_FOR_FUSED_SAMPLE = 20
+
 __all__ = [
     "COUNTERS",
+    "MIN_BATCH_FOR_FUSED_SAMPLE",
     "install_fused_sample",
     "fused_sample_applicable",
     "reset_state",
@@ -139,6 +146,11 @@ def fused_sample_applicable(logits: Any, md: Any, predict_bonus_token: bool) -> 
         return False
     # 全 greedy 批次交给 H36(它更轻:连 softmax 都不做)
     if not _has_real_sampling(md):
+        return False
+    # **batch 门槛**:设备实测(V=248320)融合内核延迟与 batch 无关(恒 ~2.88ms),
+    # 而原生 sort+cdf 随 batch 线性增长(8→0.98ms,32→4.44ms),交叉点约 batch=20。
+    # 低于门槛时接管只会更慢(8 时慢 2.9 倍),必须回退。
+    if int(logits.shape[0]) < MIN_BATCH_FOR_FUSED_SAMPLE:
         return False
     return True
 

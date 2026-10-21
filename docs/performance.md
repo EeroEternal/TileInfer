@@ -2108,17 +2108,98 @@ tilelang 0.1.15 的两条硬约束(都是编译错误逼出来的):
 ### 实现状态
 
 - 内核:`tileinfer/kernels/sampling/fused_sample.py`(`do_sample=True/False`
-  两个分支**均已编译通过**);
+  两个分支均编译通过并**在设备上数值验证**);
 - 集成:`tileinfer/integrations/fused_sample.py`,7 条守卫 + 逐调用回退;
 - 契约:`tests/test_fused_sample.py`(13 项)+ `tests/test_fused_sample_integration.py`
   (23 项),**36 项全绿**;
-- 设备数值验证:`benchmarks/probes/fused_sample_oracle.py`,预登记 4 条判据
-  (greedy 逐位 / top-k 语义 / 采样分布 / 边界),**待设备窗口**。
+- 设备数值验证:`benchmarks/probes/fused_sample_device_test.py`,9 项判据
+  (greedy 逐位 / 保留集 / top-k 语义 / 分布拟合 / 边界)**全部 PASS**
+  (V=256 与 V=16384 多 chunk 两种配置均验证)。
+
+### 设备实测:数值正确,但**只在 batch ≥ 20 时才有性能收益**
+
+`benchmarks/probes/fused_sample_perf.py`,V=248320(真实词表),中位延迟:
+
+| batch | 融合内核 | torch `sort+cdf` | 比值 |
+|---|---|---|---|
+| 8 | 2.882 ms | 0.978 ms | 0.34×(慢 2.9×) |
+| 32 | 2.880 ms | 4.436 ms | **1.54×(快)** |
+
+**判决(有条件通过)**:融合内核的延迟**与 batch 无关**(每行一个 block,
+并行跑),而排序路径随 batch 线性增长,交叉点在 batch ≈ 20。
+- batch ≥ 20(高并发解码):**值得启用**,32 时快 1.54×;
+- batch < 20(低并发 / 单请求):**不值得**,应回退原生 sort。
+
+因此集成层的守卫**必须包含 batch 门槛**,不能只要 `top_p<1 / top_k>0` 就接管。
+
+### 端到端验证:尚未完成(2026-10-21 尝试,被环境阻塞)
+
+**未验证项**(下面三项都还没有端到端数字):
+
+| 验证项 | 现状 | 缺什么 |
+|---|---|---|
+| 引擎级 TPOT 收益 | 只有内核级 2.88ms 微基准 | 需要 off/on 两侧同 prompt A/B |
+| `fused_sample_calls` 实际命中数 | 未在服务里观测过 | 需要一次成功启动 + 请求 |
+| 真实 batch 分布下的收益 | 假设 batch≈32 | 生产 batch 可能远低于交叉点 |
+
+**本次尝试(3 次启动,全部失败)**:
+
+根因是**主机内存 pin 配额不足**,与内核无关:
+
+```
+# dmesg
+[ascend] [ERROR] [svm] [svm_pin_user_npages_fast 87] Get_user_pages_fast fail.
+[ascend] [ERROR] [svm] [svm_pin_host_pa 124] Pin host addr failed. (ret=-22)
+```
+
+```
+$ ulimit -l
+65536                    # 64 MB
+$ ulimit -Hl
+65536                    # 硬限制同样是 64MB
+$ ulimit -l unlimited
+bash: ulimit: max locked memory: cannot modify limit: Operation not permitted
+```
+
+权重 64.7GB 在 torch.compile 阶段需要 pin 大块主机内存,64MB 配额必然失败,
+EngineCore 静默退出(日志无 traceback,只有 APIServer 侧
+`Engine core initialization failed`)。把 `--gpu-memory-utilization` 从 0.90
+降到 0.75 仍然失败——瓶颈是锁定内存配额,不是显存。
+
+**附带发现**:失败后残留的 `VLLM::EngineCore` 会成为孤儿进程卡在驱动层,
+`kill -9` 也不能立即生效,占住 119GB HBM。清理后降到 5.4GB。下次跑 A/B 前
+应先 `npu-smi info` 确认无残留进程。
+
+**恢复验证的前置条件**:在 `ulimit -l` 至少 ≥ 8GB 的会话/容器里启动服务
+(需要 `--ulimit memlock=` 的容器参数或宿主机 limits.conf,当前 shell 无法自行提升)。
+
+### 踩坑记录(每条都是实测定位,不是推测)
+
+1. **UB 越界 → `507035`**:`vals_ub` 之外还有 `vecsum_ub`(`n_vec` 个)、
+   `em_ub`/`vec_ub`(各 64 个)和一堆标量缓冲。`ub_cap=16384` 时叠加后越界。
+   最终默认 **8192**(40 chunk),实测稳定且比 4096/2048 都快(扫描次数更少)。
+2. **int32 的 `vcadd` + `vsts` 写 int32 shared 会崩**。所有归约(token 计数)
+   统一用 float32 —— 词表 ≤ 2^24 时 float32 可精确表示每个整数。
+3. **`MODE_MERGING` 语义不可依赖**:掩码累加改用「先 `vsel` 置零、再无条件
+   `vadd`」,并直接赋给 `alloc_local` 寄存器。
+4. **`vcadd` 不能省**:逐 lane 累加后必须 `vcadd` 再 `vsts`,否则只写出 lane 0
+   的部分和(`total`/`keep_mass` 偏小 64 倍)。
+5. **16 轮搜索精度不够**:搜索区间是 float32 位模式上的 `[2^-32, 1]`,跨约 2^31,
+   16 轮后只剩 `2^-1` → 阈值偏差 5%、保留集偏大。**改为 32 轮**后阈值与 torch
+   逐位吻合。
+6. **count 被覆盖**:三分位搜索里 `stat_ub[3..5]`(三档数量)曾被直接赋值而非累加,
+   `n_chunks>1` 时只剩最后一个 chunk 的计数 → top-k 完全失效。必须累加。
+7. **`for g` 内穿插 SIMD 块 + 标量块 → 多 chunk 时结果错乱**(SIMD 写与标量读
+   跨迭代重排)。改成「每 chunk 一个纯 SIMD 块 + 一次 `n_vec` 标量判断」。
+8. **动态 global 偏移的 `T.copy` 会错位**(`logits[row, pick:pick+64]`)。第二遍
+   定位改为按 chunk 顺序重放、只在目标 chunk 生效。
+9. **全词表标量前缀和不可用**:248K 次串行 → 47ms,比 sort 慢 48 倍。
 
 ### 一个必须说清的限制
 
 内核**不保证与原生 `multinomial` 逐个随机数相同**——随机数流实现不同,这种比较
 没有意义。验证走统计口径:大样本频率 vs 过滤后概率,以及阈值一致性。
+
 
 
 ### 明确不可借鉴

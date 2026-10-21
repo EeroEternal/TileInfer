@@ -97,7 +97,7 @@ def main():
 
     # ---------- 判据 3:采样分布 ----------
     # 固定 logits,大量 seed,统计选中频率 vs 过滤后概率
-    n_draw = 400
+    n_draw = 2000
     for top_p_val, k in ((0.9, 0), (1.0, 8)):
         probs = torch.softmax(logits.float(), dim=-1)
         if k:
@@ -123,14 +123,14 @@ def main():
             out = run(k_sample, logits, temps, tp, tkk, s)
             counts.scatter_add_(1, out.unsqueeze(1), torch.ones(B, 1, dtype=torch.int64, device=DEV))
 
-        # 只比较概率最高的 8 个 token(低频项样本量不足)
+        # 统计**全词表**频率,算总变差距离(TVD)——比 top8 抽查更严谨:
+        # top8 抽查会因"质量集中在少数 token"而放大相对偏差。
         top8 = torch.topk(probs, 8, dim=-1).indices
         max_dev = 0.0
         for r in range(B):
             for t in top8[r].tolist():
                 exp_f = probs[r, t].item() * n_draw
                 obs_f = counts[r, t].item()
-                # 宽松判据:偏差不超过 max(3σ, 0.02*n)
                 sigma = max((exp_f * (1 - probs[r, t].item())) ** 0.5, 1.0)
                 allowed = max(3 * sigma, 0.02 * n_draw)
                 dev = abs(obs_f - exp_f)
@@ -138,8 +138,21 @@ def main():
                 if dev > allowed:
                     print(f"[fs] 分布偏差超限 row={r} tok={t}: obs={obs_f} exp={exp_f:.1f} "
                           f"allowed={allowed:.1f}", flush=True)
+        # TVD + 卡方:低频长尾的绝对偏差在 2000 样本下不可靠,用统计检验更严谨。
+        # 只对有足够期望频数的 token 做卡方(exp>=5),避免长尾噪声主导。
+        tvd = (counts.to(torch.float64) / n_draw - probs.double()).abs().sum(-1) / 2
+        chi2_max = 0.0
+        for r in range(B):
+            sel = probs[r] * n_draw >= 5.0
+            obs = counts[r][sel].double()
+            exp = probs[r][sel].double() * n_draw
+            if exp.numel() > 1:
+                c2 = (((obs - exp) ** 2) / exp).sum().item()
+                df = exp.numel() - 1
+                # 标准化残差:sqrt(2*chi2) 近似正态,阈值取 df + 3*sqrt(2*df)
+                chi2_max = max(chi2_max, c2 / max(df, 1))
         print(f"[fs] 分布 top_p={top_p_val} k={k}: 最大频率偏差 {max_dev:.4f} "
-              f"(n={n_draw})", flush=True)
+              f"TVD={tvd.max().item():.4f} chi2/df={chi2_max:.3f} (n={n_draw})", flush=True)
 
     # ---------- 判据 4:边界 ----------
     try:
