@@ -2569,3 +2569,25 @@ vllm-ascend 13:28:14Z),相邻领域(cannbench 算子库/CANN 869 opapi 枚举/�
 同水平或消除路径不可达」,已兑现优化(capture8/H28/H61/H73/H79/split-KV/SIMD/shunt)
 全部入役后 c1 仍 +7.5%。按任务书终止条件 b),系统级专项以 FINAL TEMPORARY 收口,
 交用户裁决。
+
+## H82 / L-A KV FP8 存储量化:CPU 数值域 oracle 判停(iter-238,E341)
+
+用户裁决解禁 KV FP8(2026-10-21)后,按精度 oracle 纪律先做数值域门槛验证
+(fp32 sdpa oracle,TOL=3e-2 相对,per-(layer,head) amax 校准,E4M3 round-trip;
+GQA 16Q/2KV、head_dim 256、decode q_len=1,均匀+相关双分布,存证
+`tests/test_kv_fp8_oracle.py`):
+
+| 场景 | rel_F | per-query max | 判 |
+|---|---|---|---|
+| S=8192 相关(尖锐 attention) | 2.616e-2 | 3.293e-2 | 贴线 PASS |
+| S=16384 相关 | 2.661e-2 | 3.651e-2 | 贴线 PASS |
+| S=8192 均匀 | **3.800e-2** | 4.239e-2 | **超差** |
+| S=16384 均匀 | **4.053e-2** | 4.620e-2 | **超差** |
+| 量化 round-trip 基础误差 | 2.642e-2 | — | — |
+
+**判决:per-head amax 校准 E4M3 的精度乐观上界(上帝视角校准)在均匀分布域超差、
+相关域贴线无裕度;按预登记「任何场景超差即停、禁止降 TOL」红线,L-A 首方案
+disproven 关闭**,设备 oracle 未做(乐观上界已超,无信息量)。
+翻案路径记档(未立项,待用户裁决或新假设轮):①scale 粒度 per-token/per-block
+(KV 行级 fp32 scale,存储 +0.4%,读取减半保留,vLLM/flashinfer fp8-KV 生产实现
+同族);②dequant-in-kernel(E334 bf044ba 同思想)仅在①之后有意义。
