@@ -817,6 +817,10 @@ class TileInferDecodeAttention:
         # 采样 top-k 阈值替换(BACKLOG 采样条目):命中/回退计数,在役探针断言用
         "sampler_topk_calls": 0,
         "sampler_topk_fallbacks": 0,
+        # H76 fused_sample 融合采样:命中/回退/守卫跳过计数,在役探针断言用
+        "fused_sample_calls": 0,
+        "fused_sample_fallbacks": 0,
+        "fused_sample_skipped": 0,
         # H32:GDN in_proj_ba→in_proj_qkvz 权重融合(S-GDN 投影族),命中/回退计数
         "gdnproj_calls": 0,
         "gdnproj_fallbacks": 0,
@@ -2424,8 +2428,14 @@ def install(raise_on_failure: bool = True) -> bool:
         # 显式 opt-in(TILEINFER_OPS 含 sampling),且守卫跳过全 greedy 批次
         # (那种场景 H36 的快路径更轻)。必须在采样器构造前装。
         try:
-            from .fused_sample import install_fused_sample
+            from .fused_sample import install_fused_sample, set_stats_sink
 
+            # 计数器接在役 _stats(metrics dumper 可见,A/B 生效探针断言用)
+            set_stats_sink(
+                lambda name: TileInferDecodeAttention._stats.__setitem__(
+                    name, TileInferDecodeAttention._stats.get(name, 0) + 1
+                )
+            )
             install_fused_sample()
         except Exception as exc:  # noqa: BLE001 - 优化模块不得影响在役路径
             logger.warning("TileInfer fused_sample not installed: %s", exc)
