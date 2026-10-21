@@ -2641,7 +2641,29 @@ for minimum buffer usage 98304
 pytest.raises 守卫(未来容量扩展/调度器支持生命周期合并使编译通过=测试失败=重开
 信号)。低优先翻案路径记档(不烧窗):gemm C 切片复用(L0C)+L0B 手工分段复用,
 依赖编译器对切片 gemm accum 的支持性取证。
-P-B 重写唯一在途实现面=**H80 NZ K/V 布局轴**(省 K 中转段+V transpose 税,发射数
-不变),份额定谳依赖 H58 profiler(A/B 域 blocked,E355);CPU 侧资产
-`tileinfer/kernels/attention/kv_nz_layout.py`(pack/unpack/直拷语义,CPU 契约 6 测
-全绿)已备。
+
+## H83-③ NZ K/V 布局轴:分析性 disproven——E88「nd2nz=MTE 固有语义」判据同构覆盖,布局转换税消除维度全域关闭(iter-245,E360/E361/D177)
+
+E356 曾判 NZ 轴「不受影响,退回 H80 继续」;本轮以 MoE preNZ 终裁(E88)证据链
+收口修正:
+
+1. **判据同构**:现役 K/V 通路(`paged_decode_ascend950.py:1223` K GM→L1、
+   `:1324` V transpose GM→L1)与 MoE 权重加载同为 tilelang T.copy GM→L1 表达、
+   同一 codegen 发射层、同一 MTE 拷贝引擎。E88 决定性判据=「nd2nz 为 MTE 固有
+   语义、主机预打包不可绕过(恒等 pack 同量级错为设备实证)」⇒ K/V cache 预排
+   NZ 存储后 T.copy 仍恒发 nd2nz → 二次重排 → 数值错乱,与内核特异性质无关。
+2. **免转换原语已三次设备证死**:raw `asc_copy_gm2l1_align`(唯一豁免路径)
+   物理序=转置连续而非 compact-NZ(E76)+多段发射竞态(E83/E88),H26/H27/H30
+   全灭;attention 域无任何特异豁免理由。
+3. **判决**:分析性 disproven,不烧设备窗重复实验(工具链层结论,设备重复无
+   信息量;H30 先例=同一堵墙撞三次才死透)。翻案条件=CANN 提供受控免转换直载
+   原语或 tilelang 升级使 align 多段发射受控(D73 平内存 pack 与
+   `kv_nz_layout.py` 资产届时可复用)。
+4. **影响(asc_copy 全家族边界,E361 汇编)**:GM→L1(nd2nz 固有/align 未受控)、
+   UB→L1(H22/E66 死)、L1→UB(codegen 无原语,E74)三通路均关;可信优化面
+   收敛为「少搬运」(dim=256 域已由 E356 判死)与「读得少」(H81 稀疏选择,唯一
+   在途)两轴。
+5. **P-B 重写线收窄**:两个已知可动面(NZ 布局+D2 split 发射减半)双死 ⇒ 当前
+   栈内无可实现面清单;命运由 H58 归因(A/B 域 blocked)定谳内核份额后裁决——
+   份额不足以支撑 ≥1.5x → 重写线关闭交用户 FINAL TEMPORARY;份额足 → 须登记
+   新可动面假设(当前未知)。
