@@ -11,6 +11,8 @@ dist/
 *.egg-info/
 .venv/
 venv/
+# DeepSeek-V4.1 独立验证环境(隔离的 venv + 源码树,绝不进仓库)
+.dsv41/
 bench_out/
 *.json
 !docs/**/*.json
