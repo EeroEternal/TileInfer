@@ -2667,3 +2667,83 @@ E356 曾判 NZ 轴「不受影响,退回 H80 继续」;本轮以 MoE preNZ 终�
    栈内无可实现面清单;命运由 H58 归因(A/B 域 blocked)定谳内核份额后裁决——
    份额不足以支撑 ≥1.5x → 重写线关闭交用户 FINAL TEMPORARY;份额足 → 须登记
    新可动面假设(当前未知)。
+
+## L-D 采样封存实验恢复评估:终局判决(D168 不满足)——引擎内激活已证,稳态收益 ~1.9%<5% 门槛,保留 opt-in 不进默认(iter-248,E369/E365-E366+ld9a/ld9b)
+
+评估链闭环(安装面→激活→A/B→判决):
+
+1. **安装面根因与修复(E369,addf026)**:三计数全 0 的终解=守卫双必杀——
+   ①`dtype!=fp32`(引擎 logits=bf16 恒拒);②`non_argmax_invariant 非空`
+   (vLLM 初始化即注册 LogitBias/MinTokens,列表恒非空)。修复=bf16 接受
+   (wrapper cast fp32)+守卫改前置实际应用处理器(`apply_logits_processors`,
+   语义与原生 forward 同序);no_penalties/bad_words/allowed_mask 守卫保留。
+   采样域 42 用例绿。
+2. **激活实锤**:ld9b on 臂 fused_sample_calls=127(=t1k50 全部 128 步−1),
+   skipped=fallbacks=0;greedy_c8(batch 8<MIN_BATCH 守卫)零触发符合设计。
+3. **权威 A/B(单变量=OPS sampling,off 基线=v8 收割同夜数据)**:
+
+| 场景 | off | on(ld9b) | Δ | 判据 |
+|---|---|---|---|---|
+| t1k50_c32 ITL p50 | 29.18 | 28.63 | **−1.88%** | <5% 不满足 |
+| t1k50_c32 TPOT p50(per-req) | 29.22 | 29.48 | +0.88% | <5% 不满足 |
+| greedy_c8 TPOT p50(守卫) | 11.61 | 11.65 | +0.37% | ≤3% ✓ |
+
+   ld9a(首跑)ITL −1.69% 佐证一致;其样本含**一次性 ~3s fused kernel JIT
+   编译停顿**(TTFT +30%/std_itl 272ms/throughput −42% 同源,不随磁盘缓存
+   消除=每 serve 进程首次激活成本)。
+4. **归因**:内核级 1.54x(E344,4.43→2.88ms@b32)不传递到引擎级的原因=
+   wrapper host 面( cast+处理器应用+参数提取)+原生 sort+cdf 路径与其他
+   工作重叠而融合核串行;净稳态收益上界 ~1.9%。
+5. **判决与建议(交用户)**:D168 主判据不满足→L-D 收口;fused_sample
+   **保留为 opt-in 资产**(OPS sampling 非默认,默认路径零影响,无回归);
+   价值面=top-k/top-p 真实采样批(batch≥20)~1.9% ITL;废弃不建议(资产
+   零成本);不进默认路径维持。原始 JSON:bench_results/ld9a_*/ld9b_*。
+
+## H58 prefill 归因定谳与 P-B/D57-② 重写线关闭(D178,D177 预登记兑现;iter-248,E367/E368)
+
+1. **fia 侧双窗画像(E367,p_prof 修复后首采)**:prefill 窗(8192/4/C8)
+   设备总 4096.5ms——**full-attn 6.5%**/MoE 35.6%/dense+胶水 29.0%/GDN 18.9%;
+   decode 窗 full-attn 仅 0.9%/MoE 53.0%。Top 内核=GroupedMatmulV5 30.2%/
+   MatMulV3 14.7%/ChunkGatedDeltaRuleFwdH 7.8%。
+2. **重写天花板**:内核重写 1.5x ⇒ prefill 窗设备时间收益 ≤6.5%×(1−1/1.5)
+   ≈**2.2%**;且 H61 在役默认 `TILEINFER_PREFILL_MAX_CTX=1` 下 TI prefill
+   内核**不在役**(份额=0),重写对权威口径 TTFT 零作用面。
+3. **判决**:P-B(微基准 ≥1.5x 现役 TI prefill)按 D177 预登记「份额不足→
+   重写线关闭」执行;H80 终态 closed(两可动面 E356/E360 双死+本条份额)。
+   资产封存不变(kv_nz_layout.py+pv_single_pass 存证分支;翻案条件=tilelang/
+   CANN 栈升级或用户改在役口径)。任务书「8K/16K prefill 落后 1.53-1.71x」为
+   iter-196 pre-shunt 旧账(H59/H61 shunt 后已修平,D57-① 0.754x/0.758x),
+   现状以权威矩阵 A/B 复核为准(见矩阵节)。
+4. **TI 侧 p_prof 记阻(E368)**:on 臂第四次失败根因=未 prewarm 的
+   split-kernel 形态在 forward 内同步 tilelang JIT 编译(py-spy 实锤,卡
+   7min+;E348「TI 侧从未导出」真因修正,profiler/图捕获非根因)。降优先,
+   prewarm 形态列表补齐或 env 对齐权威口径后转 H62(b1 固定开销)输入再采。
+
+## 权威矩阵 A/B 全量复核(iter-248,2026-10-22 02:2x–02:4x,同机同日成对,v9b 链 failbits=0)
+
+口径:`vllm bench serve` random 数据集,temperature 0,num-prompts 32,percentile p50;
+off=`TILEINFER_VLLM=0`(纯 FIA 原始昇腾路径),on=TI 当前最优配置(VLLM=1+OPS
+decode,prefill,greedy+SIMD softmax+ktp 分带+MAX_CTX=1+fold+DENSE_NN+capture8)。
+原始 JSON:`.agent_loop/run/bench_results/mtx_{off,on}_*.json`。
+
+| 场景 | TTFT p50 off→on | ΔTTFT | TPOT p50 off→on | ΔTPOT | 对照目标 |
+|---|---|---|---|---|---|
+| 128x128_c1 | 100.4→92.4 | **−7.98%**(TI 快) | 8.77→9.42 | +7.40% | c1 已知弱点(域内 +7.5% 一致,判不可达档) |
+| 128x128_c8 | 205.3→185.5 | **−9.62%**(TI 快) | 16.69→11.62 | **−30.38%** | ≥30% ✓ |
+| 128x512_c8 | 200.1→185.7 | **−7.21%**(TI 快) | 17.02→11.66 | **−31.53%** | ≥30% ✓ |
+| 8192x128_c8 | 1052.1→1070.6 | **+1.76%** | 39.56→36.46 | −7.85% | 目标② TTFT ≤5% ✓;目标① TPOT 未达 |
+| 16384x128_c8 | 1839.8→1980.7 | +7.66% | 68.29→65.35 | −4.31% | 目标② ✗(>5%);目标① 未达 |
+
+结论:
+1. **短场景 TTFT 全部 TI 显著更快**(−7~−9.6%,优向超 |Δ|≤3% 带,非劣化);
+   c8 档 TPOT −30.4%/−31.5% 保持 ≥30%(对今日新鲜 FIA 基线;基线较 docs 旧账
+   18.01→16.69 漂移 −7%,TI 11.62 与在役档案 11.65 一致)。
+2. **目标②(8K/16K 纯 prefill TTFT ≤5%)**:8192 PASS(+1.76%);16384 未达
+   (+7.66%,+141ms)——shunt 全分流下双侧同为 FIA 内核,差值=TI host 胶水面
+   (chunked prefill 每 chunk 集成开销);短场景无此面暴露。残值面=P-C 再校准
+   或胶水减薄,与 E327 独有面 0.3% 口径需区分(16K 域未单独画像,记 NEXT)。
+3. **目标①(8K/16K×C8 TPOT ≥30%)**:−7.85%/−4.31%,远未达;与任务书
+   「当前 +12%/+5.9%」同量级(基线漂移内)。唯一在途改善路径=L-B 稀疏选择
+   (H81/H85,dump 判据待真实 trace);L-A 已终局判停(D174)。
+4. 大账(今日口径):c8 −30.4%/−31.5% ✓;c1 +7.4%(不可达档,E327 证据链);
+   8K −7.9%/16K −4.3%(长上下文档)。
