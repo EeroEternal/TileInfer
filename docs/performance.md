@@ -2783,3 +2783,25 @@ decode 步逐 full-attn 层累积,一步一文件,E364 格式;CPU 契约 7 用�
 5. dump 资产:6 个真实 trace(run/lb_dump/,gitignored);oracle 两处修正(非页对齐 S 尾页
    pad;多 real 层 verdict 取全层最小);E337 教训再证(dump 臂首跑漏 source env.sh 即
    E30009,补挂即通)。
+
+## 16K 域 TTFT 残值归因:差值全在 host 面——SyncStream 101 次 vs 1 决定性,H86 立项(iter-249,E374/E375)
+
+16K prefill 窗(16384/4/C8×8 条)双臂 p_prof 对照(on=TI 权威口径 env+enforce-eager /
+off=FIA),prof_summary_{ti16k,fia16k}.md:
+
+| 口径 | on(ti16k) | off(fia16k) | Δ |
+|---|---|---|---|
+| 设备总耗时 | 8459.9 ms(171391 条) | 8369.5 ms(170252 条) | **+1.08%(噪声内)** |
+| 设备 full-attn | 10.7%(904.9 ms) | 10.8%(905.6 ms) | ≈0 |
+| host API 总 | 6524.2 ms | 6225.7 ms | **+298.5 ms** |
+| aclrtSynchronizeStream | 161.6 ms × **101** | 0 ms × 1 | **+161.6 ms(决定性)** |
+| aclrtMemcpyAsync | 1931.1 ms × 3352 | 1767.1 ms × 3283 | +164.0 ms |
+| 发射类(launch/LaunchKernel) | 1966.1 ms | 1673.3 ms | +92.8 ms |
+| 胶水小算子(Copy/Cat/Fill/Zero) | 683.6 ms | 606.3 ms | +77.3 ms |
+
+结论:16K TTFT +141ms(D179)不在设备(同 FIA 内核),在 TI 集成层 host 面——每步 2-3 次
+流同步(prefill 判据 D2H:vllm_ascend.py L603 分流判据 cat().cpu().tolist() / L695 页数 /
+L718 last-page-len)及其引发的 MemcpyAsync 排队。**H86 立项**:MAX_CTX=1 全分流在役口径下
+分流判据恒真可短路(零设备信息需求),消除同步后预期 16384 TTFT ≤5%(8192 +1.76% 不回退)。
+full-attn 16K 份额 10.7%(较 8K 窗 6.5% 升,序列平方域符合预期)——若未来重启 attention
+域工作,16K 域份额输入以此为准。
