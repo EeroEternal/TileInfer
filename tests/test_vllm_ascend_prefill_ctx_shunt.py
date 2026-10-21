@@ -13,12 +13,16 @@ H59 起默认启用(4096);H61 终审起**默认 1**(全量交还 FIA),显式 0 �
      ``_PREFILL_SKIP_GUARD`` 初始空(分流步其余层的短路键);
   3. env 旋钮默认 4096(H59);显式 0 = 关闭,恢复旧行为;
   4. metrics 合并语义:dump 视图含 prefill_long_skips 键(空进程静默守卫不受影响,
-     该键不参与静默判定)。
+     该键不参与静默判定);
+  5. H86:全分流极端口径(``0 < MAX_CTX < 128``)下分流判决在 D2H 之前短路——
+     零 ``.cpu()`` 同步、计数器/守卫与 "ctx shunt (early)" 分支等价;H59 档(4096)
+     不短路,判据仍读设备侧 seq_lens。
 """
 
 from __future__ import annotations
 
 import pytest
+import torch
 
 try:
     from tileinfer.integrations import vllm_ascend as mod
@@ -118,7 +122,116 @@ def test_env_knob_name_documented():
     assert "TILEINFER_PREFILL_KV_TILE_PAGES" in src  # 既有旋钮不被误改
 
 
-# ------------------------------------------------- 4. H60:解包尾部搬运的缓冲契约
+# ------------------------------------------------- 5. H86:全分流口径的 D2H 前短路
+
+
+def _make_step(kv_lens, qo_lens):
+    """最小 CPU 步参数(与 test_vllm_ascend_prefill_step_guard 的同款骨架)。"""
+    num_tokens = sum(qo_lens)
+    heads, dim = 8, 32
+    pool = torch.zeros(8, 128, heads // 4, dim, dtype=torch.bfloat16)
+    table = torch.arange(len(kv_lens), dtype=torch.int32).unsqueeze(1)
+    seq_lens = torch.tensor(kv_lens, dtype=torch.int32)
+    qsl = torch.tensor(
+        [0] + list(torch.cumsum(torch.tensor(qo_lens, dtype=torch.int64), 0)),
+        dtype=torch.int32,
+    )
+    q = torch.randn(num_tokens, heads, dim, dtype=torch.bfloat16)
+    return dict(
+        query=q,
+        key_cache=pool,
+        value_cache=pool.clone(),
+        block_tables=table,
+        seq_lens=seq_lens,
+        query_start_loc=qsl,
+        block_size=128,
+        output=torch.zeros_like(q),
+        num_heads=heads,
+        num_kv_heads=heads // 4,
+        head_size=dim,
+        scale=dim**-0.5,
+        batch_cap=4,
+    )
+
+
+@pytest.fixture()
+def _reset_shunt_state():
+    before_stats = dict(mod._PREFILL_STATS)
+    before_guard = mod._PREFILL_SKIP_GUARD
+    yield
+    mod._PREFILL_STATS.clear()
+    mod._PREFILL_STATS.update(before_stats)
+    mod._PREFILL_SKIP_GUARD = before_guard
+
+
+def test_h86_all_shunt_refuses_without_any_d2h(_reset_shunt_state, monkeypatch):
+    """H86 主契约:MAX_CTX=1 下判决短路——``.cpu()`` 一次都不许发生。"""
+    monkeypatch.setattr(mod, "_PREFILL_MAX_CTX", 1)
+
+    def _no_cpu(self, *a, **k):
+        raise AssertionError("H86: 全分流口径下 prefill 判决不得触发 D2H(.cpu())")
+
+    monkeypatch.setattr(torch.Tensor, "cpu", _no_cpu)
+    before = mod._PREFILL_STATS["prefill_long_skips"]
+    step = object()
+    kw = _make_step([200], [200])
+    assert mod.prefill_step(**kw, step_obj=step) is False
+    assert mod._PREFILL_STATS["prefill_long_skips"] == before + 1
+    # 与 "ctx shunt (early)" 分支同款守卫键:同一步其余层零成本短路
+    assert mod._PREFILL_SKIP_GUARD == (id(step), 1, kw["query"].shape[0])
+
+
+def test_h86_second_layer_hits_skip_guard_still_zero_d2h(_reset_shunt_state, monkeypatch):
+    """同一步第二层:守卫短路,计数器不重复累加,依旧零 D2H。"""
+    monkeypatch.setattr(mod, "_PREFILL_MAX_CTX", 1)
+
+    def _no_cpu(self, *a, **k):
+        raise AssertionError("H86: 分流步其余层走守卫短路,同样不得触发 D2H")
+
+    monkeypatch.setattr(torch.Tensor, "cpu", _no_cpu)
+    step = object()
+    kw = _make_step([200], [200])
+    assert mod.prefill_step(**kw, step_obj=step) is False
+    first = mod._PREFILL_STATS["prefill_long_skips"]
+    assert mod.prefill_step(**kw, step_obj=step) is False
+    assert mod._PREFILL_STATS["prefill_long_skips"] == first  # 第二层不计数
+
+
+def test_h86_short_circuit_not_armed_at_h59_threshold(_reset_shunt_state, monkeypatch):
+    """H59 档(4096 ≥ 1 页)不得短路:判据仍需读设备侧 seq_lens。"""
+    monkeypatch.setattr(mod, "_PREFILL_MAX_CTX", 4096)
+    seen: list = []
+    orig_cpu = torch.Tensor.cpu
+
+    def _rec(self, *a, **k):
+        seen.append(1)
+        return orig_cpu(self, *a, **k)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", _rec)
+    monkeypatch.setattr(mod.PrefillShapeManager, "usable", staticmethod(lambda spec: False))
+    kw = _make_step([200], [200])  # 2 页 = 256 token ≤ 4096:本不该分流
+    assert mod.prefill_step(**kw, step_obj=object()) is False  # usable=False 拒绝
+    assert seen, "H59 档不允许短路:分流判决需要真实的 seq_lens"
+
+
+def test_h86_short_circuit_not_armed_when_disabled(_reset_shunt_state, monkeypatch):
+    """MAX_CTX=0(全 TI 接管,shunt 关闭)更不允许短路。"""
+    monkeypatch.setattr(mod, "_PREFILL_MAX_CTX", 0)
+    seen: list = []
+    orig_cpu = torch.Tensor.cpu
+
+    def _rec(self, *a, **k):
+        seen.append(1)
+        return orig_cpu(self, *a, **k)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", _rec)
+    monkeypatch.setattr(mod.PrefillShapeManager, "usable", staticmethod(lambda spec: False))
+    kw = _make_step([200], [200])
+    assert mod.prefill_step(**kw, step_obj=object()) is False
+    assert seen
+
+
+# ------------------------------------------------- 6. H60:解包尾部搬运的缓冲契约
 
 
 def test_h60_unpack_tail_contract():

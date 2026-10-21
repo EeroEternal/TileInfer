@@ -596,6 +596,20 @@ def prefill_step(
         # First layer of this step (or a library-level caller without step identity):
         # build the layer-independent payload once.
         group = max(1, num_heads // num_kv_heads)
+        # H86(E375):全分流极端口径(``0 < MAX_CTX < KERNEL_PAGE_SIZE``,在役默认 =1)下,
+        # 任何非空 prefill 步的页数上界 ≥ 1 → ``max(pages)·128 > MAX_CTX`` 恒真,分流判决
+        # 不需要任何设备侧信息。把判决提到 D2H 之前,消除每个 prefill chunk 步一次强制
+        # 流同步——16K 域双臂画像实测 TI 侧 SyncStream 101 次 vs FIA 1 次,构成 TTFT
+        # +141ms 差值的决定性 host 面。语义与下方 "ctx shunt (early)" 分支逐字等价
+        # (同一计数器/同一 skip 守卫/同一 refuse),只是省掉了为读 ``seq_lens`` 付的同步。
+        if 0 < _PREFILL_MAX_CTX < KERNEL_PAGE_SIZE:
+            _PREFILL_STATS["prefill_long_skips"] = (
+                _PREFILL_STATS.get("prefill_long_skips", 0) + 1
+            )
+            if step_id is not None:
+                _PREFILL_SKIP_GUARD = (step_id, num_reqs, int(query.shape[0]))
+            _refuse("ctx shunt (all)", _PREFILL_MAX_CTX, KERNEL_PAGE_SIZE)
+            return False
         # H59-② 需要 ``seq_lens`` 判分流;把它与 ``qo_host`` **拼成一次 D2H**,
         # 否则短上下文(<4K、不分流)路径会因新判据多付一次同步——那是净回归。
         _qo_dev = (query_start_loc[1:] - query_start_loc[:-1]).to(torch.int64)
