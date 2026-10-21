@@ -38,6 +38,15 @@ SHARE_BUDGETS = (0.3, 0.4, 0.5, 0.6, 0.7, 0.8)
 SHARE_FAIL = 0.8
 
 
+def _pad_to_pages(t: torch.Tensor) -> torch.Tensor:
+    """(HKV, S, D) 尾部 pad 0 到页倍数(真实 decode 步 S=ctx+已生成,非页对齐)。"""
+    s = t.shape[1]
+    pad = (-s) % PAGE
+    if pad:
+        t = torch.nn.functional.pad(t, (0, 0, 0, pad))
+    return t
+
+
 def _dense_pages(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
     """q (HQ, D), k (HKV, S, D) -> 页质量 (HQ, n_pages),fp32 稳定 softmax(GQA 展开)。"""
     k_full = k.repeat_interleave(HQ // HKV, dim=0)  # (HQ, S, D)
@@ -45,7 +54,10 @@ def _dense_pages(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
     logits = logits - logits.amax(dim=-1, keepdim=True)
     p = torch.softmax(logits, dim=-1)  # (HQ, S)
     s = p.shape[-1]
-    return p.view(HQ, s // PAGE, PAGE).sum(dim=-1)
+    pad = (-s) % PAGE
+    if pad:
+        p = torch.nn.functional.pad(p, (0, pad))  # padding token 零质量
+    return p.view(HQ, s // PAGE + (1 if pad else 0), PAGE).sum(dim=-1)
 
 
 def _select_pages(q: torch.Tensor, k: torch.Tensor, budget: int) -> torch.Tensor:
@@ -79,7 +91,9 @@ def _cover(q: torch.Tensor, k: torch.Tensor, masks: torch.Tensor) -> list[float]
 
 def run_case(mode: str, s: int, seed: int = 0, load: dict | None = None) -> dict:
     if load is not None:
-        q, k, v = load["q"].float(), load["k"].float(), load["v"].float()
+        q = load["q"].float()
+        k = _pad_to_pages(load["k"]).float()
+        v = _pad_to_pages(load["v"]).float()
     elif mode == "correlated":
         g = torch.Generator().manual_seed(seed)
         k = torch.randn(HKV, s, D, generator=g)
@@ -142,7 +156,7 @@ def run_share_case(layers: list[dict]) -> dict | None:
         return None
     ls = []
     for ld in layers:
-        q, k = ld["q"].float(), ld["k"].float()
+        q, k = ld["q"].float(), _pad_to_pages(ld["k"]).float()
         s = k.shape[1]
         n_pages = s // PAGE
         centroid = k.view(HKV, n_pages, PAGE, D).mean(dim=2)
@@ -198,14 +212,18 @@ def main() -> int:
 
     print("[select-quality] H81 判据口径: top-50%% 页 min-cover >= %.0f%% → 立项" % (COVER_GATE * 100))
     verdict = None
+    real_mins = [r["cover_min"] for r in results if r["mode"].startswith("real")]
     for r in results:
         print(
             f"[select-quality] {r['mode']:10s} S={r['s']:6d} pages={r['n_pages']} "
             f"budget={r['budget']} cover_min={r['cover_min']:.4f} cover_mean={r['cover_mean']:.4f} "
             f"per_head={r['cover_per_head']}"
         )
-        if r["mode"].startswith("real"):
-            verdict = "PASS_LB_GATE" if r["cover_min"] >= COVER_GATE else "LB_DISPROVEN"
+    if real_mins:
+        # H81 判据口径 = 所有 real 层 × 所有 Q head 的最小覆盖(最严口径)
+        gmin = min(real_mins)
+        verdict = "PASS_LB_GATE" if gmin >= COVER_GATE else "LB_DISPROVEN"
+        print(f"[select-quality] H81 全层最小覆盖: {gmin:.4f} (layers={len(real_mins)})")
     if share_result is not None:
         print(f"[select-quality] H85 共享判据: layers={share_result['n_layers']} "
               f"f*={share_result['f_star']} curve={share_result['curve']}")

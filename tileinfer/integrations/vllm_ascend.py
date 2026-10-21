@@ -151,6 +151,110 @@ def _bucket_for(num_reqs: int) -> int:
     )
 
 
+# ---------------------------------------------------------------------------------------
+# L-B 选择质量 dump(H81/H85 判据输入,E364 dump 格式)。env 门控:仅当
+# TILEINFER_LB_DUMP=<dir> 时激活,在役默认路径零影响。采集口径 = decode 单请求步的
+# 全量 Q/K/V(逐 full-attn 层累积,一个步一个文件);dump 臂须以 --enforce-eager 运行
+# (权威口径 decode 走 ACLGraph 回放,Python 不执行),本路径内的 .item()/host 拷贝
+# 只发生在 dump 臂,不在役。
+# ---------------------------------------------------------------------------------------
+_LB_DUMP_STATE: Dict[str, Any] = {"acc_key": None, "acc": None, "saved": 0}
+
+
+def _lb_dump_enabled() -> bool:
+    return bool(os.environ.get("TILEINFER_LB_DUMP"))
+
+
+def _lb_dump_collect(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_size: int,
+) -> Optional[Dict[str, torch.Tensor]]:
+    """单请求 decode 步:从 paged cache 收集全序列 K/V 与该步 Q(E364 格式的一层)。
+
+    返回 {"q": (HQ, D), "k": (HKV, S, D), "v": (HKV, S, D)}(bf16,CPU);采集失败返回 None
+    (静默,dump 永不影响服务)。
+    """
+    try:
+        if key_cache.dim() != 4 or value_cache.shape != key_cache.shape:
+            return None  # 非 NHD 布局(如 NZ 变体):不 dump,交由人工核
+        _, _, num_kv_heads, head_size = key_cache.shape
+        num_heads = query.shape[1]
+        seq_len = int(seq_lens[0].item())
+        if seq_len <= 0:
+            return None
+        sub = _sub_pages(block_size)
+        eng_pages = (seq_len + block_size - 1) // block_size
+        if int(block_tables.shape[1]) < eng_pages:
+            return None
+        # 引擎页表展开为 128-token 子页 id(与内核消费同一条路径),再按子页收集。
+        seq_pages = (seq_len + KERNEL_PAGE_SIZE - 1) // KERNEL_PAGE_SIZE
+        expanded = _expand_page_table(block_tables[:1], sub)
+        ids = expanded[0, :seq_pages].to(torch.long)
+        pool_k = _pool_sub_view(key_cache, sub)
+        pool_v = _pool_sub_view(value_cache, sub)
+        k = pool_k.index_select(0, ids).reshape(-1, num_kv_heads, head_size)[:seq_len]
+        v = pool_v.index_select(0, ids).reshape(-1, num_kv_heads, head_size)[:seq_len]
+        q = query[:1, :num_heads].reshape(num_heads, head_size)
+        return {
+            "q": q.detach().to("cpu", torch.bfloat16),
+            "k": k.detach().permute(1, 0, 2).contiguous().to("cpu", torch.bfloat16),
+            "v": v.detach().permute(1, 0, 2).contiguous().to("cpu", torch.bfloat16),
+        }
+    except Exception:  # noqa: BLE001 - dump 永不影响服务
+        return None
+
+
+def _lb_dump_flush() -> None:
+    """把当前步的逐层累积写盘(步边界触发;atexit 兜底最后一笔)。"""
+    st = _LB_DUMP_STATE
+    layers = st["acc"]
+    if not layers:
+        return
+    try:
+        out_dir = os.environ.get("TILEINFER_LB_DUMP", "")
+        if not out_dir:
+            st["acc"] = None
+            return
+        ctx = int(layers[0]["k"].shape[1])
+        path = os.path.join(out_dir, f"lb_dump_ctx{ctx}_step{st['saved']}.pt")
+        torch.save({"layers": layers}, path)
+        st["saved"] += 1
+        logger.info("TileInfer lb-dump saved %d layers (ctx=%d) -> %s", len(layers), ctx, path)
+    except Exception:  # noqa: BLE001
+        logger.exception("TileInfer lb-dump flush failed")
+    finally:
+        st["acc"] = None
+        st["acc_key"] = None
+
+
+def _lb_dump_record(step_obj: Any, payload: Dict[str, torch.Tensor]) -> None:
+    st = _LB_DUMP_STATE
+    if not st.get("exit_hooked"):
+        import atexit
+
+        atexit.register(_lb_dump_flush)
+        st["exit_hooked"] = True
+    max_steps = int(os.environ.get("TILEINFER_LB_DUMP_STEPS", 2))
+    key = id(step_obj)
+    if st["acc_key"] != key:
+        # 步边界:上一笔(若未存)落盘;达到步数上限后停止累积(仅剩清空)。
+        if st["acc"] and st["saved"] < max_steps:
+            _lb_dump_flush()
+        else:
+            st["acc"] = None
+            st["acc_key"] = None
+        if st["saved"] >= max_steps:
+            return
+        st["acc_key"] = key
+        st["acc"] = []
+    if st["acc"] is not None and st["saved"] < max_steps:
+        st["acc"].append(payload)
+
+
 def _parse_ktp_policy(raw: str) -> Dict[int, int]:
     """Parse ``TILEINFER_KV_TILE_PAGES_POLICY`` (H21): ``"1:16,2:32,8:128"`` → per-bucket ktp.
 
@@ -1501,6 +1605,25 @@ def _build_classes():
 
             try:
                 num_reqs = int(attn_metadata.seq_lens.numel())
+                # L-B 选择质量 dump(H81/H85):单请求 decode 步、eager(非图捕获)时采集。
+                if (
+                    _lb_dump_enabled()
+                    and num_reqs == 1
+                    and not torch.npu.is_current_stream_capturing()
+                ):
+                    try:
+                        payload = _lb_dump_collect(
+                            query=query,
+                            key_cache=self.key_cache,
+                            value_cache=self.value_cache,
+                            block_tables=attn_metadata.block_tables[:num_reqs],
+                            seq_lens=attn_metadata.seq_lens,
+                            block_size=int(self.key_cache.shape[1]),
+                        )
+                        if payload is not None:
+                            _lb_dump_record(attn_metadata, payload)
+                    except Exception:  # noqa: BLE001 - dump 永不影响服务
+                        logger.exception("TileInfer lb-dump collect failed")
                 # Device-resident lengths only: the host-side `seq_lens` cannot be copied inside
                 # an ACLGraph capture (aclrtMemcpy is rejected while the stream is capturing),
                 # and replay would never refresh a plan-owned buffer from a host tensor.  The

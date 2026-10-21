@@ -2747,3 +2747,39 @@ decode,prefill,greedy+SIMD softmax+ktp 分带+MAX_CTX=1+fold+DENSE_NN+capture8)�
    (H81/H85,dump 判据待真实 trace);L-A 已终局判停(D174)。
 4. 大账(今日口径):c8 −30.4%/−31.5% ✓;c1 +7.4%(不可达档,E327 证据链);
    8K −7.9%/16K −4.3%(长上下文档)。
+
+## L-B 页级 top-k 稀疏选择:真实 trace 判据 LB_DISPROVEN——centroid 选择器对真实分布无判别力,「读得少」维度全域关闭(iter-249,E373/D180)
+
+装备:dump hook(`TILEINFER_LB_DUMP` env 门控,`tileinfer/integrations/vllm_ascend.py` 模块级
+`_lb_dump_collect/_lb_dump_record/_lb_dump_flush` + `forward_impl` DecodeOnly 分支接入;单请求
+decode 步逐 full-attn 层累积,一步一文件,E364 格式;CPU 契约 7 用例 `tests/test_lb_dump_hook.py`)。
+采集:dump 臂 = 权威 ti 臂 env + `--enforce-eager`(eager 下每步 Python 执行;plan miss =
+后台编译 + 本步 FIA,无 E368 型 capture 窗卡死面);单请求 8192/8 与 16384/8,6 文件全收
+(8K ctx8193/8194 双步,16K ctx16385-16388 四步)。
+
+判据(HYPOTHESES H81/H85 预登记门槛;sparse_select_quality.py --load,三 dump 一致):
+
+| 判据 | 8K | 16K | 门槛 | 判决 |
+|---|---|---|---|---|
+| H81 top-50% 页 min-cover(全层×全 head) | 0.23% / 0.21% | 0.50% | ≥99% | **LB_DISPROVEN** |
+| H85 共享选择器最小可行预算 f* | None | None | ≤0.5 可行 | **SHARE_DISPROVEN** |
+| top-10% 页 softmax 质量占比 | 38.3% | 49.0% | —(均匀=10%) | 分布集中度不足 |
+| 最大单页质量份额 | ~19% | ~21% | —(均匀 1.5%/0.8%) | 有集中但远不足 |
+
+结论:
+1. **H81/H85 双关闭**:centroid(q·K 均值)打分与真实注意力分布几乎无关——个别 Q-head
+   top-50% 页覆盖低至 0.2%(选择反向);cover_mean 也仅 0.55-0.70。要覆盖 99% 质量需
+   ~95%+ 页,「读减半」前提不存在。
+2. **DeepInfer 索引器训练件必要性反向确认**(深读线收口):E362 定位「centroid=训练-free
+   等价物」,本轮实证该等价物在真实分布上不成立——DeepInfer DeepSelect 的收益来源是训练
+   判别力而非选择结构,不可映射定谳。深读七轮(E330/E335/E339/E345/E357/E362/E371)
+   累计登记 H80/H81/H83/H85,至此四假设全部终态关闭。
+3. **「读得少」维度全域关闭**:L-A KV FP8(per-head/per-block MX 双粒度判停,E341/E353)
+   + L-B(本轮)⇒ 长上下文 TPOT 在当前栈内的可达值 = 在役 split-KV+SIMD softmax 配置
+   (权威矩阵 c8 档 −30.4%/−31.5%);进一步改善需新维度(训练件索引器/硬件 KV 压缩),
+   超出本轮授权口径。
+4. 口径声明:判据以 random-input trace 出数;若生产负载分布显著更尖锐,重开需带生产
+   trace 重验(dump 装备保留,复验成本=一次 dump 臂 serve+一次 --load)。
+5. dump 资产:6 个真实 trace(run/lb_dump/,gitignored);oracle 两处修正(非页对齐 S 尾页
+   pad;多 real 层 verdict 取全层最小);E337 教训再证(dump 臂首跑漏 source env.sh 即
+   E30009,补挂即通)。
