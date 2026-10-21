@@ -122,7 +122,10 @@ def fused_sample_applicable(logits: Any, md: Any, predict_bonus_token: bool) -> 
         return False
     if not isinstance(logits, torch.Tensor) or logits.ndim != 2:
         return False
-    if logits.dtype != torch.float32:
+    # E367:引擎内 lm_head 直出 logits 是 bf16(模型 dtype),原生 fp32 只在基类
+    # forward 内部转换——要求 fp32 会把整条引擎路径恒拒(三计数全 0 根因①)。
+    # 放宽到低精度浮点,wrapper 在进内核前统一 cast fp32(内核物料约定不变)。
+    if logits.dtype not in (torch.float32, torch.bfloat16, torch.float16):
         return False
     if not logits.is_contiguous():
         return False
@@ -134,15 +137,17 @@ def fused_sample_applicable(logits: Any, md: Any, predict_bonus_token: bool) -> 
         return False
     if getattr(md, "logprob_token_ids", None):
         return False
-    # 会改写 logits 的处理器 → 概率分布已变,内核看不到
+    # E367:不再以「non_argmax_invariant 列表非空」为由回退——vLLM 在初始化期
+    # 就把 LogitBias/MinTokens 处理器登记进该列表(与请求参数无关),守卫恒触发
+    # (三计数全 0 根因②)。语义改为:wrapper 在进内核前调用
+    # `apply_logits_processors` 把这些处理器**实际应用**掉(no-op 时零影响,
+    # 有值时与原生 forward 逐位同序),改写不再可能被内核漏看。
+    # 会改写 logits 且无需处理器对象的直改面仍由守卫拒绝:
     if not getattr(md, "no_penalties", False):
         return False
     if getattr(md, "bad_words_token_ids", None):
         return False
     if getattr(md, "allowed_token_ids_mask", None) is not None:
-        return False
-    procs = getattr(md, "logprobsprocs", None) or getattr(md, "logitsprocs", None)
-    if procs is not None and len(getattr(procs, "non_argmax_invariant", [None])):
         return False
     # 全 greedy 批次交给 H36(它更轻:连 softmax 都不做)
     if not _has_real_sampling(md):
@@ -211,12 +216,20 @@ def make_fused_forward(orig_forward: Callable) -> Callable:
                     batch = int(logits.shape[0])
                     vocab = int(logits.shape[-1])
                     do_sample = True
-                    temps, top_p, top_k, seed = _extract_params(
-                        sampling_metadata, batch, logits.device
+                    # E367 修复的两个语义面(回退路径始终用**原始入参**重做):
+                    # ①低精度 logits 先 cast fp32(内核物料约定 [batch, vocab] fp32);
+                    # ②应用 non_argmax_invariant 处理器(min_tokens/logit_bias),
+                    #   与原生 forward 同序同语义,no-op 处理器零影响。
+                    fp32 = logits.to(torch.float32)
+                    fp32 = self.apply_logits_processors(
+                        fp32, sampling_metadata, predict_bonus_token
                     )
-                    out = torch.empty(batch, dtype=torch.int32, device=logits.device)
+                    temps, top_p, top_k, seed = _extract_params(
+                        sampling_metadata, batch, fp32.device
+                    )
+                    out = torch.empty(batch, dtype=torch.int32, device=fp32.device)
                     kern = _get_kernel(vocab, batch, do_sample)
-                    kern(logits.contiguous(), temps, top_p, top_k, seed, out)
+                    kern(fp32.contiguous(), temps, top_p, top_k, seed, out)
                     from vllm.v1.outputs import SamplerOutput
 
                     _inc("fused_sample_calls")

@@ -66,8 +66,14 @@ def test_rejects_non_2d():
     assert integ.fused_sample_applicable(torch.randn(2, 2, V), _MD(), False) is False
 
 
-def test_rejects_non_float32():
-    assert integ.fused_sample_applicable(_logits().bfloat16(), _MD(), False) is False
+def test_accepts_low_precision_logits():
+    """E367 根因①:引擎内 lm_head 直出 bf16,守卫必须放行(wrapper 内 cast fp32)。"""
+    for dtype in (torch.float32, torch.bfloat16, torch.float16):
+        assert integ.fused_sample_applicable(_logits().to(dtype), _MD(), False) is True
+
+
+def test_rejects_non_float_dtype():
+    assert integ.fused_sample_applicable(_logits().double(), _MD(), False) is False
 
 
 def test_rejects_non_contiguous():
@@ -113,11 +119,78 @@ def test_rejects_allowed_mask():
     assert integ.fused_sample_applicable(_logits(), _MD(allowed_token_ids_mask=mask), False) is False
 
 
-def test_rejects_non_argmax_invariant_procs():
-    class _Procs:
-        non_argmax_invariant = [object()]
+def test_accepts_non_argmax_invariant_procs():
+    """E367 根因②:LogitBias/MinTokens 处理器在 vLLM 初始化期即登记进
+    non_argmax_invariant(与请求参数无关),恒非空——不得作为拒绝理由;
+    语义改为 wrapper 内实际应用处理器(见 test_forward_applies_processors)。"""
+    import types
 
-    assert integ.fused_sample_applicable(_logits(), _MD(logitsprocs=_Procs()), False) is False
+    md = _MD(logitsprocs=types.SimpleNamespace(non_argmax_invariant=[object()]))
+    assert integ.fused_sample_applicable(_logits(), md, False) is True
+
+
+def test_forward_applies_processors(monkeypatch):
+    """接管路径必须先 cast fp32 并应用 processors,再喂内核;失败回退用原始入参。"""
+    monkeypatch.setattr(integ, "_ops_enabled", lambda: True)
+    integ.reset_state()
+
+    seen = {}
+
+    class _Self:
+        def apply_logits_processors(self, logits, md, pbt):
+            seen["dtype"] = logits.dtype
+            seen["applied"] = True
+            return logits
+
+    def fake_kernel(fp32_logits, temps, tp, tk, seed, out):
+        seen["kernel_dtype"] = fp32_logits.dtype
+        seen["kernel_batch"] = int(out.shape[0])
+        out.fill_(7)
+
+    monkeypatch.setattr(integ, "_get_kernel", lambda *a: fake_kernel)
+
+    import types
+
+    md = _MD(logitsprocs=types.SimpleNamespace(non_argmax_invariant=[object()]))
+    bf16 = _logits().to(torch.bfloat16)
+    fwd = integ.make_fused_forward(lambda self, *a, **k: pytest.fail("must not fall back"))
+    out = fwd(_Self(), bf16, md, False, None)
+    assert seen == {
+        "dtype": torch.float32,
+        "applied": True,
+        "kernel_dtype": torch.float32,
+        "kernel_batch": integ.MIN_BATCH_FOR_FUSED_SAMPLE,
+    }
+    assert integ.COUNTERS["fused_sample_calls"] == 1
+    assert torch.all(out.sampled_token_ids == 7)
+
+
+def test_forward_falls_back_if_processors_raise(monkeypatch):
+    """processors 应用抛异常 → 计 fallbacks 并用**原始入参**回退原生 forward。"""
+    monkeypatch.setattr(integ, "_ops_enabled", lambda: True)
+    integ.reset_state()
+
+    sentinel = object()
+    orig_logits = {}
+
+    class _Self:
+        def apply_logits_processors(self, logits, md, pbt):
+            raise RuntimeError("synthetic processor failure")
+
+    def orig(self, logits, md, pbt=False, lmo=None):
+        orig_logits["dtype"] = logits.dtype
+        return sentinel
+
+    import types
+
+    fwd = integ.make_fused_forward(orig)
+    bf16 = _logits().to(torch.bfloat16)
+    md = _MD(logitsprocs=types.SimpleNamespace(non_argmax_invariant=[object()]))
+    out = fwd(_Self(), bf16, md, False, None)
+    assert out is sentinel
+    assert orig_logits["dtype"] == torch.bfloat16  # 原始入参,未被 cast 污染
+    assert integ.COUNTERS["fused_sample_fallbacks"] == 1
+    assert integ.COUNTERS["fused_sample_calls"] == 0
 
 
 def test_rejects_pure_greedy_batch():
