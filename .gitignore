@@ -35,3 +35,6 @@ exception_info.*
 *.o
 .tilelang_cache/
 benchmarks/probes/h2[79]_perm_*.npy
+
+# vLLM 运行期产物(测试进程内创建)
+runtime/

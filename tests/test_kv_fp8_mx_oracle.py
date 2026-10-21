@@ -68,15 +68,15 @@ def _make_inputs(s: int, mode: str, seed: int) -> tuple:
 
 
 @pytest.mark.parametrize(
-    "mode,s",
+    "mode,s,expect_pass",
     [
-        ("uniform", 8192),
-        ("uniform", 16384),
-        ("correlated", 8192),
-        ("correlated", 16384),
+        ("uniform", 8192, False),
+        ("uniform", 16384, False),
+        ("correlated", 8192, True),
+        ("correlated", 16384, True),
     ],
 )
-def test_kv_fp8_mx_oracle_rel_tol(mode, s):
+def test_kv_fp8_mx_oracle_rel_tol(mode, s, expect_pass):
     q, k, v = _make_inputs(s, mode, seed=42 + s)
     k8 = _quant_e4m3_mx(k)
     v8 = _quant_e4m3_mx(v)
@@ -86,10 +86,14 @@ def test_kv_fp8_mx_oracle_rel_tol(mode, s):
     rel = (o8 - o32).norm() / o32.norm()
     per_q = ((o8 - o32).norm(dim=-1) / o32.norm(dim=-1).clamp(min=1e-12)).max()
     print(f"[kv_fp8_mx_oracle] S={s} {mode} rel_F={rel:.3e} per_q_max={per_q:.3e}")
-    assert rel.item() <= TOL_REL, (
-        f"MX 粒度超差 rel_F={rel:.3e} > {TOL_REL}: L-A 终局判停"
-        f"(per-head 与 per-block 双粒度均不可行)"
-    )
+    if expect_pass:
+        assert rel.item() <= TOL_REL
+    else:
+        # 亮停存证(iter-243 E353 终局判决):MX per-block 粒度在均匀域同样超差
+        # ⇒ per-head/per-block 双粒度均不可行,L-A 终局关闭。此断言守卫该事实:
+        # 若未来 uniform 回落 TOL 内(如混合精度/更高尾数格式),此处失败即为
+        # L-A 重开评估信号。
+        assert rel.item() > TOL_REL, "亮停存证失效: uniform 已回落 TOL 内,重开 L-A 评估"
 
 
 def test_kv_fp8_mx_roundtrip_fidelity():
@@ -102,8 +106,13 @@ def test_kv_fp8_mx_roundtrip_fidelity():
     assert rel.item() < TOL_REL
 
 
-def test_kv_fp8_mx_vs_per_head_gap():
-    """对照:同输入下 MX 粒度 raw round-trip 误差应优于 per-head 单 scale。"""
+def test_kv_fp8_mx_vs_per_head_granularity_invariance():
+    """粒度不变性存证(iter-243 E353):i.i.d. 分布下 per-block MX 与 per-head
+    单 scale 的 raw round-trip 误差相等(±5% 口径)——每 32 元素块的 amax 与
+    整头 amax 同分布,scale 粒度不改变尾数舍入噪声地板。该地板由 E4M3 三位
+    尾数决定(~2.4e-2 量级),任何 scale 粒度细化均无法突破 ⇒ L-A 终局判停的
+    理论依据(uniform 域 3.8e-2 超差不可通过细化粒度修复)。
+    """
     from test_kv_fp8_oracle import _quant_e4m3_per_head
 
     g = torch.Generator().manual_seed(7)
@@ -112,4 +121,4 @@ def test_kv_fp8_mx_vs_per_head_gap():
     xh, _ = _quant_e4m3_per_head(x)
     rel_ph = ((xh - x).norm() / x.norm()).item()
     print(f"[kv_fp8_mx_oracle] roundtrip mx={rel_mx:.3e} per_head={rel_ph:.3e}")
-    assert rel_mx < rel_ph
+    assert abs(rel_mx - rel_ph) / rel_ph < 0.05

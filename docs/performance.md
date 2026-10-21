@@ -2591,3 +2591,28 @@ disproven 关闭**,设备 oracle 未做(乐观上界已超,无信息量)。
 翻案路径记档(未立项,待用户裁决或新假设轮):①scale 粒度 per-token/per-block
 (KV 行级 fp32 scale,存储 +0.4%,读取减半保留,vLLM/flashinfer fp8-KV 生产实现
 同族);②dequant-in-kernel(E334 bf044ba 同思想)仅在①之后有意义。
+
+## H84 / L-A 终局判停:per-block MX 粒度同样超差,scale 粒度细化被证死(iter-243,E353/D174)
+
+E341 翻案路径①(per-block scale)经 H84 立项验证(MX 标准:E4M3+per-32 连续元素
+E8M0 2 的幂 scale,存证 `tests/test_kv_fp8_mx_oracle.py`;实现通路已备=E352
+tilelang 0.1.15 昇腾后端原生 blockscaled MAD `ascend_mad_mx`,dequant-in-MAD 零额外内核):
+
+| 场景 | MX per-block rel_F | per-head(H82 对照) | 判 |
+|---|---|---|---|
+| S=8192 均匀 | **3.843e-2** | 3.800e-2 | **超差** |
+| S=16384 均匀 | **3.867e-2** | 4.053e-2 | **超差** |
+| S=8192 相关 | 2.784e-2 | 2.616e-2 | 贴线 PASS |
+| S=16384 相关 | 2.667e-2 | 2.661e-2 | 贴线 PASS |
+| raw round-trip(mx vs per-head,同 seed) | 2.653e-2 | 2.642e-2 | **零增益** |
+
+**判决:按 H84 预登记红线,L-A 终局判停**。决定性证据=同输入下 per-32 粒度相对
+per-head 单 scale raw round-trip 零改进(±5% 口径)——i.i.d. 分布下每 32 元素块
+amax 与整头 amax 同分布,scale 粒度不改变 E4M3 三位尾数的舍入噪声地板
+(gaussian ~2.4e-2/uniform 端到端 ~3.8e-2);任何更细粒度(per-token/per-16)同理无效。
+
+**终局结论:「KV FP8(E4M3 族,任意 scale 粒度)在 TOL 3e-2 下对均匀域不可达」,
+交用户裁决**(选项:a) 降 TOL 需明示口径变更;b) K/V 混合精度分置(误差主导度
+分析先行);c) 放弃 KV 量化轴,L-B 稀疏选择为「读得少」唯一在途路径)。
+存证语义=expect_pass 守卫(uniform 反向断言),未来若回落 TOL 内测试即失败=重开信号;
+两轮穷尽(H82 iter-238+H84 iter-242/243)满足循环终止条件 b) 的 L-A 单线口径。
