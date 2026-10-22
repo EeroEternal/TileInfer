@@ -2975,3 +2975,16 @@ lc 链(iter-252 武装,iter-255 收割)H32 棒双臂:off=在役最优基座,on=+
 - 后续(等窗):单探针 serve(ops=decode,prefill,greedy,moeprefetch,PORT 8153,
   128x128_c1 单场景 ~2min)读计数定死钩点/守卫拦截→守卫可修即修→STICKS="h36 h37"
   重挂 on 臂(off 产物自动跳过)→H36/H37 终判。此二棒终判前 L-C 不算收割完毕。
+
+### L-D DeepSelect 臂终态补记(iter-260,D186/E404)
+- **定谳:上游内核不存在,臂关闭**。DeepInfer(同硬件参考实现)
+  `npu_ops/deep_select.py` 源码实证:采样路径(`return_value=True`,即我方
+  `topk.py` 唯一用法)官方直接 fallback `torch.topk`,注释明示「Sampler is
+  not supported yet」——D167-3「等外部补齐库或语义」两通道均关闭:装库也无
+  内核,与静默失效等价零收益;不装 deep_select 包(非官方源不可得+无收益)。
+- 「torch.topk-on-logits 变体重开」分析性判死(不烧设备窗):权威口径全批
+  greedy→apply_top_k_top_p 零暴露;单步替换收益必低于同域 fused_sample 全链
+  引擎级 ~1.9%(已判 <5% 门槛)。
+- 处置:`tileinfer/kernels/sampling/topk.py` 静默失效即终态(import 失败→
+  交还原生,现行为正确,零维护成本);`_OPS_ALL` "sampling" 键与 fused_sample
+  接线维持(H76 终态建议仍待用户裁决)。**L-D 两臂至此全部终态,L-D 线关闭。**
