@@ -15,9 +15,17 @@ in-engine 3.8µs/次 ≈ 0.67% TPOT,E97)。把 ba 权重 cat 到 qkvz 权重尾�
 任何守卫不满足或运行期异常均回退原 ``forward_cuda``(``TILEINFER_OPS`` 每步读取,
 翻转即回退,重启免编译)。fused 权重在首次 forward(预热期、图捕获前)懒构建,
 额外显存 = 12352×2048×2B × 30 层 ≈ 1.5GB。
+
+H90 物化变体(``TILEINFER_GDNPROJ_MATERIALIZED``,默认 off=E390 strided 形态):
+融合 GEMM 输出行 stride=12352(非 128 对齐),零拷贝 strided 切片喂下游消费链
+在权威 A/B(E390)全场景 TPOT 常数劣化 +1.3~1.6ms/步。本开关把两段切片
+``.contiguous()`` 物化(stride 恢复 12288/64 对齐,与分离路径同型),decode
+M≤8 物化拷贝量 ≈0.2MB/层(理论税 <20µs/层),换取消费内核访存回到对齐快路径。
 """
 
 from __future__ import annotations
+
+import os
 
 import torch
 
@@ -25,6 +33,12 @@ try:  # einops 是 vllm 的硬依赖,forward_cuda 原实现同样使用
     from einops import rearrange
 except ImportError:  # pragma: no cover - vllm 缺席时本模块不会被引擎加载
     rearrange = None
+
+
+def materialized_enabled() -> bool:
+    """H90 物化形态开关(``TILEINFER_GDNPROJ_MATERIALIZED``,每步读取,翻转即切)。"""
+    spec = os.environ.get("TILEINFER_GDNPROJ_MATERIALIZED")
+    return spec is not None and spec.strip().lower() in ("1", "true", "yes", "on")
 
 
 def build_fused_inproj_weight(layer: torch.nn.Module) -> torch.Tensor | None:
@@ -70,6 +84,9 @@ def fused_forward_cuda(layer: torch.nn.Module, hidden_states: torch.Tensor,
     * ``gqa_interleaved_layout=False``(Qwen3.5,本模型):qkvz 按
       ``[qkv_size, z_size]`` 切分、ba 按 ``chunk(2)`` 切 b/a —— 与上游逐行同构。
     上游演进时本函数需同步复核。
+
+    输出切片默认零拷贝 strided(E390 在役形态);``TILEINFER_GDNPROJ_MATERIALIZED``
+    打开时物化为连续 buffer(H90 变体,见模块 docstring)。
     """
     weight = getattr(layer, "_tileinfer_fused_inproj", None)
     if weight is None:
@@ -84,9 +101,13 @@ def fused_forward_cuda(layer: torch.nn.Module, hidden_states: torch.Tensor,
     num_tokens = hidden_states.size(0)
     fused = torch.nn.functional.linear(hidden_states, weight)
     n_qkvz = layer.in_proj_qkvz.weight.shape[0]
-    # 零拷贝 strided 切片:下游只做切分/纯维度 view(E101)
+    # 零拷贝 strided 切片:下游只做切分/纯维度 view(E101);
+    # H90 物化开关打开时改为连续拷贝(stride 恢复 12288/64 对齐,消费内核回快路径)
     mixed_qkvz = fused[:, :n_qkvz]
     ba = fused[:, n_qkvz:]
+    if materialized_enabled():
+        mixed_qkvz = mixed_qkvz.contiguous()
+        ba = ba.contiguous()
 
     if getattr(layer, "gqa_interleaved_layout", False):
         query, key, value, z, b, a = layer.fix_query_key_value_ordering(mixed_qkvz, ba)

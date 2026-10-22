@@ -194,6 +194,72 @@ def test_qwen35_layout_fused_slices_match_separate():
     assert torch.equal(layer.split_ba(y_ba)[1], layer.split_ba(y_fused[:, n_qkvz:])[1])
 
 
+def test_materialized_mode_gating():
+    """H90 物化开关:TILEINFER_GDNPROJ_MATERIALIZED 每步读取,缺省 off(在役 strided 形态)。"""
+    from tileinfer.kernels.gdn.proj_fusion import materialized_enabled
+
+    import os
+
+    old = os.environ.get("TILEINFER_GDNPROJ_MATERIALIZED")
+    try:
+        os.environ.pop("TILEINFER_GDNPROJ_MATERIALIZED", None)
+        assert materialized_enabled() is False
+        for on in ("1", "true", "YES", "on"):
+            os.environ["TILEINFER_GDNPROJ_MATERIALIZED"] = on
+            assert materialized_enabled() is True, on
+        for off in ("0", "false", "no", "", "  "):
+            os.environ["TILEINFER_GDNPROJ_MATERIALIZED"] = off
+            assert materialized_enabled() is False, repr(off)
+    finally:
+        if old is None:
+            os.environ.pop("TILEINFER_GDNPROJ_MATERIALIZED", None)
+        else:
+            os.environ["TILEINFER_GDNPROJ_MATERIALIZED"] = old
+
+
+def test_qwen35_materialized_buffers_contiguous_and_matches_separate():
+    """H90 契约:物化 = 对 fused 两段切片 .contiguous()。
+
+    ① 物化 buffer 连续(row stride 12288/64,与分离路径同型,fused 原 stride 12352
+    非 128 对齐 = E390 消费慢路径疑面);② 物化后 Qwen3.5 分支切分语义
+    (split qkv/z + split_ba)与分离双 GEMM 路径逐位一致。
+    """
+    layer = _ordering_layer()
+    layer.gqa_interleaved_layout = False
+    layer.key_dim = HK * DK
+    layer.value_dim = HV * DV
+    layer.num_v_heads = HV
+    layer.head_v_dim = DV
+    layer.tp_size = 1
+    layer.disable_tp_for_ba_proj = False
+
+    w_qkvz, w_ba = _interleaved_weights(17)
+    fused_w = torch.cat([w_qkvz, w_ba], dim=0)
+    x = torch.randn(M, HIDDEN)
+    y_fused = x @ fused_w.T
+
+    n_qkvz = w_qkvz.shape[0]
+    mixed_qkvz, ba = y_fused[:, :n_qkvz], y_fused[:, n_qkvz:]
+    assert not mixed_qkvz.is_contiguous() and not ba.is_contiguous()
+    assert mixed_qkvz.stride(0) == fused_w.shape[0] == 12352  # 非 128 对齐行距
+
+    mixed_qkvz = mixed_qkvz.contiguous()
+    ba = ba.contiguous()
+    assert mixed_qkvz.is_contiguous() and mixed_qkvz.stride(0) == 12288
+    assert ba.is_contiguous() and ba.stride(0) == 64
+
+    # 物化后的切分语义与分离路径逐位一致(融合不改变下游消费的张量内容)
+    y_qkvz = x @ w_qkvz.T
+    y_ba = x @ w_ba.T
+    qkv_size = (layer.key_dim * 2 + layer.value_dim) // layer.tp_size
+    z_size = layer.value_dim // layer.tp_size
+    mk_sep, z_sep = y_qkvz.split([qkv_size, z_size], dim=-1)
+    mk_mat, z_mat = mixed_qkvz.split([qkv_size, z_size], dim=-1)
+    assert torch.equal(mk_sep, mk_mat) and torch.equal(z_sep, z_mat)
+    assert torch.equal(layer.split_ba(y_ba)[0], layer.split_ba(ba)[0])
+    assert torch.equal(layer.split_ba(y_ba)[1], layer.split_ba(ba)[1])
+
+
 @pytest.mark.npu
 @pytest.mark.skipif(not is_npu_available(), reason="no Ascend NPU available")
 def test_fused_gemm_tol_equal_on_device():
