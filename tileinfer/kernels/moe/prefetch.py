@@ -31,7 +31,10 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Callable
+
+_logger = logging.getLogger("tileinfer.moe.prefetch")
 
 #: 探针计数器(安装时同步进后端类 _stats,metrics dumper 读取)
 COUNTERS: dict[str, int] = {
@@ -143,7 +146,14 @@ class _LazyPrefetchMethod:
             _arm(real, self._gate_up_ratio)
             self._real = real
             return real
-        except Exception:  # noqa: BLE001 - 物化失败=管道失活,不破引擎
+        except Exception as exc:  # noqa: BLE001 - 物化失败=管道失活,不破引擎
+            # 首次失活一次性告警(H37 A/B 归因:E402 fallbacks=1 零 active 的静默盲区)
+            _logger.warning_once(
+                "moeprefetch pipeline materialization failed, prefetch permanently "
+                "inactive this process: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
             self._dead = True
             _inc("moeprefetch_fallbacks")
             return None

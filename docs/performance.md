@@ -2939,3 +2939,39 @@ lc 链(iter-252 武装,iter-255 收割)H32 棒双臂:off=在役最优基座,on=+
   oracle→微基准→A/B 全链,若仍劣化则 gdnproj 全族(含物化)永久关闭。
 - 附记:on 臂 16384 场景客户端 32 连接 7s 内全断(TransferEncodingError),服务端引擎
   同期正常推进 prefill 无崩溃;on 臂独有+长场景,归因记档不阻塞判决。
+
+## L-C 收割:H34 判死 + H36/H37 on 臂零激活定谳(iter-259,2026-10-22,E402/D185)
+
+### H34(load 期行重排)closed——disproven at engine gate
+- 数据:lc 链补跑(STICKS=h34,off 臂产物复用跳过)failbits=0 五场景 completed=32;
+  TPOT Δ(c1/c8/512/8k/16k)=+0.54/−0.69/−0.71/+0.03/+0.30%,全噪声带。
+- 探针:gdnreorder_fallbacks=30/30、gdnproj_calls=30(未归零)→ reorder 每次 forward
+  均回退(`build_reordered_inproj_weight` 引擎内懒构建失败→`_tileinfer_reordered_inproj_failed`
+  缓存→永久 decline),on 臂从未激活。
+- 处置(D185):不修守卫不重挂——H34 仅为 H32 翻案通道,同目标 H90 已完整武装
+  (契约 9 passed+微基准/链就绪),基座 H32 经济学已判死(E390),修复懒构建不改变
+  fused GEMM 基线。翻案条件=H90 亦败且新证据指向行重排路径。
+
+### H36(greedy 快路径)arm invalid——引擎内零激活,根因取证中
+- 数据:双臂 failbits=0,TPOT Δ=−0.17/+0.17/+0.19/−0.22/−0.20% 全噪声带
+  (=死钩点差异,无假设信息量);探针 h36_on 零 greedy 键(calls/fallbacks 双无)。
+- 离线三重取证:install 链通(load_general_plugins 后 AscendSampler.forward=tileinfer
+  包装)、机制通(离线直调 calls=1+输出正确)、引擎静态链通(0.23.0
+  NPUModelRunner:333 sampler=AscendSampler→_sample:2626 self.sampler(...)→类属性
+  forward,无实例遮蔽)。守卫逐条对照 0.23.0 SamplingMetadata 字段理论全过。
+- 盲区与修复:守卫不满足路径零计数(静默 None,仅异常计 fallbacks)→ 死钩点/守卫
+  拦截不可区分。已落地 greedy_fast_guard_skips 计数+_first_guard_fail 逐因命名
+  (10 守卫)+warning_once;tests 11 用例全绿。
+
+### H37(MoE 权重 prefetch)arm invalid——物化一次死亡
+- 数据:双臂 failbits=0,TPOT Δ=−0.09~−0.89% 噪声(≪2% 门槛);探针
+  moeprefetch_fallbacks=1+active=0=_materialize 首次异常即 _dead 永久失活。
+- 疑根因:model_runner init set_weight_prefetch_method 与惰性替位时序冲突或升级后
+  API 失配;已加物化失败首次 warning_once(异常类型+消息入 serve 日志)。
+- 价值风险(E109 在录):950PR L2-bypass 可能架空预取假设,≥2% 门槛预期低。
+
+### 推论与后续
+- 权威基座 ops 的 greedy token 自始惰性(死钩点,h36 噪声为证),零行为影响,基座不改。
+- 后续(等窗):单探针 serve(ops=decode,prefill,greedy,moeprefetch,PORT 8153,
+  128x128_c1 单场景 ~2min)读计数定死钩点/守卫拦截→守卫可修即修→STICKS="h36 h37"
+  重挂 on 臂(off 产物自动跳过)→H36/H37 终判。此二棒终判前 L-C 不算收割完毕。

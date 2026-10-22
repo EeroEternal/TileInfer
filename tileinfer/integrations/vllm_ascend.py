@@ -2458,6 +2458,7 @@ def start_metrics_dumper() -> bool:
                     and stats.get("sampler_topk_fallbacks", 0) == 0
                     and stats.get("greedy_fast_calls", 0) == 0
                     and stats.get("greedy_fast_fallbacks", 0) == 0
+                    and stats.get("greedy_fast_guard_skips", 0) == 0
                     and stats.get("moeprefetch_active", 0) == 0
                     and stats.get("moeprefetch_fallbacks", 0) == 0
                 ):

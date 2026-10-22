@@ -145,6 +145,35 @@ def test_guard_predict_bonus_token_fall_back():
     assert greedy.COUNTERS["greedy_fast_calls"] == 0
 
 
+def test_guard_skips_counted_with_reason():
+    """守卫不满足(E402 可观测面):guard_skips 计数,原因逐条可诊断,契约不变。"""
+    logits = torch.randn(B, V, dtype=torch.bfloat16)
+    fast = _wrap(_sentinel_orig)
+    assert fast(object(), logits, _md(all_greedy=False)) == "ORIG"
+    assert greedy.COUNTERS["greedy_fast_guard_skips"] == 1
+    assert greedy.COUNTERS["greedy_fast_calls"] == 0
+    # 逐条守卫原因(与 greedy_fast_applicable 布尔契约单一事实源)
+    cases = [
+        (_md(), True, "predict_bonus_token"),
+        (_md(all_greedy=False), False, "not_all_greedy"),
+        (_md(max_num_logprobs=5), False, "logprobs_requested"),
+        (_md(logprob_token_ids={0: [1]}), False, "logprob_token_ids"),
+        (_md(no_penalties=False), False, "penalties_present"),
+        (_md(bad_words_token_ids={0: [[9]]}), False, "bad_words"),
+        (_md(allowed_token_ids_mask=torch.zeros(B, V, dtype=torch.bool)), False, "allowed_token_ids_mask"),
+        (_md(logitsprocs=None), False, "non_argmax_invariant_procs"),
+        (_md(logitsprocs=types.SimpleNamespace(non_argmax_invariant=[object()])), False, "non_argmax_invariant_procs"),
+        (_md(), False, "logits_shape"),
+    ]
+    for md, bonus, reason in cases[:-1]:
+        assert greedy._first_guard_fail(logits, md, bonus) == reason, reason
+    # logits 形状守卫:3D 张量
+    assert greedy._first_guard_fail(torch.randn(B, V, V), _md(), False) == "logits_shape"
+    # 全满足 → None,且 applicable 布尔与之一致
+    assert greedy._first_guard_fail(logits, _md(), False) is None
+    assert greedy.greedy_fast_applicable(logits, _md(), False) is True
+
+
 def test_guard_thinking_budget_tracked_fall_back():
     class _Holder:
         def has_tracked_requests(self):

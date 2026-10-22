@@ -28,6 +28,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Callable
 
 import torch
@@ -36,9 +37,43 @@ import torch
 COUNTERS: dict[str, int] = {
     "greedy_fast_calls": 0,
     "greedy_fast_fallbacks": 0,
+    "greedy_fast_guard_skips": 0,
 }
 
 _stats_sink: Callable[[str], None] | None = None
+
+_logger = logging.getLogger("tileinfer.sampling.greedy")
+
+
+def _first_guard_fail(logits: Any, md: Any, predict_bonus_token: bool) -> str | None:
+    """返回首个不满足的守卫名(诊断可观测面);全满足返回 None。
+
+    与 ``greedy_fast_applicable`` 逐条同序同语义(单一事实源,后者委托本函数)。
+    """
+    if predict_bonus_token:
+        return "predict_bonus_token"
+    if not getattr(md, "all_greedy", False):
+        return "not_all_greedy"
+    if getattr(md, "max_num_logprobs", 0) is not None:
+        return "logprobs_requested"
+    if getattr(md, "logprob_token_ids", None):
+        return "logprob_token_ids"
+    if not getattr(md, "no_penalties", False):
+        return "penalties_present"
+    if getattr(md, "bad_words_token_ids", None):
+        return "bad_words"
+    if getattr(md, "allowed_token_ids_mask", None) is not None:
+        return "allowed_token_ids_mask"
+    procs = getattr(md, "logitsprocs", None)
+    if procs is None or len(getattr(procs, "non_argmax_invariant", [None])):
+        # non_argmax_invariant 桶含 min_tokens/logit_bias(贪心敏感),必须为空
+        return "non_argmax_invariant_procs"
+    holder = getattr(md, "thinking_budget_state_holder", None)
+    if holder is not None and holder.has_tracked_requests():
+        return "thinking_budget_tracked"
+    if not isinstance(logits, torch.Tensor) or logits.ndim != 2:
+        return "logits_shape"
+    return None
 
 
 def _inc(name: str) -> None:
@@ -58,30 +93,7 @@ def _ops_enabled() -> bool:
 
 def greedy_fast_applicable(logits: Any, md: Any, predict_bonus_token: bool) -> bool:
     """严格守卫:仅 host 侧标量/集合检查(零 D2H),任一不满足即 False。"""
-    if predict_bonus_token:
-        return False
-    if not getattr(md, "all_greedy", False):
-        return False
-    if getattr(md, "max_num_logprobs", 0) is not None:
-        return False
-    if getattr(md, "logprob_token_ids", None):
-        return False
-    if not getattr(md, "no_penalties", False):
-        return False
-    if getattr(md, "bad_words_token_ids", None):
-        return False
-    if getattr(md, "allowed_token_ids_mask", None) is not None:
-        return False
-    procs = getattr(md, "logitsprocs", None)
-    if procs is None or len(getattr(procs, "non_argmax_invariant", [None])):
-        # non_argmax_invariant 桶含 min_tokens/logit_bias(贪心敏感),必须为空
-        return False
-    holder = getattr(md, "thinking_budget_state_holder", None)
-    if holder is not None and holder.has_tracked_requests():
-        return False
-    if not isinstance(logits, torch.Tensor) or logits.ndim != 2:
-        return False
-    return True
+    return _first_guard_fail(logits, md, predict_bonus_token) is None
 
 
 def greedy_fast_forward(logits: torch.Tensor, md: Any, predict_bonus_token: bool):
@@ -110,6 +122,15 @@ def make_greedy_forward(orig_forward: Callable) -> Callable:
                 if out is not None:
                     _inc("greedy_fast_calls")
                     return out
+                # 守卫不满足:按因计数+一次性告警(诊断可观测面——引擎 A/B 探针
+                # 需要区分「包装器从未被调用」与「守卫拦截」;此前该路径完全静默,
+                # E402:h36 on 臂零计数无法归因即此盲区)。
+                reason = _first_guard_fail(logits, sampling_metadata, predict_bonus_token)
+                _inc("greedy_fast_guard_skips")
+                if reason:
+                    _logger.warning_once(
+                        "greedy fast path guard skip: %s", reason
+                    )
             except Exception:  # noqa: BLE001 - 接管失败必须静默回退,绝不破坏服务
                 _inc("greedy_fast_fallbacks")
         return orig_forward(
