@@ -2858,3 +2858,26 @@ vs 本轮 p32 +1.85%);伴随预测(p16/p32 按波数稳定重现残差)证伪—
 消波 +1.49%+全分布持续不落后):当前栈内无系统性 TTFT 差值源可攻击。在役配置不动
 (MAX_CTX=1 维持,P-C 无收窄条件);双专项整体 FINAL TEMPORARY 交用户
 (PERFORMANCE_REPORT §17)。
+
+## H88 / L-A2 per-token scale 翻案判停:粒度不变性 token 轴再证,L-A 线永久关闭(iter-252,E381/D183)
+
+用户裁决 D147「未实现的都接着实现」复活 L-A 最后一档翻案路径:per-(head, token)
+行级 amax 校准(token 间动态范围解耦,存储开销 +0.4%),同 oracle 门槛
+(TOL 3e-2 相对,fp32 sdpa,uniform+correlated 双域,S∈{8192,16384}):
+存证 `tests/test_kv_fp8_oracle_per_token.py`(5 passed):
+
+| 场景 | per-token rel_F | per-head(H82 对照) | per-block MX(H84 对照) | 判 |
+|---|---|---|---|---|
+| S=8192 均匀 | **3.816e-2** | 3.800e-2 | 3.843e-2 | **超差** |
+| S=16384 均匀 | **3.907e-2** | 4.053e-2 | 3.867e-2 | **超差** |
+| S=8192 相关 | 2.609e-2 | 2.616e-2 | 2.784e-2 | PASS |
+| S=16384 相关 | 2.579e-2 | 2.661e-2 | 2.667e-2 | PASS |
+| raw round-trip | 2.611e-2 | 2.642e-2 | 2.653e-2 | 同地板 |
+
+**判决:按任务书 L-A2 预登记红线「超差即永久关闭,不再留翻案」→ L-A 线
+(KV FP8 一切 scale 粒度变体)永久关闭**。三粒度(per-head/per-block MX/per-token)
+数值逐项 Δ<5% 互证:E353「i.i.d. 粒度不变性」机理在 token 轴精确兑现——
+每 token 行 amax 与整头 amax 同分布,scale 粒度不改变 E4M3 三位尾数的舍入噪声
+地板(round-trip 2.61e-2 三粒度同水平);correlated 域异常 token 的 per-token
+归一改善不落在误差主项(softmax 输出误差由全体 token 平均量化噪声决定)。
+「读得少」维度至此四重判死(H82/H84/H88+L-B E373)。
