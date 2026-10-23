@@ -226,3 +226,65 @@ def test_lazy_delegation_surface(monkeypatch):
     # 短路返回,不触达设备 op——postprocess 的设备 op 属 NPU 域,不进 CPU 契约)
     lazy.maybe_prefetch_moe_weight_preprocess(torch.zeros(32, 4), "gate_up")
     assert pf.COUNTERS["moeprefetch_active"] == 1
+
+
+def test_runner_binding_constructs_in_ctx_and_arms(monkeypatch):
+    """E409 修复:runner init 绑定接管——构造交还 ctx 时点+就地武装(单事实源)。
+
+    引擎时序:worker_base.init_device 的 set_current_vllm_config 包裹 runner
+    构造(model_runner_v1:338 在其中);绑定包装在该时点被调用,构造出真实
+    武装 method 并落位,惰性替位对象不再被触碰。
+    """
+    wp, ac = _stub_real(monkeypatch)
+    vutils = pytest.importorskip("vllm_ascend.utils")
+    import sys
+    import types
+
+    vllm_cfg_mod = pytest.importorskip("vllm.config")
+    ctx_holder: dict = {"cfg": object()}
+    entered: list = []
+    monkeypatch.setattr(
+        vllm_cfg_mod, "get_current_vllm_config_or_none", lambda: ctx_holder["cfg"], raising=False
+    )
+
+    def _fake_set(cfg):
+        entered.append(cfg)
+        import contextlib
+
+        @contextlib.contextmanager
+        def _cm():
+            yield
+
+        return _cm()
+
+    monkeypatch.setattr(vllm_cfg_mod, "set_current_vllm_config", _fake_set, raising=False)
+
+    fake_mrv1 = types.ModuleType("vllm_ascend.worker.model_runner_v1")
+    stock_calls: list = []
+
+    def _orig_set(cfg):
+        stock_calls.append(cfg)
+
+    fake_mrv1.set_weight_prefetch_method = _orig_set
+    fake_worker = types.ModuleType("vllm_ascend.worker")
+    fake_worker.model_runner_v1 = fake_mrv1
+    monkeypatch.setitem(sys.modules, "vllm_ascend.worker", fake_worker)
+    monkeypatch.setitem(sys.modules, "vllm_ascend.worker.model_runner_v1", fake_mrv1)
+
+    monkeypatch.setenv("TILEINFER_OPS", "moeprefetch")
+    assert pf.install_moe_weight_prefetch() is True
+    # 绑定接管:mrv1 绑定被替换为 force-construct 包装(打标幂等)
+    assert getattr(fake_mrv1.set_weight_prefetch_method, "_tileinfer_force_construct", False) is True
+    # runner init 时点调用:构造自持(ctx 在位→ctx 包装),槽位落真实武装 method
+    fake_mrv1.set_weight_prefetch_method(None)
+    real = vutils._WEIGHT_PREFETCH_METHOD
+    assert real is not None and not isinstance(real, pf._LazyPrefetchMethod)
+    assert real.moe.enable is True
+    assert entered, "ctx 包装未发生"
+    assert stock_calls == [], "stock 原函数不应被调用(构造权自持)"
+    assert real.maybe_prefetch_moe_weight_preprocess.__name__ == "_pre"
+    assert real.attn.enable is False  # 单变量纪律
+    # 幂等:二次 install 走 _installed 早退,绑定不重复包装
+    binding = fake_mrv1.set_weight_prefetch_method
+    assert pf.install_moe_weight_prefetch() is True
+    assert fake_mrv1.set_weight_prefetch_method is binding

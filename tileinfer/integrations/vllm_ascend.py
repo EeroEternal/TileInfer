@@ -2723,6 +2723,56 @@ def install(raise_on_failure: bool = True) -> bool:
                 "TileInfer MoE weight prefetch left off (TILEINFER_OPS does not list "
                 "moeprefetch; H37 engine A/B pending)"
             )
+        # 进程级安装回执(E409,H36/H37 归因可观测面):serve 多进程下「包装器
+        # 已装但从未被调」与「分支异常静默」从日志不可区分(install 期日志先于
+        # logging 配置被吞,E402/E409 盲区即此)。每进程落一份 JSON:patch 落点、
+        # 槽位类型、ctx 在位性单一事实源。写入失败不影响安装。
+        try:
+            import json as _json
+            import time as _time
+
+            _mp = os.environ.get("TILEINFER_METRICS_PATH")
+            if _mp:
+                _rec: dict[str, Any] = {
+                    "pid": os.getpid(),
+                    "ts": _time.time(),
+                    "ops": sorted(_parts),
+                }
+                try:
+                    from vllm.config import get_current_vllm_config_or_none
+
+                    _rec["vllm_cfg_present"] = (
+                        get_current_vllm_config_or_none() is not None
+                    )
+                except Exception:
+                    _rec["vllm_cfg_present"] = None
+                if "greedy" in _parts:
+                    try:
+                        from vllm_ascend.sample.sampler import AscendSampler as _asq
+
+                        _rec["greedy_patched"] = bool(
+                            getattr(_asq, "_tileinfer_greedy_fast_installed", False)
+                        )
+                        _rec["greedy_cls"] = f"{_asq.__module__}.{_asq.__qualname__}"
+                    except Exception as _e:  # noqa: BLE001
+                        _rec["greedy_patched"] = f"err:{type(_e).__name__}"
+                if "moeprefetch" in _parts:
+                    try:
+                        from vllm_ascend import utils as _vau
+
+                        _m = getattr(_vau, "_WEIGHT_PREFETCH_METHOD", None)
+                        _rec["moeprefetch_slot"] = (
+                            type(_m).__name__ if _m is not None else None
+                        )
+                    except Exception as _e:  # noqa: BLE001
+                        _rec["moeprefetch_slot"] = f"err:{type(_e).__name__}"
+                with open(
+                    os.path.join(os.path.dirname(_mp), f"install_receipt_{os.getpid()}.json"),
+                    "w",
+                ) as _f:
+                    _json.dump(_rec, _f)
+        except Exception:
+            pass
         logger.info(
             "TileInfer registered as the CUSTOM attention backend (decode accelerated, "
             "prefill falls back to vLLM-Ascend)"

@@ -174,6 +174,64 @@ def test_guard_skips_counted_with_reason():
     assert greedy.greedy_fast_applicable(logits, _md(), False) is True
 
 
+def test_guard_persistent_logitsprocs_noop_semantics(monkeypatch):
+    """E409:0.23.0 持久实例语义——内建处理器常驻桶,空状态=可证 no-op 放行。
+
+    MinTokens/LogitBias 处理器无条件构建( build_logitsprocs BUILTIN 链),
+    空追踪状态时 apply() 短路返回原 logits(builtin.py)⇒ 桶非空不再等价于
+    贪心敏感状态在轨;有追踪或未知类型仍保守拦截。
+    """
+
+    class _FakeMT:
+        def __init__(self, min_toks):
+            self.min_toks = min_toks
+
+    class _FakeLB:
+        def __init__(self, biases):
+            self.biases = biases
+
+    monkeypatch.setattr(greedy, "_MTProc", _FakeMT)
+    monkeypatch.setattr(greedy, "_LBProc", _FakeLB)
+    logits = torch.randn(B, V, dtype=torch.bfloat16)
+
+    def _mdx(*procs):
+        return _md(
+            logitsprocs=types.SimpleNamespace(non_argmax_invariant=list(procs), argmax_invariant=[])
+        )
+
+    # 双内建空状态 → 放行(等价原实现逐位一致;apply 逐字 no-op)
+    assert greedy._first_guard_fail(logits, _mdx(_FakeMT({}), _FakeLB({})), False) is None
+    # min_tokens 追踪在轨 → 拦截(逐因)
+    assert (
+        greedy._first_guard_fail(logits, _mdx(_FakeMT({0: 5})), False)
+        == "min_tokens_tracked"
+    )
+    # logit_bias 追踪在轨 → 拦截(逐因)
+    assert (
+        greedy._first_guard_fail(logits, _mdx(_FakeLB({0: {1: 0.5}})), False)
+        == "logit_bias_tracked"
+    )
+    # 未知/自定义处理器 → 保守拦截(不赌 argmax 不变性)
+    assert greedy._first_guard_fail(logits, _mdx(object()), False) == "non_argmax_invariant_procs"
+    # 真实类型导入在位(引擎内 isinstance 判定依赖真类型,桩仅限本用例)
+    assert greedy._MTProc is not None and greedy._LBProc is not None
+    # 端到端:空状态内建实例(真实类型)进包装 forward → 快路径命中
+    md = _md(
+        logitsprocs=types.SimpleNamespace(
+            non_argmax_invariant=[greedy._MTProc.__new__(greedy._MTProc)],
+            argmax_invariant=[],
+        )
+    )
+    setattr(md.logitsprocs.non_argmax_invariant[0], "min_toks", {})
+    from vllm.v1.sample.sampler import Sampler as BaseSampler
+
+    fast = _wrap(BaseSampler.forward)
+    base = BaseSampler()
+    out = fast(base, logits, md)
+    assert out.sampled_token_ids.shape == (B, 1)
+    assert greedy.COUNTERS["greedy_fast_calls"] == 1
+
+
 def test_guard_thinking_budget_tracked_fall_back():
     class _Holder:
         def has_tracked_requests(self):

@@ -69,6 +69,78 @@ def _fallback_cfg(gate_up_ratio: float) -> dict[str, Any]:
     }
 
 
+def _resolve_cfg_dict(gate_up_ratio: float) -> dict[str, Any]:
+    """配置真值优先(ADDCF enabled),否则回退比例配置(enabled=True)。"""
+    try:
+        from vllm_ascend.ascend_config import get_ascend_config
+
+        addcfg = get_ascend_config().weight_prefetch_config
+        if getattr(addcfg, "enabled", False):
+            return {
+                "enabled": True,
+                "prefetch_ratio": dict(getattr(addcfg, "prefetch_ratio", {}) or {}),
+            }
+    except Exception:  # noqa: BLE001 - ascend config 未初始化属常态(安装期早)
+        pass
+    return _fallback_cfg(gate_up_ratio)
+
+
+def _construct_armed(gate_up_ratio: float) -> Any:
+    """构造并武装真实 ``WeightPrefetchMethod``(E409 H37 修复核心)。
+
+    ``WeightPrefetchMethod.__init__`` 断言 ``is_moe_model(get_current_vllm_config())``
+    ——必须在 ``set_current_vllm_config`` 作用域内构造(worker_base.init_device:
+    321-323 包裹 runner 构造,model_runner_v1:338 在其中)。当前进程无 ctx 时按
+    原样构造(旧行为;AssertionError 交由调用方 dead-path 兜底)。构造成功即
+    就地武装(比例+计数包装),返回真实 method。
+    """
+    from vllm.config import get_current_vllm_config_or_none, set_current_vllm_config
+    from vllm_ascend.ascend_config import WeightPrefetchConfig
+    from vllm_ascend.ops.weight_prefetch import WeightPrefetchMethod
+
+    cfg_dict = _resolve_cfg_dict(gate_up_ratio)
+    ctx = get_current_vllm_config_or_none()
+    if ctx is not None:
+        with set_current_vllm_config(ctx):
+            real = WeightPrefetchMethod(WeightPrefetchConfig(cfg_dict))
+    else:
+        real = WeightPrefetchMethod(WeightPrefetchConfig(cfg_dict))
+    return _arm(real, gate_up_ratio)
+
+
+def _install_runner_binding(gate_up_ratio: float) -> bool:
+    """接管 runner init 的 ``set_weight_prefetch_method``(E409 H37 修复)。
+
+    惰性替位路径的物化时点(model build 后首次 hook 触碰)在
+    ``set_current_vllm_config`` 作用域之外 ⇒ 构造断言炸 ⇒ 管道永久失活
+    (E409 探针实证:moeprefetch_fallbacks=1+日志 AssertionError)。本绑定把
+    构造交还 runner init 的 ctx 时点(worker_base.py:321→worker.py:518→
+    model_runner_v1:338),构造后就地武装;runner 侧 V1 绑定被替换,惰性对象
+    不再被触碰。import 失败(CPU 测试/非昇腾)返回 False,维持惰性兜底。
+    """
+    try:
+        from vllm_ascend import utils as vutils
+        from vllm_ascend.worker import model_runner_v1 as mrv1
+    except Exception:  # noqa: BLE001 - CPU 测试/非昇腾环境
+        return False
+    orig = mrv1.__dict__.get("set_weight_prefetch_method")
+    if orig is None:
+        return False
+    if getattr(orig, "_tileinfer_force_construct", False):
+        return True
+
+    def _set_and_arm(weight_prefetch_config: Any) -> Any:
+        # 构造权自持(ctx 内构造+enabled 真值优先),槽位落真实武装 method;
+        # 不调 _orig——其槽位非 None 判据只会跳过构造,且 stock cfg(enabled
+        # 随 ADDCF)与我们 enabled=True 的武装语义冲突。
+        vutils._WEIGHT_PREFETCH_METHOD = _construct_armed(gate_up_ratio)
+        return vutils._WEIGHT_PREFETCH_METHOD
+
+    _set_and_arm._tileinfer_force_construct = True  # type: ignore[attr-defined]
+    mrv1.set_weight_prefetch_method = _set_and_arm
+    return True
+
+
 def _arm(real: Any, gate_up_ratio: float) -> Any:
     """就地武装真实 method:moe 臂强制使能 + 比例设置 + MoE hook 计数包装。
 
@@ -127,23 +199,7 @@ class _LazyPrefetchMethod:
         if self._dead:
             return None
         try:
-            from vllm_ascend.ascend_config import WeightPrefetchConfig, get_ascend_config
-            from vllm_ascend.ops.weight_prefetch import WeightPrefetchMethod
-
-            cfg_dict: dict[str, Any] | None = None
-            try:
-                addcfg = get_ascend_config().weight_prefetch_config
-                if getattr(addcfg, "enabled", False):
-                    cfg_dict = {
-                        "enabled": True,
-                        "prefetch_ratio": dict(getattr(addcfg, "prefetch_ratio", {}) or {}),
-                    }
-            except Exception:  # noqa: BLE001 - ascend config 未初始化属常态(安装期早)
-                cfg_dict = None
-            if cfg_dict is None:
-                cfg_dict = _fallback_cfg(self._gate_up_ratio)
-            real = WeightPrefetchMethod(WeightPrefetchConfig(cfg_dict))
-            _arm(real, self._gate_up_ratio)
+            real = _construct_armed(self._gate_up_ratio)
             self._real = real
             return real
         except Exception as exc:  # noqa: BLE001 - 物化失败=管道失活,不破引擎
@@ -200,6 +256,9 @@ def install_moe_weight_prefetch(
         vutils._WEIGHT_PREFETCH_METHOD = _LazyPrefetchMethod(gate_up_ratio)
     else:
         _arm(vutils._WEIGHT_PREFETCH_METHOD, gate_up_ratio)
+    # E409 修复:优先把构造交还 runner init 的 ctx 时点(worker_base 包裹),
+    # 惰性替位降级为兜底(绑定接管失败=测试/CPU 环境才走)。
+    _install_runner_binding(gate_up_ratio)
     wp.MOE_PREFETCH_TOKEN_THRESHOLD = int(token_threshold)
     _installed = True
     return True

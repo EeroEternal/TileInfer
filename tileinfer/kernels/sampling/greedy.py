@@ -12,8 +12,10 @@
 * 跳过分支的可证 no-op 论证(与基类 forward 源码逐条对应):
   - allowed_token_ids_mask 为 None → masked_fill_ 不执行;
   - bad_words_token_ids 为空 → apply_bad_words 不调用;
-  - logitsprocs.non_argmax_invariant 为空(min_tokens/logit_bias 均属该桶,
-    基类 docstring 步骤 5)→ 贪心敏感处理器不执行;
+  - logitsprocs 贪心敏感面为空:0.23.0 持久实例语义下 MinTokens/LogitBias
+    处理器常驻 non_argmax_invariant 桶(E409),空追踪状态(min_toks/biases
+    为空 dict)时 apply() 短路返回原 logits=可证 no-op;有追踪或未知处理器
+    即拦截;
   - no_penalties → apply_all_penalties 原样返回;
   - thinking_budget holder 为 None 或无追踪 → update_state/apply_to_logits 不执行;
   - max_num_logprobs None 且 logprob_token_ids 空 → 无 logprobs 物料需求;
@@ -32,6 +34,15 @@ import logging
 from typing import Any, Callable
 
 import torch
+
+try:  # 0.23.0 内建处理器类型(E409 守卫语义依赖);缺失则退回保守拦截
+    from vllm.v1.sample.logits_processor.builtin import (
+        LogitBiasLogitsProcessor as _LBProc,
+        MinTokensLogitsProcessor as _MTProc,
+    )
+except Exception:  # noqa: BLE001 - 非 vLLM 环境(纯 CPU 契约)退回保守拦截
+    _LBProc = None
+    _MTProc = None
 
 #: 探针计数器(安装时同步进后端类 _stats,metrics dumper 读取)
 COUNTERS: dict[str, int] = {
@@ -65,9 +76,22 @@ def _first_guard_fail(logits: Any, md: Any, predict_bonus_token: bool) -> str | 
     if getattr(md, "allowed_token_ids_mask", None) is not None:
         return "allowed_token_ids_mask"
     procs = getattr(md, "logitsprocs", None)
-    if procs is None or len(getattr(procs, "non_argmax_invariant", [None])):
-        # non_argmax_invariant 桶含 min_tokens/logit_bias(贪心敏感),必须为空
+    if procs is None:
         return "non_argmax_invariant_procs"
+    for _proc in getattr(procs, "non_argmax_invariant", ()) or ():
+        # 0.23.0 持久实例语义(E409):MinTokens/LogitBias 处理器无条件构建且
+        # 常驻 non_argmax_invariant 桶——桶非空≠贪心敏感状态在轨。两者空状态
+        # 时 apply() 逐字返回原 logits(builtin.py:apply 的 `if not self.min_toks`
+        # /`if self.biases` 短路)=可证 no-op,放行;有追踪请求或未知处理器
+        # (无法证明 argmax 不变性)一律保守拦截。
+        if _MTProc is not None and isinstance(_proc, _MTProc):
+            if getattr(_proc, "min_toks", None):
+                return "min_tokens_tracked"
+        elif _LBProc is not None and isinstance(_proc, _LBProc):
+            if getattr(_proc, "biases", None):
+                return "logit_bias_tracked"
+        else:
+            return "non_argmax_invariant_procs"
     holder = getattr(md, "thinking_budget_state_holder", None)
     if holder is not None and holder.has_tracked_requests():
         return "thinking_budget_tracked"

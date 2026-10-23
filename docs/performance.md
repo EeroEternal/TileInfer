@@ -2988,3 +2988,29 @@ lc 链(iter-252 武装,iter-255 收割)H32 棒双臂:off=在役最优基座,on=+
 - 处置:`tileinfer/kernels/sampling/topk.py` 静默失效即终态(import 失败→
   交还原生,现行为正确,零维护成本);`_OPS_ALL` "sampling" 键与 fused_sample
   接线维持(H76 终态建议仍待用户裁决)。**L-D 两臂至此全部终态,L-D 线关闭。**
+
+## H36/H37 根因定谳+修复+终判:守卫持久实例语义(H36 DISPROVEN)/物化时机+域门(H37 closed),L-C 收割完毕(iter-266,2026-10-23,E409/E412/D188)
+
+### 根因①(H36,E402「死钩点」误判翻案)
+- 探针(install 回执+guard_skips 可观测面):greedy_fast_guard_skips=**4096**(32×128 全步 100% 拦截),原因=`non_argmax_invariant_procs`——vLLM 0.23.0 `build_logitsprocs`(logits_processor/__init__.py:197-217)**无条件实例化** BUILTIN=[MinTokens,LogitBias,MinP],MinP 入 argmax_invariant 桶,LogitBias/MinTokens **恒驻** non_argmax_invariant 桶 ⇒ 「桶空」守卫在 0.23.0 恒假。包装器自始被调用,是守卫全拦+旧代码该路径静默零计数(iter-259「守卫理论全过」复核错误=假设桶成员随请求参数变化,实际持久实例)。
+- 修复(greedy.py):守卫改持久实例语义——MinTokens 空状态(`if not self.min_toks` 短路,builtin.py:251)与 LogitBias 空状态(`if self.biases`,:161)apply() 逐字返回原 logits=可证 no-op 放行;有追踪或未知处理器保守拦截(min_tokens_tracked/logit_bias_tracked/non_argmax_invariant_procs)。修复后探针 **greedy_fast_calls=4096 全步命中**,零 skips/fallbacks。
+
+### 根因②(H37)+修复
+- 惰性替位物化时点(model build 后首次触碰)在 set_current_vllm_config 作用域外,WeightPrefetchMethod.__init__(weight_prefetch.py:47)is_moe_model(get_current_vllm_config()) 断言炸 ⇒ 永久失活(E402 fallbacks=1 实证)。
+- 修复(prefetch.py):`_install_runner_binding` 接管 model_runner_v1.py:338 绑定——worker_base.py:321-323 init_device 的 set_current_vllm_config 包裹 runner 构造(worker.py:518),构造交还 ctx 时点(_construct_armed,ADDCF enabled 真值优先)+就地武装;惰性替位降级 CPU/测试兜底。修复后探针零物化失败。
+- **域门定谳(closed)**:hook 调用点全谱系=量化 MoE(moe_mlp.py:151)+DS V4.1(sfa/mla)——**bf16 权威口径(quantization=None)零调用点** ⇒ moeprefetch_active=0,A/B 无信息量;修复代码保留(量化路径启用即生效)。
+
+### H36 权威 A/B 终判(STICKS="h36",failbits=0,E412)
+| 场景 | TPOT p50 off→on | Δ | TTFT p50 Δ |
+|---|---|---|---|
+| 128x128_c1 | 9.438→9.439 | +0.02% | −6.63%(跨日臂,噪声) |
+| 128x128_c8 | 11.625→11.642 | +0.14% | −8.68%(同上) |
+| 128x512_c8 | 11.640→11.663 | +0.19% | −7.10%(同上) |
+| 8192x128_c8 | 36.627→36.393 | **−0.64%** | +0.40% |
+| 16384x128_c8 | 66.399→66.442 | +0.06% | +0.24% |
+
+- 主判 best_primary=+0.00% ≪ 0.3% 门 ⇒ **D115-1 DISPROVEN(关闭域)**;全场景 |Δ|≤0.64% 零回归;探针 calls=7843/fallbacks=0=arm valid。
+- 机理收口:E91/E97 fp32 cast 3.74% 份额=物料化面,capture8 图外采样段被 decode 主路径重叠吸收——内核级收益不传递引擎级(H76 fused_sample 1.9%<5% 同构)。greedy opt-in 保留不进默认;基座配置不动(修复后 greedy token 转实活,TPOT 漂移 ≤0.2% 噪声带)。
+
+### L-C 收割完毕(收官前置兑现)
+- 四棒+域门全终态:H42-③(E296)/H32(E390 disproven,翻案通道 H90 待验)/H34(E402 closed)/H36(本条 DISPROVEN)/H37(closed 域门)。
