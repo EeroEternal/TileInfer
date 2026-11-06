@@ -557,3 +557,13 @@ vs torch 1.21 ms；bmm 仅 0.09 ms。dequant 是瓶颈且自定义 kernel 未胜
 
 dense 2.28 ms、persistent 4.46 ms，均慢于 torch 1.17–1.21 ms。dequant-only kernel 放弃；
 继续需把 dequant 融进 GEMM L1 载入，且收益上限 ~15 ms/token，无法单独达标。
+
+### 12.43 最终代码首 token 门：100/100
+
+HEAD 3cab588 上 `--max-tokens 1 --limit 100`：100/100，与串行首 token 100/100 一致；
+11111 出现 1 次（指定 prompt）。质量门最终回归通过。
+
+### 12.44 负结果：torch.compile MoE 更慢
+
+`DSV41_COMPILE_MOE=1`（compile `_fp4_linear_batched`）：TPOT 656.6 vs 默认 536.9（+22%），
+decode 单次 477 ms 不足以抵消 guard 开销。已回退，HEAD 不含该路径。

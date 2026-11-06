@@ -1735,3 +1735,35 @@ kernel 工程；且即便成功，按 §62 的 bmm=0.09 ms，收益上限也只�
 不足以单独把 430 ms 拉到 350。
 
 探测脚本：`probe_dequant_tilelang.py`（dense）、`probe_dequant_persistent.py`（persistent）。
+
+## 64. 最终代码首 token 门复测：100/100 与串行一致（含指定 11111 prompt）
+
+在提交后的最终代码（HEAD `3cab588`）上重跑质量门的第一 token 项：
+
+```
+perf_quality_gate --conc 4 --max-tokens 1 --limit 100
+100/100 （errors=0）
+与 q_s2 串行首 token 比对：agreement 100/100
+11111 出现 1 次（指定 prompt，符合预期）
+```
+
+这补齐了"首 token 仍为 11111"的最终回归证据；4-token 逐 token 95% 的结论仍按 §38 定稿为
+不可达（差异来自 batched dense kernel tiling），质量门维持组件级 + 首 token + 同臂确定性。
+
+## 65. 负结果：torch.compile 包住 `_fp4_linear_batched` 反而更慢（656.6 vs 536.9 ms）
+
+`torch.compile` 在本机 NPU 上**可用**（简单 `sin+1` 测试通过）。于是试把
+`_fp4_linear_batched`（unpack + scale + bmm）整体 compile，期望融合 elementwise 并减少
+launch（`DSV41_COMPILE_MOE=1`，`dynamic=False`，按 `(out,in,bf16)` 缓存 compiled fn）。
+
+同窗口 A/B（arena384，conc1，`N1=8/N2=32 reps=5`）：
+
+| 配置 | TPOT | decode ms/chunk |
+|---|---|---|
+| 默认 | **536.9 ms** | ~521–531 |
+| torch.compile MoE | 656.6 ms | 477（该次 TTFT 测量） |
+
+TPOT **+22%（更差）**；decode 单次数字虽有 477 的亮点，但整体被 compiled 调用的
+guard/调度开销吃掉（极差 16–62%）。该路径已**回退**，HEAD 中不保留 `DSV41_COMPILE_MOE`
+代码（工作区与 HEAD 一致）。结论：这个 M=1 的小 GEMV 不适合 dynamo/inductor；
+只有手写 fused kernel（L1 内 dequant）才可能真正省时。
