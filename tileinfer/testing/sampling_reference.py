@@ -1,7 +1,7 @@
 """采样 top-k 阈值选择的 oracle(测试参照)。
 
 对照 ``tileinfer.kernels.sampling.topk.apply_top_k_top_p``(DeepSelect 路径)与原生
-``vllm_ascend.sample.sampler.apply_top_k_top_p``(对整张词表 ``probs.sort``)。
+``apply_top_k_top_p``(对整张词表 ``probs.sort``;冻结副本见 ``legacy/``)。
 
 等价性:``softmax`` 严格单调 ⇒ ``prob_i < 第k大 prob`` ⟺ ``logit_i < 第k大 logit``。
 本 oracle 直接在 logits 上用 ``torch.topk`` 求第 k 大作阈值,与 DeepSelect 路径同语义

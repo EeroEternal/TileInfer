@@ -85,7 +85,18 @@ class TileLangAscend950Backend(AttentionBackend):
 
     @classmethod
     def supports_mode(cls, mode: AttentionMode) -> bool:
-        return mode is AttentionMode.DECODE
+        """Both modes are served: DECODE through :meth:`finalize_plan`/:meth:`run` (one compiled
+        plan per batch bucket), PREFILL through ``tileinfer.vllm.attn.prefill.PrefillPath``.
+
+        PREFILL is *not* plan-backed on purpose.  A prefill step's tile count is
+        ``sum_b ceil(qo_len_b * group / block_q)``, which changes with every prompt length; a plan
+        is compiled once and cached, so it cannot express that.  The prefill path therefore
+        rebuilds its schedule per step (host-only) and quantizes the kernel variant on the tile
+        and batch axes instead — see ``docs/plan-performance.md`` §17 and ``prefill.py``.
+
+        Declaring the mode is only a capability declaration: nothing compiles on it.
+        """
+        return mode in (AttentionMode.DECODE, AttentionMode.PREFILL)
 
     # ------------------------------------------------------------------ planning
 

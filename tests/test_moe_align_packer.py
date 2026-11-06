@@ -7,8 +7,7 @@ Scope (CPU-only by design):
 * strip addressing contract consumed by the align kernels (gate strip = e*2*NT+nt, up = +NT,
   down = e*NT+nt), including the multi-tile (NT>1) case;
 * D73 flat-memory in-place pack/unpack (equal-numel pure permutation on the weight's own
-  storage, temp peak = one layer; reversible ND restore for fallback) and the takeover
-  state's acquire/release registry semantics;
+  storage, temp peak = one layer; reversible ND restore for fallback);
 * kernel factory constructibility and the burst geometry constants.
 
 Device numerics/perf authority is the H26 probe chain (benchmarks/probes/h26_moe_prenz_align.py:
@@ -151,60 +150,3 @@ def test_pack_inplace_multi_tile_gate_up():
     pack_gate_up_inplace(w13, inter=i2)
     assert torch.equal(w13.view(-1), ref)
     unpack_gate_up_inplace(w13, inter=i2)
-
-
-def test_prenz_state_inplace_flat_memory_multilayer():
-    """D73 平内存契约:打包=权重自身存储(data_ptr 不变,零第二副本,E78),
-    回退可逆逐位还原 ND,多层注册并存互不干扰,回退后重入重 pack 一致。"""
-    from tileinfer.integrations.moe_prenz import _PrenzMoeState
-
-    st = _PrenzMoeState(inter=I, hidden=H, num_experts=E)
-    w13a, w2a = _w(10)
-    w13b, w2b = _w(11)
-    ref_a = (pack_gate_up(w13a.clone(), inter=I), pack_down(w2a.clone(), inter=I))
-    ref_b = (pack_gate_up(w13b.clone(), inter=I), pack_down(w2b.clone(), inter=I))
-    orig_a = (w13a.clone(), w2a.clone())
-    orig_b = (w13b.clone(), w2b.clone())
-
-    pa = st.acquire_packed(w13a, w2a)
-    assert pa[0].data_ptr() == w13a.data_ptr()
-    assert pa[1].data_ptr() == w2a.data_ptr()
-    assert torch.equal(pa[0], ref_a[0]) and torch.equal(pa[1], ref_a[1])
-    assert len(st._packed) == 2
-
-    pb = st.acquire_packed(w13b, w2b)  # 层 B 不得干扰层 A(多层并存)
-    assert len(st._packed) == 4
-    assert torch.equal(pb[0], ref_b[0]) and torch.equal(pb[1], ref_b[1])
-
-    pa2 = st.acquire_packed(w13a, w2a)  # 打包态重入:零重 pack 快路径
-    assert pa2[0].data_ptr() == pa[0].data_ptr()
-    assert torch.equal(pa2[0], ref_a[0]) and torch.equal(pa2[1], ref_a[1])
-
-    st.release_packed(w13a, w2a)  # 回退可逆:逐位还原 ND
-    assert torch.equal(w13a, orig_a[0]) and torch.equal(w2a, orig_a[1])
-    assert len(st._packed) == 2
-
-    pa3 = st.acquire_packed(w13a, w2a)  # 回退后重入:重 pack 结果一致
-    assert pa3[0].data_ptr() == w13a.data_ptr()
-    assert torch.equal(pa3[0], ref_a[0]) and torch.equal(pa3[1], ref_a[1])
-
-    st.release_packed(w13a, w2a)
-    st.release_packed(w13b, w2b)
-    assert torch.equal(w13a, orig_a[0]) and torch.equal(w2a, orig_a[1])
-    assert torch.equal(w13b, orig_b[0]) and torch.equal(w2b, orig_b[1])
-    assert len(st._packed) == 0
-
-
-def test_prenz_state_repack_after_external_nd_mutation():
-    """回退后权重被外部就地改写(ND 语义)再接入:按新 ND 内容重 pack。"""
-    from tileinfer.integrations.moe_prenz import _PrenzMoeState
-
-    st = _PrenzMoeState(inter=I, hidden=H, num_experts=E)
-    w13, w2 = _w(12)
-    st.acquire_packed(w13, w2)
-    st.release_packed(w13, w2)
-    w13.mul_(1.5)  # ND 语义下的外部更新(版本漂移)
-    ref = pack_gate_up(w13.clone(), inter=I)
-    pa = st.acquire_packed(w13, w2)
-    assert torch.equal(pa[0], ref)
-    st.release_packed(w13, w2)

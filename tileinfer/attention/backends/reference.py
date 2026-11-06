@@ -14,6 +14,7 @@ from typing import Optional
 
 import torch
 
+from ...metadata import RaggedMetadata
 from ...plan import AttentionPlan
 from ...testing.reference import reference_attention, reference_attention_tiled
 from .base import AttentionBackend, register_backend
@@ -43,6 +44,13 @@ class ReferenceBackend(AttentionBackend):
         kv_last_page_len: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         meta = plan.meta
+        # The tiled reference takes ``[batch, h_q, qo_len, d]`` (``testing/reference.py:190``), while
+        # the decode path hands this backend ``[batch, h_q, d]`` (one token per sequence).  Squeeze a
+        # trailing axis here rather than at every call site: a 3-D query has exactly one query token
+        # per sequence, which is the decode case this backend is the fallback for.
+        squeezed = q.dim() == 3
+        if squeezed:
+            q = q.unsqueeze(2)
         if kv_indptr is not None or kv_indices is not None or kv_last_page_len is not None:
             meta = RaggedMetadata(
                 kv_indptr=kv_indptr if kv_indptr is not None else meta.kv_indptr,
@@ -69,6 +77,13 @@ class ReferenceBackend(AttentionBackend):
         if plan.needs_merge:
             # the tiled path already merged; kernel-shaped output for consistency
             result = result.reshape(result.shape[0], plan.num_qo_heads, 1, plan.head_dim)
+        if squeezed:
+            # give the caller back the shape it asked with: ``[batch, h_q, d]``
+            result = result.squeeze(2)
+            if out is not None:
+                out.copy_(result)
+                return out
+            return result
         if out is not None:
             out.copy_(result)
             return out

@@ -7,7 +7,7 @@ vllm-ascend 在役 chunk 链(E20/E22)中段两步:
     u  = Ai @ (v * beta)
 
 本文件按数学定义给出 fp32/fp64 参照(不依赖 triton),供设备测试对照。
-语义要点(均与 vllm_ascend/ops/triton/fla 对齐):
+语义要点(均与生产环境的 Ascend chunk 链对齐,冻结副本见 ``legacy/``):
 * A 的非零元仅在每 64-token 块内严格下三角:A[i,j] = beta_i·exp(g_i-g_j)·(k_i·k_j),i>j(块内);
 * k 按 head 折算:k head = i_h // (HV // HK)(GQA:HK=16, HV=32);
 * 无效行(序列末尾不足 64 的补齐区)不产生输出;三角形保证有效输出只依赖有效行/列。

@@ -2370,6 +2370,28 @@ def forward_split(
     return result
 
 
+def _pack_indices(schedule, kv_heads: int, rows_per_req: int, br: int, num_tiles: int,
+                  total_rows: int, dev) -> tuple:
+    """The gather index and validity mask for packing Q into the kernel's tile layout.
+
+    Pure function of the schedule (which is itself a pure function of the per-request query
+    lengths), so the caller may cache the pair and skip ~6 small kernels per prefill step: measured
+    1.17 ms of host time per step at 144 tokens in §64.2, and this derivation is the bulk of it.
+    """
+    seq_ids64 = schedule.seq_ids.to(device=dev, dtype=torch.int64)
+    q_off64 = schedule.q_offsets.to(device=dev, dtype=torch.int64)
+    q_len64 = schedule.q_lens.to(device=dev, dtype=torch.int64)
+    head_ids = torch.arange(kv_heads, dtype=torch.int64, device=dev)
+    src_row = (seq_ids64 * kv_heads).unsqueeze(1) * rows_per_req + q_off64.unsqueeze(1)
+    src_row = src_row + head_ids.unsqueeze(0) * rows_per_req  # [num_tiles, kv_heads]
+    row_ar = torch.arange(br, dtype=torch.int64, device=dev)
+    src = src_row.unsqueeze(2) + row_ar  # [num_tiles, kv_heads, br]
+    valid = (row_ar.view(1, 1, br) < q_len64.view(num_tiles, 1, 1)).expand(num_tiles, kv_heads, br)
+    # Rows past a request's live count (and every row of a padded tile) may address beyond the
+    # packed buffer; clamp so the gather stays in bounds (the mask zeroes them right after).
+    return src.clamp(0, max(total_rows - 1, 0)).reshape(-1), valid.reshape(-1)
+
+
 def forward_prefill(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -2384,6 +2406,7 @@ def forward_prefill(
     out: torch.Tensor | None = None,
     kernel_batch: int | None = None,
     pv_single_pass: bool = False,
+    pack: tuple | None = None,
 ) -> torch.Tensor:
     """Run paged prefill / append: packs ``Q`` into the kernel's tile layout, unpacks the result.
 
@@ -2433,24 +2456,21 @@ def forward_prefill(
     num_slots = num_tiles * kv_heads
     rows_per_req = max_qo_len * group
     dev = q.device
-    # Flat row index of each packed slot's first row inside ``q_flat`` ([batch, kv_heads, rows, dim]).
-    seq_ids64 = schedule.seq_ids.to(device=dev, dtype=torch.int64)
-    q_off64 = schedule.q_offsets.to(device=dev, dtype=torch.int64)
-    q_len64 = schedule.q_lens.to(device=dev, dtype=torch.int64)
-    head_ids = torch.arange(kv_heads, dtype=torch.int64, device=dev)
-    src_row = (seq_ids64 * kv_heads).unsqueeze(1) * rows_per_req + q_off64.unsqueeze(1)
-    src_row = src_row + head_ids.unsqueeze(0) * rows_per_req  # [num_tiles, kv_heads]
-    row_ar = torch.arange(br, dtype=torch.int64, device=dev)
-    src = src_row.unsqueeze(2) + row_ar  # [num_tiles, kv_heads, br]
-    valid = (
-        row_ar.view(1, 1, br) < q_len64.view(num_tiles, 1, 1)
-    ).expand(num_tiles, kv_heads, br)  # [num_tiles, kv_heads, br]
-
-    total_rows = q_flat.numel() // max(dim, 1)
-    # Rows past a request's live count (and every row of a padded tile) may address beyond
-    # ``q_flat``; clamp so the gather stays in bounds and mask them to zero right after.
-    src_flat = src.clamp(0, max(total_rows - 1, 0)).reshape(-1)
-    valid_flat = valid.reshape(-1)
+    if pack is not None:
+        # Cached by the caller: the index tensors below are a pure function of the schedule (which
+        # is itself a pure function of the per-request query lengths), and rebuilding them cost
+        # ~0.6 ms of the 1.17 ms host time measured per prefill step (§64.2).
+        src_flat, valid_flat = pack
+    else:
+        src_flat, valid_flat = _pack_indices(
+            schedule,
+            kv_heads,
+            rows_per_req,
+            br,
+            num_tiles,
+            q_flat.numel() // max(dim, 1),
+            dev,
+        )
     gathered = q_flat.view(-1, dim).index_select(0, src_flat).reshape(num_slots, br, dim)
     # Padded rows read an arbitrary neighbour row; mask them back to zero (the kernel's RowThr
     # already masks them, this keeps the buffer contract "padding is zero").
@@ -3117,26 +3137,14 @@ def pool_view(k_cache: torch.Tensor, cap: int) -> torch.Tensor:
     trash slot and the spans only ever name real pages), and the pool *must not* be padded — the
     engine writes new KV into it every step.
 
-    ``cap < pool`` would silently hide live pages and is a caller bug (asserted).
+    The arithmetic lives in :func:`tileinfer.serving.buckets.capacity_view` so it can be tested
+    without the toolchain.  It **carries the storage offset over**: the V half of a fused pool
+    starts at a non-zero offset, and re-binding at offset 0 made the kernel read K as V (silent,
+    no error).  ``cap < pool`` would silently hide live pages and is a caller bug (rejected).
     """
-    pool = int(k_cache.shape[0])
-    if pool == cap:
-        return k_cache.reshape(-1, *k_cache.shape[1:])
-    if pool > cap:
-        raise ValueError(
-            f"pool grew past the kernel's compiled capacity ({pool} > {cap}); "
-            "the declared capacity must cover every live page"
-        )
-    flat = k_cache if k_cache.is_contiguous() else k_cache.contiguous()
-    view = torch.empty(0, dtype=flat.dtype, device=flat.device)
-    view.set_(flat.untyped_storage(), 0, (cap, *flat.shape[1:]), flat.stride())
-    return view
-    pool = int(k_cache.shape[0])
-    if pool == cap:
-        return k_cache.reshape(-1, *k_cache.shape[1:])
-    assert pool < cap, f"pool grew past the kernel's compiled capacity ({pool} > {cap})"
-    flat = k_cache if k_cache.is_contiguous() else k_cache.contiguous()
-    return flat.as_strided((cap, *flat.shape[1:]), flat.stride())
+    from ...serving.buckets import capacity_view
+
+    return capacity_view(k_cache, cap)
 
 
 def forward(

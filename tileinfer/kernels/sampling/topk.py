@@ -1,10 +1,11 @@
 """采样 top-k 阈值选择:用 DeepSelect ``topk`` 替换原生对整张词表的 ``probs.sort``。
 
-定位(A5 采样路径):``vllm_ascend.sample.sampler.AscendTopKTopPSampler.apply_top_k_top_p``
-在 **top-k-only**(``p is None``)时仍对整张词表(V=151936)做 ``probs.sort``(O(V log V))
-求第 k 大阈值。本模块在**采样门控包络**(词表 >= ``SAMPLING_MIN_VOCAB`` 且 batch >=
-``SAMPLING_MIN_BATCH``)内,改用 DeepSelect ``topk``(``sorted=False``、int32)在 logits 上
-直接求第 k 大(``values.min``)作阈值,语义等价且省去整词表排序。
+定位(A5 采样路径):Ascend 原生采样器的 ``AscendTopKTopPSampler.apply_top_k_top_p``
+(冻结副本见 ``legacy/``)在 **top-k-only**(``p is None``)时仍对整张词表(V=151936)做
+``probs.sort``(O(V log V))求第 k 大阈值。本模块在**采样门控包络**(词表 >=
+``SAMPLING_MIN_VOCAB`` 且 batch >= ``SAMPLING_MIN_BATCH``)内,改用 DeepSelect ``topk``
+(``sorted=False``、int32)在 logits 上直接求第 k 大(``values.min``)作阈值,语义等价且省去
+整词表排序。
 
 等价性:``softmax`` 严格单调 ⇒ ``prob_i < 第k大 prob`` ⟺ ``logit_i < 第k大 logit``。
 原生在 probs 上取第 k 大后 ``probs < cutoff`` 丢弃(保留并列项);本实现取第 k 大 logit
@@ -12,7 +13,7 @@
 temperature 引入的额外 fp32 尾数时完全一致)。
 
 回退契约:``apply_top_k_top_p`` 在**包络外**或**硬约束不满足**时返回 ``None``,由集成层
-(``integrations/vllm_ascend.py``)交还原生实现——保证小 batch / top-p 场景零额外开销。
+(legacy 适配器,见 ``legacy/``)交还原生实现——保证小 batch / top-p 场景零额外开销。
 """
 
 from __future__ import annotations

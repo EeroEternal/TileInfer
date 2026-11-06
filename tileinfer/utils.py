@@ -112,16 +112,20 @@ def synchronize(device: Optional[torch.device] = None) -> None:
 
 
 def have_tilelang() -> bool:
-    """Whether a TileLang toolchain (Ascend flavour, containing ``T.Kernel(..., is_npu=True)``)
-    is importable.  The plain PyPI ``tilelang`` wheel has no Ascend backend, so presence of the
-    module alone is not enough — we also require the NPU pass-config keys."""
+    """Whether a TileLang toolchain (Ascend flavour) is importable.
+
+    This used to require ``PassConfigKey.TL_ASCEND_AUTO_SYNC``.  That key is **absent** from the
+    0.1.15 wheel on the reference box even though the wheel ships the Ascend backend and compiles
+    our kernels (verified on Ascend950PR: the decode kernel compiled and ran, the TileLang cache
+    holds its artifacts, and the first hardware failure was the kernel's own ``KCache dtype
+    mismatch`` check).  So the right question is "can the backend be imported", not "does it
+    expose a particular pass-config key" - the old test made ``tileinfer doctor`` report the
+    toolchain missing while the kernels were working.
+    """
     try:
         import tilelang  # noqa: F401
-    except Exception:
-        return False
-    try:
-        from tilelang import PassConfigKey
-
-        return hasattr(PassConfigKey, "TL_ASCEND_AUTO_SYNC")
+        import tilelang.ascend  # noqa: F401  (the module the kernels import)
+        from tilelang.ascend import language  # noqa: F401
+        return True
     except Exception:
         return False

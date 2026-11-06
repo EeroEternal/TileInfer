@@ -92,7 +92,7 @@ def main() -> int:
     ap.add_argument("--json", action="store_true", help="with --plan-only, emit the plan as JSON")
     args = ap.parse_args()
 
-    from tileinfer.integrations.vllm_ascend import BATCH_BUCKETS
+    from tileinfer.serving.buckets import BATCH_BUCKETS
 
     buckets = tuple(args.buckets) if args.buckets else BATCH_BUCKETS
     pin = os.environ.get("TILEINFER_POOL_CAP", "").strip() or None

@@ -36,15 +36,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-#: 内核页的 token 数:TyileLang 内核以 128-token 页为 N tile(见 vllm_ascend.KERNEL_PAGE_SIZE)。
+#: 内核页的 token 数:TyileLang 内核以 128-token 页为 N tile(见 serving 层的 ``KERNEL_PAGE_SIZE``)。
 KERNEL_PAGE_SIZE = 128
 
-#: prefill 内核的 query 行块默认值(与 vllm_ascend 的 canonical 变体一致)。
+#: prefill 内核的 query 行块默认值(与生产环境 legacy 适配器的 canonical 变体一致,见 ``legacy/``)。
 PREFILL_BLOCK_Q = 128
 
 
 def next_pow2(n: int) -> int:
-    """最小的 ``>= n`` 的 2 的幂(1 保持 1);与 ``vllm_ascend._next_pow2`` 同义。"""
+    """最小的 ``>= n`` 的 2 的幂(1 保持 1);与 ``serving.buckets.next_pow2`` 同义。"""
     return 1 if n <= 1 else 1 << (n - 1).bit_length()
 
 
@@ -63,7 +63,7 @@ def sub_pages(block_size: int) -> int:
 
 
 def bucket_for(num_reqs: int, buckets: Tuple[int, ...]) -> int:
-    """第一个 ``>= num_reqs`` 的桶;超出最大桶则报错(与 ``vllm_ascend._bucket_for`` 同义)。"""
+    """第一个 ``>= num_reqs`` 的桶;超出最大桶则报错(与 ``serving.buckets.bucket_for`` 同义)。"""
     for b in buckets:
         if b >= num_reqs:
             return b

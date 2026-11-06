@@ -38,3 +38,9 @@ benchmarks/probes/h2[79]_perm_*.npy
 
 # vLLM 运行期产物(测试进程内创建)
 runtime/
+.venv_baseline/
+.venv_native213/
+
+# pytest 临时缓存目录与本地调试日志（git 权限受限时无法扫描，显式忽略以防误提交）
+pytest-cache-files-*/
+/debug.log

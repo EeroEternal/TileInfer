@@ -27,12 +27,27 @@ dependencies = ["torch>=2.0"]
 [project.optional-dependencies]
 dev = ["pytest>=7", "pytest-timeout", "tabulate", "rich"]
 npu = ["torch_npu"]
+# The engine this package is a backend for.  Pinned to the 0.23 line: `tileinfer.vllm.platform`
+# and `tileinfer.vllm.attn.backend` are written against 0.23's `Platform` ABC and v1 attention API,
+# and `docs/notes/vllm-api-0.23.md` is the transcription they were checked against.
+vllm = ["vllm>=0.23,<0.24"]
+
+[project.scripts]
+# `tileinfer` prints the bring-up checklist (docs/hardware-checklist.md steps 1-5) as
+# PASS/FAIL/SKIP with the fix hint, and exits non-zero on a hard failure — see
+# tileinfer/vllm/doctor.py.  The natural spellings `tileinfer doctor` (and the aliases
+# `tileinfer check` / `tileinfer status`) are accepted too, as are `--json` / `--help`; any
+# other argument is a usage error.  It imports nothing engine-side until a check needs it.
+tileinfer = "tileinfer.vllm.doctor:main"
 
 # vLLM loads these in *every* process of a server (API server, EngineCore, workers), which is
-# exactly what an attention backend needs - see docs/integration-vllm-ascend.md.  The plugin is a
-# no-op unless TILEINFER_VLLM=1.
+# exactly what a platform + attention backend need - see tileinfer/vllm/plugin.py's docstring for
+# the install sequence and the two decisions (backend registry slot, graph bridge).
+[project.entry-points."vllm.platform_plugins"]
+tileinfer = "tileinfer.vllm.platform:register"
+
 [project.entry-points."vllm.general_plugins"]
-tileinfer = "tileinfer.integrations.vllm_ascend:install"
+tileinfer = "tileinfer.vllm.plugin:install"
 
 [project.urls]
 Homepage = "https://github.com/EeroEternal/TileInfer"

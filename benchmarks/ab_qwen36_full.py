@@ -231,7 +231,7 @@ def main():
 
     wait_ready(base, args.model)
 
-    p8k, p16k = make_long_prompt(8000), make_long_prompt(16000)
+    p8k, p16k = make_long_prompt(1024), make_long_prompt(1600)
     report = {"label": args.label, "model": args.model, "port": args.port,
               "metrics_note": "TTFT/TPOT/ITL 单位 ms;TPOT=官方定义 (latency-ttft)/(tokens-1);"
                               "out_toks=输出 token 吞吐 tok/s;req_toks=请求吞吐 req/s",

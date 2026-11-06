@@ -2,8 +2,9 @@
 
 Target: `--attention-backend TILEINFER` selects TileInfer instead of the CANN FIA path.
 
-The runnable reference implementation of everything below is
-[`examples/vllm_ascend_tileinfer_backend.py`](../examples/vllm_ascend_tileinfer_backend.py); this
+The runnable reference implementation of everything below is the frozen snapshot at
+[`legacy/examples/vllm_ascend_tileinfer_backend.py`](../legacy/examples/vllm_ascend_tileinfer_backend.py)
+(see [`legacy/README.md`](../legacy/README.md)); this
 document explains the design decisions behind it.
 
 ## Status (2026-10-10)

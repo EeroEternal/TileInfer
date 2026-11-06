@@ -120,7 +120,7 @@ out = attn.run(q, k_cache, v_cache, plan=plan)   # 纯计算，可被 ACLGraph �
 3. Forward：调用 `run`，plan 在捕获前构建完毕；
 4. 注册到平台选择逻辑，支持 `--attention-backend TILEINFER`。
 
-可运行草图见 [`../examples/vllm_ascend_tileinfer_backend.py`](../examples/vllm_ascend_tileinfer_backend.py)。
+可运行草图见 [`../legacy/examples/vllm_ascend_tileinfer_backend.py`](../legacy/examples/vllm_ascend_tileinfer_backend.py)（冻结快照，见 [`../legacy/README.md`](../legacy/README.md)）。
 
 ## 7. 路线图（含实机状态）
 
