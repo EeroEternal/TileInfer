@@ -567,3 +567,7 @@ HEAD 3cab588 上 `--max-tokens 1 --limit 100`：100/100，与串行首 token 100
 
 `DSV41_COMPILE_MOE=1`（compile `_fp4_linear_batched`）：TPOT 656.6 vs 默认 536.9（+22%），
 decode 单次 477 ms 不足以抵消 guard 开销。已回退，HEAD 不含该路径。
+
+### 12.45 负结果：w13 合并调用无收益
+
+`DSV41_MOE_W13_FUSED=1`：TPOT 540.2 vs 默认 536.9（+0.6%，噪声），已回退。

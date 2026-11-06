@@ -1767,3 +1767,18 @@ TPOT **+22%（更差）**；decode 单次数字虽有 477 的亮点，但整体�
 guard/调度开销吃掉（极差 16–62%）。该路径已**回退**，HEAD 中不保留 `DSV41_COMPILE_MOE`
 代码（工作区与 HEAD 一致）。结论：这个 M=1 的小 GEMV 不适合 dynamo/inductor；
 只有手写 fused kernel（L1 内 dequant）才可能真正省时。
+
+## 66. 负结果：合并 w1+w3 的 unpack+GEMM 无收益（540.2 vs 536.9 ms）
+
+把 w1/w3 的 packed 权重与 e8m0 scale 先沿 out 维 concat，一次
+`_fp4_linear_batched` 出 gate+up（`DSV41_MOE_W13_FUSED=1`），减少一次 LUT/scale/bmm 调用。
+
+同窗口 conc1（arena384，`N1=8/N2=32 reps=5`）：
+
+| 配置 | TPOT |
+|---|---|
+| 默认 | 536.9 ms |
+| w13 fused | 540.2 ms |
+
++0.6%，噪声内，无收益（concat 的 70 MB 拷贝与更大的 bmm 抵消了少一次调用的收益）。
+已回退，HEAD 不含该路径。
