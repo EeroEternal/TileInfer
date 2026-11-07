@@ -69,6 +69,17 @@ w2 按 expert 逐个调用（激活不同）。w13 的 bmm 被完全消除。
 - 与既有 batched decode 的 4-token 54% 同一量级：**逐 token 相等不是这套 kernel 的有效判据**；
   继续沿用“组件级 + 首 token + 同臂确定性 + 任务级准确率”。
 
+### 4.1 任务级准确率（20 条事实题，8 token 贪心）
+
+`tools/dsv41/perf_task_accuracy.py`，同 venv/同参数，仅切 `DSV41_MOE_BLOCKSCALED`：
+
+| 臂 | 正确 | 错题 |
+|---|---|---|
+| block-scaled | **18/20（90%）** | Brazil→Rio（模型事实错误）、7+8→nine（模型算术错误） |
+| baseline | **18/20（90%）** | 同两条 |
+
+两臂逐题结果一致；错误来自模型本身，不是 blockscaled 数值。任务级准确率与 baseline 持平。
+
 ## 5. 复现
 
 ```bash
