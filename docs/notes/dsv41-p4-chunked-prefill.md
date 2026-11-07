@@ -94,11 +94,19 @@ HBM 总 40.8 GB。
 
 > 注：更早的 5.66 s 是“chunked suffix + 无 blockscaled”版本；4.75 s 是当前推荐配置。
 
-**16K 负结果**：用同样的 512-token block 预填 16K prompt（16101 token）时，冷 prefill
-超过 7 分钟仍未完成，只能杀进程。原因是每 512 token 调一次 `transformer_forward` 的
-chunked prefill 会反复触发专家换入，32 个 chunk 的成本远高于整段 prefill（基线 200 s）。
-因此 16K 暂不采用 512-block；下一步试 1024/2048 block（减少 chunk 数、命中粒度变粗），
-或改成“整段 prefill + 只对少数关键位置做快照”的机制。
+**16K（1024-block）**：`VLLM_DSV41_BLOCK_SIZE=1024`，A=16101 token cold 223.42 s（16 个 block），
+C=14K 公共前缀 + 8 token：
+
+| 项 | 结果 |
+|---|---|
+| C block hit（恢复 14336 + 8 token） | **4.65 / 4.67 / 4.59 s（中位 4.65，≤5 s）** |
+| 恢复 / 短 suffix | 6 ms / 约 3.4 s |
+| HBM 总 | 77.7 GB |
+| C 首 token | `455,6102,294,14251`（与 4K 冷 C 一致） |
+
+**16K 512-block 负结果**：512-token block 预填 16K 时冷 prefill 超过 7 分钟仍未完成，只能杀进程；
+每 512 token 一次 chunked prefill 会反复触发专家换入，32 个 chunk 的成本远高于整段 prefill。
+1024-block 把 chunk 数减半到 16，冷 prefill 223 s，命中仍可对齐到 1024 边界，因此 16K 采用 1024。
 
 ### 1.7 设计要点
 
