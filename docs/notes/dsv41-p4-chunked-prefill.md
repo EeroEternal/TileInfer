@@ -69,7 +69,27 @@ T(8)=11.843s  T(32)=32.930s  →  878.6 ms/step
 说明 chunked suffix 的数学与整段 prefill 一致；候选源层的 `compress_lens` 需要
 `unsqueeze(-1)` 才能与 `[b,s,T]` 的 block 维广播（已修）。
 
-### 1.6 block-level 锚点（设计）
+### 1.6 block-level 锚点（原型，默认关）
+
+`VLLM_DSV41_BLOCK_CACHE=1 VLLM_DSV41_BLOCK_SIZE=512` 时，cold prefill 按 512 token 分块，
+每块结束把 `window_kv/compress_kv/index_k/kv_state/score_state/engram` 的**已用切片**存到
+CPU（设备端快照在 4K 时触发 507035，CPU 快照稳定），key 为 token 前缀哈希。
+
+实测（A=4K cold，C=3.5K 公共前缀 + 8 token）：
+
+| 项 | 结果 |
+|---|---|
+| A cold（含 7 个 block 快照） | 77.0 s |
+| C block hit（恢复 3584 + chunked suffix 8） | **5.66 s** |
+| C 输出首 token | 与 cold C 一致（`455,6102,294,14251`） |
+| 128-block / 421-token 小测 | hit 8.05 s vs cold 11.9 s，8 token 逐位一致 |
+
+目标 ≤5 s，当前 5.66 s（差 13%）：恢复本身约 2–3 s，suffix 的 chunked prefill 约 2–3 s。
+把短 suffix 改回逐 token decode 反而更慢（8.49 s，prefill 上下文下每 token 都触发 6 专家换入），
+因此保留 chunked suffix。下一步压缩恢复成本（复用 state、只拷贝必要层）或把块大小/恢复做成
+增量式。
+
+### 1.7 设计要点
 
 - block 大小取所有 `compress_ratio` 的公倍数（本模型 ratio ∈ {1,2}，block=256 即可）；
 - prefill 每完成一个 block，对 `window_kv/compress_kv/index_k/kv_state/score_state` 做快照，

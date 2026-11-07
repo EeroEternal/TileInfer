@@ -367,11 +367,33 @@ class DeepseekV41ForCausalLM(nn.Module):
 
         _t0 = _time.perf_counter()
         _cache_on = os.environ.get("VLLM_DSV41_PROMPT_CACHE", "") not in ("", "0")
+        _block_on = os.environ.get("VLLM_DSV41_BLOCK_CACHE", "") not in ("", "0")
+        _block_size = int(os.environ.get("VLLM_DSV41_BLOCK_SIZE", "512") or 512)
         _pkey = None
         _ptoks = None
         if _cache_on and pos == 0:
             _ptoks = tuple(int(x) for x in ids.flatten().tolist())
             _pkey = hash(_ptoks)
+            if _block_on and len(_ptoks) > _block_size:
+                _bsnap = self._block_lookup(_ptoks)
+                if _bsnap is not None:
+                    state = self._restore_block(_bsnap, len(_ptoks))
+                    self._stream_state = state
+                    _moe = self._runtime_moe()
+                    _suffix = len(_ptoks) - len(_bsnap["tokens"])
+                    _chunk = int(os.environ.get("VLLM_DSV41_PREFIX_CHUNK", "0") or 0)
+                    if _suffix > 0 and _chunk > 0:
+                        _lg, out = self._prefill_suffix_chunked(
+                            ids, state, len(_bsnap["tokens"]), len(_ptoks), _moe, _chunk
+                        )
+                        self._last_logits = _lg
+                        if os.environ.get("VLLM_DSV41_DEBUG"):
+                            print(
+                                "DSV41_BLOCK_CACHE hit block=%d suffix=%d"
+                                % (len(_bsnap["tokens"]), _suffix),
+                                flush=True,
+                            )
+                        return out
             _best = None
             for _row in getattr(self, "_prompt_cache", {}).values():
                 _t = _row.get("tokens")
@@ -446,6 +468,22 @@ class DeepseekV41ForCausalLM(nn.Module):
         _t2 = _time.perf_counter()
         _timing_on = os.environ.get("VLLM_DSV41_DECODE_TIMING", "") not in ("", "0")
         _timings = {} if _timing_on else None
+        if _cache_on and _block_on and _ptoks is not None and len(_ptoks) > _block_size:
+            logits, out = self._prefill_blocks(ids, state, len(_ptoks), _moe_fn, _block_size)
+            self._last_logits = logits
+            import copy as _copy
+
+            if getattr(self, "_prompt_cache", None) is None:
+                self._prompt_cache = {}
+            if len(self._prompt_cache) >= 2:
+                self._prompt_cache.pop(next(iter(self._prompt_cache)))
+            self._prompt_cache[_pkey] = {
+                "tokens": _ptoks,
+                "state": _copy.deepcopy(state),
+                "hidden": out.detach().clone(),
+                "logits": logits.detach().clone(),
+            }
+            return out
         logits, _extras = transformer_forward(
             self.model, ids, state, pos, capture=capture, moe_fn=_moe_fn,
             capture_layers=cap_layers, timings=_timings,
@@ -517,6 +555,104 @@ class DeepseekV41ForCausalLM(nn.Module):
                 )
         return out
 
+    def _snapshot_state(self, state, length: int):
+        """Compact CPU snapshot of one prefix (block boundary), only the used slices."""
+        layers = {}
+        for lid, rt in state.layers.items():
+            ratio = int(state.cfg.compress_ratio(lid))
+            n = int(length) // ratio if ratio else 0
+            d = {"window_kv": rt.window_kv.detach().cpu()}
+            if getattr(rt, "compress_kv", None) is not None:
+                d["compress_kv"] = rt.compress_kv[:, :n].detach().cpu()
+            if getattr(rt, "index_k", None) is not None:
+                d["index_k"] = rt.index_k[:, :n].detach().cpu()
+            if getattr(rt, "kv_state", None) is not None:
+                d["kv_state"] = rt.kv_state.detach().cpu()
+                d["score_state"] = rt.score_state.detach().cpu()
+            layers[lid] = d
+        eh = getattr(state, "engram_hash", None)
+        engram = None if eh is None else eh.cache[:, : int(length)].detach().cpu()
+        return {"len": int(length), "layers": layers, "engram": engram}
+
+    def _restore_block(self, snap, total_len: int):
+        from tileinfer.models.dsv41.block import ModelState
+
+        state = getattr(self, "_stream_state", None)
+        if state is None or int(getattr(state, "max_seq_len", 0)) < int(total_len) + 64:
+            state = ModelState(
+                cfg=self.dsv41_config,
+                max_seq_len=max(1024, int(total_len) + 64),
+                bsz=1,
+                device=str(self.model.embed.weight.device),
+                engram_hash=self._engram_hash(),
+            )
+        for lid, d in snap["layers"].items():
+            new = state.runtime(lid, self.dsv41_config.n_layers)
+            new.window_kv.copy_(d["window_kv"].to(new.window_kv.device, non_blocking=True))
+            if "compress_kv" in d and new.compress_kv is not None:
+                n = min(d["compress_kv"].shape[1], new.compress_kv.shape[1])
+                new.compress_kv[:, :n].copy_(d["compress_kv"][:, :n].to(new.compress_kv.device, non_blocking=True))
+            if "index_k" in d and new.index_k is not None:
+                n = min(d["index_k"].shape[1], new.index_k.shape[1])
+                new.index_k[:, :n].copy_(d["index_k"][:, :n].to(new.index_k.device, non_blocking=True))
+            if "kv_state" in d and new.kv_state is not None:
+                new.kv_state.copy_(d["kv_state"].to(new.kv_state.device, non_blocking=True))
+                new.score_state.copy_(d["score_state"].to(new.score_state.device, non_blocking=True))
+        if snap.get("engram") is not None and getattr(state, "engram_hash", None) is not None:
+            n = min(snap["engram"].shape[1], state.engram_hash.cache.shape[1])
+            state.engram_hash.cache[:, :n].copy_(
+                snap["engram"][:, :n].to(state.engram_hash.cache.device, non_blocking=True)
+            )
+        return state
+
+    def _block_lookup(self, tokens):
+        best = None
+        for snap in getattr(self, "_block_cache", {}).values():
+            t = snap["tokens"]
+            if len(t) <= len(tokens) and tokens[: len(t)] == t:
+                if best is None or len(t) > len(best["tokens"]):
+                    best = snap
+        return best
+
+    def _prefill_blocks(self, ids, state, total: int, moe_fn, block: int):
+        """Prefill in block-sized chunks, snapshotting a compact state after each block."""
+        from tileinfer.models.dsv41.block import transformer_forward
+
+        p = 0
+        logits = None
+        out = None
+        while p < total:
+            n = min(int(block), total - p)
+            if n > 1 and n % 2:
+                n -= 1
+            if n <= 0:
+                n = 1
+            last = p + n >= total
+            cap = {}
+            logits, _ = transformer_forward(
+                self.model,
+                ids[:, p : p + n],
+                state,
+                p,
+                capture=cap if last else None,
+                moe_fn=moe_fn,
+                skip_logits=not last,
+            )
+            p += n
+            if last:
+                h = cap["h"]
+                out = h[0] if h.dim() == 3 else h
+                break
+            if p % int(block) == 0:
+                snap = self._snapshot_state(state, p)
+                snap["tokens"] = tuple(int(x) for x in ids[0, :p].tolist())
+                if getattr(self, "_block_cache", None) is None:
+                    self._block_cache = {}
+                self._block_cache[(p, hash(snap["tokens"]))] = snap
+                if len(self._block_cache) > 64:
+                    self._block_cache.pop(next(iter(self._block_cache)))
+        return logits, out
+
     def _prefill_suffix_chunked(self, ids, state, start: int, total: int, moe_fn, chunk: int):
         """Run the suffix after a restored prefix with ratio-aligned chunks.
 
@@ -533,6 +669,24 @@ class DeepseekV41ForCausalLM(nn.Module):
         _t0 = _time.perf_counter()
         logits = None
         out = None
+        if total - start <= 32:
+            # A short suffix is cheaper as decode-shaped steps: prefill MoE would fan out to
+            # topk * suffix distinct experts per layer, while decode touches only topk.
+            cap = {}
+            for i in range(int(start), int(total)):
+                last = i == total - 1
+                logits, _ = transformer_forward(
+                    self.model,
+                    ids[:, i : i + 1],
+                    state,
+                    i,
+                    capture=cap if last else None,
+                    moe_fn=moe_fn,
+                    skip_logits=not last,
+                )
+            h = cap["h"]
+            out = h[0] if h.dim() == 3 else h
+            return logits, out
         cap = {}
         p = int(start)
         if p % 2 and p < total:
