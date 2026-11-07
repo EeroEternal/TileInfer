@@ -81,7 +81,38 @@ DSV41_MOE_BLOCKSCALED=1 ... --max-num-seqs 1 --enforce-eager --port 8123
 .venv/bin/python tools/dsv41/perf_vllm_tpot.py --port 8123 --n1 8 --n2 72 --reps 3
 ```
 
-## 6. 下一步
+## 6. 逐层成本与 100-prompt（2026-11-07 补充）
+
+`VLLM_DSV41_BATCHED_MOE_TIMING=1` 下 40 层 decode 的单层均值：
+
+| 项 | ms/layer | 说明 |
+|---|---|---|
+| gate | 0.1 | 路由 |
+| **load** | **2.5–4.5** | 6 专家 × 17.93 MiB 的 H2D；理论 107.6 MiB / 53.7 GB/s ≈ 2.0 ms |
+| gather | 0.3 | 路由簿记 |
+| w13 | 0.25–0.3 | 一次 blockscaled GEMM（N=E·2·hid） |
+| w2 | 0.7–1.2 | 6 次 blockscaled GEMM |
+| shared | 0.24 | FP8 shared expert（未改） |
+
+合计约 4–6 ms/layer，×40 ≈ 160–240 ms/token；**H2D 仍是 MoE 的主要成本**，w13 已接近
+launch 下限。TPOT 复测（N1=8/N2=72，3 次）**419.9 ms**，相对 baseline 571.5 为 −26.5%。
+
+shared expert 是 FP8 + 32×32 block scale，不是 MX per-row，不能直接用 `gemm_blockscaled`；
+尝试过“bf16 权重常驻缓存”，TPOT 432.0（更差，且多占 2.8 GiB），已回退。
+
+100-prompt 质量门（`perf_quality_gate.py --limit 100 --max-tokens 4`，同 venv/同参数，仅切
+`DSV41_MOE_BLOCKSCALED`）：
+
+| 指标 | 结果 |
+|---|---|
+| 首 token 一致 | **100/100** |
+| 逐位置一致（pos0..3） | 100 / 92 / 84 / 65（85.3%） |
+| 完整 4-token 一致 | **63/100（63%）** |
+| logprob 有界 δ=1 nat | 91.5%（366/400） |
+
+4-token 逐 token 仍未达 95%，与既有 batched 臂同量级；首 token 硬门槛已满足。
+
+## 7. 下一步
 
 1. 合并 6 次 w2 调用（grouped block-scaled 或 block-diagonal），目标 ≤400 ms；
 2. 把 `npu_swiglu_mx_quant` 用于 SwiGLU + 激活量化融合，省一次 quant；

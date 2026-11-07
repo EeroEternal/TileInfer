@@ -896,6 +896,8 @@ def moe_forward_batched(moe, x, layer_id, arena, device="npu:0", image_mask=None
         w13 = torch.cat([_u8(w1), _u8(w3)], dim=1).reshape(e * 2 * hid, dim // 2)
         s13 = torch.cat([_u8(s1), _u8(s3)], dim=1).reshape(e * 2 * hid, dim // 32)
         both = _blockscaled_linear(xd, w13, s13, e * 2 * hid, dim).view(e, 2 * hid)
+        if _tm:
+            _mark("w13")
         gate_out, up = both[:, :hid], both[:, hid:]
         limit = moe.experts[ids[0]].swiglu_limit
         if limit > 0:
@@ -907,8 +909,26 @@ def moe_forward_batched(moe, x, layer_id, arena, device="npu:0", image_mask=None
         for i in range(e):
             part = _blockscaled_linear(act[i : i + 1].to(torch.bfloat16), w2[i], s2[i], dim, hid)
             acc = part if acc is None else acc + part
+        if _tm:
+            _mark("w2")
         y = acc.cpu()
         y = y + expert_forward(moe.shared_experts, flat).float().cpu()
+        if _tm:
+            _mark("shared")
+            _d = {k: (_marks[k] - _marks["t0"]) * 1e3 for k in _marks if k != "t0"}
+            print(
+                "DSV41_BSMOE layer=%d gate=%.2f load=%.2f gather=%.2f w13=%.2f w2=%.2f shared=%.2f"
+                % (
+                    int(layer_id),
+                    _d.get("gate", 0.0),
+                    _d.get("load", 0.0) - _d.get("gate", 0.0),
+                    _d.get("gather", 0.0) - _d.get("load", 0.0),
+                    _d.get("w13", 0.0) - _d.get("gather", 0.0),
+                    _d.get("w2", 0.0) - _d.get("w13", 0.0),
+                    _d.get("shared", 0.0) - _d.get("w2", 0.0),
+                ),
+                flush=True,
+            )
         return y.type_as(x).to(x.device).view(shape)
 
     xk = xd.expand(len(slots), -1, -1)
