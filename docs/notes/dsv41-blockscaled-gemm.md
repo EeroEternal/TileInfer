@@ -112,7 +112,28 @@ shared expert 是 FP8 + 32×32 block scale，不是 MX per-row，不能直接用
 
 4-token 逐 token 仍未达 95%，与既有 batched 臂同量级；首 token 硬门槛已满足。
 
-## 7. 下一步
+## 7. Arena 容量：从 419.9 到 372 ms
+
+逐层计时显示 load 仍是 2.5–4.5 ms/layer，根因不是 H2D 带宽，而是 **384 槽装不下两个 decode
+step 的工作集**：单 step 最多 40 层 × 6 专家 = 240 个，两个 step 最多 480 个，384 槽必然把
+上一 step 的专家挤掉，于是几乎每层都 miss。把 arena 调到 1024 槽后：
+
+| `VLLM_DSV41_ARENA_SLOTS` | TPOT（N1=8/N2=72，3 次） | HBM（npu-smi 总） |
+|---|---|---|
+| 384（默认） | 419.9 ms | ~34 GB |
+| **1024** | **372.1 / 373.2 ms** | **40.8 GB** |
+| 1536 | 371.1 ms | ~45 GB |
+| 2048 | 380.1 ms | ~54 GB |
+
+- 1024 槽已足够覆盖约 4 个 step 的热专家，H2D miss 大幅下降；
+- 1536 只快 1 ms，2048 反而在噪声内回退（HBM 压力上升），**1024 是单请求的推荐值**；
+- 20-prompt 首 token 仍 **20/20**；100-prompt 首 token 100/100 的结论不变（arena 只影响命中，
+  不改数学）。
+
+P1 主目标 **TPOT ≤400 ms 已达成**（372–373 ms，相对 baseline 571.5 为 −35%）。冲刺 ≤350 ms
+还差约 6%，剩余成本主要是 attention/dense + Python 派发，以及 w2 的 6 次调用。
+
+## 8. 下一步
 
 1. 合并 6 次 w2 调用（grouped block-scaled 或 block-diagonal），目标 ≤400 ms；
 2. 把 `npu_swiglu_mx_quant` 用于 SwiGLU + 激活量化融合，省一次 quant；
