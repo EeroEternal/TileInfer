@@ -580,6 +580,77 @@ _BS_KERNELS: Dict[tuple, object] = {}
 _BS_PAD: Dict[tuple, tuple] = {}
 
 
+def _bs_kernel_grouped(E: int, N: int, K: int):
+    """One launch for E independent MXFP4 GEMMs (the w2 of all routed experts)."""
+    key = ("group", E, N, K)
+    fn = _BS_KERNELS.get(key)
+    if fn is not None:
+        return fn
+
+    import tilelang
+    import tilelang.ascend.language as T
+
+    assert K % 64 == 0
+    BN = 128 if N % 128 == 0 else 64 if N % 64 == 0 else 32
+    BK = 512 if K % 512 == 0 else 256 if K % 256 == 0 else 128 if K % 128 == 0 else 64
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((E, 32, K // 2), "int8"),
+        B: T.Tensor((E, N, K // 2), "int8"),
+        SA: T.Tensor((E, K // 64, 32), "uint16"),
+        SB: T.Tensor((E, K // 64, N), "uint16"),
+        C: T.Tensor((E, 32, N), "float32"),
+    ):
+        with T.Kernel(E * (N // BN)) as bid:
+            e = bid // (N // BN)
+            bx = bid % (N // BN)
+            a_l1 = T.alloc_l1((32, BK), "float4_e2m1fn")
+            b_l1 = T.alloc_l1((BN, BK), "float4_e2m1fn")
+            sa_l1 = T.alloc_l1((32, BK // 64), "uint16")
+            sb_l1 = T.alloc_l1((BN, BK // 64), "uint16")
+            acc = T.alloc_l0c((32, BN), "float32")
+            a_data = T.view(A, (E, 32, K), "float4_e2m1fn")
+            b_data = T.view(B, (E, N, K), "float4_e2m1fn")
+            for k in T.serial(K // BK):
+                T.copy(a_data[e, 0:32, k * BK : (k + 1) * BK], a_l1)
+                T.copy(b_data[e, bx * BN : (bx + 1) * BN, k * BK : (k + 1) * BK], b_l1)
+                T.copy(SA[e, k * (BK // 64) : (k + 1) * (BK // 64), 0:32], sa_l1, transpose=True)
+                T.copy(
+                    SB[e, k * (BK // 64) : (k + 1) * (BK // 64), bx * BN : (bx + 1) * BN],
+                    sb_l1,
+                    transpose=True,
+                )
+                T.gemm_blockscaled(
+                    a_l1, b_l1, acc, sa_l1, sb_l1, transpose_B=True, clear_accum=(k == 0)
+                )
+            T.copy(acc, C[e, 0:32, bx * BN : (bx + 1) * BN])
+
+    fn = tilelang.compile(main, target="ascend", out_idx=-1)
+    _BS_KERNELS[key] = fn
+    return fn
+
+
+def _blockscaled_linear_grouped(act, packed, scale, out_f: int, in_f: int):
+    """E rows of independent activations against E packed weights, one kernel."""
+    import torch_npu
+
+    e = int(act.shape[0])
+    assert act.shape == (e, in_f) and e <= 32
+    q, s = torch_npu.npu_dynamic_mx_quant(
+        act.contiguous().to(torch.bfloat16), dst_type=296, block_size=32
+    )
+    a = torch.zeros((e, 32, in_f // 2), dtype=torch.uint8, device=act.device)
+    a[:, 0, :] = q
+    sa8 = torch.full((e, in_f // 64, 32, 2), 127, dtype=torch.uint8, device=act.device)
+    sa = sa8.view(torch.uint16).reshape(e, in_f // 64, 32)
+    sa[:, :, 0] = s.reshape(e, in_f // 64, 2).view(torch.uint16).reshape(e, in_f // 64)
+    b = packed.view(torch.uint8) if packed.dtype != torch.uint8 else packed
+    sb = scale.view(torch.uint8).view(torch.uint16).permute(0, 2, 1).contiguous()
+    k = _bs_kernel_grouped(e, out_f, in_f)
+    return k(a.view(torch.int8), b.view(torch.int8), sa, sb)[:, 0, :].float()
+
+
 def _bs_kernel(M: int, N: int, K: int):
     """Build (once) an Ascend MXFP4 x MXFP4 block-scaled GEMM with an FP32 accumulator.
 
@@ -905,13 +976,10 @@ def moe_forward_batched(moe, x, layer_id, arena, device="npu:0", image_mask=None
             gate_out = torch.clamp(gate_out, max=limit)
         act = torch.nn.functional.silu(gate_out) * up
         act = act * weights[0, :, None].float().to(act.device)
-        acc = None
-        for i in range(e):
-            part = _blockscaled_linear(act[i : i + 1].to(torch.bfloat16), w2[i], s2[i], dim, hid)
-            acc = part if acc is None else acc + part
+        acc = _blockscaled_linear_grouped(act.to(torch.bfloat16), w2, s2, dim, hid)
         if _tm:
             _mark("w2")
-        y = acc.cpu()
+        y = acc.sum(dim=0, keepdim=True).cpu()
         y = y + expert_forward(moe.shared_experts, flat).float().cpu()
         if _tm:
             _mark("shared")
