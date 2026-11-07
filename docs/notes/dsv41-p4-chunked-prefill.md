@@ -30,10 +30,9 @@ T(8)=11.843s  T(32)=32.930s  →  878.6 ms/step
 | ratio=2，8 token 整段 vs 2×4 chunk | `torch.equal` ✅ |
 | ratio=4，16 token 整段 vs 4×4 chunk | `torch.equal` ✅ |
 
-### 1.3 indexer chunked prefill（下一步）
+### 1.3 indexer chunked prefill（已完成）
 
-`indexer_forward` 在 `start_pos>0` 仍假定 `seqlen==1`（`cos[start_pos+1-ratio]`、标量
-`compress_lens`、标量 topk）。需要改为：
+`indexer_forward` 在 `start_pos>0 && seqlen>1` 时：
 
 1. 新 latent 的 RoPE 位置：对齐 chunk 用 `start_pos + i*ratio`（不是 decode 的
    `start_pos+1-ratio`）；
@@ -42,6 +41,16 @@ T(8)=11.843s  T(32)=32.930s  →  878.6 ms/step
 4. topk 用 `min(index_topk, end_pos//ratio)`，再按每行 `compress_lens` 把越界项置 -1；
 5. candidate source 的 `select_candidate_blocks` 对 `[b,s,T]` 已支持，且 score 仍覆盖
    **全部历史 T**，因此每个 chunk 重算候选是精确的，不需要跨 chunk 合并。
+
+新增 CPU 用例 `tests/test_dsv41_chunked_indexer.py`：
+
+| 用例 | 结果 |
+|---|---|
+| ratio=2，8 token 整段 vs 2×4 chunk | index_k 与 top-k 逐位相等 ✅ |
+| ratio=1，8 token 整段 vs 2×4 chunk | index_k 与 top-k 逐位相等 ✅ |
+
+注意：不同 chunk 的 `topk` 宽度可以不同（例如前 4 个 token 只有 2 个压缩块）；每个 chunk
+独立调用 `sparse_attn` 即可，不需要拼接成统一宽度。
 
 ### 1.4 block-level 锚点（设计）
 
@@ -57,7 +66,7 @@ T(8)=11.843s  T(32)=32.930s  →  878.6 ms/step
 ```bash
 cd /home/userlist/zxs/TileInfer
 .venv/bin/python -m pytest tests/test_dsv41_chunked_compress.py -q
-.venv/bin/python -m pytest tests/test_dsv41_*.py -q   # 142 passed
+.venv/bin/python -m pytest tests/test_dsv41_*.py -q   # 144 passed
 ```
 
 ## 3. 下一步

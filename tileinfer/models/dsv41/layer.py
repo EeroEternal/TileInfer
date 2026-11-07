@@ -379,12 +379,23 @@ def indexer_forward(
         raise ValueError("indexer on a non-compressing layer")
 
     if ix.owns_k and latent is not None:
+        n_lat = int(latent.size(1))
         if start_pos == 0:
             c = rt.cos[: seqlen - seqlen % ratio : ratio]
             s = rt.sin[: seqlen - seqlen % ratio : ratio]
-        else:
+        elif n_lat == 1:
             c = rt.cos[start_pos + 1 - ratio].unsqueeze(0)
             s = rt.sin[start_pos + 1 - ratio].unsqueeze(0)
+        else:
+            # Chunked prefill: latents cover consecutive blocks starting at ``start_pos``.
+            if start_pos % ratio:
+                raise ValueError(
+                    "chunked indexer requires start_pos % ratio == 0: "
+                    f"start_pos={start_pos} ratio={ratio}"
+                )
+            pos = torch.arange(n_lat, device=x.device) * ratio + start_pos
+            c = rt.cos[pos]
+            s = rt.sin[pos]
         k = rms_norm(ix.k_norm, o.linear(latent, ix.wk.weight, ix.wk.scale))
         rotate(k[..., -rd:], c, s)
         o.fp4_act_quant(k, 32, True)
@@ -405,8 +416,12 @@ def indexer_forward(
 
     if start_pos == 0:
         compress_lens = (torch.arange(1, seqlen + 1, device=x.device) // ratio).unsqueeze(-1)
-    else:
+    elif seqlen == 1:
         compress_lens = end_pos // ratio
+    else:
+        # one lens per query: how many compressed blocks each absolute position can see
+        compress_lens = ((torch.arange(seqlen, device=x.device) + start_pos + 1) // ratio).unsqueeze(0)
+        compress_lens = compress_lens.expand(bsz, -1)
 
     import os as _os_idx
 
@@ -426,6 +441,11 @@ def indexer_forward(
         score.masked_fill_(
             torch.arange(seqlen // ratio, device=x.device) >= compress_lens, -math.inf
         )
+    elif seqlen > 1:
+        score.masked_fill_(
+            torch.arange(score.size(-1), device=x.device) >= compress_lens.unsqueeze(-1),
+            -math.inf,
+        )
 
     if cfg.is_candidate_source(rt.layer_id):
         rt.shared.candidates = select_candidate_blocks(
@@ -440,7 +460,11 @@ def indexer_forward(
 
     topk = min(cfg.index_topk, end_pos // ratio)
     idxs = score.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
-    return torch.where(idxs < compress_lens, idxs + offset, -1).int()
+    if seqlen > 1 and start_pos > 0:
+        valid = idxs < compress_lens.unsqueeze(-1)
+    else:
+        valid = idxs < compress_lens
+    return torch.where(valid, idxs + offset, -1).int()
 
 
 def _indexer_block_scores(q, index_k, weights, t0: int, t1: int) -> torch.Tensor:
@@ -712,10 +736,14 @@ def _compress_kv(attn, x, qr, start_pos, offset, rt, cfg, o):
             c = rt.cos[start_pos + 1 - ratio].unsqueeze(0)
             s = rt.sin[start_pos + 1 - ratio].unsqueeze(0)
         else:
-            # 分块解码 / 投机验证：一次可能产出多个压缩条目
-            pos = torch.tensor(
-                compress_rope_positions(start_pos, ratio, n_lat), device=rt.cos.device
-            ).clamp_min(0)
+            # 分块 prefill：chunk 与 ratio 对齐时，latent 的 rope 位置就是块起点；
+            # 非对齐（投机验证）沿用 decode 的“块末尾”约定。
+            if start_pos % ratio == 0:
+                pos = torch.arange(n_lat, device=rt.cos.device) * ratio + start_pos
+            else:
+                pos = torch.tensor(
+                    compress_rope_positions(start_pos, ratio, n_lat), device=rt.cos.device
+                ).clamp_min(0)
             c = rt.cos[pos]
             s = rt.sin[pos]
         rotate(latent[..., -cfg.rope_head_dim :], c, s)
