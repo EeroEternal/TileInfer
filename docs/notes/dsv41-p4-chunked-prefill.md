@@ -84,10 +84,13 @@ CPU（设备端快照在 4K 时触发 507035，CPU 快照稳定），key 为 tok
 | C 输出首 token | 与 cold C 一致（`455,6102,294,14251`） |
 | 128-block / 421-token 小测 | hit 8.05 s vs cold 11.9 s，8 token 逐位一致 |
 
-目标 ≤5 s，当前 5.66 s（差 13%）：恢复本身约 2–3 s，suffix 的 chunked prefill 约 2–3 s。
-把短 suffix 改回逐 token decode 反而更慢（8.49 s，prefill 上下文下每 token 都触发 6 专家换入），
-因此保留 chunked suffix。下一步压缩恢复成本（复用 state、只拷贝必要层）或把块大小/恢复做成
-增量式。
+定位（`VLLM_DSV41_DEBUG=1`）：恢复只花 **3 ms**，suffix chunked prefill **3308 ms**，
+其余约 2.3 s 是 vLLM 请求/调度/回包固定开销。因此 5 s 目标卡在 8-token suffix 的 prefill：
+它每层要换入约 48 个专家，prefill MoE 的 H2D + 计算约 3.3 s。
+
+把短 suffix 改回逐 token decode 反而更慢（8.49 s，每 token 都触发 6 专家换入），
+因此保留 chunked suffix。下一步要么让 suffix 走 blockscaled/更省的 prefill，要么把
+vLLM 固定开销压下去。
 
 ### 1.7 设计要点
 

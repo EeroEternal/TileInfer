@@ -377,15 +377,23 @@ class DeepseekV41ForCausalLM(nn.Module):
             if _block_on and len(_ptoks) > _block_size:
                 _bsnap = self._block_lookup(_ptoks)
                 if _bsnap is not None:
+                    import time as _tb
+
+                    _tr = _tb.perf_counter()
                     state = self._restore_block(_bsnap, len(_ptoks))
+                    if os.environ.get("VLLM_DSV41_DEBUG"):
+                        print("DSV41_BLOCK_RESTORE %.0fms" % ((_tb.perf_counter() - _tr) * 1e3), flush=True)
                     self._stream_state = state
                     _moe = self._runtime_moe()
                     _suffix = len(_ptoks) - len(_bsnap["tokens"])
                     _chunk = int(os.environ.get("VLLM_DSV41_PREFIX_CHUNK", "0") or 0)
                     if _suffix > 0 and _chunk > 0:
+                        _ts = _tb.perf_counter()
                         _lg, out = self._prefill_suffix_chunked(
                             ids, state, len(_bsnap["tokens"]), len(_ptoks), _moe, _chunk
                         )
+                        if os.environ.get("VLLM_DSV41_DEBUG"):
+                            print("DSV41_BLOCK_SUFFIX %.0fms" % ((_tb.perf_counter() - _ts) * 1e3), flush=True)
                         self._last_logits = _lg
                         if os.environ.get("VLLM_DSV41_DEBUG"):
                             print(
@@ -670,8 +678,7 @@ class DeepseekV41ForCausalLM(nn.Module):
         logits = None
         out = None
         if total - start <= 32:
-            # A short suffix is cheaper as decode-shaped steps: prefill MoE would fan out to
-            # topk * suffix distinct experts per layer, while decode touches only topk.
+            # short suffix: decode-shaped steps reuse the blockscaled decode MoE
             cap = {}
             for i in range(int(start), int(total)):
                 last = i == total - 1
