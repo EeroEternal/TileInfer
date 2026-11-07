@@ -568,6 +568,136 @@ def moe_forward_streamed(
     return y.type_as(x).to(x.device).view(shape)
 
 
+def _sf_u16_2d(scale):
+    """[N, K/32] e8m0 bytes -> [K/64, N] uint16 (two scale bytes per 64 K)."""
+    b = scale.view(torch.uint8) if scale.dtype != torch.uint8 else scale
+    return b.view(torch.uint16).T.contiguous()
+
+
+#: compiled ``T.gemm_blockscaled`` kernels, keyed by (M, N, K)
+_BS_KERNELS: Dict[tuple, object] = {}
+#: padded MXFP4 activation rows shared by all decode layers (M=32, rows beyond r stay zero)
+_BS_PAD: Dict[tuple, tuple] = {}
+
+
+def _bs_kernel(M: int, N: int, K: int):
+    """Build (once) an Ascend MXFP4 x MXFP4 block-scaled GEMM with an FP32 accumulator.
+
+    ``K`` must be a multiple of 64 (the hardware scale granularity), ``BN`` must divide ``N``.
+    The kernel is the fused replacement for ``unpack_fp4_lut`` + broadcast scale + ``bmm``: the
+    packed uint8 weights and the e8m0 scales are consumed directly by the Cube unit.
+    """
+    key = (M, N, K)
+    fn = _BS_KERNELS.get(key)
+    if fn is not None:
+        return fn
+
+    import tilelang
+    import tilelang.ascend.language as T
+
+    assert K % 64 == 0 and M == 32
+    BN = 128 if N % 128 == 0 else 64 if N % 64 == 0 else 32
+    assert N % BN == 0
+    BK = 512 if K % 512 == 0 else 256 if K % 256 == 0 else 128 if K % 128 == 0 else 64
+    assert K % BK == 0
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((M, K // 2), "int8"),
+        B: T.Tensor((N, K // 2), "int8"),
+        SA: T.Tensor((K // 64, M), "uint16"),
+        SB: T.Tensor((K // 64, N), "uint16"),
+        C: T.Tensor((M, N), "float32"),
+    ):
+        with T.Kernel(N // BN) as bx:
+            a_l1 = T.alloc_l1((M, BK), "float4_e2m1fn")
+            b_l1 = T.alloc_l1((BN, BK), "float4_e2m1fn")
+            sa_l1 = T.alloc_l1((M, BK // 64), "uint16")
+            sb_l1 = T.alloc_l1((BN, BK // 64), "uint16")
+            acc = T.alloc_l0c((M, BN), "float32")
+            a_data = T.view(A, (M, K), "float4_e2m1fn")
+            b_data = T.view(B, (N, K), "float4_e2m1fn")
+            for k in T.serial(K // BK):
+                T.copy(a_data[0:M, k * BK : (k + 1) * BK], a_l1)
+                T.copy(b_data[bx * BN : (bx + 1) * BN, k * BK : (k + 1) * BK], b_l1)
+                T.copy(SA[k * (BK // 64) : (k + 1) * (BK // 64), 0:M], sa_l1, transpose=True)
+                T.copy(
+                    SB[k * (BK // 64) : (k + 1) * (BK // 64), bx * BN : (bx + 1) * BN],
+                    sb_l1,
+                    transpose=True,
+                )
+                T.gemm_blockscaled(
+                    a_l1, b_l1, acc, sa_l1, sb_l1, transpose_B=True, clear_accum=(k == 0)
+                )
+            T.copy(acc, C[0:M, bx * BN : (bx + 1) * BN])
+
+    fn = tilelang.compile(main, target="ascend", out_idx=-1)
+    _BS_KERNELS[key] = fn
+    return fn
+
+
+def _bs_pad_a(q, s, M: int, K: int):
+    """Pad a 1-row (or E-row) MXFP4 activation to 32 rows; rows past ``r`` are exact zeros."""
+    key = (M, K, str(q.device))
+    ent = _BS_PAD.get(key)
+    if ent is None:
+        qp = torch.zeros((M, K // 2), dtype=torch.uint8, device=q.device)
+        sp = torch.full((M, K // 64, 2), 127, dtype=torch.uint8, device=q.device)
+        _BS_PAD[key] = (qp, sp)
+        ent = (qp, sp)
+    qp, sp = ent
+    r = q.shape[0]
+    qp[:r].copy_(q)
+    sp[:r].copy_(s)
+    if r < M:
+        qp[r:].zero_()
+        sp[r:].fill_(127)
+    return qp, sp
+
+
+def _bs_run(q, s, packed, scale, out_f: int, in_f: int):
+    """Run one padded MXFP4 GEMM for already-quantised activation rows."""
+    qp, sp = _bs_pad_a(q, s, 32, in_f)
+    sa = sp.reshape(32, in_f // 64, 2).view(torch.uint16).reshape(32, in_f // 64).T.contiguous()
+    b = packed.view(torch.uint8) if packed.dtype != torch.uint8 else packed
+    k = _bs_kernel(32, out_f, in_f)
+    out = k(qp.view(torch.int8), b.view(torch.int8), sa, _sf_u16_2d(scale))
+    return out[: q.shape[0]].float()
+
+
+def _deq_mx(q, s, in_f: int):
+    """Dequantise an MXFP4 activation tile (small row count) for the residual pass."""
+    from tools.dsv41 import ref_cpu
+
+    r = q.shape[0]
+    x = ref_cpu.unpack_fp4_lut(q, r, in_f, dtype=torch.float32)
+    sf = s.reshape(r, in_f // 32).view(torch.float8_e8m0fnu)
+    return (x.reshape(r, in_f // 32, 32) * ref_cpu.scale_to_float(sf).unsqueeze(-1)).reshape(r, in_f)
+
+
+def _blockscaled_linear(x, packed, scale, out_f: int, in_f: int):
+    """One MXFP4 x MXFP4 block-scaled linear on the NPU.
+
+    ``x`` [r, in_f] bf16, ``packed`` [out_f, in_f/2] (uint8 / fp4) and ``scale``
+    [out_f, in_f/32] (e8m0).  The activation is quantised by ``npu_dynamic_mx_quant`` into the
+    same MXFP4 format the checkpoint uses for the weights, so the whole path avoids materialising
+    a dequantised bf16 weight.  ``DSV41_MOE_BLOCKSCALED_RESIDUAL=1`` adds a second MXFP4 GEMM on
+    the quantisation residual, which brings the error back to the FP8-activation path.
+    """
+    import torch_npu
+
+    assert x.dim() == 2 and x.shape[0] <= 32 and in_f % 64 == 0
+    xb = x.contiguous().to(torch.bfloat16)
+    q, s = torch_npu.npu_dynamic_mx_quant(xb, dst_type=296, block_size=32)
+    out = _bs_run(q, s, packed, scale, out_f, in_f)
+    if os.environ.get("DSV41_MOE_BLOCKSCALED_RESIDUAL", "") not in ("", "0"):
+        x0 = _deq_mx(q, s, in_f)
+        r = (xb.float() - x0).to(torch.bfloat16)
+        q1, s1 = torch_npu.npu_dynamic_mx_quant(r, dst_type=296, block_size=32)
+        out = out + _bs_run(q1, s1, packed, scale, out_f, in_f)
+    return out
+
+
 def _fp4_linear_batched(x, packed, scale, out_f, in_f, return_w=False):
     """``ref_cpu.fp4_gemm`` with a batch dim: x [k, m, in], packed [k, out, in//2], scale [k, out, in//32]."""
     from tools.dsv41 import ref_cpu
@@ -755,6 +885,32 @@ def moe_forward_batched(moe, x, layer_id, arena, device="npu:0", image_mask=None
         _mark("gather")
 
     xd = flat.to(device)
+    if os.environ.get("DSV41_MOE_BLOCKSCALED", "") not in ("", "0") and len(slots) <= 32:
+        # One MXFP4 block-scaled GEMM for all routed experts' w1/w3 (the token is the same for
+        # every expert), then one per expert for w2 (the activation differs).  This replaces the
+        # unpack + broadcast-scale + bf16 bmm path without materialising a bf16 weight.
+        def _u8(t):
+            return t.view(torch.uint8) if t.dtype != torch.uint8 else t
+
+        e = len(slots)
+        w13 = torch.cat([_u8(w1), _u8(w3)], dim=1).reshape(e * 2 * hid, dim // 2)
+        s13 = torch.cat([_u8(s1), _u8(s3)], dim=1).reshape(e * 2 * hid, dim // 32)
+        both = _blockscaled_linear(xd, w13, s13, e * 2 * hid, dim).view(e, 2 * hid)
+        gate_out, up = both[:, :hid], both[:, hid:]
+        limit = moe.experts[ids[0]].swiglu_limit
+        if limit > 0:
+            up = torch.clamp(up, min=-limit, max=limit)
+            gate_out = torch.clamp(gate_out, max=limit)
+        act = torch.nn.functional.silu(gate_out) * up
+        act = act * weights[0, :, None].float().to(act.device)
+        acc = None
+        for i in range(e):
+            part = _blockscaled_linear(act[i : i + 1].to(torch.bfloat16), w2[i], s2[i], dim, hid)
+            acc = part if acc is None else acc + part
+        y = acc.cpu()
+        y = y + expert_forward(moe.shared_experts, flat).float().cpu()
+        return y.type_as(x).to(x.device).view(shape)
+
     xk = xd.expand(len(slots), -1, -1)
     _want = _scap_gb > 0
     if _want:
