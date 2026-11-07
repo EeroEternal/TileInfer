@@ -94,6 +94,12 @@ HBM 总 40.8 GB。
 
 > 注：更早的 5.66 s 是“chunked suffix + 无 blockscaled”版本；4.75 s 是当前推荐配置。
 
+**16K 负结果**：用同样的 512-token block 预填 16K prompt（16101 token）时，冷 prefill
+超过 7 分钟仍未完成，只能杀进程。原因是每 512 token 调一次 `transformer_forward` 的
+chunked prefill 会反复触发专家换入，32 个 chunk 的成本远高于整段 prefill（基线 200 s）。
+因此 16K 暂不采用 512-block；下一步试 1024/2048 block（减少 chunk 数、命中粒度变粗），
+或改成“整段 prefill + 只对少数关键位置做快照”的机制。
+
 ### 1.7 设计要点
 
 - block 大小取所有 `compress_ratio` 的公倍数（本模型 ratio ∈ {1,2}，block=256 即可）；
