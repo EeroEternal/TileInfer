@@ -448,8 +448,9 @@ def indexer_forward(
         )
 
     if cfg.is_candidate_source(rt.layer_id):
+        _cand_lens = compress_lens.unsqueeze(-1) if (start_pos > 0 and seqlen > 1) else compress_lens
         rt.shared.candidates = select_candidate_blocks(
-            score, compress_lens, cfg.candidate_topk_blocks, cfg.candidate_block_size
+            score, _cand_lens, cfg.candidate_topk_blocks, cfg.candidate_block_size
         )
     elif cfg.uses_candidates(rt.layer_id):
         candidates = rt.shared.candidates

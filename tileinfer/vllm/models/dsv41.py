@@ -389,11 +389,23 @@ class DeepseekV41ForCausalLM(nn.Module):
                     if os.environ.get("VLLM_DSV41_DEBUG"):
                         print("DSV41_PROMPT_CACHE exact hit len=%d" % _p, flush=True)
                     return out
-                # partial prefix: restore, then run only the suffix token-by-token (decode-shaped,
-                # which the compressor/indexer already support for start_pos > 0)
+                # partial prefix: restore, then either chunked prefill (new path, default off) or the
+                # verified token-by-token suffix.
                 state = self._restore_prefix_state(_best["state"], len(_ptoks))
                 self._stream_state = state
                 _moe = self._runtime_moe()
+                _suffix = len(_ptoks) - _p
+                _chunk = int(os.environ.get("VLLM_DSV41_PREFIX_CHUNK", "0") or 0)
+                if _chunk > 0 and _suffix > 1:
+                    _lg, out = self._prefill_suffix_chunked(ids, state, _p, len(_ptoks), _moe, _chunk)
+                    self._last_logits = _lg
+                    if os.environ.get("VLLM_DSV41_DEBUG"):
+                        print(
+                            "DSV41_PROMPT_CACHE prefix hit prefix=%d suffix=%d chunk=%d"
+                            % (_p, _suffix, _chunk),
+                            flush=True,
+                        )
+                    return out
                 _cap = {}
                 _lg = None
                 for _i in range(_p, len(_ptoks)):
@@ -504,6 +516,58 @@ class DeepseekV41ForCausalLM(nn.Module):
                     flush=True,
                 )
         return out
+
+    def _prefill_suffix_chunked(self, ids, state, start: int, total: int, moe_fn, chunk: int):
+        """Run the suffix after a restored prefix with ratio-aligned chunks.
+
+        All compression ratios in this model divide 2, so aligning the first chunk to an even
+        ``start_pos`` lets ``compressor_forward``/``indexer_forward`` take their ``seqlen > 1``
+        branches.  Chunks are even-sized; a trailing single token falls back to the normal decode
+        shape.
+        """
+        import time as _time
+        import os as _os_env
+
+        from tileinfer.models.dsv41.block import transformer_forward
+
+        _t0 = _time.perf_counter()
+        logits = None
+        out = None
+        cap = {}
+        p = int(start)
+        if p % 2 and p < total:
+            logits, _ = transformer_forward(
+                self.model, ids[:, p : p + 1], state, p, moe_fn=moe_fn, skip_logits=True
+            )
+            p += 1
+        while p < total:
+            n = min(int(chunk), total - p)
+            if n > 1 and n % 2:
+                n -= 1
+            if n <= 0:
+                n = 1
+            last = p + n >= total
+            cap = {}
+            logits, _ = transformer_forward(
+                self.model,
+                ids[:, p : p + n],
+                state,
+                p,
+                capture=cap if last else None,
+                moe_fn=moe_fn,
+                skip_logits=not last,
+            )
+            if last:
+                h = cap["h"]
+                out = h[0] if h.dim() == 3 else h
+            p += n
+        if _os_env.environ.get("VLLM_DSV41_DEBUG"):
+            print(
+                "DSV41_PREFIX_CHUNK start=%d total=%d elapsed=%.0fms"
+                % (start, total, (_time.perf_counter() - _t0) * 1e3),
+                flush=True,
+            )
+        return logits, out
 
     def _restore_prefix_state(self, cached, total_len: int):
         """Restore a cached post-prefill state, growing buffers for a longer prompt if needed."""

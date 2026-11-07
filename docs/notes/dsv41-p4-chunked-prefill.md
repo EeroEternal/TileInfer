@@ -52,7 +52,24 @@ T(8)=11.843s  T(32)=32.930s  →  878.6 ms/step
 注意：不同 chunk 的 `topk` 宽度可以不同（例如前 4 个 token 只有 2 个压缩块）；每个 chunk
 独立调用 `sparse_attn` 即可，不需要拼接成统一宽度。
 
-### 1.4 block-level 锚点（设计）
+### 1.5 chunked suffix 已接进 prefix cache（默认关）
+
+`VLLM_DSV41_PROMPT_CACHE=1 VLLM_DSV41_PREFIX_CHUNK=128` 时，prompt 级前缀命中后的 suffix
+走 `_prefill_suffix_chunked`：先对齐到偶数位置，再按偶数 chunk 调 `transformer_forward`
+（`start_pos>0, seqlen>1`），尾随单 token 回退 decode 形状。
+
+实测（A=421 token，B=A+7 token，同 venv/同参数）：
+
+| 臂 | 输出 token | 文本 | 耗时 |
+|---|---|---|---|
+| A 冷 prefill（缓存 A） | `[1,0,5,223]` | `# ` | 11.7 s |
+| B 前缀命中 + chunked suffix | `[455,6102,294,14251,344,16235,16,455]` | ` The capital of Italy is Rome. The` | 8.89 s |
+| B 冷 prefill（对照） | **同上，8 个 token 逐位相同** | 同上 | 14.85 s |
+
+说明 chunked suffix 的数学与整段 prefill 一致；候选源层的 `compress_lens` 需要
+`unsqueeze(-1)` 才能与 `[b,s,T]` 的 block 维广播（已修）。
+
+### 1.6 block-level 锚点（设计）
 
 - block 大小取所有 `compress_ratio` 的公倍数（本模型 ratio ∈ {1,2}，block=256 即可）；
 - prefill 每完成一个 block，对 `window_kv/compress_kv/index_k/kv_state/score_state` 做快照，
