@@ -1,0 +1,67 @@
+# P4 chunked prefill / block-level KV 锚点（进行中）
+
+> 2026-11-07。目标：任意公共前缀命中 ≤5 s，4K/16K 先验收，32K 窗口可用时补测。
+
+## 1. 当前进展
+
+### 1.1 P3 回归（不破坏）
+
+同一 4 并发配置（`BATCHED_FWD=1 / ARENA_SLOTS=4096 / max-num-seqs 4`）：
+
+```
+T(8)=11.843s  T(32)=32.930s  →  878.6 ms/step
+20/20 请求输出含 Paris
+```
+
+≤889 ms，P3 未回归。blockscaled MoE 默认关闭，P3 路径未改。
+
+### 1.2 compressor chunked prefill（已完成）
+
+`compressor_forward` 增加 `start_pos>0 && seqlen>1` 分支，要求 chunk 与 `ratio` 对齐：
+
+- `start_pos % ratio == 0` 且 `seqlen % ratio == 0`；
+- 每个 chunk 产出 `seqlen/ratio` 个完整 latent，不携带 partial-block state；
+- 与整段 prefill 逐位一致（fp32 softmax 聚合顺序相同）。
+
+新增 CPU 用例 `tests/test_dsv41_chunked_compress.py`：
+
+| 用例 | 结果 |
+|---|---|
+| ratio=2，8 token 整段 vs 2×4 chunk | `torch.equal` ✅ |
+| ratio=4，16 token 整段 vs 4×4 chunk | `torch.equal` ✅ |
+
+### 1.3 indexer chunked prefill（下一步）
+
+`indexer_forward` 在 `start_pos>0` 仍假定 `seqlen==1`（`cos[start_pos+1-ratio]`、标量
+`compress_lens`、标量 topk）。需要改为：
+
+1. 新 latent 的 RoPE 位置：对齐 chunk 用 `start_pos + i*ratio`（不是 decode 的
+   `start_pos+1-ratio`）；
+2. `index_k` 写入 `start_pos//ratio : +n_lat`；
+3. `compress_lens` 变成 `[b,s]`：`(arange(s)+start_pos+1)//ratio`，score 按 query 逐行 mask；
+4. topk 用 `min(index_topk, end_pos//ratio)`，再按每行 `compress_lens` 把越界项置 -1；
+5. candidate source 的 `select_candidate_blocks` 对 `[b,s,T]` 已支持，且 score 仍覆盖
+   **全部历史 T**，因此每个 chunk 重算候选是精确的，不需要跨 chunk 合并。
+
+### 1.4 block-level 锚点（设计）
+
+- block 大小取所有 `compress_ratio` 的公倍数（本模型 ratio ∈ {1,2}，block=256 即可）；
+- prefill 每完成一个 block，对 `window_kv/compress_kv/index_k/kv_state/score_state` 做快照，
+  以 token block 哈希为 key；
+- 新 prompt 找最长命中 block 前缀，恢复快照，剩余 suffix 用 chunked prefill（而非逐 token
+  decode）补齐；
+- 快照占 HBM：每 block 的 state 约 ``window + compress + index``，需按 4K/16K 实测预算。
+
+## 2. 复现
+
+```bash
+cd /home/userlist/zxs/TileInfer
+.venv/bin/python -m pytest tests/test_dsv41_chunked_compress.py -q
+.venv/bin/python -m pytest tests/test_dsv41_*.py -q   # 142 passed
+```
+
+## 3. 下一步
+
+1. 完成 `indexer_forward` 的 `seqlen>1` 分支 + CPU 对拍；
+2. 把 chunked prefill 接进 `_restore_prefix_state` 的 suffix 路径；
+3. block 快照/哈希/恢复 + 4K 命中验收，再跑 16K。

@@ -329,14 +329,27 @@ def compressor_forward(
         score = score.unflatten(1, (-1, ratio))
         kv = (kv * score.softmax(dim=2)).sum(dim=2)
     else:
-        should_compress = (start_pos + 1) % ratio == 0
-        slot = start_pos % ratio
-        rt.kv_state[:bsz, slot] = kv.squeeze(1)
-        rt.score_state[:bsz, slot] = score.squeeze(1)
-        if should_compress:
-            kv = (
-                rt.kv_state[:bsz] * rt.score_state[:bsz].softmax(dim=1)
-            ).sum(dim=1, keepdim=True)
+        if seqlen == 1:
+            should_compress = (start_pos + 1) % ratio == 0
+            slot = start_pos % ratio
+            rt.kv_state[:bsz, slot] = kv.squeeze(1)
+            rt.score_state[:bsz, slot] = score.squeeze(1)
+            if should_compress:
+                kv = (
+                    rt.kv_state[:bsz] * rt.score_state[:bsz].softmax(dim=1)
+                ).sum(dim=1, keepdim=True)
+        else:
+            # Chunked prefill: a chunk that starts and ends on a compression boundary produces
+            # ``seqlen // ratio`` complete latents, so no partial-block state is carried.
+            if start_pos % ratio or seqlen % ratio:
+                raise ValueError(
+                    "chunked compressor requires alignment to ratio: "
+                    f"start_pos={start_pos} seqlen={seqlen} ratio={ratio}"
+                )
+            kv = kv.unflatten(1, (-1, ratio))
+            score = score.unflatten(1, (-1, ratio))
+            kv = (kv * score.softmax(dim=2)).sum(dim=2)
+            should_compress = True
     if not should_compress:
         return None
     return rms_norm(comp.norm, kv.to(dtype))
