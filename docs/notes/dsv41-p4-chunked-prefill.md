@@ -80,17 +80,19 @@ CPU（设备端快照在 4K 时触发 507035，CPU 快照稳定），key 为 tok
 | 项 | 结果 |
 |---|---|
 | A cold（含 7 个 block 快照） | 77.0 s |
-| C block hit（恢复 3584 + chunked suffix 8） | **5.66 s** |
+| C block hit（恢复 3584 + 8 token） | **4.75 / 4.68 / 4.79 s（中位 4.75，≤5 s）** |
 | C 输出首 token | 与 cold C 一致（`455,6102,294,14251`） |
 | 128-block / 421-token 小测 | hit 8.05 s vs cold 11.9 s，8 token 逐位一致 |
 
-定位（`VLLM_DSV41_DEBUG=1`）：恢复只花 **3 ms**，suffix chunked prefill **3308 ms**，
-其余约 2.3 s 是 vLLM 请求/调度/回包固定开销。因此 5 s 目标卡在 8-token suffix 的 prefill：
-它每层要换入约 48 个专家，prefill MoE 的 H2D + 计算约 3.3 s。
+关键配置：`BLOCK_SHORT_DECODE=1`（≤32 token suffix 走 decode）+ `DSV41_MOE_BLOCKSCALED=1`
++ `ARENA_SLOTS=1024` + `gpu-memory-utilization 0.35`。短 suffix 的 decode 每 token 只换入
+6 专家，8 token 的 suffix 从 chunked prefill 的 3.3 s 降到约 2–3 s；总耗时压到 4.75 s。
+HBM 总 40.8 GB。
 
-把短 suffix 改回逐 token decode 反而更慢（8.49 s，每 token 都触发 6 专家换入），
-因此保留 chunked suffix。下一步要么让 suffix 走 blockscaled/更省的 prefill，要么把
-vLLM 固定开销压下去。
+定位（`VLLM_DSV41_DEBUG=1`）：恢复只花 **3 ms**，短 suffix decode 约 **3.46 s**，
+其余约 1.3 s 是 vLLM 请求/调度/回包固定开销。
+
+> 注：更早的 5.66 s 是“chunked suffix + 无 blockscaled”版本；4.75 s 是当前推荐配置。
 
 ### 1.7 设计要点
 

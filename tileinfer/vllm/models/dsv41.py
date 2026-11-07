@@ -677,8 +677,7 @@ class DeepseekV41ForCausalLM(nn.Module):
         _t0 = _time.perf_counter()
         logits = None
         out = None
-        if total - start <= 32:
-            # short suffix: decode-shaped steps reuse the blockscaled decode MoE
+        if total - start <= 32 and _os_env.environ.get("VLLM_DSV41_BLOCK_SHORT_DECODE", "") not in ("", "0"):
             cap = {}
             for i in range(int(start), int(total)):
                 last = i == total - 1
