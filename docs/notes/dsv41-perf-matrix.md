@@ -5,18 +5,20 @@
 > 表中 `out` 是实际流式统计到的输出 token/chunk 数；请求 `max_tokens` 另注。
 > 没有的格子写“未测”，不同配置的数字单独标 config。
 
-## 1. 原生 vllm-ascend：无法启动
+## 1. 原生 vllm-ascend：支持 v41 的 0.30 卡在 A5/A2 设备类型
 
-独立目录 `.venv_ascend`（从 `.venv` 复制并改写 shebang，未污染原 `.venv`）：
+独立目录 `.venv_ascend` / `.venv_ascend30`（复制并改写 shebang，未污染原 `.venv`）：
 
-- `vllm 0.23.0 + vllm-ascend 0.23.0 + transformers 5.5.4` 可 import，NPU 可用；
-- 原生只认 `deepseek_v4`，不认 `deepseek_v41`；
-- 改 config 为 `deepseek_v4 + DeepseekV4ForCausalLM` 后报
-  `text_config ... does not have num_attention_heads`；
-- `vllm-ascend 0.30.0` 要求 `torch-npu==2.10.0.post7`、`triton-ascend==3.6.0.post2`、
-  `transformers==5.14.1`，当前 `post4` 不兼容，需要独立 CANN/torch-npu 环境。
+- `vllm-ascend 0.23.0` 与 `0.23.0.post1` 只认 `deepseek_v4`，不认 `deepseek_v41`；
+- `vllm-ascend 0.30.0` **已包含 `vllm/models/deepseek_v41` 和 `DeepseekV41Config`**，
+  `vllm 0.30 + transformers 5.14.1` 能正确解析 v41 config；
+- 但 0.30 启动需要 `torch-npu==2.10.0.post7 + triton-ascend==3.6.0.post2`，公开索引上的
+  post7 是 **A2 构建**，当前卡是 **A5（950PR）**，启动报
+  `Current device type: AscendDeviceType.A5 does not match ... AscendDeviceType.A2`；
+  换回 A5 的 post4 后仍报同一错误。
 
-因此**原生 vllm-ascend 无性能数字**。原 `.venv` 的误装已卸载；`.venv_ascend` 未跟踪。
+因此**原生 vllm-ascend 没有可比的性能数字**。原 `.venv` 的误装已卸载；`.venv_ascend*` 未跟踪。
+详见 `dsv41-native-ascend-attempt.md`。
 
 ## 2. 单并发
 
