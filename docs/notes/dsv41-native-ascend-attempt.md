@@ -43,6 +43,38 @@
 因此“之前验证可以部署”验证的是 TileInfer 路径，不是原生 vllm-ascend；原生在当前
 128 GB HBM + 628 GB host 上无法容纳 475 GB 模型。
 
+## 已有专家级卸载分支（关键）
+
+`/home/dlb/vllm-ascend` 的 `feat/ds4-expert-offload`（commit `358be06`）确实实现了
+**单卡专家权重 offload**，文档 `docs/source/tutorials/models/DeepSeek-V4-Flash.md` 第 11 节给的是：
+
+```bash
+--offload-backend prefetch \
+--offload-group-size 2 \
+--offload-num-in-group 1 \
+--offload-params '["w13_weight","w2_weight"]'
+# pinned 受限时：
+VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY=1
+```
+
+这说明 vLLM 侧可以只卸载 `w13_weight` / `w2_weight`，而不是整层权重；之前我用
+`--offload-params experts` 是**错的匹配段**，且 PyPI 0.30 的 offloader 在初始载入时仍先把
+119 GB 权重放进 HBM，所以出现“900 GB / 初始 OOM”。
+
+该分支的限制：
+
+- `.github/vllm-release-tag.commit` 是 **v0.23.0**；
+- 分支源码里只有 `deepseek_v4`，**没有 `deepseek_v41`**；
+- 我们的 checkpoint 是 `deepseek_v41`，直接换分支不能加载 V4.1。
+
+所以正确路径不是继续试 PyPI 0.30 的 offload 参数，而是二选一：
+
+1. 把该分支的 `model_executor/offloader/prefetch.py` +
+   `patch_process_weights_after_loading.py` 的**专家级载入补丁**移植到 0.30 的 v41 栈；
+2. 让该分支支持 `deepseek_v41`（模型/config 注册），再按第 11 节 recipe 启动。
+
+在此之前，原生 v41 仍不能单卡跑；但这证明“900 GB 不是模型本身要求”，而是 offload 粒度/载入顺序问题。
+
 ## 判断与恢复条件
 
 0.30 已包含 DSV4.1 模型代码，且手动注册模型 + `block-size=64` 可以绕过 CUDA 注意力和 block size
