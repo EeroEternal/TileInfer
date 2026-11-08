@@ -18,16 +18,17 @@
 | `vllm-ascend 0.23.0.post1` | 源码仍只含 `deepseek_v4`，无 v41 |
 | 0.23 + config 改成 `deepseek_v4` | vLLM 报 `text_config ... does not have num_attention_heads` |
 | `vllm-ascend 0.30.0` | **有 `vllm/models/deepseek_v41`、`DeepseekV41Config`，能正确解析 v41 config** |
-| 0.30 + `vllm 0.30 + transformers 5.14.1 + torch-npu post7` | import 通过；启动时报 **A5/A2 设备类型不匹配**：`Current device type: AscendDeviceType.A5 does not match the installed version's device type: AscendDeviceType.A2` |
-| 0.30 + 换回 A5 的 `torch-npu 2.10.0.post4` + triton 3.2 | 仍报同一 A5/A2 错误；另有 `triton.language.target_info` 缺失 |
+| 0.30 + `vllm 0.30 + transformers 5.14.1 + torch-npu post7` | import 通过；启动报 **A5/A2 设备类型不匹配** |
+| 0.30 + 强制 `_build_info.__device_type__='A5'` + `VLLM_USE_V2_MODEL_RUNNER=1` | 继续推进到 engine 初始化；带 `--cpu-offload-gb` 报 `get_accelerator_view_from_cpu_tensor is currently not supported in: npu` |
+| 0.30 + 去掉 CPU offload | 报 **`AssertionError: DeepseekV4 attention requires a CUDA device`**（vllm 0.30 上游注意力实现未被 vllm-ascend 0.30 完全替换） |
 
 ## 判断
 
-0.30 已经支持 DSV4.1，缺的是 **A5 对应的 `torch-npu 2.10.0.post7` / `triton-ascend 3.6` 构建**；
-公开索引上的 post7 是 A2 构建，当前卡是 A5（950PR）。仅换 venv 解决不了，需要：
+0.30 已包含 DSV4.1 模型代码，但当前组合仍不可运行，缺两层：
 
-1. 提供 A5 版 `torch-npu 2.10.0.post7` 和 `triton-ascend 3.6.0.post2` 的 wheel/安装源；或
-2. 使用官方 vllm-ascend 0.30 的 A5 镜像/容器；或
-3. 退回 0.23 + 让 vllm-ascend 支持 `deepseek_v41`（需要改模型注册/config，不是调参）。
+1. **A5 构建的 `torch-npu 2.10.0.post7` / `triton-ascend 3.6`**：公开索引的 post7 是 A2；
+2. **与 vllm-ascend 0.30 匹配的 vLLM 0.30 构建**：上游 vllm 0.30 的 DeepseekV4 注意力仍要求 CUDA，
+   vllm-ascend 只替换了部分路径；需要官方 A5 镜像/配套 vllm 轮子，或让 0.30 的 V2 runner 走
+   `vllm_ascend.models.deepseek_v41`。
 
-在此之前，原生臂无 TTFT/TPOT/ITL 可报；不把 0.23 的 `deepseek_v4` 冒充 v4.1。
+仅换 venv 解决不了；在没有 A5 配套轮子前，原生臂没有可报的 TTFT/TPOT/ITL。

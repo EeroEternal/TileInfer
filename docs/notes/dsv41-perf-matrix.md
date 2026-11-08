@@ -15,7 +15,8 @@
 - 但 0.30 启动需要 `torch-npu==2.10.0.post7 + triton-ascend==3.6.0.post2`，公开索引上的
   post7 是 **A2 构建**，当前卡是 **A5（950PR）**，启动报
   `Current device type: AscendDeviceType.A5 does not match ... AscendDeviceType.A2`；
-  换回 A5 的 post4 后仍报同一错误。
+- 强制 A5 + V2 runner 后，带 CPU offload 报 `get_accelerator_view_from_cpu_tensor` 不支持；
+  去掉 offload 报 `DeepseekV4 attention requires a CUDA device`（上游 vllm 0.30 注意力未完全替换）。
 
 因此**原生 vllm-ascend 没有可比的性能数字**。原 `.venv` 的误装已卸载；`.venv_ascend*` 未跟踪。
 详见 `dsv41-native-ascend-attempt.md`。
