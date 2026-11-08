@@ -97,6 +97,14 @@ NPU out of memory. Tried to allocate 4.22 GiB
 分支的专家级释放没有在构造阶段生效；需要继续改 V2 的 model construction/load hook，
 或把分支的 V4 模型路径整体接到 0.30。移植尚未跑通。
 
+后续又试了两条：
+
+- 放行 V1（patch `platform.py` 的 V2 强制校验）后，V1 仍在同一 `wrap_modules` 处
+  `119.44 GiB already allocated`；
+- 在 `wrap_modules` 内对每个 `_NPUModuleOffloader` 立即 `post_init()`，仍 OOM。
+  说明 `_CpuParamOffloader` 的“构造时搬到 CPU”没有覆盖到这些专家参数，或离线层数不够；
+  需要打印 whitelist / offloaded_bytes / 每层 HBM 占用继续定位，而不是继续调参数。
+
 ## 判断与恢复条件
 
 0.30 已包含 DSV4.1 模型代码，且手动注册模型 + `block-size=64` 可以绕过 CUDA 注意力和 block size
