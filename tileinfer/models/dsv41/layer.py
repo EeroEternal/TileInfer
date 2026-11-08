@@ -578,6 +578,15 @@ def attention_forward(
     cfg = cfg or rt.cfg
     o = ops()
     bsz, seqlen, _ = x.shape
+    ratio = int(cfg.compress_ratio(rt.layer_id))
+    if start_pos > 0 and seqlen > 1 and ratio and (start_pos % ratio or seqlen % ratio):
+        # Non-aligned chunk (e.g. vLLM's automatic chunked prefill): fall back to the
+        # verified single-token path, which handles the partial compressor block exactly.
+        outs = [
+            attention_forward(attn, x[:, i : i + 1], start_pos + i, rt, cfg, recorder)
+            for i in range(seqlen)
+        ]
+        return torch.cat(outs, dim=1)
     cos = rt.cos[start_pos : start_pos + seqlen]
     sin = rt.sin[start_pos : start_pos + seqlen]
     rd = cfg.rope_head_dim
