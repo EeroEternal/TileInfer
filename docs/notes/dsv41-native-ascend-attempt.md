@@ -75,6 +75,28 @@ VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY=1
 
 在此之前，原生 v41 仍不能单卡跑；但这证明“900 GB 不是模型本身要求”，而是 offload 粒度/载入顺序问题。
 
+### 移植尝试（2026-11-08 晚）
+
+已在 `.venv_ascend30` 内做了隔离移植：
+
+- 用分支的 `vllm_ascend/model_executor/offloader/prefetch.py` 替换 0.30 版本；
+- 补 `ACL_FORMAT_FRACTAL_NZ_C0_16=50` 和 `AscendPrefetchOffloader` 别名；
+- 在入口把 `vllm.v1.worker.gpu.model_runner.create_offloader` 指向 vllm-ascend 的工厂；
+- 启动参数改为 `--offload-params w13_weight w2_weight`（不再用 `experts`），
+  并设置 `VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY=1`。
+
+结果：offloader 已正确选成 `NPUPrefetchOffloader`，参数也解析为 `['w13_weight','w2_weight']`，
+但仍在 `wrap_modules` 的模型构造阶段 OOM：
+
+```
+NPU out of memory. Tried to allocate 4.22 GiB
+119.42 GiB already allocated; 2.96 GiB free
+```
+
+说明 0.30 V4.1 的 V2 模型构造/载入顺序仍是“先把权重放 HBM，再 wrap”，
+分支的专家级释放没有在构造阶段生效；需要继续改 V2 的 model construction/load hook，
+或把分支的 V4 模型路径整体接到 0.30。移植尚未跑通。
+
 ## 判断与恢复条件
 
 0.30 已包含 DSV4.1 模型代码，且手动注册模型 + `block-size=64` 可以绕过 CUDA 注意力和 block size
