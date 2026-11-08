@@ -102,8 +102,28 @@ NPU out of memory. Tried to allocate 4.22 GiB
 - 放行 V1（patch `platform.py` 的 V2 强制校验）后，V1 仍在同一 `wrap_modules` 处
   `119.44 GiB already allocated`；
 - 在 `wrap_modules` 内对每个 `_NPUModuleOffloader` 立即 `post_init()`，仍 OOM。
-  说明 `_CpuParamOffloader` 的“构造时搬到 CPU”没有覆盖到这些专家参数，或离线层数不够；
-  需要打印 whitelist / offloaded_bytes / 每层 HBM 占用继续定位，而不是继续调参数。
+
+**2026-11-08 21:33 的关键进展**：把 `--offload-group-size` 从 4 改成 **1**、
+`--offload-num-in-group 1`（每层都卸载），专家权重 offload 生效，HBM 稳定在 **24.6 GiB**；
+whitelist 已正确匹配：
+
+```
+mlp.experts.routed_experts.w13_weight
+mlp.experts.routed_experts.w2_weight
+```
+
+新的阻塞点变成 **Engram 的 98.3 GB host 分配**，不是专家：
+
+```
+vllm_ascend/models/deepseek_v41/engram/npu.py:157
+HostUvaBuffer: aclrtMallocHost failed: rc=207001 size=98305579008
+```
+
+即专家 offload 已经成功，剩下的 98 GB engram UVA 主机内存在当前 host/pinned 限制下分配失败。
+下一步是：
+1. 将 `HostUvaBuffer` 拆成多个较小的 host 段（`ptrs` 已按 `CHUNK_ROWS` 分块，具备拆分条件）；
+2. 或关闭 engram host offload（但 189 GB engram 放 HBM 不可行，需要另想办法）；
+3. 或使用 pageable + 分段 `aclrtHostRegisterV2`。
 
 ## 判断与恢复条件
 
