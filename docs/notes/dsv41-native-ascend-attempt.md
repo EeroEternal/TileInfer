@@ -26,17 +26,22 @@
 | 0.30 + `--block-size 64` | 继续到权重加载；**475 GB 模型在 123 GB HBM 上 OOM**（119 GB allocated，申请 8.44 GB 失败） |
 | 0.30 + `--cpu-offload-gb 300` | `get_accelerator_view_from_cpu_tensor is currently not supported in: npu` |
 | 0.30 + prefetch offload（`--offload-group-size 5 --offload-num-in-group 3`） | 仍先加载 119 GB 权重后 OOM；该 offload 未覆盖初始权重载入 |
+| 0.30 + `--offload-backend prefetch --offload-params experts` | 走到 offload 阶段；主机 pinned 分配 OOM：`aclrtMallocHostWithCfg ... 207001`（主机 free 仅 187 GB，模型 475 GB） |
 
 ## 判断
 
 0.30 已包含 DSV4.1 模型代码，且手动注册模型 + `block-size=64` 可以绕过 CUDA 注意力和 block size
-问题；当前真正卡住的是 **A5 版 torch-npu/triton + 单卡 HBM 不足以载入 475 GB 模型，而
-vLLM 0.30 的 CPU/prefetch offload 在这套 V2+A5 组合上不可用**。
+问题；当前真正卡住的是 **单卡容量**：
+
+- 模型 475.2 GB，HBM 123 GB；
+- 需要约 350 GB 的主机 offload 才能装下；
+- 当前主机 `free` 只有 187 GB（其他租户已占 438 GB），pinned offload 直接失败；
+- vLLM 0.30 的 UVA offload 在 NPU V2 上不支持，prefetch offload 又需要先固定住整段权重。
 
 需要的条件（任一）：
 
-1. A5 版 `torch-npu 2.10.0.post7` / `triton-ascend 3.6` + 官方配套 vLLM 0.30；
+1. 主机腾出 ≥400 GB 可用内存，且 A5 版 torch-npu/triton + 配套 vLLM 0.30；
 2. 官方 vllm-ascend A5 镜像（含可用的权重 offload）；
-3. 多卡/更大 HBM（原生不做 host-offload 时，单卡 123 GB 放不下 475 GB 模型）。
+3. 多卡/更大 HBM：原生不做 host-offload 时，单卡 123 GB 放不下 475 GB 模型。
 
 在此之前，原生臂没有可报的 TTFT/TPOT/ITL。
