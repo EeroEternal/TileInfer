@@ -147,6 +147,11 @@ host 容量。下一步必须把 engram 改成**文件-backed mmap**（页面可
 
 这不是继续改 `offload-params` 能解决的；瓶颈已经从专家转移到 engram 的 UVA 常驻内存模型。
 
+**swap 尝试（2026-11-08 22:00）**：在 `/home` 建了 128 GB swapfile 并 `swapon`，再启动原生；
+结果 host 仍为 624 GB used / 4 GB free，swap 只用了 3 GB，模型载入继续停住。
+说明这些 CPU 权重/engram 页面是 **pinned**，内核不能换出；swap 不能解决问题。
+已 `swapoff` 并删除 swapfile，host 回到 free 525 GB。
+
 ## 判断与恢复条件
 
 0.30 已包含 DSV4.1 模型代码，且手动注册模型 + `block-size=64` 可以绕过 CUDA 注意力和 block size
