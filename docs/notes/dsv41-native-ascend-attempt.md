@@ -125,6 +125,17 @@ HostUvaBuffer: aclrtMallocHost failed: rc=207001 size=98305579008
 2. 或关闭 engram host offload（但 189 GB engram 放 HBM 不可行，需要另想办法）；
 3. 或使用 pageable + 分段 `aclrtHostRegisterV2`。
 
+**2026-11-08 21:38 起**：已按方案 3 改造 `HostUvaBuffer`：用一个 `mmap` 连续虚拟区，
+按 `CHUNK_ROWS` 分段 `aclrtHostRegisterV2`，`ptrs` 每个 chunk 一个 device pointer。
+这样绕过了单次 98 GB `aclrtMallocHost` 的 207001。
+
+结果：engram 注册不再报错，但**主机 RSS 涨到 543 GB**；host 总 628 GB，叠加其他租户后
+只剩 4 GB available，模型载入在 module 39 之后停住（12+ 分钟无进展），只能 kill。
+
+根因从“98 GB 单块分配”变成“**475 GB 模型 + 98 GB engram 匿名 host + 运行时**”超过
+host 容量。下一步必须把 engram 改成**文件-backed mmap**（页面可回收）或换更大 host/多卡，
+而不是继续拆 chunk。
+
 ## 判断与恢复条件
 
 0.30 已包含 DSV4.1 模型代码，且手动注册模型 + `block-size=64` 可以绕过 CUDA 注意力和 block size
