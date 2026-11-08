@@ -136,6 +136,17 @@ HostUvaBuffer: aclrtMallocHost failed: rc=207001 size=98305579008
 host 容量。下一步必须把 engram 改成**文件-backed mmap**（页面可回收）或换更大 host/多卡，
 而不是继续拆 chunk。
 
+**进一步核实**：engram 的 mmap 会走 `aclrtHostRegisterV2`，UVA 注册会把页面
+**pin 住**，因此即使改成文件-backed mmap，98 GB 仍然不可回收，host RSS 不会下降。
+当前 628 GB host 上有约 100 GB 是 VSCode/Node 等常驻进程；模型 475 + engram 98 +
+运行时已经接近/超过剩余 526 GB。要单卡跑原生，实际需要：
+
+- host ≥ 700–750 GB 可用（且不为其他进程占用）；或
+- 原生 engram 改用 **pageable + 按需 H2D gather**（不再 UVA pin 98 GB）；或
+- 多卡/更大 HBM，把 engram 放 HBM。
+
+这不是继续改 `offload-params` 能解决的；瓶颈已经从专家转移到 engram 的 UVA 常驻内存模型。
+
 ## 判断与恢复条件
 
 0.30 已包含 DSV4.1 模型代码，且手动注册模型 + `block-size=64` 可以绕过 CUDA 注意力和 block size
