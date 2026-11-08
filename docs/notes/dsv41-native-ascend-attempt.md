@@ -152,6 +152,13 @@ host 容量。下一步必须把 engram 改成**文件-backed mmap**（页面可
 说明这些 CPU 权重/engram 页面是 **pinned**，内核不能换出；swap 不能解决问题。
 已 `swapoff` 并删除 swapfile，host 回到 free 525 GB。
 
+**pageable engram 尝试（2026-11-08 22:10）**：给 `HostUvaBuffer` 加了
+`VLLM_ASCEND_ENGRAM_PAGEABLE=1` 分支：不再 `aclrtHostRegisterV2`，engram 表为 pageable
+CPU tensor，`gather_dequantize_host_uva` 改为 CPU 按 ids 取行、反量化后 H2D；
+同时建 64 GB swap。结果 engine 被 OOM killer 杀掉（`EngineCore: -9`），64 GB swap 被用满。
+说明即使 engram 可换出，模型 475 GB + 其他 100 GB 仍把 host 压满，pageable 方案在当前
+628 GB host 上也不够；需要更大 host / 多卡，或把模型 CPU 权重也改成可回收 mmap。
+
 ## 判断与恢复条件
 
 0.30 已包含 DSV4.1 模型代码，且手动注册模型 + `block-size=64` 可以绕过 CUDA 注意力和 block size
