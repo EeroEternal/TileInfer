@@ -22,15 +22,21 @@
 | 0.30 + 强制 `_build_info.__device_type__='A5'` + `VLLM_USE_V2_MODEL_RUNNER=1` | 继续推进到 engine 初始化；带 `--cpu-offload-gb` 报 `get_accelerator_view_from_cpu_tensor is currently not supported in: npu` |
 | 0.30 + 去掉 CPU offload | 报 **`AssertionError: DeepseekV4 attention requires a CUDA device`**：V2 runner 的 `load_model` 仍加载上游 `DeepseekV41LLMForCausalLM` |
 | 0.30 + `VLLM_USE_V2_MODEL_RUNNER=0` | 被平台校验直接拒绝：`DeepSeek V4.1 on Ascend A5 requires Model Runner V2` |
+| 0.30 + 手动 `vllm_ascend.register_model()` + V2 | 绕过上游 CUDA 注意力，进入模型构造；`block_size=16` 报 `KeyError: 16` |
+| 0.30 + `--block-size 64` | 继续到权重加载；**475 GB 模型在 123 GB HBM 上 OOM**（119 GB allocated，申请 8.44 GB 失败） |
+| 0.30 + `--cpu-offload-gb 300` | `get_accelerator_view_from_cpu_tensor is currently not supported in: npu` |
+| 0.30 + prefetch offload（`--offload-group-size 5 --offload-num-in-group 3`） | 仍先加载 119 GB 权重后 OOM；该 offload 未覆盖初始权重载入 |
 
 ## 判断
 
-0.30 已包含 DSV4.1 模型代码，但当前组合仍不可运行，缺三层：
+0.30 已包含 DSV4.1 模型代码，且手动注册模型 + `block-size=64` 可以绕过 CUDA 注意力和 block size
+问题；当前真正卡住的是 **A5 版 torch-npu/triton + 单卡 HBM 不足以载入 475 GB 模型，而
+vLLM 0.30 的 CPU/prefetch offload 在这套 V2+A5 组合上不可用**。
 
-1. **A5 构建的 `torch-npu 2.10.0.post7` / `triton-ascend 3.6`**：公开索引的 post7 是 A2；
-2. **与 vllm-ascend 0.30 匹配的 vLLM 0.30 构建**：V2 runner 仍走上游
-   `DeepseekV41LLMForCausalLM`，其注意力 assert 要求 CUDA；V1 又被平台禁止；
-3. **真实 `fla_npu`**：公开索引无此包，当前用 import-only stub 才走到 engine 初始化。
+需要的条件（任一）：
 
-仅换 venv 解决不了；需要官方 A5 镜像/配套 vllm 轮子，或把 V2 runner 切到
-`vllm_ascend.models.deepseek_v41` 的 Ascend 实现。没有这些，原生臂没有可报的 TTFT/TPOT/ITL。
+1. A5 版 `torch-npu 2.10.0.post7` / `triton-ascend 3.6` + 官方配套 vLLM 0.30；
+2. 官方 vllm-ascend A5 镜像（含可用的权重 offload）；
+3. 多卡/更大 HBM（原生不做 host-offload 时，单卡 123 GB 放不下 475 GB 模型）。
+
+在此之前，原生臂没有可报的 TTFT/TPOT/ITL。
