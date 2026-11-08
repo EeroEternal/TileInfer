@@ -70,7 +70,10 @@ baseline 用 `ARENA=96 + 同样 chunking`、util 0.2。
 
 - 4 并发 4K/16K（P3 配置 max-len/arena 不足，未跑）；
 - 32K 冷启动全矩阵（单次 15–20 min，且当前 32K 只验证过 prompt 缓存/不 OOM）；
-- 原生 vllm-ascend（版本/模型架构卡住）；
+- 原生 vllm-ascend：host 容量、packed MXFP4、mmap、逐专家 offload 均已打通，
+  但 profile 卡在 `aclnnHcPre` 的 950 kernel 缺 `tilingKey 1003`（预编译
+  `hc_pre.json` 只有 1000/1001），无可测 TTFT/TPOT/ITL；详见
+  `docs/notes/dsv41-native-mmap.md` §5；
 - baseline 4K/16K 的 `max_tokens` 更大档位（本轮只测 8）。
 
 ## 5. 复现
