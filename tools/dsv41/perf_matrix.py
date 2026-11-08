@@ -128,12 +128,15 @@ def main() -> int:
         for i, r in enumerate(rows):
             r["request"] = i
             r["rep"] = rep
+            r["wall_ms"] = wall
         all_rows.extend(rows)
         ok = [r for r in rows if "error" not in r]
         if ok:
             def _m(key):
-                v = statistics.median(r[key] for r in ok if r.get(key) is not None)
-                return f"{v:.1f}" if v is not None else "NA"
+                vals = [r[key] for r in ok if r.get(key) is not None]
+                if not vals:
+                    return "NA"
+                return f"{statistics.median(vals):.1f}"
 
             print(
                 f"  rep{rep}: wall={wall:.0f}ms ttft_med={_m('ttft_ms')} "
@@ -152,14 +155,16 @@ def main() -> int:
         "itl_p50_ms_median": statistics.median(r["itl_p50_ms"] for r in ok) if ok else None,
         "itl_p90_ms_median": statistics.median(r["itl_p90_ms"] for r in ok) if ok else None,
         "itl_max_ms_median": statistics.median(r["itl_max_ms"] for r in ok) if ok else None,
-        "wall_ms_median": statistics.median([r.get("wall", 0) for r in all_rows]) if all_rows else None,
+        "output_tokens_median": statistics.median(r["n_tokens"] for r in ok) if ok else None,
+        "wall_ms_median": statistics.median([r.get("wall_ms", 0) for r in all_rows]) if all_rows else None,
         "rows": all_rows,
     }
     print(
         f"[{args.label}] TTFT={summary['ttft_ms_median']:.1f}ms "
         f"TPOT={summary['tpot_ms_median'] if summary['tpot_ms_median'] is not None else float('nan'):.1f}ms "
         f"ITL_P50={summary['itl_p50_ms_median'] if summary['itl_p50_ms_median'] is not None else float('nan'):.1f}ms "
-        f"ITL_P90={summary['itl_p90_ms_median'] if summary['itl_p90_ms_median'] is not None else float('nan'):.1f}ms"
+        f"ITL_P90={summary['itl_p90_ms_median'] if summary['itl_p90_ms_median'] is not None else float('nan'):.1f}ms "
+        f"out_tokens={summary['output_tokens_median']}"
     )
     if args.out:
         with open(args.out, "w", encoding="utf-8") as f:
