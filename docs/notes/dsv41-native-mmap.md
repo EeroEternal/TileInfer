@@ -140,6 +140,32 @@ call aclnnHcPre failed ... Cannot find tilingKey[1003] in kernel json file of Hc
 `cann-ops-transformer-custom` 包，或用同版本源码重新编译 `HcPre` 950 kernel；
 这不是 host 内存或本仓库 offload 代码能解决的。
 
+### 5.3 2026-11-09 续：HcPre 已自编译，后面还有 CANN/wheel ABI 墙
+
+按 §5.2 的结论继续补缺失件：
+
+1. 用 site-packages 里带 1003 分支的 `hc_pre.cpp` + `*_premix_arch35.h`
+   替换 `csrc/moe/hc_pre/op_kernel`，并把 `hc_pre_def.cpp` / `HcPre.py`
+   op spec 扩成 5 输入（含 `pre_mix`）/4 输出（含 `pre`）；
+2. `bash build.sh --pkg --soc=ascend950 --ops=hc_pre,...` 重新生成
+   `HcPre_6c9f...json`，`kernelList` 已含 **tilingKey 1003**；
+3. 把新 kernel 装进 wheel vendor 的 `kernel/ascend950/hc_pre`，并合并
+   `binary_info_config.json` 的 HcPre 条目；
+4. 引擎随后**通过了 HcPre**，继续跑 attention，卡在
+   `aclnnSwigluGroupQuant`：CANN 9.3.0 自带实现与 wheel 的
+   `vllm_ascend_C.so` 调用约定不一致，报 `Check yOut != nullptr failed`；
+5. 用 `torch_npu.npu_swiglu` + `npu_dynamic_mx_quant` 替换
+   `w4a8_mxfp4.py` 与 `shared_experts.py` 的 3 处调用后，profile 继续，
+   最终在 MoE 路径报 **AI Core vector error（MTE invalid GM address）**，
+   说明某条自定义 kernel 的输入/scale 布局与 CANN 9.3.0 不匹配。
+
+结论：HcPre 950 kernel 已由本仓库补出并能执行；剩余是
+vllm-ascend 0.30 wheel 与 CANN 9.3.0 的**自定义算子 ABI/布局不一致**
+（先 `SwigluGroupQuant`，后 vector core），不是 host 容量或 offload 逻辑。
+要拿到原生性能数字，需要与 wheel 匹配的 `cann-ops-transformer-custom`
+950 包（或按同一 CANN 版本重编全部自定义算子）。TileInfer 侧结果不受影响。
+
+
 复现命令（会加载约 468 GB host mmap，profile 在 HcPre 处失败）：
 
 ```bash
