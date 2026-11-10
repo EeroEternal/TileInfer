@@ -47,6 +47,7 @@ the matching TileInfer kernel from ``tileinfer/kernels/``.
 
 from __future__ import annotations
 
+from .extern import apply as _apply_extern
 from .gdn import chunk_local_cumsum, l2norm_fwd
 from .moe import (
     fused_experts,
@@ -55,6 +56,10 @@ from .moe import (
     silu_and_mul,
     topk_softmax,
 )
+
+# One-way dependency made explicit and inert by default: with ``TILEINFER_OPS_LIB`` unset this is a
+# no-op, and the names above stay this repo's own implementations.
+_EXTERN = _apply_extern(globals(), ("chunk_local_cumsum", "l2norm_fwd"))
 
 __all__ = [
     "chunk_local_cumsum",
