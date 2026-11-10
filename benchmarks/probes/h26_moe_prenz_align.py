@@ -26,7 +26,7 @@ E83 离线取证)。
 
 用法(设备,NPU 空闲窗)::
 
-    source .agent_loop/run/env.sh
+    source bench_out/env.sh
     .venv/bin/python benchmarks/probes/h26_moe_prenz_align.py --numeric          # oracle 数值
     .venv/bin/python benchmarks/probes/h26_moe_prenz_align.py --bench            # 7 场景门槛
     .venv/bin/python benchmarks/probes/h26_moe_prenz_align.py --bench --gate     # 仅门槛双场景
@@ -562,7 +562,7 @@ def main():
     ap.add_argument("--numeric", action="store_true")
     ap.add_argument("--bench", action="store_true")
     ap.add_argument("--gate", action="store_true", help="仅门槛双场景")
-    ap.add_argument("--out", default=".agent_loop/run/e71_h26_align_bench.json")
+    ap.add_argument("--out", default="bench_out/e71_h26_align_bench.json")
     ap.add_argument("--iters", type=int, default=100)
     args = ap.parse_args()
     if not (args.numeric or args.bench):

@@ -24,7 +24,7 @@
 
 用法(设备,NPU 空闲窗)::
 
-    source .agent_loop/run/env.sh
+    source bench_out/env.sh
     .venv/bin/python benchmarks/probes/h27_l1_layout_probe.py
 """
 

@@ -1,9 +1,16 @@
-# 迁到 vLLM 原生集成：现状盘点与待实现清单
+# vLLM 官方扩展点耦合图
 
-> 目标：去掉对 `vllm_ascend` 内部结构的依赖，让 TileInfer 通过 **vLLM 官方扩展点**接入。
-> 本文只做两件事：说清现在卡在哪，列出还需要实现什么（含验收口径）。
-> 现有集成的行为与证据见 [`integration-vllm-ascend.md`](integration-vllm-ascend.md)、
-> [`status.md`](status.md)。
+> **定位**：这份文档回答"我们用了 vLLM 的哪些官方扩展点、每个扩展点我们实现了什么、
+> 还有哪些没接"。它是**耦合地图**，不是计划——计划和里程碑在
+> [`plan-vllm-native-backend.md`](plan-vllm-native-backend.md)，现状在 [`status.md`](status.md)。
+>
+> **历史**：本文最初写于迁移之前，标题是「迁到 vLLM 原生集成：现状盘点与待实现清单」，
+> §4 的 N1–N12 是当时的待办清单。迁移已经完成，那份清单保留下来只作对照——每条现在由
+> 哪个文件实现，看 §1。**§6「风险与必须先拍板的 5 件事」和 §7「建议里程碑」已删除**，
+> 里面拍板的结论已经落进代码，里程碑也已由当前方案取代。
+>
+> §2（耦合点逐条对照）、§5（只有彻底不装 vllm-ascend 才要做的部分）、§8（迁移后要用 grep
+> 核对的 vLLM 0.23 API）仍然有效，是查资料时最该看的三节。
 
 ---
 
@@ -209,7 +216,7 @@ tileinfer/
 - 含义：一旦移除 vllm-ascend，**prefill 没有兜底**，必须由 TileInfer 自己扛。
 - 要做（三选一，需决策）：
   - (a) 先接受短上下文回归，只保证正确性，长上下文限流；
-  - (b) 优化 prefill 内核（`docs/next-tasks.md` T4/T5 方向：M tile 全用、SIMD softmax、
+  - (b) 优化 prefill 内核（`docs/plan-vllm-native-backend.md` T4/T5 方向：M tile 全用、SIMD softmax、
         分页流水），目标 ≤1.0x FIA；
   - (c) 保留一条原生算子 prefill 路径（`torch_npu` FIA）作为显式降级，承认它仍是"别人的算子"。
 - 验收：`pytest tests/test_tilelang_ascend950_prefill*.py` + serve 下 TTFT 对比表落盘。
@@ -264,31 +271,6 @@ tileinfer/
 
 结论：C4 + C2 两项就超过 TileInfer 现有全部代码量，且**没有任何性能收益**——它只是把
 vllm-ascend 的活重做一遍。除非目标是"完全自持昇腾栈"，否则不建议。
-
----
-
-## 6. 风险与必须先拍板的 5 件事
-
-1. **口径**：A / B / C。建议 A，并把 B 作为 A 之后的清理动作。
-2. **prefill 谁扛**（N8）。这是移除 vllm-ascend 后唯一**能力回退**的地方，不是工作量问题。
-3. **是否接受"仍要装 vllm-ascend"**。A 口径下它还在，只是不再被 patch；对外说法要一致。
-4. **split-KV 是否随之默认化**。KI-1 根因已定位并修复（`known-issues.md`，2026-10-14），
-   但 `docs/status.md` / `next-tasks.md` 仍写"open / 延后"——**文档漂移**，
-   迁移前先对齐，否则会按错误前提排期。
-5. **私有补丁清理**：`seq_lens_device` 是对 vllm-ascend 的改动（D17）。A 口径下它变成
-   "不需要"，要确保新路径不引用；否则会逼着继续维护那个补丁。
-
----
-
-## 7. 建议里程碑
-
-| 阶段 | 内容 | 出口标准 |
-|---|---|---|
-| M1（周 1） | 抽 `tileinfer/serving/`，参数化掉 `AscendMetadata`；旧集成改为调用它，行为不变 | CPU 套件全绿；serve 数字与迁移前一致 |
-| M2（周 1–2） | N1–N5：backend/builder/impl/KV 写入/页视图，`TILEINFER_VLLM_NATIVE=1` 双跑 | 同 prompt logprobs 一致；capture 探针 PASS |
-| M3（周 2） | N6/N7/N9/N10：捕获契约、回退策略、层选择、入口拆分 | Qwen2.5 与 Qwen3.6 图模式在役，fallbacks=0 |
-| M4（周 3） | N8/N11/N12：prefill 决策落地、prewarm 自派生、双跑 A/B | 性能表落盘，短上下文 ≤1.0x，长上下文不劣化 |
-| M5 | B 口径清理：删/降级 `install_*` 补丁 | `grep -r vllm_ascend tileinfer/` 只剩回退与平台探测 |
 
 ---
 

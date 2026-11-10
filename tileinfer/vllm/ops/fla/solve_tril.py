@@ -11,7 +11,7 @@ readability; the TileInfer kernel can replace it later once a profile says it pa
 
 Semantics, as established from the source
 -----------------------------------------
-Source quoted below is ``runtime/vllm-api/fla_solve_tril.py`` (vLLM 0.23 copy of FLA).
+Source quoted below is ``reference/vllm-0.23/fla_solve_tril.py`` (vLLM 0.23 copy of FLA).
 
 1. **What is inverted.**  The host docstring (lines 513-530) states it outright::
 

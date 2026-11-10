@@ -12,7 +12,7 @@
 配套官方工具:`vllm bench serve --dataset-name random --percentile-metrics ttft,tpot,itl`
 双源交叉验证。
 
-用法: python ab_qwen36_full.py --port 8321 --label fia_eager --outdir .agent_loop/run/ab_full_fia_eager
+用法: python ab_qwen36_full.py --port 8321 --label fia_eager --outdir bench_out/ab_full_fia_eager
 """
 from __future__ import annotations
 

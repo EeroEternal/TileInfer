@@ -18,7 +18,7 @@ Real Qwen3.6-35B-A3B shapes: E=256, hidden=2048, inter=512, top_k=8, bf16.
 
 Usage::
 
-    .venv/bin/python benchmarks/bench_moe_grouped.py --out .agent_loop/run/e19_moe_bench.json
+    .venv/bin/python benchmarks/bench_moe_grouped.py --out bench_out/e19_moe_bench.json
 """
 
 from __future__ import annotations
@@ -129,7 +129,7 @@ def bench(fn, warmup=20, iters=100):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default=".agent_loop/run/e19_moe_bench.json")
+    ap.add_argument("--out", default="bench_out/e19_moe_bench.json")
     ap.add_argument("--iters", type=int, default=100)
     args = ap.parse_args()
 

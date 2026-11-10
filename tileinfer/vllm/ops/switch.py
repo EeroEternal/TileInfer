@@ -15,7 +15,7 @@ Differences from the legacy switch, and why
   all (``docs/plan-vllm-native-backend.md`` §4: "6-10 是唯一没有 native 兜底的族").  So unset means
   :data:`OPS_DEFAULT_ON` - ``gdn`` and ``moe`` on, ``dense`` off - not "everything".
 * **``dense`` is off by default** because its takeover names are still [unverified] offline: no
-  module in ``runtime/vllm-api/`` shows where vLLM 0.23 calls ``silu_and_mul`` (see ``install.py``),
+  module in ``reference/vllm-0.23/`` shows where vLLM 0.23 calls ``silu_and_mul`` (see ``install.py``),
   so enabling it by default would only add unbound warnings on every boot.
 * **An unknown name still raises** from :func:`ops_enabled` - that is the legacy contract and the
   only way a typo is ever noticed (``tests/test_gdn_proj_fusion.py`` pins the same behaviour).

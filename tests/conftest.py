@@ -16,27 +16,41 @@ import sys
 _BOOTSTRAP_MARK = "TILEINFER_ENV_BOOTSTRAPPED"
 
 
+def _find_env_sh(root: str) -> str | None:
+    """定位机器环境脚本:仓库内的 scripts/env-ascend102.sh 优先,旧的 loop 脚本作后备。
+
+    环境脚本必须**随仓库走**:它原来只存在于 .agent_loop/run/env.sh(未跟踪的临时目录),
+    删掉那个目录就等于删掉了项目唯一的工具链定义。
+    """
+    for rel in (os.path.join("scripts", "env-ascend102.sh"),
+                os.path.join(".agent_loop", "run", "env.sh")):
+        path = os.path.join(root, rel)
+        if os.path.exists(path):
+            return path
+    return None
+
+
 def _bootstrap_ascend_env() -> None:
-    """裸 shell 下自举项目 CANN 工具链环境(见 .agent_loop/state/DECISIONS.md D26/D32)。
+    """裸 shell 下自举项目 CANN 工具链环境。
 
-    项目真实工具链在 .work/cann930,经 .agent_loop/run/env.sh 导出;但 loop 框架的
-    验收调用(verify_task.sh → pytest)不经过任何 source。此时 TILELANG_CACHE_DIR
-    缺失导致内核缓存全量未命中,tilelang 退回系统 cann-9.1.1 编译器并因缺模板
-    intrinsic 而失败(D26),decode/prefill/moe/gdn 全族设备用例连坐失败(E25)。
+    项目工具链在 .work/cann930,由 scripts/env-ascend102.sh 导出;但 pytest 被直接调用时
+    不经过任何 source。此时 TILELANG_CACHE_DIR 缺失导致内核缓存全量未命中,tilelang
+    退回系统 cann-9.1.1 编译器并因缺模板 intrinsic 而失败,decode/prefill/moe/gdn
+    全族设备用例连坐失败。
 
-    这里把 env.sh 的导出变量导入 os.environ:子进程(tilelang 编译器、vllm 子进程)
+    这里把 env 脚本的导出变量导入 os.environ:子进程(tilelang 编译器、vllm 子进程)
     与运行期读取的变量(缓存目录、ASCEND_* 路径)由此与手工 source 完全一致;
     LD_PRELOAD 的 libcust_opapi 对当前进程无效,改为 ctypes 全局预加载。
-    仅当调用方未 source(env.sh 的关键变量缺失)时才生效,不改变手工环境行为;
-    无 env.sh 的机器(CPU-only CI)直接跳过,失败只告警不抛异常。
+    仅当调用方未 source(env 脚本的关键变量缺失)时才生效,不改变手工环境行为;
+    无 env 脚本的机器(CPU-only CI)直接跳过,失败只告警不抛异常。
     """
     if os.environ.get(_BOOTSTRAP_MARK) == "1":
         return
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    env_sh = os.path.join(root, ".agent_loop", "run", "env.sh")
-    if not os.path.exists(env_sh):
+    env_sh = _find_env_sh(root)
+    if env_sh is None:
         return
-    if os.environ.get("TILELANG_CACHE_DIR"):  # 调用方已 source env.sh
+    if os.environ.get("TILELANG_CACHE_DIR"):  # 调用方已 source env 脚本
         os.environ[_BOOTSTRAP_MARK] = "1"
         return
     try:

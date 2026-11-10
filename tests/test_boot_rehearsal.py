@@ -108,6 +108,19 @@ FIXTURE_CONFIG: Dict[str, Any] = {
 #: ``tileinfer.vllm.*`` cannot be imported until a ``vllm`` exists; this is the same shared fake
 #: the other contract tests install (cooperating: it only fills in names).
 VLLM_MODE = fake_vllm.install()
+#: The contract tests below pin the *shape* of vLLM 0.23's API against ``tests/fake_vllm.py``.
+#: When a real ``vllm`` is importable, :func:`fake_vllm.install` deliberately refuses to inject
+#: anything (mode ``"real"``) - so the recorder names this file reads straight out of
+#: ``sys.modules`` (``kv_transfer_calls``, ``request_memory_calls``, ...) do not exist, and the
+#: failure surfaces as a collection error rather than a test failure.  Skip instead: the CPU-only
+#: CI venv (no vLLM, no NPU) is where this file is meant to run.
+if VLLM_MODE == "real":
+    pytest.skip(
+        "contract test pins vLLM 0.23's API shape with tests/fake_vllm.py; a real vLLM is "
+        "installed so the fake supplies nothing. Run it in a venv without vLLM (the CPU CI venv).",
+        allow_module_level=True,
+    )
+
 
 # The platform-side names (``vllm.platforms.Platform``/``PlatformEnum``, ``vllm.config``, ...) and
 # the ``tileinfer.vllm.platform`` import belong to tests/test_platform_contract.py.  Importing it
@@ -1589,11 +1602,11 @@ def test_the_mamba_policy_matches_the_vendored_vllm_023_source():
     """A vLLM rename of the enum, registry, gate or GDN decode call must fail *here*.
 
     Everything the decision rests on is read back from the vendored 0.23 files
-    (``runtime/vllm-api/``), so the tests above cannot keep passing against a newer vLLM that
+    (``reference/vllm-0.23/``), so the tests above cannot keep passing against a newer vLLM that
     renamed one of these - which is exactly how the stale "SSU is the first device failure"
     claim survived until the source was fetched.
     """
-    api = ROOT / "runtime" / "vllm-api"
+    api = ROOT / "reference" / "vllm-0.23"
     mamba_config = (api / "vllm__config__mamba.py").read_text(encoding="utf-8")
     dispatch = (
         api / "vllm__model_executor__layers__mamba__ops__ssu_dispatch.py"

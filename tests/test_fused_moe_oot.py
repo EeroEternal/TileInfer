@@ -24,7 +24,7 @@ things worth pinning are all observable without hardware:
 
 ``_StockBase`` below is a reduced transcription of ``UnquantizedFusedMoEMethod`` +
 ``FusedMoEMethodBase``: every method carries the line number it comes from, so a reader can check
-the claim against ``runtime/vllm-api/`` instead of trusting this file.
+the claim against ``reference/vllm-0.23/`` instead of trusting this file.
 """
 
 from __future__ import annotations

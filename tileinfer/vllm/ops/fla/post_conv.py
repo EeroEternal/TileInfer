@@ -12,7 +12,7 @@ the V1 profiling warmup repeats the same call at [vLLM] ``:1113-1124``.  It is i
 Upstream body: the real source, read line by line
 -------------------------------------------------
 ``vllm/model_executor/layers/fla/ops/fused_gdn_prefill_post_conv.py`` **is** in this checkout, as
-``runtime/vllm-api/vllm__model_executor__layers__fla__ops__fused_gdn_prefill_post_conv.py``: one
+``reference/vllm-0.23/vllm__model_executor__layers__fla__ops__fused_gdn_prefill_post_conv.py``: one
 Triton kernel plus a launcher, and every claim below is now read out of it rather than inferred.
 
 * ``_fused_post_conv_kernel`` (:19-149) with grid ``(cdiv(L, BLOCK_T), H + HV)`` (:214).  Every
@@ -32,7 +32,7 @@ bf16/fp16 inputs - the kernel casts every gate operand with ``.to(tl.float32)`` 
 Provenance tags used below:
 
 * **[vLLM]** - a line number in ``fused_gdn_prefill_post_conv.py`` (this operator), or - where the
-  claim is about the call site - in ``runtime/vllm-api/`` ``vllm__model_executor__layers__mamba__\\
+  claim is about the call site - in ``reference/vllm-0.23/`` ``vllm__model_executor__layers__mamba__\\
   gdn__qwen_gdn_linear_attn.py`` (the file is named at the citation).
 * **[port]** - a deliberate difference between this torch transcription and that source, always
   with the reason.  There is exactly one; see "Deliberate deviations" at the end.
@@ -46,7 +46,7 @@ per-head L2 normalisation, a per-value-head gate and a per-value-head sigmoid.
 Argument semantics (the signature both the launcher and the call site use)
 -------------------------------------------------------------------------
 The ten arguments are the **caller's**, so every ``[vLLM]`` line in this table is a line of
-``runtime/vllm-api/vllm__model_executor__layers__mamba__gdn__qwen_gdn_linear_attn.py``; the kernel
+``reference/vllm-0.23/vllm__model_executor__layers__mamba__gdn__qwen_gdn_linear_attn.py``; the kernel
 file's own lines are cited from "Packed layout" onward.  The launcher's signature
 (``fused_gdn_prefill_post_conv.py:152-163``) takes exactly the same ten in the same order, with the
 same two defaults (:161-162).

@@ -604,7 +604,7 @@ class TileInferAttentionImpl(AttentionImpl):
         num_tokens: int,
     ) -> torch.Tensor:
         """Prefill/append on the paged-prefill kernel, with the reference backend as a *counted*
-        fallback (``docs/plan-performance.md`` §17 ③, M1 exit needs the ratio).
+        fallback (``docs/performance.md`` §17 ③, M1 exit needs the ratio).
 
         The kernel path is eager, not plan-backed: a prefill step's tile count changes with every
         prompt length, so the schedule is rebuilt per step (host-only, no device sync) and the
@@ -1216,7 +1216,7 @@ def _split_kv_pages() -> int:
 
 
 # --------------------------------------------------------------------------------------------
-# Phase timing (docs/plan-performance.md M0)
+# Phase timing (docs/performance.md M0)
 #
 # Wrapped at module import rather than inline in ``forward``: the method has many early returns,
 # and a try/finally wrapper keeps the measurement out of the logic and completely inert when

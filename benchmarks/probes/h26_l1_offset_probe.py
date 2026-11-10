@@ -6,7 +6,7 @@
 检查 emitted 指针表达式是否含偏移,并与 baseline `T.copy(GM→L1 nd2nz)` 的 dst 发射对照。
 
 用法::
-    source .agent_loop/run/env.sh
+    source bench_out/env.sh
     python benchmarks/probes/h26_l1_offset_probe.py
 """
 

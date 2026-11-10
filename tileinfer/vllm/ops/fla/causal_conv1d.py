@@ -2,9 +2,9 @@
 
 Source of truth
 ---------------
-``runtime/vllm-api/vllm__model_executor__layers__mamba__ops__causal_conv1d.py`` (1239 lines, read in
+``reference/vllm-0.23/vllm__model_executor__layers__mamba__ops__causal_conv1d.py`` (1239 lines, read in
 full).  Every semantic below is quoted from it with a line number.  Caller:
-``runtime/vllm-api/vllm__model_executor__layers__mamba__gdn__qwen_gdn_linear_attn.py``
+``reference/vllm-0.23/vllm__model_executor__layers__mamba__gdn__qwen_gdn_linear_attn.py``
 
 * prefill  -> ``causal_conv1d_fn(mixed_qkv.T, conv_weights, bias, activation=..., conv_states=...,
   has_initial_state=..., cache_indices=..., query_start_loc=..., metadata=attn_metadata)`` (l.1365)

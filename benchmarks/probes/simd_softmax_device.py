@@ -24,7 +24,7 @@ Semantics wired in here (read off ``tilelang/src/tl_templates/ascend/simd_inst.h
 
 Usage::
 
-    source .agent_loop/run/env.sh
+    source bench_out/env.sh
     python benchmarks/probes/simd_softmax_device.py
 """
 

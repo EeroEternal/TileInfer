@@ -48,3 +48,6 @@ pytest-cache-files-*/
 .venv_ascend30/
 trace_out/
 /inventory-report.txt
+
+# 统一剖析工具与探针的配置/产物
+!scripts/*.json

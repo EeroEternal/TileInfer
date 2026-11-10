@@ -85,6 +85,6 @@ for name, tokens, skewed in scenarios:
         results[f"{name}:{which}"] = per_step
         print(name, which, per_step, flush=True)
 
-with open(".agent_loop/run/e19_device_time.json", "w") as f:
+with open("bench_out/e19_device_time.json", "w") as f:
     json.dump(results, f, indent=2)
-print("saved .agent_loop/run/e19_device_time.json")
+print("saved bench_out/e19_device_time.json")

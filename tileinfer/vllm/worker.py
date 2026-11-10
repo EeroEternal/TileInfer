@@ -3,10 +3,10 @@
 Status
 ------
 Implemented against the local vLLM 0.23 sources.  ``gpu_model_runner.py`` is now in
-``runtime/vllm-api/`` (334,736 B), so the signatures below are *read*, not inferred:
+``reference/vllm-0.23/`` (334,736 B), so the signatures below are *read*, not inferred:
 
-* ``runtime/vllm-api/vllm__v1__worker__gpu_worker.py`` (the ``Worker`` we subclass, 1,204 lines);
-* ``runtime/vllm-api/vllm__v1__worker__gpu_model_runner.py`` (``GPUModelRunner``, 7,561 lines:
+* ``reference/vllm-0.23/vllm__v1__worker__gpu_worker.py`` (the ``Worker`` we subclass, 1,204 lines);
+* ``reference/vllm-0.23/vllm__v1__worker__gpu_model_runner.py`` (``GPUModelRunner``, 7,561 lines:
   class ``:418``, ``_init_device_properties`` ``:1109-1112``, ``_dummy_run`` ``:5599``,
   ``profile_run`` ``:6168``, ``profile_cudagraph_memory`` ``:6376``, ``capture_model`` ``:6525``,
   ``initialize_kv_cache`` ``:7284``).
@@ -113,7 +113,7 @@ import torch
 
 # ---------------------------------------------------------------------------------------------
 # The two vLLM imports this module builds on.  Both files are transcribed into
-# `runtime/vllm-api/`; the error below names them because a partial vLLM install (a `vllm` that
+# `reference/vllm-0.23/`; the error below names them because a partial vLLM install (a `vllm` that
 # ships the worker but not the runner) would otherwise surface as an AttributeError much later.
 # ---------------------------------------------------------------------------------------------
 try:  # pragma: no cover - exercised only outside a vLLM env (the CPU suite injects a fake)
@@ -124,8 +124,8 @@ except ImportError as exc:  # pragma: no cover
         "tileinfer.vllm.worker requires vLLM 0.23's V1 worker and model runner "
         "(vllm.v1.worker.gpu_worker.Worker and vllm.v1.worker.gpu_model_runner.GPUModelRunner); "
         f"importing them failed with {exc!r}. Install vllm>=0.23,<0.24 - this module subclasses "
-        "both (see runtime/vllm-api/vllm__v1__worker__gpu_worker.py and "
-        "runtime/vllm-api/vllm__v1__worker__gpu_model_runner.py)."
+        "both (see reference/vllm-0.23/vllm__v1__worker__gpu_worker.py and "
+        "reference/vllm-0.23/vllm__v1__worker__gpu_model_runner.py)."
     ) from exc
 
 from tileinfer.vllm import graphs
@@ -977,7 +977,7 @@ class NPUWorker(Worker):
                 "vllm_config.use_v2_model_runner is set, but TileInfer only implements the V1 "
                 "runner (vllm.v1.worker.gpu_model_runner.GPUModelRunner, gpu_worker.py:337-341); "
                 "the V2 runner lives in vllm/v1/worker/gpu/model_runner.py, which is not in "
-                "runtime/vllm-api/ and has no subclass here. Run without --use-v2-model-runner, "
+                "reference/vllm-0.23/ and has no subclass here. Run without --use-v2-model-runner, "
                 "or add a TileInfer V2 runner and construct it here."
             )
         self.model_runner = TileInferModelRunner(self.vllm_config, self.device)

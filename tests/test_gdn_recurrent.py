@@ -3,7 +3,7 @@
 Two entry points, two independent oracles, one cross-check that ties them together:
 
 * ``_seq_oracle`` -- the literal per-token / per-head recurrence transcribed from the *sequence*
-  kernel (``runtime/vllm-api/fla_fused_recurrent.py`` lines 122-170), written one token at a time;
+  kernel (``reference/vllm-0.23/fla_fused_recurrent.py`` lines 122-170), written one token at a time;
 * ``_packed_oracle`` -- the literal per-token / per-head recurrence transcribed from the *packed
   decode* kernel (lines 292-336), including its gate (lines 318-325) written as a mask-and-assign
   softplus so that it does not share code with the port's ``gating._sigmoid_gating_decay``.
@@ -13,7 +13,7 @@ Neither oracle calls the module under test.
 THE property (``test_t_decode_steps_equals_whole_sequence_form``): the packed decode entry point has
 no token loop (grid ``(NV, B*HV)``, line 449), so it is a *one-token* operator.  Applying it once
 per token with the state carried in place -- which is exactly how vLLM drives it
-(``runtime/vllm-api/vllm__..._qwen_gdn_linear_attn.py`` lines 1684-1695) -- must reproduce, token
+(``reference/vllm-0.23/vllm__..._qwen_gdn_linear_attn.py`` lines 1684-1695) -- must reproduce, token
 for token and state for state, the whole-sequence form run over the same ``T`` tokens once the
 sequence gate is supplied as ``g = -exp(A_log) * softplus(a + dt_bias)`` and the step as
 ``beta = sigmoid(b)``.  Both must also reproduce the two independent oracles, for ``T`` in

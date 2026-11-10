@@ -509,7 +509,7 @@ def bind() -> List[Any]:
                 "default would only add unbound warnings to every boot."
             ),
             remove_when="when SiluAndMul's vLLM call site is verified.",
-            upstream_ref="[unverified] - no activation module in runtime/vllm-api",
+            upstream_ref="[unverified] - no activation module in reference/vllm-0.23",
         ),
     ]
     # Every record gets its candidate seam last, so the table above stays what it always was: one

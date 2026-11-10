@@ -7,7 +7,7 @@
 - 每组 3 次取中位数;另取首 token top-5 logprobs 做数值一致性对照;
 - 原始数字落盘 JSON,供 PERFORMANCE_REPORT.md 引用。
 
-用法: python ab_qwen36.py --port 8321 --label fia --outdir .agent_loop/run/ab_fia
+用法: python ab_qwen36.py --port 8321 --label fia --outdir bench_out/ab_fia
 """
 from __future__ import annotations
 

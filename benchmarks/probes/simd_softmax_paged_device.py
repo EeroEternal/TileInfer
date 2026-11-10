@@ -19,7 +19,7 @@ What it pins down (each verified against ``torch.softmax`` on the masked scores,
 
 Usage::
 
-    source .agent_loop/run/env.sh
+    source bench_out/env.sh
     python benchmarks/probes/simd_softmax_paged_device.py
 """
 

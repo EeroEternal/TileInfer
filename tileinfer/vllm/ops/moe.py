@@ -13,7 +13,7 @@ here.
 
 Provenance of every semantic claim
 ----------------------------------
-* ``[vLLM]`` - a line number in the vLLM 0.23 source now vendored under ``runtime/vllm-api/``:
+* ``[vLLM]`` - a line number in the vLLM 0.23 source now vendored under ``reference/vllm-0.23/``:
   ``vllm___custom_ops.py`` (the Python wrappers over ``torch.ops._moe_C``), and
   ``vllm__model_executor__layers__fused_moe__fused_moe.py`` (the Triton expert path).  These are the
   files that decide the *signatures* this module has to honour, and they are read, not guessed.
@@ -580,7 +580,7 @@ def topk_softmax(
             "it (vllm/_custom_ops.py:2500) and forwards it to torch.ops._moe_C.topk_softmax "
             "(:2502-2508), but whether the CUDA kernel adds it to the selection score only or to "
             "the returned weight as well is in the kernel body, which is not in "
-            "runtime/vllm-api/. Pass None (the default, and what an un-biased router does): that "
+            "reference/vllm-0.23/. Pass None (the default, and what an un-biased router does): that "
             "path is exact."
         )
     if gating_output.dim() != 2:
@@ -693,7 +693,7 @@ def moe_align_block_size(
             "moe_align_block_size(expert_map=...) is not implemented: the real op takes the "
             "expert-parallel global->local map (vllm/_custom_ops.py:2353) and applies it inside "
             "torch.ops._moe_C.moe_align_block_size (:2355-2363), whose body is not in "
-            "runtime/vllm-api/ - in particular whether a '-1' expert leaves a padding slot or "
+            "reference/vllm-0.23/ - in particular whether a '-1' expert leaves a padding slot or "
             "shrinks num_tokens_post_pad. v0 runs without expert parallelism, where the argument "
             "is None; that path is exact."
         )

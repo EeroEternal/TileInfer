@@ -241,7 +241,7 @@ def _probe_leaf_modules(runner: Any, phases: Any, make: Any) -> list:
 def _apply_phase_probes_on_load() -> None:
     """Wrap the model and sampler forwards with ``phases.timed`` once the weights are loaded.
 
-    M0/W8 (``docs/plan-performance.md``): the phase table showed ~59% of a decode step happening
+    M0/W8 (``docs/performance.md``): the phase table showed ~59% of a decode step happening
     outside the ops TileInfer takes over, so that remainder has to be split too - and the only
     place where the model object exists and is stable is right after ``load_model``.  Nothing
     happens unless ``TILEINFER_PHASE_TIMING=device`` (or ``both``).

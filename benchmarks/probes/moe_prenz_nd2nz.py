@@ -25,7 +25,7 @@ belongs to the vLLM weight-loading path).  Both need device iteration.
 
 Usage::
 
-    source .agent_loop/run/env.sh
+    source bench_out/env.sh
     python benchmarks/probes/moe_prenz_nd2nz.py
 """
 

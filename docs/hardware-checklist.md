@@ -10,8 +10,8 @@
 > （`tileinfer/vllm/compat/patches.py`）都已就位；worker 的四个 hook
 > （`init_device` / `determine_available_memory` / `initialize_from_config` /
 > `compile_or_warm_up_model`）在 `tileinfer/vllm/worker.py` 里**已经实现**
-> （`:562` / `:752` / `:931` / `:999`），它们依据的 `vllm/v1/worker/gpu_model_runner.py` 也**已经入库**
-> （`runtime/vllm-api/vllm__v1__worker__gpu_model_runner.py`，334,736 B，含 `_dummy_run:5599`、
+> （`:848` / `:1533` / `:1712` / `:1819`），它们依据的 `vllm/v1/worker/gpu_model_runner.py` 也**已经入库**
+> （`reference/vllm-0.23/vllm__v1__worker__gpu_model_runner.py`，334,736 B，含 `_dummy_run:5599`、
 > `profile_run:6168`、`capture_model:6525`、`initialize_kv_cache:7284`）。
 > 所以：**步骤 1–5 今天就能过**；步骤 4 的「缺 runner 文件」这条 blocker 已经关闭——6–11 的阻塞
 > 不再是缺文件或骨架，而是这些硬件路径**还没在真机上跑过**（未验证 ≠ 已坏）：每步列出的
@@ -46,7 +46,7 @@ python -m tileinfer.vllm.doctor --json    # 机器可读版本，贴进报告/CI
 
 它把本清单步骤 1–5 里能在**单进程**内回答的问题一次问完：CANN 环境、`torch`/`torch_npu`、
 设备可见性、TileLang **Ascend** wheel 与可写的 `TILELANG_CACHE_DIR`、vLLM 版本、插件的四段安装状态
-（patch 报告 / attention backend 槽位 / 图桥 / 算子接线）与 ops 绑定、`runtime/vllm-api/` 里的
+（patch 报告 / attention backend 槽位 / 图桥 / 算子接线）与 ops 绑定、`reference/vllm-0.23/` 里的
 runner，以及步骤 10 的图判定 `graphs.capture_path_ready`（这一项是 soft）。逐项打印
 `PASS`/`FAIL`/`SKIP` 加一行 `fix:` 提示，末行是
 `Start at docs/hardware-checklist.md step N: …`——**它指的那一步就是先要修的**；有 hard check 失败时
@@ -214,12 +214,12 @@ python -m pytest tests/test_no_vllm_ascend.py tests/test_layer_deps.py \
 引擎要的四个 worker hook（`init_device` / `determine_available_memory` /
 `initialize_from_config` / `compile_or_warm_up_model`）全部落在 model runner 上，而这份
 `vllm/v1/worker/gpu_model_runner.py`（本项目转录的 v0.23 线）**已经在仓库里**：
-`runtime/vllm-api/vllm__v1__worker__gpu_model_runner.py`（334,736 B），其中
+`reference/vllm-0.23/vllm__v1__worker__gpu_model_runner.py`（334,736 B），其中
 `_dummy_run:5599`、`profile_run:6168`、`capture_model:6525`、`initialize_kv_cache:7284` 就是四个
 hook 的调用点。`tileinfer/vllm/worker.py` 的四个 hook 已按这些签名实现（该文件开头的 file:line
 表即出处），所以这一步不再是「先取回文件、再靠猜签名」。
 
-下面两条命令保留作**核对 / 重取**用：换机器、或怀疑 `runtime/vllm-api/` 被别的版本覆盖时，用它们
+下面两条命令保留作**核对 / 重取**用：换机器、或怀疑 `reference/vllm-0.23/` 被别的版本覆盖时，用它们
 确认文件与仓库记录的 v0.23 线一致（不需要网络）。
 
 ```bash
@@ -227,7 +227,7 @@ hook 的调用点。`tileinfer/vllm/worker.py` 的四个 hook 已按这些签名
 python - <<'PY'
 import pathlib, shutil, vllm
 src = pathlib.Path(vllm.__file__).parent / "v1" / "worker" / "gpu_model_runner.py"
-dst = pathlib.Path("runtime/vllm-api/vllm__v1__worker__gpu_model_runner.py")
+dst = pathlib.Path("reference/vllm-0.23/vllm__v1__worker__gpu_model_runner.py")
 assert src.is_file(), f"not found: {src} (installed vllm is not 0.23.x?)"
 dst.parent.mkdir(parents=True, exist_ok=True)
 shutil.copyfile(src, dst)
@@ -236,7 +236,7 @@ PY
 
 # 4.2 校验：文件里必须有这四个定义（worker 的四个 hook 就是它们的调用方）
 grep -n "def capture_model\|def profile_run\|def initialize_kv_cache\|def _dummy_run" \
-     runtime/vllm-api/vllm__v1__worker__gpu_model_runner.py
+     reference/vllm-0.23/vllm__v1__worker__gpu_model_runner.py
 ```
 
 **期望输出**（当前仓库里的实际状态）：`334736` bytes，随后 4 行 `def …`，行号与上面那句一致
@@ -248,8 +248,8 @@ grep -n "def capture_model\|def profile_run\|def initialize_kv_cache\|def _dummy
 |---|---|---|
 | `AssertionError: not found` | 装的 vLLM 不是 0.23.x（路径变了） | `pip show vllm`；`python -c "import vllm,pathlib;print(pathlib.Path(vllm.__file__).parent)"` 手工找 |
 | `AttributeError: 'NoneType'… __file__` | vLLM 以 namespace/奇怪的可编辑方式安装 | `python -c "import vllm;print(vllm.__path__)"`，在 `__path__[0]` 下找 |
-| 只有 1–2 个 `def`，或行号与本清单差很多 | `runtime/vllm-api/` 里是旧/新大版本的 runner，签名与本项目转录不符 | 用 4.1 重取 `v0.23.0` 的版本；**不要**用别的版本来「先跑起来」 |
-| 有网络时的替代 | — | `curl -sSL -o runtime/vllm-api/vllm__v1__worker__gpu_model_runner.py https://raw.githubusercontent.com/vllm-project/vllm/v0.23.0/vllm/v1/worker/gpu_model_runner.py` |
+| 只有 1–2 个 `def`，或行号与本清单差很多 | `reference/vllm-0.23/` 里是旧/新大版本的 runner，签名与本项目转录不符 | 用 4.1 重取 `v0.23.0` 的版本；**不要**用别的版本来「先跑起来」 |
+| 有网络时的替代 | — | `curl -sSL -o reference/vllm-0.23/vllm__v1__worker__gpu_model_runner.py https://raw.githubusercontent.com/vllm-project/vllm/v0.23.0/vllm/v1/worker/gpu_model_runner.py` |
 
 > 核对通过后：`tileinfer/vllm/worker.py` 的四个 hook **已经**按这份文件的签名实现；`HARDWARE_CHECKLIST`
 > 里剩的是上机待核实项，不再是「等文件」。步骤 6 之后若失败，第一处通常**不是** `NotImplementedError`：
@@ -305,7 +305,7 @@ enforce_eager   = True            # 图捕获尚未就绪时平台会强制 eage
 | `RuntimeError: Only one platform plugin can be activated` | 同时还有别的 out-of-tree 平台插件（例如遗留的 vllm-ascend） | `pip uninstall vllm_ascend`，或 `pip show -f` 查同组入口点 |
 | `block_size = 1024/…` 且 `user_specified True` | 命令行显式传了非 2048 倍数的 `--block-size`，平台按设计**拒绝**而不是偷偷改 | 去掉 `--block-size`（让平台对齐），或显式传 `2048` |
 | `block_size` 非 2048 且 `is_hybrid True`、无报错 | 对齐逻辑没跑到（vLLM 没调 `check_and_update_config`） | 确认 `current_platform` 是 TileInferPlatform（5.1），否则平台根本没参与 |
-| `worker_cls` 不是 `tileinfer.vllm.worker.NPUWorker` | 平台没写进 `parallel_config`。字段名现在是**已核实**的：`runtime/vllm-api/vllm__config__parallel.py:248` 声明 `worker_cls: str = "auto"`，消费点是 `vllm__v1__worker__worker_base.py:249-253` | 回看 5.1 的 `current_platform`；若启动直接抛 `ValueError: parallel_config.worker_cls=… conflicts`，说明命令行显式传了别的 `--worker-cls`——去掉它（平台只在 `"auto"` 哨兵时改写，见 `docs/status-native-backend.md` §7.7） |
+| `worker_cls` 不是 `tileinfer.vllm.worker.NPUWorker` | 平台没写进 `parallel_config`。字段名现在是**已核实**的：`reference/vllm-0.23/vllm__config__parallel.py:248` 声明 `worker_cls: str = "auto"`，消费点是 `vllm__v1__worker__worker_base.py:249-253` | 回看 5.1 的 `current_platform`；若启动直接抛 `ValueError: parallel_config.worker_cls=… conflicts`，说明命令行显式传了别的 `--worker-cls`——去掉它（平台只在 `"auto"` 哨兵时改写，见 `docs/notes/handover-2026-10-28.md` §7.7） |
 | 5.2 抛 `ValueError` 提到 MLA / sparse / sleep mode / speculative | 配置里带了 v0 明确不做的特性（见 `docs/plan-vllm-native-backend.md` §0） | 去掉对应 flag；这类拒绝是**期望行为**，报错文本会直接点名 |
 | 5.2 抛 `ValueError: kv-cache dtype …` | `--kv-cache-dtype` 不是 `auto` | 去掉该 flag（v0 只跑未量化） |
 
@@ -361,8 +361,8 @@ grep -n "TileInfer vLLM plugin" /tmp/ti-serve.log
 | `RuntimeError: tileinfer.vllm.worker.init_device requires torch_npu` | 四个 hook 已实现，缺的是设备栈：`torch_npu` 不在这个 venv，或与 torch 不配对 | 回步骤 1.1 / 1.2：source CANN、装配套的 `torch_npu` |
 | `RuntimeError: Not support device type`（来自 `gpu_worker.py`） | 平台没把 `worker_cls` 写进去，vLLM 用了自己的 CUDA worker | 回步骤 5.2 看 `worker_cls` |
 | 权重加载到一半 `torch.OutOfMemoryError` | 池子/alive 权重超过卡容量（`--gpu-memory-utilization`、`--max-model-len` 太大） | 降 `--gpu-memory-utilization` 或 `--max-model-len` |
-| `npu-smi` 看不到占用增长 | 权重没真正上卡（meta device 加载失败），或 KV 池没分配：`initialize_from_config`（`worker.py:931`）把 `KVCacheConfig` 转交 runner，失败会从 `model_runner.initialize_kv_cache` 抛出 | 搜日志 traceback；确认步骤 5.2 的 `worker_cls` 是 `NPUWorker`，再看 `TileInfer: KV pool initialised by the runner` 那行 |
-| KV 块数为 0 / 极小 | `determine_available_memory`（`worker.py:752`）量错了口径：`torch.npu.mem_get_info` / `allocated_bytes.all.peak` 的拼写或统计范围不对，或权重记账把池吃光 | 看 `TileInfer: Memory accounting:` 与 `available KV cache` 两行，数值对 `npu-smi info`（`HARDWARE_CHECKLIST` 第 3 条） |
+| `npu-smi` 看不到占用增长 | 权重没真正上卡（meta device 加载失败），或 KV 池没分配：`initialize_from_config`（`worker.py:1712`）把 `KVCacheConfig` 转交 runner，失败会从 `model_runner.initialize_kv_cache` 抛出 | 搜日志 traceback；确认步骤 5.2 的 `worker_cls` 是 `NPUWorker`，再看 `TileInfer: KV pool initialised by the runner` 那行 |
+| KV 块数为 0 / 极小 | `determine_available_memory`（`worker.py:1533`）量错了口径：`torch.npu.mem_get_info` / `allocated_bytes.all.peak` 的拼写或统计范围不对，或权重记账把池吃光 | 看 `TileInfer: Memory accounting:` 与 `available KV cache` 两行，数值对 `npu-smi info`（`HARDWARE_CHECKLIST` 第 3 条） |
 | 只有 attention 层进池、mamba 层缺失 | `support_hybrid_kv_cache()` 现在返回 `True`（`platform.py`）；若 mamba 层仍缺失，是 `check_and_update_config` 没跑到（步骤 5.1）或 mamba spec 构建失败，不是能力位的问题 | 看 `TileInfer hybrid KV:` 那行的 `block_size` / `mamba_block_size` / `mamba_page_size_padded`；判据仍是 10 + 30 = 40 层（分组数由 vLLM 的 page-size 分组决定） |
 | 首个 forward 报 `KV pool must be contiguous for the zero-copy sub-page view` | 池不是 block-first 物理序。本后端声明 `get_kv_cache_shape = (blocks, 2, page, heads, dim)` + `get_kv_cache_stride_order = (1, 0, 2, 3, 4)`（`attn/backend.py:168-231`），vLLM 因此**跳过** hybrid 重写（`gpu_model_runner.py:7190-7191`） | 先确认 `TileInferAttentionBackend` 来自本仓库、且没有 `block_dim == 1` 的旧实现；旧的「W7 剩余工作」已关闭，再现即旧 wheel/旧副本 |
 | 启动期报 `TileInfer cannot start this model: N mamba layer(s) use vLLM's Mamba SSU dispatch` | 只有 `MambaSpec(mamba_type=MAMBA1/MAMBA2)` 才会进 `initialize_mamba_ssu_backend`（`ssu_dispatch.py:202-208`）；vLLM 0.23 只支持 `triton`/`flashinfer`，且 `_BACKEND_REGISTRY` 是私有 dict、没有注册钩子（`ssu_dispatch.py:185-188`），本仓库无 NPU SSU 实现 | 这是**预期拦截**：Qwen3.6 的 GDN 层是 `GDN_ATTN`，不会走到这里；若真在 MAMBA1/2 模型上看到，二选一——换 GDN/linear-attention 混合模型，或上游加 NPU SSU 后端（非配置项） |
@@ -418,7 +418,7 @@ PY
 ## 8. GDN 路径：30 层线性注意力的 state 必须是有限值
 
 GDN 层的 state 在 `QwenGatedDeltaNetAttention.kv_cache`（`[conv_state, ssm_state]`，
-见 `runtime/vllm-api/vllm__model_executor__layers__mamba__gdn__qwen_gdn_linear_attn.py:1308-1316`）。
+见 `reference/vllm-0.23/vllm__model_executor__layers__mamba__gdn__qwen_gdn_linear_attn.py:1308-1316`）。
 必须在**同一个进程**里包一层断言——所以用离线 `LLM` 跑，而不是给 `vllm serve` 外挂探针。
 
 ```bash
@@ -691,7 +691,7 @@ PY
 | 步骤 | 完成判据 | 今天能过吗 |
 |---|---|---|
 | 1–3 | 命令输出与期望一致 | ✅ 能 |
-| 4 | `runtime/vllm-api/` 里有 runner 且 4 个 `def` 命中 | ✅ 已满足（334,736 B；`5599`/`6168`/`6525`/`7284`） |
+| 4 | `reference/vllm-0.23/` 里有 runner 且 4 个 `def` 命中 | ✅ 已满足（334,736 B；`5599`/`6168`/`6525`/`7284`） |
 | 5 | `TileInferPlatform` + `block_size=2048` + `worker_cls` 正确 | ✅ 能 |
 | 6 | 权重加载 + KV 池 + `npu-smi` 占用 + 10/30 混合 spec | 🔶 工件就位（runner 在库、四个 hook 已实现），**未上机验证** |
 | 7 | top-5 logprobs 与冻结基线 4 位小数一致 | 🔶 未上机验证（依赖 6） |
@@ -701,6 +701,6 @@ PY
 | 11 | TTFT/TPOT 与现网比值落盘 | 🔶 未上机验证（依赖 7–10） |
 
 > 🔶 不是「环境坏了」，也不再是「缺文件 / 骨架」：6–11 的阻塞是这些硬件路径**尚未在真机上跑过**
-> （v0 的施工顺序见 `docs/plan-vllm-native-backend.md` §9；`docs/status-native-backend.md` 的 worker
+> （v0 的施工顺序见 `docs/plan-vllm-native-backend.md` §9；`docs/notes/handover-2026-10-28.md` 的 worker
 > 行仍写着「骨架」，是更早的状态，以本清单与 `tileinfer/vllm/worker.py` 为准）。
 > 每完成一格，把实际输出追加到 `/tmp/bringup.log`，并把本节表格的状态改成 ✅。

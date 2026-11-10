@@ -30,7 +30,7 @@ not to attention or to our kernel in particular.
 
 ## Minimal reproducer
 
-[`benchmarks/probes/pto_cv_handoff.py`](../../benchmarks/probes/pto_cv_handoff.py) — 25 lines of
+[`benchmarks/probes/pto_cv_handoff.py`](../benchmarks/probes/pto_cv_handoff.py) — 25 lines of
 kernel body, `target="pto"`, the standard auto-sync pass configs:
 
 ```python

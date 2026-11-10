@@ -18,7 +18,7 @@ sharpens E36's "pre-NZ direct load is not expressible" into a concrete, reproduc
 
 Usage::
 
-    source .agent_loop/run/env.sh
+    source bench_out/env.sh
     python benchmarks/probes/moe_prenz_device.py
 """
 

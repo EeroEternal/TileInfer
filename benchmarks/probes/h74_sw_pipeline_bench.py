@@ -20,7 +20,7 @@ D) 与 H42-③ 手写版对照:若编译器版也不赚,说明"页循环流水"�
 
 运行
 ----
-    source .agent_loop/run/env.sh
+    source bench_out/env.sh
     python benchmarks/probes/h74_sw_pipeline_bench.py
 
 输出行格式:

@@ -16,7 +16,7 @@ file checks it:
    and both directions of the block/rows agreement) instead of requiring one;
 5. the MISSING block and the MISSING rows agree with each other.
 
-The ledger's line numbers point at ``runtime/vllm-api/`` (gitignored), so nothing here reads the
+The ledger's line numbers point at ``reference/vllm-0.23/`` (gitignored), so nothing here reads the
 sources: only the note's own structure is pinned.  Adding a row is expected; adding a *class* or a
 MISSING name without the corresponding code change is the thing that fails.
 """

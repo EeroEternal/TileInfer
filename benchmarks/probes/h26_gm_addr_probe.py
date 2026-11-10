@@ -8,7 +8,7 @@ H26 生产内核需要把 align 直载的 GM 实参指到 ``W13nz[eid*2*NT + h*N
 3. 动态 strip + 动态 K 偏移:``access_ptr(W[e_idx, 0, k0*BN])``,k0 循环变量。
 
 用法::
-    source .agent_loop/run/env.sh
+    source bench_out/env.sh
     python benchmarks/probes/h26_gm_addr_probe.py
 """
 

@@ -12,7 +12,7 @@ numerics without ever raising.
 
 Where the semantics come from (not guessed)
 -------------------------------------------
-`runtime/vllm-api/fla_l2norm.py`, `l2norm_fwd_kernel1`:
+`reference/vllm-0.23/fla_l2norm.py`, `l2norm_fwd_kernel1`:
 
 ```
 b_var  = tl.sum(b_x * b_x, axis=0)

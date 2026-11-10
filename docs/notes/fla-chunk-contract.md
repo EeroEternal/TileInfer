@@ -6,8 +6,8 @@
 
 阅读约定：
 
-* `chunk.py` = `runtime/vllm-api/vllm__model_executor__layers__fla__ops__chunk.py`（**真·vLLM 0.23**）
-* `fla_solve_tril.py` / `fla_cumsum.py` / `fla_l2norm.py` = `runtime/vllm-api/fla_*.py`（**真·vLLM 0.23**）
+* `chunk.py` = `reference/vllm-0.23/vllm__model_executor__layers__fla__ops__chunk.py`（**真·vLLM 0.23**）
+* `fla_solve_tril.py` / `fla_cumsum.py` / `fla_l2norm.py` = `reference/vllm-0.23/fla_*.py`（**真·vLLM 0.23**）
 * `SG-<name>.py` = `E:\project\python_test\.venv\Lib\site-packages\sglang\srt\layers\attention\fla\<name>.py`
   （sglang 0.5.10 vendored 的同一份上游 FLA 代码，**不是** vLLM 0.23，见下节）
 * `tileinfer` = 本仓库已移植的 torch 版本，是本契约的既有对端
@@ -730,7 +730,7 @@ o_i = scale · Σ_{j≤i} (q_i·k_j) · exp(g_i - g_j) · v_j
 ## 7. 本轮无法从源头确定的事项（明确列出，不要猜）
 
 1. **四个待移植文件的 vLLM 0.23 原文没拿到**（§0）。所有 kernel 体内数学来自 SG-* 姊妹版本，
-   行号指向的是 `E:\project\python_test\.venv\Lib\site-packages\sglang\...` 而非 `runtime/vllm-api/`。
+   行号指向的是 `E:\project\python_test\.venv\Lib\site-packages\sglang\...` 而非 `reference/vllm-0.23/`。
 2. **`FLA_CHUNK_SIZE` 的字面定义**在 `vllm/.../fla/ops/utils.py`，未下载。值 64 已由
    `qwen_gdn_linear_attn.py:1085-1087` 与 SG 三处默认值交叉钉死，但“定义在哪一行”未知。
 3. **`SUPPRESS_LEVEL` 默认值**（`chunk.py:19,83`）。只影响 `chunk_gated_delta_rule_fwd`
@@ -757,6 +757,6 @@ o_i = scale · Σ_{j≤i} (q_i·k_j) · exp(g_i - g_j) · v_j
 > `python .work/fetch_vllm_api.py` 风格的脚本，把
 > `chunk_delta_h / chunk_o / chunk_scaled_dot_kkt / wy_fast` 四个 `.py` 从
 > `raw.githubusercontent.com/vllm-project/vllm/v0.23.0/vllm/model_executor/layers/fla/ops/`
-> 落到 `runtime/vllm-api/fla_<name>.py`，然后逐条替换本文第 2/3/5 节的
+> 落到 `reference/vllm-0.23/fla_<name>.py`，然后逐条替换本文第 2/3/5 节的
 > `SG-*` 行号为 `fla_<name>.py` 的行号。**`chunk.py` 那一级的结论（§1、§4、§2 的签名与 dtype）
 > 不依赖这些文件，已经可以直接开工。**

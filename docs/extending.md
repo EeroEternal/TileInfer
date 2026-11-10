@@ -1,6 +1,6 @@
 # 扩展指南：加一个模型、一个算子族，或一个更快的实现
 
-> **读者**：读完 [`status-native-backend.md`](status-native-backend.md) 之后，要往这个后端里**加东西**的人。
+> **读者**：读完 [`notes/handover-2026-10-28.md`](notes/handover-2026-10-28.md) 之后，要往这个后端里**加东西**的人。
 > 不是来修 bug 的，是来加一个模型 / 一族算子 / 一个 TileLang 内核的。
 > **用途**：三个扩展点的**文件位置、最小骨架、注册表、证明它的测试**，以及**哪些代码不能动、违约后是什么症状**。
 > **前提**：本文的「不能改」是契约，不是风格建议。核心流水线只有一条，扩展点只有三处；
@@ -8,7 +8,7 @@
 > **交叉阅读**：[`hardware-checklist.md`](hardware-checklist.md)（上机 11 步，设备实测的记录方式）、
 > [`plan-vllm-native-backend.md`](plan-vllm-native-backend.md)（v0 范围与取舍）、
 > [`notes/fla-chunk-contract.md`](notes/fla-chunk-contract.md)（GDN chunk 链的张量/dtype 契约）。
-> **约定**：`file:line` 默认指本仓库；`runtime/vllm-api/...` 的行号指本地转录的 vLLM 0.23 源码。
+> **约定**：`file:line` 默认指本仓库；`reference/vllm-0.23/...` 的行号指本地转录的 vLLM 0.23 源码。
 
 ---
 
@@ -288,7 +288,7 @@ def bind() -> List[Any]:
             impl=gdn.my_op,
             why="调用点 + 上游是 Triton/CUDA kernel，Ascend 上没有 fallback",
             remove_when="上游出现 NPU/torch 分支时",
-            upstream_ref="runtime/vllm-api/...py:123-145",
+            upstream_ref="reference/vllm-0.23/...py:123-145",
         ),
         # 只报告、不接管（ABI 不是 drop-in）——让「缺席」出现在日志和 doctor 里：
         OpBinding(
@@ -299,7 +299,7 @@ def bind() -> List[Any]:
             abi_note="declined - not a drop-in: 上游多 chunk_indices/head_first 两个参数",
             why="Reported, not patched: see abi_note.",
             remove_when="本仓库端口补齐该 ABI 时",
-            upstream_ref="runtime/vllm-api/...py:243-252",
+            upstream_ref="reference/vllm-0.23/...py:243-252",
         ),
     ]
 ```
@@ -359,7 +359,7 @@ README 级别的判据：**`python -m pytest tests/test_ops_install.py -q` 必�
 * **dtype 契约照抄上游，不要「优化成 fp32」。** `A_inv` 是 `k.dtype`、`wy_fast` 两个 dot 前先降回 bf16、
   `h` 每个 chunk 边界落盘截断一次——这三处是**契约**：全程 fp32 更准但不逐位一致。
   另一个具体例子：`fused_post_conv_prep` 上游把 `g`/`beta` 装进 **fp32** 容器
-  （`runtime/vllm-api/...fused_gdn_prefill_post_conv.py:202-203`），本仓库端口把 `beta` 落回 `b.dtype`
+  （`reference/vllm-0.23/...fused_gdn_prefill_post_conv.py:202-203`），本仓库端口把 `beta` 落回 `b.dtype`
   （bf16）——这是**已知差异**，GDN prefill 数值不对时第一个查它，不要顺手「修」回去。
 * **`upstream_ref` 要写行号。** 「函数签名」的最终依据是调用点实参（例如 `fla/ops/chunk.py:41-86`），
   不是 sglang 的 vendored 副本；B 级数学的地方要标注来源（见 `notes/fla-chunk-contract.md`）。
@@ -581,6 +581,6 @@ def _with_candidates(binding):
    「哪些候选存在、哪些被关、为什么被关」；本机（无 vLLM）预期是 SKIP 但**仍带**
    `| candidates: fused_experts[moe_reference_oracle=disabled: off by default]`。
    exit code 只由 hard check 决定：本机无 `torch_npu` / `tilelang`，仍然 **exit 1**。
-5. **补台账**：`docs/status-native-backend.md` §2 的模块清单要加新文件（否则下一个读者会以为它不存在），
+5. **补台账**：`docs/notes/handover-2026-10-28.md` §2 的模块清单要加新文件（否则下一个读者会以为它不存在），
    §0 一句话状态要能看出这次扩展；拒绝/取舍写进 profile 的 `unsupported_features` 和
    `docs/plan-vllm-native-backend.md`，不要只活在 commit message 里。

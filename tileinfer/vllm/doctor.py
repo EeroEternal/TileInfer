@@ -29,7 +29,7 @@ check                              step  what it proves
                                          each op's candidate gate status (only an *unexpected*
                                          miss fails: ``chunk_local_cumsum`` is declined on
                                          purpose, ``abi_ok=False``)
-``runner_source``                   4    ``runtime/vllm-api/...gpu_model_runner.py`` with the four
+``runner_source``                   4    ``reference/vllm-0.23/...gpu_model_runner.py`` with the four
                                          hooks the worker needs
 ``graphs.capture_path_ready``       5    the graph verdict (soft: not-ready is the documented
                                          ``enforce_eager=True`` fallback, i.e. correct-but-slow)
@@ -107,7 +107,7 @@ STEP_TITLES: Dict[int, str] = {
     1: "environment: CANN, torch/torch_npu, the device, the TileLang cache",
     2: "packages and the general plugin: vLLM version, plugin.status(), the operator wiring",
     3: "the CPU suite (not run from doctor: `python -m pytest tests -q`)",
-    4: "the local model-runner subset (runtime/vllm-api/...gpu_model_runner.py)",
+    4: "the local model-runner subset (reference/vllm-0.23/...gpu_model_runner.py)",
     5: "platform selection and the graph verdict (capture_path_ready)",
 }
 
@@ -553,7 +553,7 @@ _RUNNER_FUNCS: Tuple[str, ...] = (
 
 
 def _check_runner_source() -> Tuple[str, str, str]:
-    api_dir = _repo_root() / "runtime" / "vllm-api"
+    api_dir = _repo_root() / "reference" / "vllm-0.23"
     if not api_dir.is_dir():
         return _skip(
             f"skipped: {api_dir} is not present (this is not a source checkout)",
@@ -562,7 +562,7 @@ def _check_runner_source() -> Tuple[str, str, str]:
     path = api_dir / "vllm__v1__worker__gpu_model_runner.py"
     if not path.is_file():
         return _fail(
-            f"{path.name} is missing from runtime/vllm-api/",
+            f"{path.name} is missing from reference/vllm-0.23/",
             "copy it from the installed vLLM wheel (step 4.1 needs no network) - "
             "docs/hardware-checklist.md step 4",
         )

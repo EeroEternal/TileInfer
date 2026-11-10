@@ -92,7 +92,7 @@ class TileLangAscend950Backend(AttentionBackend):
         ``sum_b ceil(qo_len_b * group / block_q)``, which changes with every prompt length; a plan
         is compiled once and cached, so it cannot express that.  The prefill path therefore
         rebuilds its schedule per step (host-only) and quantizes the kernel variant on the tile
-        and batch axes instead — see ``docs/plan-performance.md`` §17 and ``prefill.py``.
+        and batch axes instead — see ``docs/performance.md`` §17 and ``prefill.py``.
 
         Declaring the mode is only a capability declaration: nothing compiles on it.
         """

@@ -1,6 +1,6 @@
 # vLLM 0.23 attention contract, transcribed from the local source
 
-Source of truth: `runtime/vllm-api/` (one file per upstream path, `__` as the separator), fetched
+Source of truth: `reference/vllm-0.23/` (one file per upstream path, `__` as the separator), fetched
 from `vllm-project/vllm@v0.23.0`; see `docs/notes/vllm-api-0.23.md` for provenance. **Every line
 number below is a line in one of those local files.** Anything marked `[inferred] ` was *not*
 established by a local file and must be re-checked on the device before it is relied on.
@@ -25,7 +25,7 @@ The port plan's W4 table (`docs/plan-vllm-native-backend.md:132`) lists `accept_
 part of `TileInferAttentionBackend`. **It does not exist in the local 0.23 source.**
 
 ```text
-$ grep -n accept_output_buffer runtime/vllm-api/*   ->  no matches
+$ grep -n accept_output_buffer reference/vllm-0.23/*   ->  no matches
 ```
 
 The complete `AttentionBackend` surface is §1 below; the word appears nowhere in it. A small

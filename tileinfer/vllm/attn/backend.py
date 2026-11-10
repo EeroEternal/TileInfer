@@ -28,7 +28,7 @@ What it deliberately does *not* do
 ----------------------------------
 ``accept_output_buffer`` is part of the port plan (``docs/plan-vllm-native-backend.md`` §W4) but
 **does not exist in the local vLLM 0.23 source**: ``grep -n accept_output_buffer`` over
-``runtime/vllm-api/`` finds no match, and the ``AttentionBackend`` ABC
+``reference/vllm-0.23/`` finds no match, and the ``AttentionBackend`` ABC
 (``v1/attention/backend.py:55-349``) has no such name.  A minimal forward-compatible hook is kept
 below because the impl *does* accept an ``output`` buffer (``v1/attention/backend.py:797-809``);
 it is documented as not being part of the 0.23 contract rather than being presented as one.
@@ -430,7 +430,7 @@ class TileInferAttentionBackend(AttentionBackend):
     def accept_output_buffer(cls) -> bool:
         """The impl writes into the caller's ``output`` when one is supplied.
 
-        **Not part of the local vLLM 0.23 API.**  ``grep`` over ``runtime/vllm-api/`` finds no
+        **Not part of the local vLLM 0.23 API.**  ``grep`` over ``reference/vllm-0.23/`` finds no
         ``accept_output_buffer``, and the ``AttentionBackend`` ABC (`v1/attention/backend.py:
         55-349`) never names it.  It is kept because the port plan lists it
         (``docs/plan-vllm-native-backend.md:132``) and because the answer is unconditionally

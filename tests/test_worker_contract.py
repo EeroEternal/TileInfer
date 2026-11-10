@@ -60,7 +60,7 @@ import fake_vllm
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 WORKER_SOURCE = ROOT / "tileinfer" / "vllm" / "worker.py"
 PLATFORM_SOURCE = ROOT / "tileinfer" / "vllm" / "platform.py"
-GPU_WORKER_SOURCE = ROOT / "runtime" / "vllm-api" / "vllm__v1__worker__gpu_worker.py"
+GPU_WORKER_SOURCE = ROOT / "reference" / "vllm-0.23" / "vllm__v1__worker__gpu_worker.py"
 
 #: The four hooks the engine relies on, in call order (``worker.py:HOOKS``).
 HOOKS = (
@@ -91,6 +91,17 @@ def _install_fake_vllm() -> str:
 
 
 VLLM_MODE = _install_fake_vllm()
+#: Same reason as tests/test_boot_rehearsal.py: this file reads the recorder names
+#: (``kv_transfer_calls``, ``request_memory_calls``) that only exist when the shared fake in
+#: ``tests/fake_vllm.py`` actually injected itself.  With a real vLLM importable, install() returns
+#: "real" and injects nothing, which would turn into a collection error.  Skip instead.
+if VLLM_MODE == "real":
+    pytest.skip(
+        "contract test pins vLLM 0.23's API shape with tests/fake_vllm.py; a real vLLM is "
+        "installed so the fake supplies nothing. Run it in a venv without vLLM (the CPU CI venv).",
+        allow_module_level=True,
+    )
+
 
 # Imported *after* the fake is in sys.modules (these modules raise their "not importable without
 # vLLM" error otherwise - which is exactly what the guarded import exists for).
@@ -322,7 +333,7 @@ def test_hooks_are_overridden_on_the_worker_itself():
 
 @pytest.mark.parametrize("hook", HOOKS)
 def test_hook_signature_matches_the_local_vllm_source(hook):
-    """Parameter names come from ``runtime/vllm-api/...gpu_worker.py`` - a rename fails here."""
+    """Parameter names come from ``reference/vllm-0.23/...gpu_worker.py`` - a rename fails here."""
     expected = _source_method_params(GPU_WORKER_SOURCE, "Worker", hook)
     actual = list(inspect.signature(getattr(worker_mod.NPUWorker, hook)).parameters)
     assert actual == expected, (

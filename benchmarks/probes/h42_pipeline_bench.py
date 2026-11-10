@@ -11,7 +11,7 @@ K/V 拷贝提前到 p 页计算前发起(写入备用 L1 对),数学逐位等价
   C) 短形状零税:128/512 ctx b8,判据 |Δ| ≤5%(E61 短 ctx 税纪律,内核级);
   D) 有效带宽对照:E118 950 paged KV 2006 GB/s 公开上界。
 
-运行(设备窗内,source .agent_loop/run/env.sh 后):
+运行(设备窗内,source bench_out/env.sh 后):
   python benchmarks/probes/h42_pipeline_bench.py
 输出行格式:[H42PP] <label> plain=<ms> pipe=<ms> speedup=<x> err=<e> bw=<gbps> GB/s
 最后一行:[H42PP] BENCH DONE (门槛判定由分析方做,本脚本只产出数字)

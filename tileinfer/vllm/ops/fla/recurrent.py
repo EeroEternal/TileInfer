@@ -1,7 +1,7 @@
 """Torch port of FLA's fused recurrent gated-delta-rule operators (GDN sequence + packed decode).
 
 Upstream: ``vllm/model_executor/layers/fla/ops/fused_recurrent.py`` at tag ``v0.23.0``, copied
-verbatim into ``runtime/vllm-api/fla_fused_recurrent.py`` (619 lines; every line number below
+verbatim into ``reference/vllm-0.23/fla_fused_recurrent.py`` (619 lines; every line number below
 refers to that local copy).  Upstream is pure Triton -- one kernel plus a launcher per entry point,
 with no torch branch -- so a backend without Triton has no way to run either operator.  This module
 reproduces both launchers' signatures verbatim and both kernels' arithmetic and state semantics in
@@ -482,7 +482,7 @@ def fused_recurrent_gated_delta_rule(
     # The GQA head map does not depend on the token, so gather once for the whole batch instead of
     # twice per token per layer.  On the device this removes ~60 small-kernel launches per token
     # (30 GDN layers x 2 gathers) - and small-kernel launch latency, not bandwidth, is what the
-    # phase table blames for GDN's 0.7 ms/layer (docs/plan-performance.md §12).
+    # phase table blames for GDN's 0.7 ms/layer (docs/performance.md §12).
     q_g = q_flat.index_select(1, hv_to_h)
     k_g = k_flat.index_select(1, hv_to_h)
 

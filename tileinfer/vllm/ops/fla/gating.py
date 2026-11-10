@@ -2,7 +2,7 @@
 update).
 
 Upstream: ``vllm/model_executor/layers/fla/ops/fused_sigmoid_gating.py`` at tag ``v0.23.0``, copied
-verbatim into ``runtime/vllm-api/fla_fused_sigmoid_gating.py`` (279 lines; every line number below
+verbatim into ``reference/vllm-0.23/fla_fused_sigmoid_gating.py`` (279 lines; every line number below
 refers to that local copy).  Upstream is one Triton kernel
 (``fused_sigmoid_gating_delta_rule_update_kernel``) plus a launcher; there is no torch branch, so a
 backend without Triton has no way to run GDN decode attention.  This module reproduces the
@@ -78,7 +78,7 @@ Verified against the source
 V1 signature and defaults — lines 181-199 (copied verbatim below in the function).
 V2 gate formula and evaluation order — lines 129-136, plus the identical standalone
    ``fused_gdn_gating_kernel`` in the caller
-   (``runtime/vllm-api/vllm__model_executor__layers__mamba__gdn__qwen_gdn_linear_attn.py``, lines
+   (``reference/vllm-0.23/vllm__model_executor__layers__mamba__gdn__qwen_gdn_linear_attn.py``, lines
    1781-1789), whose docstring states
    ``g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)`` (line 1805).
 V3 decay-before-delta and output-from-updated-state — lines 143-154.

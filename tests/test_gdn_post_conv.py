@@ -6,7 +6,7 @@ What is under test
 ``qwen_gdn_linear_attn.py:1428`` (prefill) / ``:1113`` (profiling warmup) to turn the packed
 causal-conv output into ``(q, k, v, g, beta)`` for the chunk chain.
 
-The upstream body is ``runtime/vllm-api/vllm__model_executor__layers__fla__ops__\\
+The upstream body is ``reference/vllm-0.23/vllm__model_executor__layers__fla__ops__\\
 fused_gdn_prefill_post_conv.py`` - one Triton kernel (:19-149) plus a launcher (:152-248) that
 allocates ``q``/``k``/``v`` in ``conv_output.dtype`` and **both** gate outputs in ``torch.float32``
 (:199-203).  The oracles below are still written *independently* of that body (a per-token fp64

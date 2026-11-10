@@ -24,7 +24,7 @@ it.
 
 ## Sources read (not memory)
 
-Every line number below refers to the tag-`v0.23.0` file of that name in `runtime/vllm-api/`
+Every line number below refers to the tag-`v0.23.0` file of that name in `reference/vllm-0.23/`
 (`__`-separated filename convention). Files fetched for this note are listed in the
 [source map](#source-map); the ones that were already present are unchanged.
 
@@ -267,7 +267,7 @@ combined output itself because `output_is_reduced()` is `False`.
 0.23 sources and pinned by CPU tests; the following are *not* proven here:
 
 * that the engine's loader really instantiates the quant method at the point `layer.py:359` shows
-  (the code is local, but `gpu_model_runner.py` is not in `runtime/vllm-api/`, so the call chain
+  (the code is local, but `gpu_model_runner.py` is not in `reference/vllm-0.23/`, so the call chain
   `prepare_communication_buffer_for_model` → `layer.py:451-457` is taken from the ledger's earlier
   reading, not re-read);
 * that nothing *else* in the unvendored engine touches `quant_method.moe_kernel` expecting a real
@@ -289,7 +289,7 @@ not adapted, when upstream catches up.
 ## Corrections to existing records
 
 1. **`silu_and_mul` is verified, and the `dense` family is not needed for correctness.**
-   `gdn_moe.py:433-449` carries `[unverified] - no activation module in runtime/vllm-api`. The
+   `gdn_moe.py:433-449` carries `[unverified] - no activation module in reference/vllm-0.23`. The
    module is there now: `SiluAndMul` is called at `qwen2_moe.py:111/116` (shared expert and the
    dense MLP branch), and `activation.py:130-141` shows it has a pure-torch `forward_native` plus a
    `_C` op that is **only** installed on cuda-alike/xpu. So the operator is a *fallback* on Ascend,
@@ -342,7 +342,7 @@ the first step just as loudly:
 
 ## Source map
 
-Fetched for this note into `runtime/vllm-api/` (0.23.0 tag, `__` convention):
+Fetched for this note into `reference/vllm-0.23/` (0.23.0 tag, `__` convention):
 
 ```
 vllm/model_executor/models/qwen3_next.py        vllm/model_executor/models/qwen2_moe.py

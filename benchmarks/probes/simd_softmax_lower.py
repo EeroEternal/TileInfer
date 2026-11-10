@@ -6,7 +6,7 @@ The Ascend950 attention kernels write their online softmax with ``T.SimtVF`` + `
 ``kernels/attention/paged_decode_ascend950.py``).  That keeps vector time on the critical path:
 the SIMT reducer lowers to per-thread scalar loops, whereas the upstream FlashAttention path uses
 the packed ``T.simd.*`` micro-API (``vexp``/``vmax``/``vcgmax`` ...), which lowers to CCE vector
-intrinsics and is the documented ~2x item still on the table (next-tasks.md T5).
+intrinsics and is the documented ~2x item still on the table (plan-vllm-native-backend.md T5).
 
 This probe lowers the *current* SIMT softmax pattern and a candidate **SIMD** softmax pattern
 offline and prints the generated CCE instruction mix.  It needs no device: the verdict ("the
@@ -27,7 +27,7 @@ probe only fixes the *shape* of the rewrite.
 
 Usage::
 
-    source .agent_loop/run/env.sh
+    source bench_out/env.sh
     python benchmarks/probes/simd_softmax_lower.py
 """
 

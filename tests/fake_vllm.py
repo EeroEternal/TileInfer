@@ -130,7 +130,7 @@ def ensure_chain(name: str) -> types.ModuleType:
 
 # ---------------------------------------------------------------------------------------
 # The attention API the three tileinfer.vllm.attn modules import
-# (runtime/vllm-api/vllm__v1__attention__backend.py / ...__registry.py)
+# (reference/vllm-0.23/vllm__v1__attention__backend.py / ...__registry.py)
 # ---------------------------------------------------------------------------------------
 
 
@@ -332,7 +332,7 @@ def _install_attention() -> None:
 
 # ---------------------------------------------------------------------------------------
 # The worker API ``tileinfer.vllm.worker`` imports
-# (runtime/vllm-api/vllm__v1__worker__gpu_worker.py / ...__gpu_model_runner.py)
+# (reference/vllm-0.23/vllm__v1__worker__gpu_worker.py / ...__gpu_model_runner.py)
 # ---------------------------------------------------------------------------------------
 
 
@@ -340,7 +340,7 @@ class Worker:
     """``gpu_worker.py:117-1159``, reduced to "a class exists to subclass".
 
     The four hook bodies are *not* copied here: the signature test compares against the real file
-    under ``runtime/vllm-api/`` (parsed with ``ast``), which is stronger than a hand copy.
+    under ``reference/vllm-0.23/`` (parsed with ``ast``), which is stronger than a hand copy.
     """
 
 

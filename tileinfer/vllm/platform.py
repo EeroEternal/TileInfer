@@ -47,7 +47,7 @@ both kinds (``gpu_model_runner.py:7284-7321``).  The platform contributes exactl
 all in this module: the capability bit :meth:`TileInferPlatform.support_hybrid_kv_cache` (the ABC
 default ``False``, ``interface.py:945-950``, makes vLLM 0.23 turn the hybrid KV cache manager off
 and then reject an attention+mamba spec mix - v0.23.0 ``config/vllm.py:1453-1455`` ->
-``v1/core/kv_cache_utils.py:1421-1428``, both outside ``runtime/vllm-api/``), the engine page
+``v1/core/kv_cache_utils.py:1421-1428``, both outside ``reference/vllm-0.23/``), the engine page
 (:data:`HYBRID_BLOCK_SIZE`), and the mamba state page size (``mamba_block_size`` /
 ``mamba_page_size_padded``, :func:`_align_mamba_state_pages`).  No spec class is registered: both
 ``FullAttentionSpec`` and ``MambaSpec`` are vLLM's own, so
@@ -60,7 +60,7 @@ method's ``HARDWARE:`` paragraph and in ``tileinfer.vllm.worker.HARDWARE_CHECKLI
 Startup-path assumptions, now read out of the source
 ----------------------------------------------------
 Two things a platform can quietly get wrong are checked here against the vendored vLLM 0.23 files
-(``runtime/vllm-api/``), not against folklore.  The worker field was marked ``[unverified]`` in an
+(``reference/vllm-0.23/``), not against folklore.  The worker field was marked ``[unverified]`` in an
 earlier revision and the model-architecture path had no call-site check at all; both are settled
 now, and the code below implements what the source says.
 
@@ -230,7 +230,7 @@ DEVICE_TYPE = "npu"
 DEVICE_NAME = "npu"
 
 #: [unverified] torch_npu registers ``PrivateUse1`` as ``"npu"``; the *dispatch key* spelling is
-#: ``"NPU"``.  Nothing in ``runtime/vllm-api/`` reads ``dispatch_key``, so the value cannot be
+#: ``"NPU"``.  Nothing in ``reference/vllm-0.23/`` reads ``dispatch_key``, so the value cannot be
 #: settled from the local source - it is recorded here (and in ``UNVERIFIED_NOTES``) rather than
 #: guessed silently.  If the device pass shows a torch warning about an unknown dispatch key,
 #: this is the line to fix.
@@ -251,7 +251,7 @@ ATTN_BACKEND_CLASS_PATH = "tileinfer.vllm.attn.backend.TileInferAttentionBackend
 #: The worker class vLLM must instantiate.  ``worker.py`` implements all four hooks
 #: (hardware-unverified); the path is what ``check_and_update_config`` writes into
 #: ``ParallelConfig.worker_cls``.  That field is real, not an assumption:
-#: ``runtime/vllm-api/vllm__config__parallel.py:248`` declares ``worker_cls: str = "auto"``, and its
+#: ``reference/vllm-0.23/vllm__config__parallel.py:248`` declares ``worker_cls: str = "auto"``, and its
 #: only consumer resolves the string when the worker wrapper is initialised
 #: (``vllm__v1__worker__worker_base.py:249-253``, ``resolve_obj_by_qualname``); a non-string value
 #: is refused there outright (``:254-259``).  The in-tree platforms select their own class in
@@ -298,7 +298,7 @@ SUPPORTED_DTYPES = (torch.bfloat16, torch.float16)
 NO_QUANT_SPELLINGS = ("", "none")
 
 #: ``AttentionSelectorConfig``'s boolean switches, read out of the real source
-#: (``runtime/vllm-api/vllm__v1__attention__selector.py:21-34``):
+#: (``reference/vllm-0.23/vllm__v1__attention__selector.py:21-34``):
 #:
 #:     head_size, dtype, kv_cache_dtype, block_size,          # :22-25  (the layer's geometry)
 #:     use_mla=False, has_sink=False, use_sparse=False,       # :26-28
@@ -332,7 +332,7 @@ NO_QUANT_SPELLINGS = ("", "none")
 #: Both tuples are *reject when True*: the policy is one rule for every field (see
 #: :func:`_selector_switches`).  Verified against vLLM 0.23's ``selector.py`` and cross-checked
 #: against the ABC's own transcription of the same fields, ``AttentionBackend.validate_configuration``
-#: (``runtime/vllm-api/vllm__v1__attention__backend.py:275-341``), whose parameter list is exactly
+#: (``reference/vllm-0.23/vllm__v1__attention__backend.py:275-341``), whose parameter list is exactly
 #: these eight booleans plus ``head_size``/``dtype``/``kv_cache_dtype``/``block_size``/
 #: ``device_capability``/``attn_type`` - so no field of the real config is unhandled.
 #: The tuples and the reason table are **derived from the boot profile's reject list**; the profile
@@ -400,14 +400,14 @@ UNVERIFIED_NOTES: Dict[str, str] = {
     ),
     "selector_fields": (
         "settled - AttentionSelectorConfig's 13 fields are transcribed from "
-        "runtime/vllm-api/vllm__v1__attention__selector.py:21-34 into SELECTOR_REJECT_SWITCHES / "
+        "reference/vllm-0.23/vllm__v1__attention__selector.py:21-34 into SELECTOR_REJECT_SWITCHES / "
         "SELECTOR_PLAIN_SWITCHES / SELECTOR_ATTN_TYPE. The old use_compress name was not a vLLM "
         "0.23 field (it came from this repo's earlier vLLM-Ascend shim); there is no field of the "
         "real config that this policy ignores."
     ),
     "worker_cls_attr": (
         "settled - ParallelConfig.worker_cls is a real vLLM 0.23 field with the sentinel default "
-        "'auto' (runtime/vllm-api/vllm__config__parallel.py:248-250), resolved by "
+        "'auto' (reference/vllm-0.23/vllm__config__parallel.py:248-250), resolved by "
         "WorkerWrapperBase.init_worker with resolve_obj_by_qualname "
         "(vllm__v1__worker__worker_base.py:249-253) after VllmConfig.__post_init__ has already "
         "called check_and_update_config (vllm__config__vllm.py:1335). The in-tree platforms write "
@@ -447,7 +447,7 @@ REASONS: Tuple[str, ...] = (
 )
 
 #: How many public members (78 methods - 3 private = 75; two of the 75 are properties) the ABC in
-#: ``runtime/vllm-api/vllm__platforms__interface.py`` declares.  Derived by AST over that file;
+#: ``reference/vllm-0.23/vllm__platforms__interface.py`` declares.  Derived by AST over that file;
 #: ``tests/test_platform_contract.py`` re-derives it and fails if the local source no longer
 #: matches, i.e. if the runtime subset is refreshed to a vLLM whose ABC has more methods.
 DOCUMENTED_ABC_SURFACE = 75
@@ -978,7 +978,7 @@ class TileInferPlatform(Platform):
             raise ValueError(
                 "TileInfer's attention backend serves plain, causal, decoder MHA/GQA only; this "
                 f"layer's AttentionSelectorConfig asks for: {reasons}. Those are the real vLLM "
-                "0.23 selector fields (runtime/vllm-api/vllm__v1__attention__selector.py:21-34) "
+                "0.23 selector fields (reference/vllm-0.23/vllm__v1__attention__selector.py:21-34) "
                 "and every one of them is a feature the TileInfer paged kernel does not implement "
                 "(docs/plan-vllm-native-backend.md §0). Silently falling back to a vLLM backend is "
                 "not possible here: the platform must name one class. Reject the request, or "
@@ -1024,7 +1024,7 @@ class TileInferPlatform(Platform):
           exactly one attention page (``interface.py:676-699``).
         * ``parallel_config.worker_cls`` - :data:`WORKER_CLASS_PATH`, but **only when the field is
           still the ``"auto"`` sentinel** that ``ParallelConfig`` defaults to
-          (``runtime/vllm-api/vllm__config__parallel.py:248``); that is what every in-tree platform
+          (``reference/vllm-0.23/vllm__config__parallel.py:248``); that is what every in-tree platform
           does (``vllm__platforms__cpu.py:153-154`` is the local copy).  An
           explicit, conflicting value is refused instead of overwritten (:func:`_select_worker_class`)
           because it would otherwise build vLLM's CUDA worker (``gpu_worker.py:285``) and fail on
@@ -1328,7 +1328,7 @@ def _require_field(obj: Any, owner: str, name: str, why: str) -> Any:
         raise RuntimeError(
             f"{owner} has no attribute {name!r}, so this check cannot be evaluated: {why}. "
             "Refusing to continue rather than assuming the feature is absent "
-            "(the local vLLM subset in runtime/vllm-api/ may predate this field - see "
+            "(the local vLLM subset in reference/vllm-0.23/ may predate this field - see "
             "UNVERIFIED_NOTES in tileinfer/vllm/platform.py)."
         )
     return getattr(obj, name)
@@ -1566,7 +1566,7 @@ _align_mamba_state_pages = align_mamba_state_pages
 def _select_worker_class(vllm_config: Any) -> str:
     """Select :data:`WORKER_CLASS_PATH` through ``parallel_config.worker_cls``, or refuse to start.
 
-    How the source settles it (``runtime/vllm-api/``):
+    How the source settles it (``reference/vllm-0.23/``):
 
     * the field exists and its default is the sentinel ``"auto"``
       (``vllm__config__parallel.py:248-250``);
@@ -1608,11 +1608,11 @@ def _select_worker_class(vllm_config: Any) -> str:
     if not hasattr(parallel_config, WORKER_CLS_ATTR):
         raise NotImplementedError(
             f"ParallelConfig has no attribute {WORKER_CLS_ATTR!r}. The field is real in vLLM 0.23 "
-            "(runtime/vllm-api/vllm__config__parallel.py:248: worker_cls: str = \"auto\"), so a "
+            "(reference/vllm-0.23/vllm__config__parallel.py:248: worker_cls: str = \"auto\"), so a "
             "config without it is not a vLLM 0.23 ParallelConfig - or the field was renamed in the "
             "installed release. Refusing to start: without it vLLM builds its CUDA worker and "
             "fails at device init on the NPU. Re-fetch vllm/config/parallel.py into "
-            "runtime/vllm-api/ and update WORKER_CLS_ATTR in tileinfer/vllm/platform.py."
+            "reference/vllm-0.23/ and update WORKER_CLS_ATTR in tileinfer/vllm/platform.py."
         )
     current = getattr(parallel_config, WORKER_CLS_ATTR)
     if current is None or current == "" or current == WORKER_CLS_AUTO:
@@ -1624,10 +1624,10 @@ def _select_worker_class(vllm_config: Any) -> str:
     raise ValueError(
         f"parallel_config.worker_cls={current!r} conflicts with the TileInfer Ascend platform, "
         f"which can only run {WORKER_CLASS_PATH}. vLLM resolves this string into the worker class "
-        "(runtime/vllm-api/vllm__v1__worker__worker_base.py:249-253), and the class it names here "
+        "(reference/vllm-0.23/vllm__v1__worker__worker_base.py:249-253), and the class it names here "
         "would be built on a device that is not an NPU (gpu_worker.py:285 hard-codes cuda:<rank>). "
         "Drop --worker-cls (the default is the 'auto' sentinel, "
-        "runtime/vllm-api/vllm__config__parallel.py:248) or pass "
+        "reference/vllm-0.23/vllm__config__parallel.py:248) or pass "
         f"--worker-cls {WORKER_CLASS_PATH} explicitly."
     )
 
@@ -1788,7 +1788,7 @@ def _selector_switches(
 ) -> Dict[str, bool]:
     """Read every boolean switch of a real ``AttentionSelectorConfig``; refuse to classify an unknown.
 
-    The field names are vLLM 0.23's (``runtime/vllm-api/vllm__v1__attention__selector.py:21-34``),
+    The field names are vLLM 0.23's (``reference/vllm-0.23/vllm__v1__attention__selector.py:21-34``),
     and the policy is one rule for all of them: **a switch that is True means the layer asks for an
     attention feature this platform does not implement**, so it is rejected.  The two tuples differ
     only in what a *missing* name means (the profile's ``selector`` fields identify a real selector;
@@ -1828,7 +1828,7 @@ def _selector_switches(
             f"{list(reject_names)}, so the feature policy cannot be evaluated and the "
             "TileInfer platform refuses to claim the attention backend slot for "
             f"{type(attn_selector_config).__name__}. Those are the real vLLM 0.23 field names "
-            "(runtime/vllm-api/vllm__v1__attention__selector.py:21-34); an object without them is "
+            "(reference/vllm-0.23/vllm__v1__attention__selector.py:21-34); an object without them is "
             "not an AttentionSelectorConfig, and classifying it as 'plain' would be a guess. Check "
             "SELECTOR_REJECT_SWITCHES (derived from the model profile's unsupported_features) in "
             "tileinfer/vllm/platform.py against the selector.py of the vLLM actually installed."
@@ -1870,7 +1870,7 @@ def _is_decoder_attention(attn_selector_config: Any) -> bool:
 def _reject_foreign_backend_selection(selected_backend: Any) -> None:
     """Allow ``None`` (auto) and TileInfer's own registration; reject a pinned foreign backend.
 
-    What the real source settles (``runtime/vllm-api/vllm__v1__attention__backends__registry.py``):
+    What the real source settles (``reference/vllm-0.23/vllm__v1__attention__backends__registry.py``):
 
     * the selector passes ``backend=vllm_config.attention_config.backend``
       (``v1/attention/selector.py:106-110``), i.e. an ``AttentionBackendEnum`` member or ``None``;

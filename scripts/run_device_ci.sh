@@ -7,9 +7,9 @@
 #   2. 再跑设备套件(pytest -m npu);
 #   3. 统一汇总 + 退出码。
 #
-# 前置:项目工具链在 .work/cann930,经 .agent_loop/run/env.sh 导出;此处 source 它,
+# 前置:项目工具链在 .work/cann930,由 scripts/env-ascend102.sh 导出;此处 source 它,
 # 与 tests/conftest.py 的裸 shell 自举等价(两者任一即可)。NPU 被他人占用时设备用例会
-# 失败/超时——脚本只报告,不 kill 任何他人进程(与 D48/D56 gate 纪律一致)。
+# 失败/超时——脚本只报告,不 kill 任何他人进程。
 #
 # 用法:
 #   bash scripts/run_device_ci.sh                 # 全套设备用例
@@ -19,13 +19,16 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
 
-if [ -f .agent_loop/run/env.sh ]; then
-  # shellcheck disable=SC1090
-  source .agent_loop/run/env.sh >/dev/null 2>&1 || true
-fi
+for env_sh in scripts/env-ascend102.sh .agent_loop/run/env.sh; do
+  if [ -f "$env_sh" ]; then
+    # shellcheck disable=SC1090
+    source "$env_sh" >/dev/null 2>&1 || true
+    break
+  fi
+done
 # 裸 shell 下 conftest 会自举同一套 env;这里显式 source 让 canary 子进程也一致。
 
-PY="${PY:-$ROOT/.venv/bin/python}"
+PY="${PY:-$ROOT/.venv_native213/bin/python}"
 if [ ! -x "$PY" ]; then
   echo "device-ci: python not found at $PY (set PY=...)" >&2
   exit 2

@@ -6,7 +6,7 @@ The verdict, first
 outside symbols still unverified.**  It is *not* device-agnostic, and it does *not* have to be
 rewritten yet.
 
-Evidence (every line number is a line of ``runtime/vllm-api/vllm__compilation__cuda_graph.py``,
+Evidence (every line number is a line of ``reference/vllm-0.23/vllm__compilation__cuda_graph.py``,
 361 lines, transcribed from ``vllm/compilation/cuda_graph.py`` @ v0.23.0):
 
 ==========================  ==========================================================  ======
@@ -76,12 +76,12 @@ initialiser reads ``torch.accelerator``), and ``get_device_name`` / ``get_device
 which the fetched FLA ops probe at module scope behind ``is_nvidia`` - ``qwen3_5.py`` does import
 that module, but the guard short-circuits on NPU, so those two calls never evaluate.  The reasons
 live in :data:`UNMAPPED_TORCH_CUDA_NAMES`; ``tests/test_platform_contract.py`` diffs the table
-against a regex scan of ``runtime/vllm-api/*.py``, so a new upstream call name cannot appear
+against a regex scan of ``reference/vllm-0.23/*.py``, so a new upstream call name cannot appear
 silently.
 
 \* device-agnostic **if** the forwarded symbols exist.  That is the part this module cannot
 settle offline, and it is why :func:`capture_path_ready` exists instead of a plain comment.
-The five symbols to check on the device (all outside ``runtime/vllm-api/``):
+The five symbols to check on the device (all outside ``reference/vllm-0.23/``):
 
 1. ``vllm.utils.torch_utils.current_stream`` (imported ``:27``, used ``:316``) — must return the
    **NPU** stream; if it is ``torch.cuda.current_stream``, capture would run on the wrong stream.
@@ -98,7 +98,7 @@ The five symbols to check on the device (all outside ``runtime/vllm-api/``):
 
 If **any** of 1-4 turns out to be CUDA-only, the verdict flips to branch 3 ("must write our
 own") and the work is ``:233-361`` re-expressed on ``torch.accelerator.Graph`` (present in the
-torch bundled here: ``runtime/pylibs/torch/accelerator/graphs.py:9`` — [unverified] for the torch
+torch bundled here: ``torch/accelerator/graphs.py:9`` — [unverified] for the torch
 version the NPU deployment pins, which is not in this tree).
 
 What the local sources do settle (the runner is in the subset now): the *caller*.
@@ -175,7 +175,7 @@ CUDA_CALL_SITES: Tuple[Tuple[int, str], ...] = (
     (313, "with torch.cuda.graph("),
 )
 
-#: Symbols the bridge decision depends on that are *not* in ``runtime/vllm-api/``.  Each entry is
+#: Symbols the bridge decision depends on that are *not* in ``reference/vllm-0.23/``.  Each entry is
 #: ``(symbol, why it matters)``.  `capture_path_ready` can only check the torch-side ones; the
 #: vLLM-side ones are listed here so the hardware pass has a checklist instead of a hunch.
 UNVERIFIED_SYMBOLS: Tuple[Tuple[str, str], ...] = (
@@ -242,7 +242,7 @@ class CudaAlias:
 
 
 #: Every ``torch.cuda.<name>`` that the capture/memory/stream path touches, in install order.
-#: Derived by scanning ``runtime/vllm-api/*.py`` for ``torch.cuda.<name>`` (13 unique names:
+#: Derived by scanning ``reference/vllm-0.23/*.py`` for ``torch.cuda.<name>`` (13 unique names:
 #: 9 mapped here, 4 in :data:`UNMAPPED_TORCH_CUDA_NAMES`).  The contract test re-runs that scan,
 #: so a new upstream call name fails the suite instead of failing at capture time.
 TORCH_CUDA_ALIASES: Tuple[CudaAlias, ...] = (
@@ -592,7 +592,7 @@ def _accelerator() -> Tuple[str, Any]:
     """``("npu" | "cuda" | "", module)`` — the device whose graph primitives would be used.
 
     NPU first: this backend exists for that device, and on an Ascend box ``torch.cuda`` is
-    present as a module (with dummy types: ``runtime/pylibs/torch/cuda/graphs.py:76-84``) but
+    present as a module (with dummy types: ``torch/cuda/graphs.py:76-84``) but
     unusable.  Never raises: an unavailable device is an answer, not an error.
     """
     npu = getattr(torch, "npu", None)
@@ -619,7 +619,7 @@ def is_capturing() -> bool:
     profile run or by a manual ``torch.npu.graph`` block.
 
     * CUDA: ``torch.cuda.is_current_stream_capturing()`` — a thin wrapper over
-      ``_cuda_isCurrentStreamCapturing`` (``runtime/pylibs/torch/cuda/graphs.py:87-92``).
+      ``_cuda_isCurrentStreamCapturing`` (``torch/cuda/graphs.py:87-92``).
     * NPU: ``torch.npu.is_current_stream_capturing()`` — [unverified] that torch_npu exposes the
       same name; if it does not, this raises instead of answering False, because a False
       returned by a missing probe would silently re-enable allocation inside a capture.

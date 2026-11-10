@@ -7,7 +7,7 @@ bench_moe_grouped)。分解臂=在役 unquant 链原语(npu_grouped_matmul×2+sw
 
 用法::
     .venv/bin/python benchmarks/probes/h28_fold_bench.py \
-        --out .agent_loop/run/h28_fold_bench.json
+        --out bench_out/h28_fold_bench.json
 """
 
 from __future__ import annotations
@@ -53,7 +53,7 @@ def bench(fn, warmup=20, iters=200):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default=".agent_loop/run/h28_fold_bench.json")
+    ap.add_argument("--out", default="bench_out/h28_fold_bench.json")
     ap.add_argument("--iters", type=int, default=200)
     args = ap.parse_args()
     dev = "npu"

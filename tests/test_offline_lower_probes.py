@@ -3,7 +3,7 @@
 T4(PM-2,full M tile)与 T5(SIMD softmax)都属"机制是否可表达"一类,结论读自生成的 CCE,
 无需设备。本测试把这两个探针的核心断言固化,防止后端回归导致探针失效。
 
-* **T4 更正**:``next-tasks.md`` 曾把 full M tile 列为未做,实际 commit ``5730b66``(PM-2)
+* **T4 更正**:``plan-vllm-native-backend.md`` 曾把 full M tile 列为未做,实际 commit ``5730b66``(PM-2)
   已用 ``RowThr`` 实现(``block_q // 2`` workaround 已移除,见 docs/known-issues.md)。
   本测试断言内核里**不再**存在 ``block_q // 2`` 的半区规划痕迹,并保留 RowThr 契约。
 * **T5**:SIMT softmax 降到标量线程循环(``scalar_for`` 多、无 ``simd_inst::``),SIMD softmax

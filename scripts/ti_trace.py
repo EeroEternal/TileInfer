@@ -313,21 +313,40 @@ def run_scenario(port: int, model: str, sc: Dict[str, Any], timeout: float) -> D
 # ---------------------------------------------------------------- 报告
 
 
-PHASE_ROW = re.compile(r"^\s*(op:[a-z_]+:[a-zA-Z0-9_]+|stage:[a-z_]+)\s+(.+)$")
+PHASE_ROW = re.compile(r"^(op:[a-z_]+:[A-Za-z0-9_]+|stage:[a-z_]+)\s+(.+)$")
+PID_PREFIX = re.compile(r"^\([^)]*pid=\d+\)\s*")
+
+
+def _extract_last_table(text: str) -> Optional[str]:
+    """取最后一段相位表。服务日志行首带 ``(EngineCore pid=...)``，必须先剥掉。
+
+    容忍表内夹杂其它日志行：只以"新的表头"为分段边界，其它行忽略。
+    """
+    header: Optional[str] = None
+    rows: List[str] = []
+    for raw in text.splitlines():
+        ln = PID_PREFIX.sub("", raw).rstrip()
+        if ln.startswith("phase "):
+            header, rows = ln, []            # 新的一段开始（旧段落丢弃）
+            continue
+        if header is None:
+            continue
+        if PHASE_ROW.match(ln):
+            rows.append(ln)
+    if not rows:
+        return None
+    if header is None:
+        header = "phase  calls  host/step  dev/step  dev/call"
+    return "\n".join([header] + rows)
 
 
 def build_report(outdir: Path, plan: Dict[str, Any], scen: List[Dict[str, Any]]) -> Path:
     raw = outdir / "raw"
     serve_log = raw / "serve.log"
-    tables: List[str] = []
+    table = None
     if serve_log.is_file():
-        text = serve_log.read_text(encoding="utf-8", errors="replace")
-        # 抓服务日志里最后几段相位表（表格以表头行开始，遇到空行终止）
-        for m in re.finditer(r"(?m)^(phase\s+.*(?:\n.*)*?)(?:\n\s*\n)", text):
-            block = m.group(1).rstrip()
-            if "dev" in block or "host" in block:
-                tables.append(block)
-    tail = tables[-1] if tables else "(服务日志里没有相位表：确认级别 >= L1，且运行时间足够)"
+        table = _extract_last_table(serve_log.read_text(encoding="utf-8", errors="replace"))
+    tail = table or "(服务日志里没有相位表：确认级别 >= L1，且运行时间足够)"
 
     summary = outdir / "summary.md"
     lines = [
@@ -419,6 +438,15 @@ def cmd_report(cfg, src, args):
         d = (REPO / d).resolve()
     if d.name == "latest" and d.is_symlink():
         d = d.resolve()
+    if getattr(args, "rebuild", False):
+        plan_f, meta_f = d / "plan.json", d / "meta.json"
+        if not plan_f.is_file():
+            print(f"[error] {d} 下没有 plan.json，无法重建", file=sys.stderr)
+            return 2
+        plan = json.loads(plan_f.read_text(encoding="utf-8"))
+        scen = json.loads(meta_f.read_text(encoding="utf-8")).get("scenarios", []) if meta_f.is_file() else []
+        build_report(d, plan, scen)
+        print(f"[rebuild] 已从原始日志重建 {d/'summary.md'}\n")
     summary = d / "summary.md"
     if summary.is_file():
         print(summary.read_text(encoding="utf-8"))
@@ -531,6 +559,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     sp = sub.add_parser("report", help="从已有目录重新打印报告")
     sp.add_argument("dir", nargs="?", default="trace_out/latest")
+    sp.add_argument("--rebuild", action="store_true", help="从 raw/serve.log 重新生成 summary.md")
     sp.set_defaults(func=cmd_report)
 
     sp = sub.add_parser("run", help="一键：起服务 → 压测 → 出报告")

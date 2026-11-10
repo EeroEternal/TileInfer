@@ -13,7 +13,7 @@
 
 运行
 ----
-    source .agent_loop/run/env.sh
+    source bench_out/env.sh
     python benchmarks/probes/fused_sample_device_test.py
 """
 

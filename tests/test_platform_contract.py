@@ -70,25 +70,25 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 #: The local vLLM 0.23 source the whole file cites.  Read (never imported) so the line numbers in
 #: the platform's docstrings stay checkable.
-INTERFACE_SOURCE = ROOT / "runtime" / "vllm-api" / "vllm__platforms__interface.py"
-CUDA_GRAPH_SOURCE = ROOT / "runtime" / "vllm-api" / "vllm__compilation__cuda_graph.py"
+INTERFACE_SOURCE = ROOT / "reference" / "vllm-0.23" / "vllm__platforms__interface.py"
+CUDA_GRAPH_SOURCE = ROOT / "reference" / "vllm-0.23" / "vllm__compilation__cuda_graph.py"
 
 #: The worker-selection mechanism, read (never imported): ``ParallelConfig`` declares the field,
 #: the worker wrapper consumes it, and the two in-tree platforms show the sentinel branch the
 #: platform has to follow.
-PARALLEL_CONFIG_SOURCE = ROOT / "runtime" / "vllm-api" / "vllm__config__parallel.py"
-WORKER_BASE_SOURCE = ROOT / "runtime" / "vllm-api" / "vllm__v1__worker__worker_base.py"
-CPU_PLATFORM_SOURCE = ROOT / "runtime" / "vllm-api" / "vllm__platforms__cpu.py"
-PLUGINS_SOURCE = ROOT / "runtime" / "vllm-api" / "vllm__plugins____init__.py"
+PARALLEL_CONFIG_SOURCE = ROOT / "reference" / "vllm-0.23" / "vllm__config__parallel.py"
+WORKER_BASE_SOURCE = ROOT / "reference" / "vllm-0.23" / "vllm__v1__worker__worker_base.py"
+CPU_PLATFORM_SOURCE = ROOT / "reference" / "vllm-0.23" / "vllm__platforms__cpu.py"
+PLUGINS_SOURCE = ROOT / "reference" / "vllm-0.23" / "vllm__plugins____init__.py"
 
 #: Model-architecture acceptance, read (never imported): the registry table and the hook call site.
-REGISTRY_SOURCE = ROOT / "runtime" / "vllm-api" / "vllm__model_executor__models__registry.py"
-MODEL_CONFIG_SOURCE = ROOT / "runtime" / "vllm-api" / "vllm__config__model.py"
-QWEN35_SOURCE = ROOT / "runtime" / "vllm-api" / "vllm__model_executor__models__qwen3_5.py"
+REGISTRY_SOURCE = ROOT / "reference" / "vllm-0.23" / "vllm__model_executor__models__registry.py"
+MODEL_CONFIG_SOURCE = ROOT / "reference" / "vllm-0.23" / "vllm__config__model.py"
+QWEN35_SOURCE = ROOT / "reference" / "vllm-0.23" / "vllm__model_executor__models__qwen3_5.py"
 
 #: ``AttentionSelectorConfig`` - the field names the platform's reject policy is built on.  Also
 #: read (never imported), because the names live in a vLLM module the CPU suite cannot import.
-SELECTOR_SOURCE = ROOT / "runtime" / "vllm-api" / "vllm__v1__attention__selector.py"
+SELECTOR_SOURCE = ROOT / "reference" / "vllm-0.23" / "vllm__v1__attention__selector.py"
 
 
 # ---------------------------------------------------------------------------------------
@@ -609,7 +609,7 @@ def _source_line(path: pathlib.Path, needle: str, exact: bool = False) -> int:
     """1-based line number of the first line containing (or, ``exact``, equal to) ``needle``.
 
     The platform's docstrings cite ``file:line`` for every claim about vLLM.  This turns those
-    citations into assertions, so refreshing ``runtime/vllm-api/`` to another point release fails
+    citations into assertions, so refreshing ``reference/vllm-0.23/`` to another point release fails
     the contract test instead of silently invalidating the reasoning.
     """
     lines = path.read_text(encoding="utf-8").splitlines()
@@ -642,7 +642,7 @@ class _Selector:
     """Stand-in for ``AttentionSelectorConfig``, field for field.
 
     The thirteen names *and* their defaults are transcribed from the real source
-    (``runtime/vllm-api/vllm__v1__attention__selector.py:21-34``), so this fake cannot drift from
+    (``reference/vllm-0.23/vllm__v1__attention__selector.py:21-34``), so this fake cannot drift from
     vLLM without ``test_selector_policy_covers_every_real_field`` failing.  The four geometry fields
     (``head_size``/``dtype``/``kv_cache_dtype``/``block_size``) are carried even though the policy
     does not read them: a fake without them would hide a policy that quietly started depending on
@@ -1211,7 +1211,7 @@ def test_check_and_update_config_forces_eager_while_capture_is_unverified(caplog
 def test_inventory_is_complete_against_the_local_abc_source():
     """Every public member of the real ABC must be accounted for.
 
-    The base class is rebuilt from ``runtime/vllm-api/vllm__platforms__interface.py`` rather than
+    The base class is rebuilt from ``reference/vllm-0.23/vllm__platforms__interface.py`` rather than
     from the stub, so this fails when the **local vLLM source** grows a method (e.g. when the
     runtime subset is refreshed for 0.24) - not merely when the fake does.
     """
@@ -1471,7 +1471,7 @@ def test_verify_quantization_accepts_the_no_quantisation_spellings(quant):
 
 
 #: The local vLLM sources the alias inventory is derived from (read, never imported).
-VLLM_API_DIR = ROOT / "runtime" / "vllm-api"
+VLLM_API_DIR = ROOT / "reference" / "vllm-0.23"
 
 #: ``torch.cuda.<name>`` as it appears in those sources.  Deliberately a regex over the text, not
 #: an import: a new upstream call site must show up in the table/coverage test, not at capture.
@@ -1530,7 +1530,7 @@ def _local_torch_cuda_sites() -> Dict[str, List[str]]:
 def test_torch_cuda_alias_table_accounts_for_every_name_in_the_local_sources():
     """The table is evidence-driven: every `torch.cuda.<name>` is mapped or explicitly unmapped.
 
-    The scan is a regex over ``runtime/vllm-api/*.py`` rather than a hard-coded list, so a new
+    The scan is a regex over ``reference/vllm-0.23/*.py`` rather than a hard-coded list, so a new
     upstream call name (a new CUDA API the runner starts using) fails here instead of failing on
     hardware inside a capture.
     """

@@ -18,7 +18,7 @@ TileLang Python 层原生表达。
 
 用法::
 
-    source .agent_loop/run/env.sh
+    source bench_out/env.sh
     python benchmarks/probes/h26_gm2l1_align_probe.py
 """
 

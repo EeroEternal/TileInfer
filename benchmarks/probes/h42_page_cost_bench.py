@@ -11,7 +11,7 @@
 
 SIMD 开关在 T trace 期生效且不入内核缓存键,故 SIMD on/off 必须分进程跑(本脚本按
 env 单模式运行,由调用方各跑一次)。运行:
-  source .agent_loop/run/env.sh && \
+  source bench_out/env.sh && \
   TILEINFER_SIMD_SOFTMAX=0 python benchmarks/probes/h42_page_cost_bench.py   # off 轮
   TILEINFER_SIMD_SOFTMAX=1 python benchmarks/probes/h42_page_cost_bench.py   # on 轮
 输出行格式: [H42] simd=<0|1> <label> ktp=<k> <ms> ms err=<e> bw=<gbps> GB/s

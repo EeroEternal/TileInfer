@@ -1,4 +1,4 @@
-"""Opt-in phase timing for the serving loop (M0/W0b of ``docs/plan-performance.md``).
+"""Opt-in phase timing for the serving loop (M0/W0b of ``docs/performance.md``).
 
 Two clocks, because they answer different questions and on Ascend they are **not** the same:
 

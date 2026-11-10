@@ -94,7 +94,7 @@ hook at all.
 
 [unverified] Whether vLLM loads general plugins *before* the frontend process resolves
 ``current_platform`` and runs ``check_and_update_config`` is not recorded in
-``runtime/vllm-api/`` (the loader, ``vllm/plugins/__init__.py``, is not in the local subset; the
+``reference/vllm-0.23/`` (the loader, ``vllm/plugins/__init__.py``, is not in the local subset; the
 legacy adapter's note in the frozen snapshot under ``legacy/`` says general plugins load in
 ``EngineCore.__init__``).  Consequence, deliberately benign: if the bridge lands *after* config
 validation, the platform still asked for eager mode — correct and slow, not wrong-and-fast.  The

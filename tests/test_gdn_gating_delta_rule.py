@@ -8,7 +8,7 @@ Everything below is CPU, fp64-first.  Two independent oracles, neither of which 
 under test:
 
 * ``_oracle`` — the literal per-token / per-head recurrence transcribed from the kernel
-  (``runtime/vllm-api/fla_fused_sigmoid_gating.py`` lines 129-154), written one token at a time;
+  (``reference/vllm-0.23/fla_fused_sigmoid_gating.py`` lines 129-154), written one token at a time;
 * ``_prefill_form`` — the *whole-sequence* closed form, using explicit ``K x K`` transfer matrices
   ``P_t = d_t (I - beta_t k_t k_t^T)`` and their prefix/suffix products, with **no state
   recursion at all**::

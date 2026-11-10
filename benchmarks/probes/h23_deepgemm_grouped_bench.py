@@ -7,14 +7,14 @@ deep_gemm 侧布局 = psum 连续布局(csrc/apis/gemm.hpp):
   组 g 真实行占 [align(psum[g-1], 256), psum[g]),grouped_layout = 前缀和 int32[G],
   BLOCK_M 恒 256(jit.hpp kMkAlignment)。
 
-运行环境(须先 source .agent_loop/run/env.sh):
+运行环境(须先 source bench_out/env.sh):
   PATH=/home/userlist/zxs/TileInfer/.work/gcc13/bin:$PATH
   LD_LIBRARY_PATH=/home/userlist/zxs/TileInfer/.work/gcc13/lib64:$LD_LIBRARY_PATH
   DG_JIT_CACHE_DIR=/home/userlist/zxs/TileInfer/.work/dg_jit_cache
 
 用法:
   .venv/bin/python benchmarks/probes/h23_deepgemm_grouped_bench.py \
-      --out .agent_loop/run/e69_h23_deepgemm_bench.json
+      --out bench_out/e69_h23_deepgemm_bench.json
 输出末行: SUM h23 verdict=... (decode_b32 与 prefill_400 合计比值 ≥1.0 为达标)
 """
 
@@ -139,7 +139,7 @@ def bench(fn, warmup=20, iters=100):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default=".agent_loop/run/e69_h23_deepgemm_bench.json")
+    ap.add_argument("--out", default="bench_out/e69_h23_deepgemm_bench.json")
     ap.add_argument("--iters", type=int, default=100)
     ap.add_argument("--skip-check", action="store_true")
     args = ap.parse_args()

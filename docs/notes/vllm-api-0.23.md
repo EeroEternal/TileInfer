@@ -1,6 +1,6 @@
 # vLLM 0.23.0 API reference (verified from source, not memory)
 
-Source: `raw.githubusercontent.com/vllm-project/vllm/v0.23.0/...`, stored in `runtime/vllm-api/`
+Source: `raw.githubusercontent.com/vllm-project/vllm/v0.23.0/...`, stored in `reference/vllm-0.23/`
 (gitignored, one file per path with `__` as separator). Re-fetch:
 
 ```powershell
@@ -85,7 +85,7 @@ fallback**: the work list is those seven FLA sub-ops plus `causal_conv1d` (prefi
 `tileinfer/vllm/ops/gdn.py` (correctness first), then swap in the TileInfer kernels where measured
 faster.
 
-### Transcribed signatures (four of the seven fetched; files in `runtime/vllm-api/fla_*.py`)
+### Transcribed signatures (four of the seven fetched; files in `reference/vllm-0.23/fla_*.py`)
 
 ```python
 # l2norm.py (4.1 KB)
@@ -132,4 +132,4 @@ Both fetched; the exact `AttentionBackend` ABC, `AttentionImpl.forward` signatur
 
 `vllm/v1/worker/gpu_worker.py` (50 KB), `vllm/compilation/cuda_graph.py` (14 KB),
 `vllm/model_executor/models/qwen3_5.py` (30 KB - the model definition that tells us the real layer
-schedule and config fields). All three are already downloaded into `runtime/vllm-api/`.
+schedule and config fields). All three are already downloaded into `reference/vllm-0.23/`.

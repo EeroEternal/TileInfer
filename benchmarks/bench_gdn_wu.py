@@ -5,8 +5,8 @@
 
 H10 门槛:融合核设备时间 ≤ 被替换两核合计 × 0.6(T=128 形状)。
 
-用法: source .agent_loop/run/env.sh && setsid .venv/bin/python benchmarks/bench_gdn_wu.py
-输出: .agent_loop/run/e23_gdn_wu_bench.json
+用法: source bench_out/env.sh && setsid .venv/bin/python benchmarks/bench_gdn_wu.py
+输出: bench_out/e23_gdn_wu_bench.json
 """
 
 import json
@@ -96,6 +96,6 @@ with set_current_vllm_config(VllmConfig()):
         torch.npu.synchronize()
         print(json.dumps({f"T{t_total}": results[f"T{t_total}"]}, indent=1), flush=True)
 
-with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".agent_loop/run/e23_gdn_wu_bench.json"), "w") as f:
+with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bench_out/e23_gdn_wu_bench.json"), "w") as f:
     json.dump(results, f, indent=1)
 print("BENCH DONE")

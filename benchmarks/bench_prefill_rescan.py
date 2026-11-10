@@ -7,7 +7,7 @@ override that forces the full page scan) to reproduce the baseline the truncatio
 
 Usage::
 
-    source .agent_loop/run/env.sh
+    source bench_out/env.sh
     python benchmarks/bench_prefill_rescan.py                     # truncated (shipped)
     TILEINFER_PREFILL_NOSCAN_OFF=1 python benchmarks/bench_prefill_rescan.py   # baseline
 """

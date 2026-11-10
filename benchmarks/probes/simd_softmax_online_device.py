@@ -15,7 +15,7 @@ block by the GEMM — a direct UB read-modify-write of ``o`` inside the same Sim
 
 Usage::
 
-    source .agent_loop/run/env.sh
+    source bench_out/env.sh
     python benchmarks/probes/simd_softmax_online_device.py
 """
 

@@ -2,7 +2,7 @@
 # 使 graph capture 期逐 op 执行的 host 栈可见,把在役 replay 中 240 次/步的
 # aclnnInplaceCopy_SliceAiCore_Slice 拷贝链精确映射到 torch 源(qwen3_next.py/
 # tilelang_ascend950.py/vllm_ascend.py 静态候选清单,E129-3)。
-# 产物:.agent_loop/run/h47_capture_prof/(chrome trace,gitignored)+
+# 产物:bench_out/h47_capture_prof/(chrome trace,gitignored)+
 #       h47_probe.log([H47V2] 可解析行)。
 # 窗口依赖:需空闲 NPU(HBM<8%),由 h47_wait_chain.sh 调度,不自行等窗。
 import os
@@ -16,10 +16,10 @@ os.environ.setdefault("VLLM_DO_NOT_TRACK", "1")
 os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
 OUT_DIR = os.environ.get(
-    "H47_PROF_DIR", "/home/userlist/zxs/TileInfer/.agent_loop/run/h47_capture_prof"
+    "H47_PROF_DIR", "/home/userlist/zxs/TileInfer/bench_out/h47_capture_prof"
 )
 LOG_PATH = os.environ.get(
-    "H47_LOG", "/home/userlist/zxs/TileInfer/.agent_loop/run/h47_probe.log"
+    "H47_LOG", "/home/userlist/zxs/TileInfer/bench_out/h47_probe.log"
 )
 MODEL = "/home/models/Qwen3.6-35B-A3B"
 

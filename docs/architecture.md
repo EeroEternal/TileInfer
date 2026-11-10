@@ -2,7 +2,7 @@
 
 This document describes the pieces that are actually implemented: the plan/run contract, the
 metadata model, the scheduler, and the invariants each kernel has to satisfy.  For the project
-positioning, read [`design.md`](design.md) first.
+positioning, read [`plan-vllm-native-backend.md`](plan-vllm-native-backend.md) first.
 
 ## 1. The plan/run split
 
@@ -208,7 +208,7 @@ hit and the first decode step is served without a stall, with no fallback to FIA
 Two consequences worth remembering:
 
 * a deployment should pre-warm the buckets it declares - this is not an optimisation, it is what makes
-  the integration usable (task T6 in `next-tasks.md`);
+  the integration usable (task T6 in `plan-vllm-native-backend.md`);
 * an in-engine compile still works (the plan is built in a background thread and requests fall back to
   FIA meanwhile), but on this box it starved the engine, so pre-warming is the supported path.
 

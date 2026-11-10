@@ -1,0 +1,15 @@
+{
+  "_说明": "ti_trace.py 的项目级配置。只需写想覆盖的项；未写的项沿用脚本内置默认。级别默认值改这里（或运行 `ti_trace.py level L2`）。",
+  "level": "L2",
+  "port": 8111,
+  "device_mem_limit_mb": 20000,
+  "serve_args": [
+    "--attention-backend", "CUSTOM",
+    "--enforce-eager",
+    "--max-model-len", "9216",
+    "--max-num-batched-tokens", "9216",
+    "--max-num-seqs", "32",
+    "--gpu-memory-utilization", "0.75",
+    "--trust-remote-code"
+  ]
+}

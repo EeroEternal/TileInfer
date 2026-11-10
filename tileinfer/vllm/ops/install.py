@@ -261,7 +261,7 @@ def _wrap(
         # of the prefill budget (~297 ms over ~1200 ops).  Off unless TILEINFER_OP_COUNT is set.
         if _OP_COUNT:
             _count_call(family, target)
-        # Phase timing (docs/plan-performance.md M0/W0b).  Off unless TILEINFER_PHASE_TIMING is set;
+        # Phase timing (docs/performance.md M0/W0b).  Off unless TILEINFER_PHASE_TIMING is set;
         # `timed` records the host clock and, in device mode, an NPU event pair for the same block.
         if _PHASE_TIMING:
             label = (

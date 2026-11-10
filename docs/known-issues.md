@@ -1,5 +1,10 @@
 # Known issues and post-mortems
 
+> **关于本文里的证据路径**：早期结论引用的 `.agent_loop/run/...`、`PERFORMANCE_REPORT.md`
+> 属于未跟踪的临时工作目录，已在 2026-11-10 的仓库清理中删除。结论与规则仍然有效，
+> 但那些原始日志不再可读；复现请按各节「Symptom / Root cause」描述重新构造实验。
+
+
 ## KI-6 — `q_pad` staging: target slice missed `[:num_reqs]` (resolved 2026-10-20)
 
 **Status:** resolved · **Lesson:** when a padded buffer's *source* is bounded but its *target*
@@ -180,7 +185,7 @@ state.
 
 ### Root cause (found 2026-10-14, evidence E37)
 
-Launch-level canary instrumentation (per-launch sync + full pointer dumps, `.agent_loop/run/p6/`)
+Launch-level canary instrumentation (per-launch sync + full pointer dumps; 原始日志随 `.agent_loop/` 清理删除)
 attributed the fault to the **merge kernel's very first launch**; the split kernel completed cleanly.
 Then the "multi-shape process" framing collapsed:
 
@@ -205,7 +210,7 @@ is 256 B and a BR-padded `out_g` would overflow UB at the long-context split cou
 32 rows × dim = 256 KB).  Device tests now cover split-KV with group 4 (`split-KV, serving group 4`,
 `split-KV, group 4 ragged`).
 
-### Verification (all green, E37 / .agent_loop/run/p6/chain.out)
+### Verification (all green at the time; 原始 `chain.out` 随 `.agent_loop/` 清理删除)
 
 * merge-only: group ∈ {4, 8} × max_splits 2, and group 4 × max_splits 32 (UB pressure) - SYNC OK;
 * backend path, single shape `b16/kv4096`: 20 consecutive launches clean;
@@ -283,7 +288,7 @@ The same decode workload (batch 1 x 128 tokens, enforce-eager, same server flags
 ~136.7 ms/step through the offline `LLM()` API but ~45.9 ms/step (TPOT) through a `vllm serve`
 HTTP benchmark — the *offline* number is 3x **worse**, which is the opposite of the usual
 intuition that a benchmark harness should be leaner than a full server (EVIDENCE E14;
-`.agent_loop/run/b3_ti_b1.log` vs the eager matrix in `PERFORMANCE_REPORT.md` §3).
+当时的 `b3_ti_b1.log` 与 `PERFORMANCE_REPORT.md` §3 的 eager 矩阵对比；两份原始文件均已随 `.agent_loop/` 清理删除)。
 
 ### Attribution
 
@@ -345,8 +350,8 @@ CPU 套件与不载该 .so 的设备套件零影响。裸进程场景(手动 pyt
    `use of undeclared identifier 'asc_pack_to_high'/'asc_pack_to_low'/
    'asc_storealign_pack_quarter'` 与 `asc_set_gm2l1_nz_para`/`asc_load_l2_cache_mode`
    不匹配(tilelang 0.1.15 头文件按 9.2+/930 API 写)。在役全链经
-   `.agent_loop/run/env.sh` 走 `.work/cann930`,不受影响;任何**独立设备脚本**
-   (微基准/探针)必须 `source .agent_loop/run/env.sh`,否则必败。
+   `scripts/env-ascend102.sh` 走 `.work/cann930`,不受影响;任何**独立设备脚本**
+   (微基准/探针)必须 `source scripts/env-ascend102.sh`,否则必败。
 2. **split-KV 内核(含 token 窗口,H67)在 dim=256 真实形状编译病态**:卡
    `tilelang/ascend/pipeline.py:83 AscendPassPipelineBody`(TVM pass pipeline)
    17min+ 不出 bisheng 子进程(100% 单线程 CPU);非 SIMD 变体(`TILEINFER_SIMD_SOFTMAX=0`)
@@ -365,9 +370,9 @@ oracle 在 dim=128(SIMD)PASS);CANN 9.1.1 头文件不匹配为环境事实。
 ### Mitigation
 
 - H67 线阻断性关闭(HYPOTHESES H67 判决,E295);复测脚本
-  `.agent_loop/run/h67_toksplit_bench.py` 已留档,tilelang 升级后一键复跑。
+  该探针已随 `.agent_loop/` 临时目录清理删除；需要复跑时按本节描述重新落一个。
 - npu 标记套件临时轮换 `-k "not nosimd"`(D159-3),vendor 修复后应去除。
-- 设备级脚本一律走 `.agent_loop/run/*_launch.sh` 启动器(内 source env.sh)。
+- 设备级脚本一律先 `source scripts/env-ascend102.sh`(等价于旧的 `*_launch.sh` 启动器)。
 
 ### E315 增补(iter-231,2026-10-21)——病态面扩展与测试守卫
 

@@ -10,7 +10,7 @@ plus the state carried from call to call.  Nothing in this file re-uses
 *is* the contract the engine relies on: T decode calls == 1 prefill call.
 
 Semantics under test are quoted line-by-line from
-``runtime/vllm-api/vllm__model_executor__layers__mamba__ops__causal_conv1d.py`` in the module
+``reference/vllm-0.23/vllm__model_executor__layers__mamba__ops__causal_conv1d.py`` in the module
 docstring of ``tileinfer/vllm/ops/fla/causal_conv1d.py``.
 """
 

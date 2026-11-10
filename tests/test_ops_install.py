@@ -5,12 +5,12 @@ Why a fake ``vllm`` package (the pattern of ``tests/test_attn_contract.py``)
 The installer resolves vLLM names lazily and never imports vLLM itself, so the module under test
 imports on a CPU laptop.  What cannot be exercised without an engine is the *resolution*: which of
 the names in the binding table exist.  The fake below therefore reproduces the exact module layout
-the local vLLM subset proves (``runtime/vllm-api/``), with one "kernel" object per call site and
+the local vLLM subset proves (``reference/vllm-0.23/``), with one "kernel" object per call site and
 each of them raising if it is ever called - so a test that accidentally runs vLLM's own
 implementation fails loudly instead of silently passing.
 
 The fake deliberately reproduces the module layout the local vLLM subset proves
-(``runtime/vllm-api/``), including the two MoE call sites that are now in it:
+(``reference/vllm-0.23/``), including the two MoE call sites that are now in it:
 ``vllm._custom_ops`` (``vllm___custom_ops.py:2346-2363`` and ``:2494-2509``) and
 ``vllm.model_executor.layers.fused_moe.fused_moe`` (``.../fused_moe/fused_moe.py:1474-1515``).  Each
 kernel raises if it is ever called, so a test that accidentally runs vLLM's own implementation fails

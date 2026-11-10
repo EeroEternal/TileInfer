@@ -15,7 +15,7 @@
   C width 敏感性(税是否随 plan 宽度线性→机理①):b32 1tok,width 16/64/256 @split16。
 输出含 SUM 汇总行(vs_plain 比值),供 watcher/轮脚本自动解析。
 
-运行:source .agent_loop/run/env.sh && python benchmarks/probes/w2_split_tax_bench.py
+运行:source bench_out/env.sh && python benchmarks/probes/w2_split_tax_bench.py
 """
 
 import os, sys, time

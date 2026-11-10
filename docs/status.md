@@ -1,201 +1,120 @@
-# Status
+# 状态
 
-One page that answers two questions: **what has been done** (with the evidence) and **what is left**.
-Details live in the linked documents; this file is the index and the honest scoreboard.
-
-Last updated: **2026-10-13** — Qwen3.6-35B-A3B on Ascend950PR, stage-2 closure (M-MoE / M-GDN verdicts in, stage-3 deferred).
+> 一页纸回答两个问题：**建成了什么（凭什么相信）**、**哪里还断着**。
+> 方案见 [`plan-vllm-native-backend.md`](plan-vllm-native-backend.md)，数字见 [`performance.md`](performance.md)。
+>
+> 最后核对：**2026-11-10**，代码 `4cb86c9`，单卡 Ascend950PR，CANN 9.3.0。
 
 ---
 
-## 0. Current state (2026-10-13, authoritative)
+## 0. 一句话
 
-Target scenario: **Qwen3.6-35B-A3B** (40 层:10 层 full-attention head_dim=256 + 30 层 GDN 线性注意力,
-256 专家 MoE),1× Ascend950PR,vLLM 0.23.0 + vllm-ascend 0.23.0 + CANN 9.3.0 + TileLang 0.1.15。
-工程事实与 A/B 数字以 `.agent_loop/PERFORMANCE_REPORT.md` 为准(第 5 节图模式双源全指标)。
+后端**能起服务、能出正确结果、混合 KV 能跑**；**性能没打平**（TPOT 2.53×、TTFT 11.8×），
+**图捕获还没接上**，**投机解码没开始**。这三件事就是当前全部工作。
 
-**已达成(阶段一,全部引擎内验证)**:
+---
 
-| piece | state | evidence |
+## 1. 已经建成
+
+| 能力 | 状态 | 凭什么相信 |
 |---|---|---|
-| decode d256 内核(dsplit-v2)+ 128-token 子页视图 | ✅ 设备 24/24 绿,图模式在役 | `tests/test_tilelang_ascend950_decode.py`;PERFORMANCE_REPORT §2 |
-| 图捕获兼容(B5):prewarm plan + 捕获态回退 + 零同步捕获 | ✅ 图模式真实服役 | probe:6 plan READY / capture_calls=40 / fallbacks=0 / markers 随 replay 增长 |
-| prefill 接线(B1):TileInfer prefill 进引擎(惰性编译+变体上限) | ✅ prefill_calls=949 | probe 与图模式 A/B 在役探针 |
-| 图模式 A/B(双源:自研 9 场景 + 官方 bench 27 case) | ✅ 短上下文 TI≈FIA(比值 0.91-1.09);长上下文落后 2-6x(结构性:KI-1 split-KV 未启用 + prefill 编译窗) | PERFORMANCE_REPORT §5(TEMPORARY_PASS,环境退化期双侧比值口径) |
-| 数值一致性 | ✅ top-5 logprobs 与 FIA 逐位一致 | 同报告 §1.5 |
+| 平台层（`vllm.platform_plugins` 注册、`AttentionBackendEnum.CUSTOM` 接管） | ✅ | 服务能起，`AttentionBackendEnum.CUSTOM.get_class()` 返回我们的类，无静默回退 |
+| worker 四个 hook（`init_device` / `determine_available_memory` / `initialize_from_config` / `compile_or_warm_up_model`） | ✅ | `tileinfer/vllm/worker.py`，`tests/test_worker_contract.py` 锁契约 |
+| attention 后端四件套（`backend` / `metadata` / `impl` / `kv_cache`） | ✅ | 设备上出 token，与参考实现对数一致 |
+| 混合 KV cache（30 层 GDN 线性 + 10 层 full attn，单池两种页） | ✅ | `support_hybrid_kv_cache()` 为真；设备实测不报池一致性错误 |
+| GDN 算子族（causal_conv1d / chunk / kkt / wu / solve_tril / delta_h / gating / recurrent / post_conv） | ✅ | `tests/test_gdn_*.py` + 设备对数；离线比值见 `notes/perf-candidates.md` |
+| MoE 算子族（sorted routing / bmm+bf16 / strict cache） | ✅ | 三个候选已进默认，各有离线比值与 bench 脚本 |
+| 分相计时（host/device 双时钟） | ✅ | `tileinfer/serving/phases.py`，报告可复现 |
+| 一键剖析工具 | 🟡 | `scripts/ti_trace.py` 已能在 102 上列预设、出计划、写报告目录；端到端真跑待验 |
+| 不依赖 `vllm_ascend` 的守卫 | ✅ | `tests/test_no_vllm_ascend.py`（AST + `sys.modules` 双重检查） |
 
-**融合算子层扩展(阶段二)结论**:
+---
 
-| 方向 | 结论 | 数据 |
+## 2. 没建成 / 已知缺陷
+
+| 项 | 现状 | 影响 |
 |---|---|---|
-| M-MoE grouped GEMM 融合 | **TEMPORARY(不接入)**:内核数值 7/7 绿,但设备时间 0.86x vs aclnn(墙钟 0.968x),3 轮优化后仍低于 1.0x 契约线 | E19/H7;`tileinfer/kernels/moe/` 保留 |
-| M-GDN 9a causal_conv1d / 9b decode 递推核 | **按证据关闭**:decode 侧 GDN 全族 ~0.38ms/步,无可实现收益 | E20/D28 |
-| M-GDN gating 替换 | **disproven(显式 opt-in)**:引擎同侧 A/B 无收益,短上下文 TTFT +2~9%(归因 JIT 窗伪影);`TILEINFER_OPS` 显式含 `gdn` 才安装 | E21/H9/D29 |
-| M-GDN 9c chunk 链融合(solve_tril+recompute_w_u) | **TEMPORARY(不接入)**:TileLang 融合核数值 6/6 绿,但微基准 0.718x@T128(门槛 ≤0.6x)、14.28x@T8192(标量块逆链不可扩展) | E22/E23/E24/H10/D31;`tileinfer/kernels/gdn/chunk_wu_ascend950.py` 保留 |
-
-**能力边界(当前默认路径)**:split-KV 关闭(KI-1,长上下文 decode 2.8x 潜力未兑现)、
-M-MoE 未接入(0.86x)、gdn gating/chunk-wu 未接入(opt-in 机制就绪,`TILEINFER_OPS`);prefill 由
-TileInfer 接管但长上下文受编译窗与 KV 重扫主导(B1 价值需 L3 后兑现)。环境退化(E15 外部扫描)
-期间的图模式数字均为双侧比值口径,绝对值待环境恢复后重测。
-
-**阶段三(L1 KI-1 诊断 → L2 池无关 ABI → L3 split-KV 启用)明确延后**,未开工;任务清单见
-[`next-tasks.md`](next-tasks.md)。
+| **图捕获（ACLGraph）** | 未接上。`--enforce-eager` 是当前唯一能跑稳的形态 | 每步固定开销吃掉大部分 TPOT 差距。这是 P0 |
+| **投机解码（MTP）** | 未开始。模型侧现成（checkpoint 有 MTP 头、vLLM 有 `qwen3_5_mtp.py`），卡在我们的批语义只允许一个 query token（`attn/metadata.py:33`） | 单 token 一步的天花板 |
+| **TPOT / TTFT** | 2.53× / 11.8× 于基线，门是 1.10× | 交付门槛未过 |
+| **长上下文** | v1 在这里崩过（8K 吞吐 0.213×）；v2 的长上下文数字还没系统测 | 风险组，不是当前门 |
+| **量化（W8A8/W4A8/FP8-KV）** | 明确不做，bf16 一条路 | 见方案 §0 |
+| **TP / EP / 多卡** | 明确延后，优先级最低 | 见方案 §1 |
+| **算子选择层** | 有候选机制（`Candidate`/`CandidateSet`）但没有 provider 抽象与账本 | 第二块的主要工作 |
 
 ---
 
-## 1. What works today(历史基线:Qwen2.5-1.5B,head_dim=128,已被上方 Qwen3.6 状态取代)
+## 3. 证据分级（引用数字前先看这个）
 
-### The library
+| 级别 | 含义 |
+|---|---|
+| **[已核实]** | 有落盘日志、命令可复现，且知道当时的口径 |
+| **[待复核]** | 只在某一个窗口测过。跨窗口漂移可达 2×，不能当结论 |
+| **[已作废]** | 曾经写进文档但被后续实验推翻。**保留在案，防止重犯** |
 
-| piece | state | evidence |
-|---|---|---|
-| Decode kernel, paged + GQA + NHD + partial tail + ragged batch | ✅ validated on device | `tests/test_tilelang_ascend950_decode.py` (7 cases, bf16 vs fp32 torch oracle, max abs diff ~1e-3) |
-| Split-KV decode (split kernel + device-side merge kernel) | ✅ validated, **opt-in** | 3.0x at batch 1 / 32k-64k tokens (51 -> 143.9 GB/s), within 2e-4 of the unsplit path |
-| Prefill / append kernel (causal, ragged, paged) | ✅ validated | `tests/test_tilelang_ascend950_prefill.py` (4 cases incl. the append causal offset) |
-| Plan / scheduler / metadata / workspace management | ✅ CPU-tested | `pytest tests -m "not npu"` green; device-side dense→ragged and batch padding helpers |
-| Decode throughput, standalone | ✅ measured | 138-147 GB/s at wide shapes; 51 GB/s at batch 1 (why split-KV exists) |
-
-All numbers and the methodology: [`performance.md`](performance.md).
-
-### The vLLM-Ascend integration
-
-Decode is **served by TileInfer inside a real engine**: the EngineCore compiles our kernel, builds the
-plan (`TileInfer plan READY ... backend=tilelang-ascend950`) and serves steps through it, with the
-first decode step's top-5 logprobs **identical to the stock FIA operator to four decimals**
-(Qwen2.5-1.5B, head_dim 128, GQA group 6).
-
-End-to-end, against the same server run with `TILEINFER_DISABLE=1` (stock FIA):
-
-| workload | TileInfer | stock FIA | ratio |
-|---|---|---|---|
-| 1-token request (TTFT + one step) | 23 ms | 22 ms | 1.05x |
-| 128-token greedy completion | 75.6 / 82.9 / 81.7 / 89.0 tok/s | 87.3 / 88.8 / 85.9 / 91.7 tok/s | 0.94x |
-| 4 concurrent requests x 64 tokens | 223.9 tok/s | 319.6 tok/s | 0.70x |
-
-Honest reading: this is the short-context regime (<= 2048 tokens, eager, no ACLGraph), which is
-precisely where our kernel has no structural advantage — the split-KV path only pays off from ~8k
-tokens and is still off by default (KI-1), and the batch-4 gap is scheduling rather than numerics.
-
-Mechanism, fallbacks and the deployment recipe: [`integration-vllm-ascend.md`](integration-vllm-ascend.md);
-details: [`performance.md`](performance.md).
-
-### Environment and tooling
-
-* Working stack pinned and documented: **CANN 9.3.0 + PyPI `tilelang==0.1.15`** (the `tile-ai/tilelang-ascend`
-  fork is a documented dead end on this box) — [`architecture.md`](architecture.md).
-* `scripts/patch-tilelang-ascend-bitcast.py`: the wheel's `numeric_limits.h` uses `std::bit_cast`
-  without `<bit>`, which fails **every** kernel compile on this CANN release; the script rewrites the
-  nine call sites to `__builtin_bit_cast`.
-* `scripts/prewarm-tileinfer-kernels.py`: compiles the declared buckets **out of process** before a
-  server starts, so the engine only ever sees cache hits (an in-engine compile blocks the engine).
-* Probes that carry their weight: `benchmarks/probes/ascend950_paged_decode.py` (5/5 PASS canary) and
-  the KI-1 probes.
+已作废的结论清单在 [`performance.md`](performance.md) §4 与
+[`notes/handover-2026-10-28.md`](notes/handover-2026-10-28.md) 的文首提示里。
+最典型的一条：**"图捕获在 950 上不可达"是错的**，v1 在服务里跑过图模式。
 
 ---
 
-## 2. What is broken or gated
-
-| issue | impact | status |
-|---|---|---|
-| **KI-1** split path faults the device (`507035`) when several shapes are compiled and run in one process | keeps split-KV off by default, so long-context decode leaves 2.8x on the table | open; 8 hypotheses refuted (see below); **诊断+启用列入阶段三 L1/L3,当前延后** |
-| **KI-4** 离线 LLM() 与 serve(HTTP) 吞吐不对称(同负载 batch1 离线 136.7ms/步 vs serve eager 45.9ms) | 性能结论口径混淆 | 已定性:EngineCore 进程拓扑+GIL 串行 vs 跨进程重叠(E14);**性能结论一律以 serve 口径为准**(2026-10-13) |
-| **PM-2** the causal mask needs a *global* row index, which a vector region cannot see, so prefill tiles were planned at `block_q // 2` | ~2x wasted M tile in prefill | **resolved (5730b66)**: host precomputes each row's causal threshold into `RowThr` and `dual_copy`s it per AIV, so the full `block_q` tile is used; no host restriction |
-| 长上下文(8K/16K)图模式 TTFT 落后 FIA 2-6x | 长上下文可用性 | 已逐项处置:KI-1 修复(P6)+ D22 prefill 编译窗消除(P3)+ chunked prefill KV 重扫截断(prefill 内核级 1.14-1.26x,见 performance.md);引擎级端到端 TTFT 复核待补 |
-| integration 的 prefill/混合步回退 FIA | 设计内降级(不是事故) | prefill 接管已落地(B1,prefill_calls>0 实证);投机解码等仍回退 |
-| `head_size != 128` is declined (e.g. Qwen2.5-0.5B) | that model is served by FIA | deliberate; head_size=256 已支持(Qwen3.6 在役) |
-
-Post-mortems and refuted hypotheses: [`known-issues.md`](known-issues.md). KI-1 has been probed for
-caller-buffer alignment, KV pool size, stream ordering, the shapes themselves, both caches, the
-harness' reference, the reference-vs-kernel ordering, and an exact mirror of the harness' case
-construction — all refuted, each with a probe in `benchmarks/probes/`.
-
-### 运行形态评估与状态审计(2026-10-13,阶段 3 P5)
-
-- **O4 · eager 残余内核调用路径 —— skip(部署形态评估)**:TileInfer 服役形态 = vLLM-Ascend
-  **图模式在役**(全部历史 A/B serve 探针 `capture_calls=40>0`、`fallbacks=0`、6 plan READY;
-  ab 基准在采数前即断言这些前提)。图捕获把 decode 步内核编入 ACLGraph,replay 期不执行任何
-  Python/主机路径,残余的 TI eager 主机调用路径(~4.4ms×10 层,D23 瘦身后,B3/E13)只在回退窗口
-  (首见形状编译窗/显式回退)或 `--enforce-eager` 部署下执行——在役数字从未受其影响。结论:
-  图模式部署下无收益可图,skip;若未来以 eager 模式部署,优化方向与 P4 的 FFI 主机批处理同向,
-  不另行立项。
-- **O7 · 状态文件 commit hash 引用审计 —— 无漂移,无需校正**:对 `docs/*.md` 与
-  `.agent_loop/state/*.md` 中全部 16 个 commit hash 引用(79a9ea5×6、4370b5c×5、8fe3a26×4、
-  7e1308f×3、13fffc4×2 及 86d926f/d72f31f/e76089e/49e7a11/49e6140/17260c4/bf016fb/339f4f2 各 1)
-  逐一 `git cat-file -e` 核对:全部可达,且引用处的主题描述与实际 commit message 一致;文档中
-  其余 7-9 位数字串均为 PID(2580095/3965161 等)非 hash。未发现历史重写漂移,无需改写。
-
----
-
-## 3. What is left
-
-The ordered, actionable list is [`next-tasks.md`](next-tasks.md) (what / why / first step / done when).
-Summary of it, with status:
-
-| # | task | value | status |
-|---|---|---|---|
-| T1 | recover the box, collect interrupted logs | — | done |
-| T2 | clean TileInfer-vs-FIA A/B | the number everyone asks for | **done(图模式双源,2026-10-13)**:短上下文持平/长上下文 2-6x 落后(结构性),见 PERFORMANCE_REPORT §5 |
-| T3 | **KI-1**: split path with several shapes in one process | unblocks 2.8x long-context decode | open — **阶段三 L1,延后** |
-| T4 | prefill: recover the wasted half of the M tile | ~2x on prefill (cube-bound) | open, designed |
-| T5 | SIMD softmax (replace the SIMT one) | vector time off the critical path | open |
-| T6 | warm-up and batch bucketing as first-class features | what makes the integration deployable | **partly done**:prewarm 进引擎首步(B5a)+ 惰性 prefill 编译+变体上限(D22) |
-| T7 | split-KV on by default | serving's main shape | blocked on T3(阶段三 L3,延后) |
-| T8 | explicit prefill / fallback policy | correctness of the integration surface | **done(B1/B6)**:prefill_step 统一三态 append 语义;TILEINFER_OPS 算子粒度开关(decode/prefill/gdn/gdnwu/moe) |
-| T9 | ACLGraph capture verification | the entire plan/run split exists for this | **done(B5)**:图模式在役 + NaN 修复 + 设备测试 3/3 + 引擎探针 PASS |
-| T10 | FIA baseline inside the benchmark harness | "we are fast" needs the operator as yardstick | **done**:vllm-ascend FIA 即在役基线,双源 A/B 已产出 |
-| T11 | three ready-to-file upstream reports | highest-value contribution we already hold | open |
-| T12 | device checklist (or CI) | every device run is manual today | open |
-| T13 | Phase 3 breadth: MLA, sparse, FP8/FP4, MoE, sampling | scope | MoE/GDN 已按 TEMPORARY/关闭收口(见 §0);其余未立项 |
-
-阶段二融合算子层(M-MoE/M-GDN)已按 TEMPORARY/关闭收口,交用户决策;**当前无进行中的优化项**,
-下一阶段为阶段三 L1-L3(延后待授权)。
-
----
-
-## 4. Reproducing any of this
+## 4. 上机第一件事
 
 ```bash
-# CPU suite (no device needed)
-pytest tests -m "not npu"
-
-# device: the two kernel suites and the canary probe
-pytest tests/test_tilelang_ascend950_decode.py tests/test_tilelang_ascend950_prefill.py
-python benchmarks/probes/ascend950_paged_decode.py          # expect 5/5 PASS
-
-# standalone decode throughput (one shape per process; --kv-tile-pages + TILEINFER_ALLOW_SPLIT_KV=1
-# for the split path)
-python benchmarks/bench_attention.py --preset serving --backend tilelang-ascend950 --dtype bf16
-
-# end to end in vLLM (see docs/integration-vllm-ascend.md for the full recipe)
-TILELANG_CACHE_DIR=/tmp/tl_cache_vllm python scripts/prewarm-tileinfer-kernels.py \
-    --kv-heads 2 --group 6 --dim 128 --page-size 128 --num-pages-cap 8192 --buckets 1 2 4
-TILEINFER_VLLM=1 python scripts/vllm_tileinfer_launch.py serve <model> --attention-backend CUSTOM \
-    --max-model-len 2048 --enforce-eager --gpu-memory-utilization 0.3 --num-gpu-blocks-override 8192
+cd /home/userlist/zxs/TileInfer
+source scripts/env-ascend102.sh
+npu-smi info | head -20            # 先确认卡是空的（本项目不抢别人的卡）
+python3 scripts/ti_trace.py config
+python3 scripts/ti_trace.py run --preset smoke
 ```
 
-Environment variables that change behaviour: `TILEINFER_ALLOW_SPLIT_KV=1` (enable the split path),
-`TILEINFER_VLLM=1` (install the vLLM plugin), `TILEINFER_DISABLE=1` (the A/B baseline),
-`TILELANG_CACHE_DIR` (kernel cache; shared by the pre-warm and the server).
+`ti_trace.py` 自己会查显存门（>20 GB 占用就拒绝）并加设备锁，不会和别的进程抢卡。
+报告落在 `trace_out/<时间戳>-smoke/`，先看 `summary.md` 顶部的异常汇总，再看 `stages.csv`。
 
 ---
 
-## 5. Lessons that cost time (so they do not cost it twice)
+## 5. 环境
 
-1. **A compile inside the engine stops the engine.** A TileLang compile holds the interpreter, so a
-   "background" compile still blocks the whole process; requests fall back to FIA but they do not get
-   served. Pre-warm out of process. This looked like the *machine* hanging for several rounds.
-2. **The KV pool is not reproducible.** vLLM derives it from a memory snapshot (9425 pages in one run,
-   9899 in the next), which silently invalidates a pre-warm and pushes compilation back inside the
-   engine. ~~Pin it with `--num-gpu-blocks-override`.~~ **Resolved (2026-10-14, L2 pool-agnostic
-   ABI)**: kernels/plan keys now use a *declared* capacity (`declared_pool_cap`: power-of-two
-   ceiling of the real pool, or an exact `TILEINFER_POOL_CAP` pin) and the pool is presented as a
-   zero-copy capacity view (`Tensor.set_`), so drifted pools land in the same bucket and a
-   pre-warm compiled for one pool size is reused by the next run as-is (9425→9899/9600 cross-process
-   cache hits measured).
-3. **A bare `wait` in bash waits for the server too.** Three "engine hangs" were my harness waiting on
-   the server process launched with `&`, with the engine idle the whole time (`Running: 0`).
-4. **Registry initialisation races in real engines.** vLLM builds one backend per attention layer and
-   every layer asks the registry on the first decode step; the "loaded" flag was set before the imports
-   and unsynchronised, producing `unknown backend ...; known: ['reference']`. It needed a lock, a
-   regression test, and it is why a single-threaded test suite never saw it.
-5. **Match processes inside a server-side script, never in an `ssh` command line**: a pattern in the
-   command line matches the command line itself (`pkill -f`) and kills the session.
+| 项 | 值 |
+|---|---|
+| 机器 | `tileinfer-102`（10.119.5.102），`/home/userlist/zxs/TileInfer` |
+| 卡 | 1 × Ascend950PR，131072 MB HBM |
+| CANN | 9.3.0，在 `.work/cann930/install/cann` |
+| Python（本题后端） | `.venv_native213`：torch 2.13.0+cpu、vLLM 0.23.0、tilelang 0.1.15 |
+| Python（基线 A/B） | `.venv_baseline`：vllm-ascend 0.23，不含 tileinfer |
+| TileLang 缓存 | `$HOME/tl_cache_213`（**不要放进仓库**） |
+| 统一入口 | `source scripts/env-ascend102.sh` |
+
+`scripts/env-ascend102.sh` 是唯一的环境定义。它原来只存在于 `.agent_loop/run/env.sh`
+（未跟踪的临时目录），删掉那个目录等于删掉项目唯一的工具链定义——这是已经修掉的一个坑。
+
+---
+
+## 6. 测试现状（2026-11-10 实测，尚未修）
+
+**CPU 套件在 102 上不是绿的**：`pytest tests -m 'not npu and not tilelang'` 有 80 项失败。
+三条已核实的事实，避免误判：
+
+1. **每个文件单独跑是绿的。** 例：`pytest tests/test_kv_cache_write.py` → 30/30 passed，
+   但同一文件在整套里会失败。**是跨文件顺序污染，不是算子坏了。**
+2. **与仓库清理无关。** 在 `HEAD`（清理前）的纯净工作树上跑同一命令是 89 项失败；
+   清理后 80 项，**0 项新增、9 项被修好**（那 9 项原先失败是因为 `reference/vllm-0.23/`
+   的转录文件没入库，测试读不到源码）。
+3. **诱因是"装了真 vLLM"这个事实本身。** 契约测试用 `tests/fake_vllm.py` 钉住 vLLM 0.23 的
+   API **形状**；该 fake 只在没有真 vLLM 时注入自己。于是同一份代码在不同机器、不同文件顺序
+   下含义不同。把 vLLM 藏起来再跑反而更差（100 项失败），所以"换个环境跑"不是解。
+
+**结论**：这是**独立的一轮排查任务**，不属于"清理工作区"。在它被修掉之前：
+
+- 判断某个改动有没有破坏东西，用 `pytest tests/<file>.py`（逐文件），不要用整套的红绿。
+- 设备侧（`-m npu`）跑的是 `scripts/run_device_ci.sh`，与上面这套是两回事。
+
+---
+
+## 7. 仓库纪律
+
+- 没有 `measured_ratio` 和 bench 脚本的算子不许进主干。
+- 环境产物、编译缓存、profiling dump 一律不进仓库（`.gitignore` 已覆盖）。
+- `reference/vllm-0.23/` 下的文件**不许改**——它们是行号锚点。
+- `legacy/` 只减不增。
+- 环境定义必须随仓库走（`scripts/env-ascend102.sh`），不许只活在临时目录里。

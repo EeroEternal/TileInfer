@@ -14,7 +14,7 @@ H21 策略候选(待本矩阵确认):{1:16, 2:32, 4:64, 8:128, ≥16:0(plain)}�
 窗口紧张时用 KTPS 环境变量收窄扫描集(如 KTPS=0,16,32)。数值契约:每个 split 点
 vs 同 real lens 的 plain plan,maxdiff ≤ 3e-2。
 
-运行:source .agent_loop/run/env.sh && python benchmarks/probes/w2_policy_bench.py
+运行:source bench_out/env.sh && python benchmarks/probes/w2_policy_bench.py
 输出 SUM 行供 watcher 自动解析:`SUM b=<b> ktp=<k> ctx=<ctx> ms=<ms> vs_plain=<r> err=<e>`
 """
 

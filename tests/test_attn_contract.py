@@ -47,7 +47,7 @@ import torch
 import fake_vllm
 
 # ---------------------------------------------------------------------------------------
-# The transcribed contract (from runtime/vllm-api/, line numbers in docs/notes/...)
+# The transcribed contract (from reference/vllm-0.23/, line numbers in docs/notes/...)
 # ---------------------------------------------------------------------------------------
 
 #: ``AttentionImpl.__init__`` — `vllm/v1/attention/backend.py:780-794`.
