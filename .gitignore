@@ -44,3 +44,7 @@ runtime/
 # pytest 临时缓存目录与本地调试日志（git 权限受限时无法扫描，显式忽略以防误提交）
 pytest-cache-files-*/
 /debug.log
+.venv_ascend/
+.venv_ascend30/
+trace_out/
+/inventory-report.txt
