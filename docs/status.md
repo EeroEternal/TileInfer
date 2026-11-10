@@ -25,7 +25,7 @@
 | GDN 算子族（causal_conv1d / chunk / kkt / wu / solve_tril / delta_h / gating / recurrent / post_conv） | ✅ | `tests/test_gdn_*.py` + 设备对数；离线比值见 `notes/perf-candidates.md` |
 | MoE 算子族（sorted routing / bmm+bf16 / strict cache） | ✅ | 三个候选已进默认，各有离线比值与 bench 脚本 |
 | 分相计时（host/device 双时钟） | ✅ | `tileinfer/serving/phases.py`，报告可复现 |
-| 一键剖析工具 | 🟡 | `scripts/ti_trace.py` 已能在 102 上列预设、出计划、写报告目录；端到端真跑待验 |
+| 一键剖析工具 | ✅ | `scripts/ti_trace.py run --preset smoke` 端到端跑通（2026-11-10）：服务 57 s 就绪，单请求 TTFT **814.7 ms**、TPOT **106.62 ms**，报告落 `trace_out/<stamp>-smoke/`（`summary.md` / `stages.csv` / `meta.json` / `raw/serve.log`）。TPOT 106.6 ms 与"一步 ≈102 ms"的分段估计自洽。**尚未做**：异常检测（R1–R6）、单次前向全量报告、`ops.csv`/`anomalies.csv` 导出 |
 | 不依赖 `vllm_ascend` 的守卫 | ✅ | `tests/test_no_vllm_ascend.py`（AST + `sys.modules` 双重检查） |
 
 ---
