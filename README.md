@@ -1,104 +1,79 @@
 # TileInfer
 
-把 **TileInfer 做成 vLLM 的原生昇腾后端**：`pip install vllm tileinfer` 之后，
-`vllm serve Qwen3.6-35B-A3B` 在**一张 Ascend 950** 上跑起来，**不安装 `vllm_ascend`**，
-性能不低于现网（vLLM 0.23 + vllm-ascend 0.23 + 图模式）。
+在 **vllm-ascend 之上**加一层兼容与适配层：让更多模型能在一张昇腾卡上跑起来，跑得对、跑得动、
+不比基线慢；**已经跑得好的模型，一行都不碰**。
 
 ```
-      vLLM 0.23 (上游，未打补丁)
-              │  平台插件 + 通用插件两个官方扩展点
-    ┌─────────▼──────────┐
-    │  tileinfer.vllm    │  平台层 / worker hook / attention 后端 / 图捕获
-    ├────────────────────┤
-    │  tileinfer.kernels │  自有算子（TileLang）+ 可混用的上游与厂商算子
-    ├────────────────────┤
-    │  CANN 9.3 + 950    │
-    └────────────────────┘
+                vLLM 0.23（上游，不打补丁）
+                          │
+              ┌───────────▼────────────┐
+              │   vllm-ascend 0.23     │  平台 / worker / 显存 / KV 池 / 图捕获
+              └───────────┬────────────┘
+                          │   6 个接入点（注册表替换 + 方法包装，不改源码）
+              ┌───────────▼────────────┐
+              │   TileInfer（本仓库）   │  模型声明 · 决策 · 契约 · 提供者 · 接入 · 内核
+              └───────────┬────────────┘
+                          │
+                  CANN 9.3 + Ascend 950
 ```
+
+**一句话定位**：我们是**选择层 + 补齐层**，不是另一个推理引擎。
+vllm-ascend 已经适配的模型走它；它没适配的模型，我们把缺的那部分补上。
+
+**边界（重要）**：设备、worker、显存、KV 池、图捕获归 vllm-ascend。
+我们不重写平台层——上一个版本（v2）试过，代价是 TPOT 2.53×、TTFT 11.8×。
 
 ## 现在是什么状态
 
-后端能起服务、能出正确结果、能跑混合 KV（30 层 GDN 线性注意力 + 10 层 full attention），
-但**性能还没有和基线打平**：TPOT 2.53×、TTFT 11.8× 于 vllm-ascend 基线，图捕获还没接上。
-确切数字、每条差距的归因、以及哪些结论已经被实验推翻，都在
-[`docs/status.md`](docs/status.md)。不要从这里或旧文档里引用性能数字。
+- **定位已改为 v3（兼容适配层）**；**代码仍是 v2 形态**（自带平台层、不装 vllm-ascend）。
+  重构计划见架构文档的里程碑，当前进度与每条断点见 [`docs/status.md`](docs/status.md)。
+- 已有资产：注意力 / GDN / MoE / 采样四族内核、`plan/run` 注意力契约、分相计时的剖析工具、
+  v1 时代在役过的 vllm-ascend 插件（冻结在 `legacy/`）。
+- 性能数字一律以 [`docs/performance.md`](docs/performance.md) 为准，**不要从 README 或旧文档引用**。
 
-## 三条价值 / 三个目标
+## 文档地图
 
-1. **单卡性能**：把 TTFT/TPOT 拉到与 vllm-ascend 基线可比，并把图捕获、投机解码接上。
-2. **算子取舍**：用自有算子，同时有能力在同一个名字下混用上游与厂商实现，共同让性能最好。
-3. **平台泛化**：同一套代码结构能换卡（如海光）、能加模型（DeepSeek-V4.1 是第二个样例）。
+先读三篇：
 
-三块怎么分工、里程碑、验收口径见 [`docs/plan-vllm-native-backend.md`](docs/plan-vllm-native-backend.md)。
+| | |
+|---|---|
+| [`docs/architecture.md`](docs/architecture.md) | 定位、分层、生命周期、两条路线、不变量、硬约束 |
+| [`docs/acceptance.md`](docs/acceptance.md) | 目标与验收口径、KPI、红线（什么情况必须收缩） |
+| [`docs/status.md`](docs/status.md) | 现在到哪一步、凭什么相信、哪里还断着 |
 
-## 快速开始（在 102 机器上）
+按需：
 
-```bash
-source scripts/env-ascend102.sh            # CANN 9.3 + TileLang 缓存目录 + 运行期开关
-.venv_native213/bin/python -m vllm.entrypoints.cli.main serve \
-  /home/models/Qwen3.5-35B-A3B \
-  --attention-backend CUSTOM --enforce-eager \
-  --max-model-len 9216 --max-num-batched-tokens 9216 --max-num-seqs 32 \
-  --gpu-memory-utilization 0.75 --trust-remote-code
-```
+| | |
+|---|---|
+| [`docs/integration.md`](docs/integration.md) | 与 vLLM / vllm-ascend 的接入关系（机制层，不含代码） |
+| [`docs/extending.md`](docs/extending.md) | 加一个模型 / 一个实现提供者 / 一个接入点 |
+| [`docs/hardware-checklist.md`](docs/hardware-checklist.md) | 上机点亮清单（操作手册，不是架构） |
+| [`docs/known-issues.md`](docs/known-issues.md) | 踩过的坑与复盘（读它能省几天） |
+| [`docs/performance.md`](docs/performance.md) | 性能口径、基线、测量方法 |
+| `docs/notes/` | 契约转录、事实清单、历史归档 |
 
-一键性能剖析（起服务 → 打流 → 采集 → 出报告）：
-
-```bash
-python3 scripts/ti_trace.py config                       # 看当前配置
-python3 scripts/ti_trace.py presets                      # 看可用预设
-python3 scripts/ti_trace.py run --preset smoke --dry-run # 只打印将要执行的计划
-python3 scripts/ti_trace.py run --preset smoke           # 真跑，报告落 trace_out/
-```
+> 历史文档已归档到 `docs/notes/archive/`，头部标了 SUPERSEDED，**不要按它们建目录或改代码**。
 
 ## 目录
 
 | 路径 | 是什么 |
 |---|---|
-| `tileinfer/vllm/` | 后端本体：平台层、worker hook、attention 后端、图捕获、算子接线 |
 | `tileinfer/kernels/` | TileLang 算子（attention / GDN / MoE / sampling） |
-| `tileinfer/models/dsv41/` | DeepSeek-V4.1 的实现，作为"加一个模型"的样例保留 |
-| `tileinfer/serving/` | 与引擎无关的 serving 侧工具（分相计时、bucket、planner） |
-| `reference/vllm-0.23/` | vLLM 0.23 关键模块的逐字副本，**只**用于让 `file:line` 引用可核对 |
-| `legacy/` | 冻结的 vllm-ascend 时代代码，不打包、不测试、不再增长；是算子取用的素材库 |
-| `tools/dsv41/` | DeepSeek-V4.1 的部署与验证脚本 |
-| `benchmarks/` | A/B harness 与探针；`scripts/ti_trace.py` 是统一入口 |
-| `docs/` | 见下面的文档地图 |
-
-## 文档地图
-
-先读这两篇，其余按需：
-
-| | |
-|---|---|
-| [`docs/status.md`](docs/status.md) | 现在到哪一步了，凭什么相信，哪里断了 |
-| [`docs/plan-vllm-native-backend.md`](docs/plan-vllm-native-backend.md) | 要做什么、怎么分块、里程碑与验收口径 |
-
-实现细节：
-
-| | |
-|---|---|
-| [`docs/integration-vllm-native.md`](docs/integration-vllm-native.md) | 用了 vLLM 的哪些官方扩展点，耦合在哪 |
-| [`docs/extending.md`](docs/extending.md) | 加一个模型 / 一族算子 / 一个更快的实现 |
-| [`docs/hardware-checklist.md`](docs/hardware-checklist.md) | 上机点亮 11 步，每步的失败归因 |
-| [`docs/known-issues.md`](docs/known-issues.md) | 踩过的坑与事后复盘（读它能省几天） |
-| [`docs/performance.md`](docs/performance.md) | 性能口径、基线、当前数字、测量方法 |
-| [`docs/architecture.md`](docs/architecture.md) | plan/run 契约、metadata 模型、调度器 |
-
-契约与转录（写代码时要对着看的）：
-
-`docs/notes/vllm-api-0.23.md` · `docs/notes/vllm-attention-contract.md` ·
-`docs/notes/fla-chunk-contract.md` · `docs/notes/op-coverage-qwen36.md` ·
-`docs/notes/perf-candidates.md` · `docs/notes/perf-comparison-rules.md`
+| `tileinfer/vllm/` | **v2 形态**的后端本体（平台层、worker hook、attention 后端、图捕获）——v3 会拆进分层 |
+| `tileinfer/models/` | 上游没有的模型实现（DeepSeek-V4.1 是样例） |
+| `tileinfer/serving/` | serving 侧工具（分相计时、bucket、planner） |
+| `legacy/` | 冻结的 vllm-ascend 时代代码：不打包、不测试、不再增长，是 v3 接入层的素材库 |
+| `reference/vllm-0.23/` | vLLM 0.23 关键模块逐字副本，只为让 `file:line` 引用可核对 |
+| `benchmarks/`、`scripts/` | A/B harness、探针、统一剖析入口 `scripts/ti_trace.py` |
+| `docs/` | 见上面的文档地图 |
 
 ## 环境
 
 - 硬件：1 × Ascend950PR（单卡是当前唯一验证过的形态）
-- 栈：CANN 9.3.0、torch 2.13.0+cpu、torch_npu、vLLM 0.23.0、tilelang 0.1.15
-- Python 环境：`.venv_native213`（本题后端）、`.venv_baseline`（vllm-ascend 基线，A/B 用）
-- 统一入口：`scripts/env-ascend102.sh`。**环境定义必须在仓库里**，不能只活在某个临时目录
+- 栈：CANN 9.3.0、torch 2.13.0、torch_npu、vLLM 0.23.0、tilelang 0.1.15
+- 统一入口：`source scripts/env-ascend102.sh`。**环境定义必须在仓库里**，不许只活在临时目录。
 
 ## License
 
-Apache License 2.0 — 见 [LICENSE](LICENSE)。`reference/vllm-0.23/` 为 vLLM（Apache-2.0）的
-未修改副本，来源与规则见该目录的 `README.md`。
+Apache License 2.0，见 [LICENSE](LICENSE)。`reference/vllm-0.23/` 是 vLLM（Apache-2.0）的未修改副本，
+来源与规则见该目录的 `README.md`。

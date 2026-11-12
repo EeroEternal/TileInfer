@@ -1,32 +1,37 @@
 # 状态
 
 > 一页纸回答两个问题：**建成了什么（凭什么相信）**、**哪里还断着**。
-> 方案见 [`plan-vllm-native-backend.md`](plan-vllm-native-backend.md)，数字见 [`performance.md`](performance.md)。
+> 目标形态见 [`architecture.md`](architecture.md)，验收口径见 [`acceptance.md`](acceptance.md)，
+> 数字见 [`performance.md`](performance.md)。
 >
-> 最后核对：**2026-11-10**，代码 `4cb86c9`，单卡 Ascend950PR，CANN 9.3.0。
+> 最后核对：**2026-11-12**，代码 `449d8bf`，单卡 Ascend950PR，CANN 9.3.0。
 
 ---
 
 ## 0. 一句话
 
-后端**能起服务、能出正确结果、混合 KV 能跑**；**性能没打平**（TPOT 2.53×、TTFT 11.8×），
-**图捕获还没接上**，**投机解码没开始**。这三件事就是当前全部工作。
+**定位已改为 v3（vllm-ascend 之上的兼容适配层），代码仍是 v2 形态（自带平台层、不装 vllm-ascend）。**
+v3 要求的"重排分层 + 收敛接入点"重构**尚未开始**；下一节列出了 v2 已经建成的东西，
+它们不会因为定位改变而作废——内核、契约、计时、剖析工具都是 v3 的资产。
+
+到目前为止最硬的一条事实：**v2 的性能没打平（TPOT 2.53×、TTFT 11.8×），图捕获没接上。**
+这正是把定位改回 v3 的直接原因，不是猜测。
 
 ---
 
-## 1. 已经建成
+## 1. 已经建成（v2 形态，v3 继续用）
 
 | 能力 | 状态 | 凭什么相信 |
 |---|---|---|
-| 平台层（`vllm.platform_plugins` 注册、`AttentionBackendEnum.CUSTOM` 接管） | ✅ | 服务能起，`AttentionBackendEnum.CUSTOM.get_class()` 返回我们的类，无静默回退 |
-| worker 四个 hook（`init_device` / `determine_available_memory` / `initialize_from_config` / `compile_or_warm_up_model`） | ✅ | `tileinfer/vllm/worker.py`，`tests/test_worker_contract.py` 锁契约 |
-| attention 后端四件套（`backend` / `metadata` / `impl` / `kv_cache`） | ✅ | 设备上出 token，与参考实现对数一致 |
-| 混合 KV cache（30 层 GDN 线性 + 10 层 full attn，单池两种页） | ✅ | `support_hybrid_kv_cache()` 为真；设备实测不报池一致性错误 |
-| GDN 算子族（causal_conv1d / chunk / kkt / wu / solve_tril / delta_h / gating / recurrent / post_conv） | ✅ | `tests/test_gdn_*.py` + 设备对数；离线比值见 `notes/perf-candidates.md` |
-| MoE 算子族（sorted routing / bmm+bf16 / strict cache） | ✅ | 三个候选已进默认，各有离线比值与 bench 脚本 |
-| 分相计时（host/device 双时钟） | ✅ | `tileinfer/serving/phases.py`，报告可复现 |
-| 一键剖析工具 | ✅ | `scripts/ti_trace.py run --preset smoke` 端到端跑通（2026-11-10）：服务 57 s 就绪，单请求 TTFT **814.7 ms**、TPOT **106.62 ms**，报告落 `trace_out/<stamp>-smoke/`（`summary.md` / `stages.csv` / `meta.json` / `raw/serve.log`）。TPOT 106.6 ms 与"一步 ≈102 ms"的分段估计自洽。**尚未做**：异常检测（R1–R6）、单次前向全量报告、`ops.csv`/`anomalies.csv` 导出 |
-| 不依赖 `vllm_ascend` 的守卫 | ✅ | `tests/test_no_vllm_ascend.py`（AST + `sys.modules` 双重检查） |
+| 平台层（平台插件注册、注意力后端枚举接管） | ✅ | 服务能起，枚举解析出我们的类，无静默回退 |
+| worker 四个 hook（设备初始化 / 可用显存 / 配置初始化 / 编译预热） | ✅ | 有契约测试锁住形状 |
+| attention 后端四件套（后端 / 元数据 / 实现 / KV 写入） | ✅ | 设备上出 token，与参考实现对得上 |
+| 混合 KV cache（30 层线性注意力 + 10 层 full attention，单池两种页） | ✅ | 能力探测为真；设备实测不报池一致性错误 |
+| 线性注意力（GDN）算子族：卷积 / chunk / kkt / wu / solve_tril / delta_h / gating / recurrent / post_conv | ✅ | 单测 + 设备对数；离线比值见 `notes/perf-candidates.md` |
+| MoE 算子族（排序路由 / bmm / 严格缓存） | ✅ | 三个候选已进默认，各有离线比值与 bench 脚本 |
+| 分相计时（主机/设备双时钟） | ✅ | 报告可复现 |
+| 一键剖析工具 | ✅ | 端到端跑通（2026-11-10）：服务 57 s 就绪，单请求首字 814.7 ms、单步 106.62 ms，报告落 `trace_out/`。**尚未做**：异常检测、单次前向全量报告、CSV 导出 |
+| "不依赖 vllm-ascend" 的守卫 | ✅ | AST + 运行时双重检查——**这条守卫在 v3 下必须拆掉**，v3 明确依赖 vllm-ascend |
 
 ---
 
@@ -34,31 +39,50 @@
 
 | 项 | 现状 | 影响 |
 |---|---|---|
-| **图捕获（ACLGraph）** | 未接上。`--enforce-eager` 是当前唯一能跑稳的形态 | 每步固定开销吃掉大部分 TPOT 差距。这是 P0 |
-| **投机解码（MTP）** | 未开始。模型侧现成（checkpoint 有 MTP 头、vLLM 有 `qwen3_5_mtp.py`），卡在我们的批语义只允许一个 query token（`attn/metadata.py:33`） | 单 token 一步的天花板 |
-| **TPOT / TTFT** | 2.53× / 11.8× 于基线，门是 1.10× | 交付门槛未过 |
-| **长上下文** | v1 在这里崩过（8K 吞吐 0.213×）；v2 的长上下文数字还没系统测 | 风险组，不是当前门 |
-| **量化（W8A8/W4A8/FP8-KV）** | 明确不做，bf16 一条路 | 见方案 §0 |
-| **TP / EP / 多卡** | 明确延后，优先级最低 | 见方案 §1 |
-| **算子选择层** | 有候选机制（`Candidate`/`CandidateSet`）但没有 provider 抽象与账本 | 第二块的主要工作 |
+| **v3 分层重构** | 未开始。目录与代码仍是 v2 形态 | 文档与代码短期不一致，按架构文档建目录前先看本节 |
+| **图捕获（ACLGraph）** | v2 未接上；v1 时代在引擎里跑过 | 每步固定开销吃掉大部分差距。P0 |
+| **投机解码** | 未开始。模型侧现成，卡在批语义只允许单 query token | 单 token 一步的天花板 |
+| **TPOT / 首字** | 2.53× / 11.8× 于基线；门是 1.10× | 交付门槛未过 |
+| **长上下文** | v1 在 8K 崩过（吞吐 0.213×）；v2 未系统测 | 风险组，不是当前门 |
+| **量化** | 只做 bf16 | 未验证组合一律不声明支持 |
+| **TP / EP / 多卡** | 明确延后 | 优先级最低 |
+| **决策层与账本** | 有候选机制雏形，没有"声明 → 缺口清单 → 提供者声明"的闭环 | v3 的主要工作 |
 
 ---
 
-## 3. 证据分级（引用数字前先看这个）
+## 3. 定位演进与已作废结论
+
+### 3.1 三次定位
+
+| | 依赖 vllm-ascend | 结果 | 现在怎么处理 |
+|---|---|---|---|
+| **v1 寄生** | 是 | 短上下文与基线打平（0.91–1.09），补丁点散落十几处 | 代码冻结在 `legacy/`，作为 v3 接入层的素材 |
+| **v2 原生** | 否 | 能跑能对，但 TPOT 2.53×、TTFT 11.8×，图捕获未接 | 形态作废；内核、契约、计时、剖析工具保留 |
+| **v3 兼容层** | 是 | 未开始 | 目标形态，见 [`architecture.md`](architecture.md) |
+
+### 3.2 已作废的结论（保留在案，防止重犯）
+
+| 结论 | 状态 | 依据 |
+|---|---|---|
+| "图捕获在 950 上不可达" | **已作废** | v1 在服务里跑过图模式（捕获次数 > 0、回退 0） |
+| "只要重写平台层就能拿回性能" | **已作废** | v2 的代价就是这条假设的反证：TPOT 2.53× |
+| "AI 侧能跑起来就算支持" | **已作废** | 四条独立结论（见 acceptance.md），能跑只是第一条 |
+
+**留这条的目的**：这三个念头每一个都曾经看起来很有道理，并且各自花掉过以周计的时间。
+
+---
+
+## 4. 证据分级（引用数字前先看这个）
 
 | 级别 | 含义 |
 |---|---|
 | **[已核实]** | 有落盘日志、命令可复现，且知道当时的口径 |
 | **[待复核]** | 只在某一个窗口测过。跨窗口漂移可达 2×，不能当结论 |
-| **[已作废]** | 曾经写进文档但被后续实验推翻。**保留在案，防止重犯** |
-
-已作废的结论清单在 [`performance.md`](performance.md) §4 与
-[`notes/handover-2026-10-28.md`](notes/handover-2026-10-28.md) 的文首提示里。
-最典型的一条：**"图捕获在 950 上不可达"是错的**，v1 在服务里跑过图模式。
+| **[已作废]** | 曾写进文档但被后续实验推翻。**保留在案，防止重犯** |
 
 ---
 
-## 4. 上机第一件事
+## 5. 上机第一件事
 
 ```bash
 cd /home/userlist/zxs/TileInfer
@@ -68,12 +92,12 @@ python3 scripts/ti_trace.py config
 python3 scripts/ti_trace.py run --preset smoke
 ```
 
-`ti_trace.py` 自己会查显存门（>20 GB 占用就拒绝）并加设备锁，不会和别的进程抢卡。
+剖析工具自己会查显存门（占用 > 20 GB 就拒绝）并加设备锁，不会和别的进程抢卡。
 报告落在 `trace_out/<时间戳>-smoke/`，先看 `summary.md` 顶部的异常汇总，再看 `stages.csv`。
 
 ---
 
-## 5. 环境
+## 6. 环境
 
 | 项 | 值 |
 |---|---|
@@ -85,36 +109,33 @@ python3 scripts/ti_trace.py run --preset smoke
 | TileLang 缓存 | `$HOME/tl_cache_213`（**不要放进仓库**） |
 | 统一入口 | `source scripts/env-ascend102.sh` |
 
-`scripts/env-ascend102.sh` 是唯一的环境定义。它原来只存在于 `.agent_loop/run/env.sh`
-（未跟踪的临时目录），删掉那个目录等于删掉项目唯一的工具链定义——这是已经修掉的一个坑。
+`scripts/env-ascend102.sh` 是唯一的环境定义。它曾经只活在未跟踪的临时目录里，
+删掉那个目录就等于删掉项目唯一的工具链定义——这是已经修掉的坑。
 
 ---
 
-## 6. 测试现状（2026-11-10 实测，尚未修）
+## 7. 测试现状（2026-11-10 实测，尚未修）
 
 **CPU 套件在 102 上不是绿的**：`pytest tests -m 'not npu and not tilelang'` 有 80 项失败。
 三条已核实的事实，避免误判：
 
-1. **每个文件单独跑是绿的。** 例：`pytest tests/test_kv_cache_write.py` → 30/30 passed，
-   但同一文件在整套里会失败。**是跨文件顺序污染，不是算子坏了。**
-2. **与仓库清理无关。** 在 `HEAD`（清理前）的纯净工作树上跑同一命令是 89 项失败；
-   清理后 80 项，**0 项新增、9 项被修好**（那 9 项原先失败是因为 `reference/vllm-0.23/`
-   的转录文件没入库，测试读不到源码）。
-3. **诱因是"装了真 vLLM"这个事实本身。** 契约测试用 `tests/fake_vllm.py` 钉住 vLLM 0.23 的
-   API **形状**；该 fake 只在没有真 vLLM 时注入自己。于是同一份代码在不同机器、不同文件顺序
-   下含义不同。把 vLLM 藏起来再跑反而更差（100 项失败），所以"换个环境跑"不是解。
+1. **每个文件单独跑是绿的。** 例：同一个文件单独跑 30/30 passed，在整套里会失败。
+   **是跨文件顺序污染，不是算子坏了。**
+2. **与仓库清理无关。** 清理前 89 项失败，清理后 80 项，0 项新增、9 项被修好。
+3. **诱因是"装了真 vLLM"这个事实本身。** 契约测试用假的 vLLM 钉住 API 形状，
+   该 fake 只在没有真 vLLM 时注入自己，于是同一份代码在不同机器、不同文件顺序下含义不同。
+   把 vLLM 藏起来再跑反而更差（100 项失败），所以"换个环境跑"不是解。
 
-**结论**：这是**独立的一轮排查任务**，不属于"清理工作区"。在它被修掉之前：
-
-- 判断某个改动有没有破坏东西，用 `pytest tests/<file>.py`（逐文件），不要用整套的红绿。
-- 设备侧（`-m npu`）跑的是 `scripts/run_device_ci.sh`，与上面这套是两回事。
+**结论**：这是独立的一轮排查任务。在它被修掉之前：判断某次改动有没有破坏东西，
+用逐文件跑，不要用整套的红绿。设备侧测试是另一套入口。
 
 ---
 
-## 7. 仓库纪律
+## 8. 仓库纪律
 
-- 没有 `measured_ratio` 和 bench 脚本的算子不许进主干。
-- 环境产物、编译缓存、profiling dump 一律不进仓库（`.gitignore` 已覆盖）。
-- `reference/vllm-0.23/` 下的文件**不许改**——它们是行号锚点。
+- 没有实测比值和 bench 脚本的算子不许进主干。
+- 环境产物、编译缓存、profiling dump 一律不进仓库。
+- `reference/vllm-0.23/` 下的文件不许改——它们是行号锚点。
 - `legacy/` 只减不增。
-- 环境定义必须随仓库走（`scripts/env-ascend102.sh`），不许只活在临时目录里。
+- 环境定义必须随仓库走，不许只活在临时目录里。
+- **文档里提到的目录必须真实存在**；不存在就写"计划"，不要写进目录表。

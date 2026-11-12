@@ -1,5 +1,11 @@
 # TileInfer 昇腾 950 硬件点亮清单（bring-up checklist）
 
+> **范围说明（2026-11-12）**：本文是**操作清单**，不是架构文档。
+> 文中出现的「原生后端」「平台层」「`tileinfer/vllm/*`」等表述属于 **v2 形态**
+> （自带平台层、不装 vllm-ascend）；项目定位已改为 **v3（vllm-ascend 之上的兼容适配层）**，
+> 见 [`architecture.md`](architecture.md)。各步骤的判据与失败归因仍然有效。
+
+
 > 适用对象：第一次在这台 Ascend 950 机器上把 **TileInfer 作为 vLLM 0.23 原生后端**跑起来的人。
 > 读者**不需要**本项目上下文：每一步给出「命令 → 期望输出 → 失败归因」，顺序按「后一步依赖前一步的结论」排。
 > 单卡、单模型（Qwen3.6-35B-A3B，40 层 = 10 层 full-attention + 30 层 GDN，256 专家 MoE）、
@@ -306,7 +312,7 @@ enforce_eager   = True            # 图捕获尚未就绪时平台会强制 eage
 | `block_size = 1024/…` 且 `user_specified True` | 命令行显式传了非 2048 倍数的 `--block-size`，平台按设计**拒绝**而不是偷偷改 | 去掉 `--block-size`（让平台对齐），或显式传 `2048` |
 | `block_size` 非 2048 且 `is_hybrid True`、无报错 | 对齐逻辑没跑到（vLLM 没调 `check_and_update_config`） | 确认 `current_platform` 是 TileInferPlatform（5.1），否则平台根本没参与 |
 | `worker_cls` 不是 `tileinfer.vllm.worker.NPUWorker` | 平台没写进 `parallel_config`。字段名现在是**已核实**的：`reference/vllm-0.23/vllm__config__parallel.py:248` 声明 `worker_cls: str = "auto"`，消费点是 `vllm__v1__worker__worker_base.py:249-253` | 回看 5.1 的 `current_platform`；若启动直接抛 `ValueError: parallel_config.worker_cls=… conflicts`，说明命令行显式传了别的 `--worker-cls`——去掉它（平台只在 `"auto"` 哨兵时改写，见 `docs/notes/handover-2026-10-28.md` §7.7） |
-| 5.2 抛 `ValueError` 提到 MLA / sparse / sleep mode / speculative | 配置里带了 v0 明确不做的特性（见 `docs/plan-vllm-native-backend.md` §0） | 去掉对应 flag；这类拒绝是**期望行为**，报错文本会直接点名 |
+| 5.2 抛 `ValueError` 提到 MLA / sparse / sleep mode / speculative | 配置里带了 v0 明确不做的特性（见 `docs/notes/archive/plan-vllm-native-backend-v2.md` §0） | 去掉对应 flag；这类拒绝是**期望行为**，报错文本会直接点名 |
 | 5.2 抛 `ValueError: kv-cache dtype …` | `--kv-cache-dtype` 不是 `auto` | 去掉该 flag（v0 只跑未量化） |
 
 ---
@@ -701,6 +707,6 @@ PY
 | 11 | TTFT/TPOT 与现网比值落盘 | 🔶 未上机验证（依赖 7–10） |
 
 > 🔶 不是「环境坏了」，也不再是「缺文件 / 骨架」：6–11 的阻塞是这些硬件路径**尚未在真机上跑过**
-> （v0 的施工顺序见 `docs/plan-vllm-native-backend.md` §9；`docs/notes/handover-2026-10-28.md` 的 worker
+> （v0 的施工顺序见 `docs/notes/archive/plan-vllm-native-backend-v2.md` §9；`docs/notes/handover-2026-10-28.md` 的 worker
 > 行仍写着「骨架」，是更早的状态，以本清单与 `tileinfer/vllm/worker.py` 为准）。
 > 每完成一格，把实际输出追加到 `/tmp/bringup.log`，并把本节表格的状态改成 ✅。

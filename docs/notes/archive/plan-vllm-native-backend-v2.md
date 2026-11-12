@@ -1,3 +1,11 @@
+> **SUPERSEDED（2026-11-12）**：本文描述的是 **v2「原生后端」** 定位（不依赖 vllm-ascend、
+> 自带平台层），该定位已被 v3 取代。**不要按本文建目录或改代码。**
+>
+> 现行文档：[`../../architecture.md`](../../architecture.md) ·
+> [`../../integration.md`](../../integration.md) · [`../../status.md`](../../status.md)
+>
+> 保留原因：历史取证与"哪些路走不通"的记录。
+
 # TileInfer 作为 vLLM 原生昇腾后端：Qwen3.6 单卡方案
 
 > 这是**唯一**的方案文档。范围、分工、里程碑、验收口径都以本文为准。

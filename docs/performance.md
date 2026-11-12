@@ -1,7 +1,7 @@
 # 性能：口径、基线、当前数字
 
 > 本文只回答三件事：**怎么测**、**基线是多少**、**现在差多少**。
-> 优化方案与优先级在 [`plan-vllm-native-backend.md`](plan-vllm-native-backend.md)；
+> 优化方案与优先级在 [`acceptance.md`](acceptance.md) 与 [`architecture.md`](architecture.md)；
 > 每个候选算子的离线比值在 [`notes/perf-candidates.md`](notes/perf-candidates.md)。
 
 ---
