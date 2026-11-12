@@ -80,17 +80,19 @@ MTP 投机、长上下文（8K/16K/32K/128K，262K 仅在 config 支持时）、
 | vllm-ascend 有 Mamba 相关 Triton 算子文件 | `.venv_v3/.../vllm_ascend/ops/triton/mamba/` |
 | vllm-ascend **没有** `MambaMixer2`/`ssd_combined` 替换 | 全树搜索这些符号为空；Mamba 目录只有 conv/lightning/postprocess |
 | vllm-ascend 补了 hybrid Mamba cache config 和 `causal_conv1d_update` | `patch_mamba_config.py`、`patch_triton.py` |
+| 目标 config：52 层 = 23 Mamba + 23 MoE + 6 attention；上下文 262144；`num_nextn_predict_layers=1` | [`m5-nemotron-config.json`](m5-nemotron-config.json)（仅 config 快照） |
+| vLLM 0.23 **直接加载**目标 config 会 `AttributeError: property 'layers_block_type' has no setter`；默认 pattern 也与目标不符 | `.venv_v3/bin/python` 实测 |
+| `normalize_config()` 转成 `hybrid_override_pattern`/`mtp_hybrid_override_pattern` 后，`NemotronHConfig` 可加载，层型/MTP 与目标一致 | `tools/nemotron/config_to_manifest.py` 测试 |
 
 ### 3.2 未知（必须在离线阶段查清，不能猜）
 
-1. 目标 checkpoint 的 `config.json`：`architectures`、`model_type`、`num_hidden_layers`、
-   `layer_types`、`num_nextn_predict_layers`、`max_position_embeddings`。
-2. checkpoint 是否真的带 MTP heads/权重；没有 MTP 就不能承诺 MTP。
-3. vllm-ascend 的 Mamba2/混合 attention 是否能接住该模型，还是只在 vLLM 通用路径下能跑。
-4. 图捕获对 Mamba state / 混合 KV 是否安全；需要上机计数，不能静态断言。
-5. 参考实现路径：HF/transformers 在 CPU 上能否在可接受时间给出固定短样例 logits；
+1. checkpoint 是否真的带 MTP heads/权重；config 声明 1 层 MTP 不等于权重有 MTP heads。
+2. vllm-ascend 的 Mamba2/混合 attention 是否能接住该模型，还是只在 vLLM 通用路径下能跑。
+3. 图捕获对 Mamba state / 混合 KV 是否安全；需要上机计数，不能静态断言。
+4. 参考实现路径：HF/transformers 在 CPU 上能否在可接受时间给出固定短样例 logits；
    若太慢，改用分层 oracle + 同输入复跑一致。
-6. 权重是否已在本地/可获取；今晚不下载，先记录阻塞。
+5. 权重是否已在本地/可获取；今晚不下载，先记录阻塞。
+6. 目标 model 的 tokenizer/chat template 是否随权重提供；参考与 C1 必须用同一模板。
 
 ---
 
@@ -101,7 +103,7 @@ MTP 投机、长上下文（8K/16K/32K/128K，262K 仅在 config 支持时）、
 | # | 工作 | 产出 | 完成判据 |
 |---|---|---|---|
 | O1 | 静态审计：vLLM/vllm-ascend 的模型、MTP、Mamba、KV、图路径 | `docs/notes/m5-nemotron-static-gap.md` | 每条事实有文件路径/行号；未知项列明 |
-| O2 | 模型声明草案：结构、能力清单、KV/state、benchmark 占位 | [`m5-nemotron-declaration.md`](m5-nemotron-declaration.md) + [`config_to_manifest.py`](../../tools/nemotron/config_to_manifest.py) | 不写“用谁的实现”；字段与 `contracts/manifest.py` 对齐；config 机械映射不猜 benchmark |
+| O2 | 模型声明草案：结构、能力清单、KV/state、benchmark 占位 | [`m5-nemotron-declaration.md`](m5-nemotron-declaration.md) + [`nemotron_3_5.py`](../../tileinfer/manifests/nemotron_3_5.py) + [`config_to_manifest.py`](../../tools/nemotron/config_to_manifest.py) | 结构来自真实 config；声明是 draft，benchmark top5 未填，**不进 registry** |
 | O3 | 缺口报告（静态先验）：required gaps、候选 provider、`delete_when` | [`m5-nemotron-static-gap.md`](m5-nemotron-static-gap.md) + [`m5-nemotron-static-audit.json`](m5-nemotron-static-audit.json) | 与 O1 一致；不把“未验证”写成 gap=0 |
 | O4 | provider 契约草案：coverage/graphable/parallel/evidence/delete_when | [`m5-nemotron-provider.md`](m5-nemotron-provider.md) | 每个 provider 对应一个真实缺口；无证据标 candidate |
 | O5 | 参考实现方案：固定样例、tokenizer、logits/文本容差 | [`reference_probe.py`](../../tools/nemotron/reference_probe.py) 骨架 | 能在 CPU 上跑小样例；不依赖 NPU |

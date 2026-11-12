@@ -16,12 +16,14 @@ import pytest
 
 from tileinfer.contracts.capabilities import CAPABILITIES, Mamba2Contract
 from tileinfer.contracts.manifest import AttentionSpec, MambaSpec, ModelManifest, MoESpec
-from tileinfer.manifests import QWEN3_6
+from tileinfer.manifests import MANIFESTS, QWEN3_6
+from tileinfer.manifests.nemotron_3_5 import BENCHMARK_PENDING, NEMOTRON_3_5_DRAFT
 from tileinfer.resolve.decide import decide
 from tileinfer.resolve.probe import Environment
 
 ROOT = Path(__file__).resolve().parents[1]
 PREFIX = ROOT / ".venv_v3/lib/python3.12/site-packages"
+VLLM_PY = ROOT / ".venv_v3/bin/python"
 
 
 def _mamba_manifest(*, layer_types: tuple[str, ...], mamba: MambaSpec | None) -> ModelManifest:
@@ -169,6 +171,82 @@ def test_config_to_manifest_rejects_bad_gqa_and_mamba_grouping() -> None:
     bad_mamba["mamba_n_groups"] = 7
     with pytest.raises(ValueError, match="divisible"):
         mod.parse_config(bad_mamba)
+
+
+def test_nemotron_declaration_matches_the_real_config_snapshot() -> None:
+    m = NEMOTRON_3_5_DRAFT
+    m.validate()
+    assert m.num_layers == 52
+    assert m.layer_types.count("mamba") == 23
+    assert m.layer_types.count("moe") == 23
+    assert m.layer_types.count("full_attention") == 6
+    assert m.attention.num_heads == 32 and m.attention.num_kv_heads == 2
+    assert m.mamba is not None and m.mamba.num_heads == 64 and m.mamba.n_groups == 8
+    assert m.moe is not None and m.moe.num_experts == 128 and m.moe.top_k == 6
+    assert m.kv["max_position_embeddings"] == 262144
+    assert m.kv["num_nextn_predict_layers"] == 1
+    assert BENCHMARK_PENDING is True
+    assert m.benchmark["top5"] == []
+    assert m.manifest_id not in MANIFESTS
+
+
+def test_config_normalizer_accepts_the_checkpoint_schema() -> None:
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "config_to_manifest", ROOT / "tools/nemotron/config_to_manifest.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+    raw = json.loads((ROOT / "docs/notes/m5-nemotron-config.json").read_text(encoding="utf-8"))
+    norm = mod.normalize_config(raw)
+    assert "layers_block_type" not in norm
+    assert "mtp_layers_block_type" not in norm
+    assert norm["hybrid_override_pattern"].count("*") == 6
+    assert norm["hybrid_override_pattern"].count("M") == 23
+    assert norm["hybrid_override_pattern"].count("E") == 23
+    assert norm["mtp_hybrid_override_pattern"] == "*E"
+    draft = mod.parse_config(raw)
+    assert draft["num_layers"] == 52
+    assert draft["max_position_embeddings"] == 262144
+    assert draft["num_nextn_predict_layers"] == 1
+
+
+@pytest.mark.skipif(not VLLM_PY.is_file(), reason="vendored v3 interpreter not present")
+def test_normalized_config_loads_in_vllm_without_npu(tmp_path: Path) -> None:
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "config_to_manifest", ROOT / "tools/nemotron/config_to_manifest.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+    raw = json.loads((ROOT / "docs/notes/m5-nemotron-config.json").read_text(encoding="utf-8"))
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps(mod.normalize_config(raw)), encoding="utf-8")
+    code = (
+        "import json,sys; from vllm.transformers_utils.configs.nemotron_h import NemotronHConfig; "
+        f"c=NemotronHConfig(**json.load(open({str(cfg)!r}))); "
+        "print(c.hybrid_override_pattern); print(c.mtp_hybrid_override_pattern)"
+    )
+    got = subprocess.run([str(VLLM_PY), "-c", code], cwd=ROOT, text=True, capture_output=True)
+    assert got.returncode == 0, got.stderr
+    pattern, mtp = got.stdout.splitlines()[-2:]
+    assert pattern.count("*") == 6 and pattern.count("M") == 23 and pattern.count("E") == 23
+    assert mtp == "*E"
+
+
+def test_real_nemotron_draft_reports_its_seven_required_gaps() -> None:
+    env = Environment(
+        vllm="0.23.0", vllm_ascend=None, torch="2.10.0+cpu", device_type="A5", has_vendor=False
+    )
+    plan, report = decide(NEMOTRON_3_5_DRAFT, env, policy="vendor_first")
+    assert report.servable is False
+    assert len(report.gaps) == len(NEMOTRON_3_5_DRAFT.required_capabilities) == 7
+    assert report.gaps[-1].required
+    assert plan.selections == []
 
 
 def test_no_vendor_decision_reports_all_gaps_without_hardware(tmp_path: Path) -> None:

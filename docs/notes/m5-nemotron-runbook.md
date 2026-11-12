@@ -11,7 +11,8 @@
 
 - [ ] O1–O5 离线产物已 review；
 - [ ] `config.json` 已确认：`architectures/model_type/num_hidden_layers/
-      hybrid_override_pattern/num_nextn_predict_layers/max_position_embeddings`；
+      layers_block_type/mtp_layers_block_type/num_nextn_predict_layers/max_position_embeddings`；
+- [ ] 已生成 vLLM 0.23 兼容的 config shim（见 §1.1），且 `NemotronHConfig` 能加载；
 - [ ] 权重路径存在，磁盘/内存足够；
 - [ ] MTP 是否存在已确认（没有就不开 MTP，不拿 ngram 冒充）；
 - [ ] `npu-smi info` 显示目标卡空闲（获准后执行）；
@@ -28,6 +29,7 @@ cd /home/userlist/zxs/TileInfer
 source scripts/env-ascend102.sh
 
 MODEL=/home/models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16   # TODO: 确认实际路径
+SHIM=/tmp/m5-nemotron-shim-$(date +%s)
 PORT=8322
 LOG=/tmp/m5-nemotron-serve.log
 METRICS=/tmp/m5-nemotron-metrics.json
@@ -36,13 +38,46 @@ AUDIT=/tmp/m5-nemotron-opaudit.json
 
 > 如果权重不在本地，先停下来确认获取方式；**不要**在本手册里自动下载。
 
+### 1.1 config shim（vLLM 0.23 不认 `layers_block_type`）
+
+目标 config 直接喂给 vLLM 0.23 会在加载 config 时抛
+`AttributeError: property 'layers_block_type' has no setter`；必须先用
+`normalize_config()` 转成 `hybrid_override_pattern`，再用一个只替换 config 的
+shim 目录启动（权重文件用 symlink，不复制、不修改原目录）：
+
+```bash
+mkdir -p "$SHIM"
+python tools/nemotron/config_to_manifest.py \
+  --config "$MODEL/config.json" --normalized-out "$SHIM/config.json"
+
+# 除 config.json 外的文件全部软链到 shim（tokenizer、权重索引、safetensors 等）
+for f in "$MODEL"/*; do
+  [ "$(basename "$f")" = "config.json" ] || ln -s "$f" "$SHIM/"
+done
+```
+
+验证：
+
+```bash
+.venv_v3/bin/python - <<PY
+import json
+from vllm.transformers_utils.configs.nemotron_h import NemotronHConfig
+c = NemotronHConfig(**json.load(open("$SHIM/config.json")))
+print(c.hybrid_override_pattern)
+print(c.mtp_hybrid_override_pattern)
+PY
+```
+
+期望：52 字符 pattern，含 23 个 `M`、23 个 `E`、6 个 `*`；MTP pattern 为 `*E`。
+**这一步只改 config 的 schema 表达，不改权重，不改上游源码。**
+
 ---
 
 ## 2. Dummy 加载（先判机械链路）
 
 ```bash
 TILEINFER_AUDIT=$AUDIT \
-vllm serve "$MODEL" \
+vllm serve "$SHIM" \
   --served-model-name nemotron \
   --load-format dummy \
   --max-model-len 8192 \
@@ -71,7 +106,7 @@ kill -TERM "$(cat /tmp/m5-nemotron.pid)"
 ## 3. C1：真权重、短请求
 
 ```bash
-vllm serve "$MODEL" \
+vllm serve "$SHIM" \
   --served-model-name nemotron \
   --max-model-len 8192 \
   --max-num-seqs 1 \
@@ -128,7 +163,7 @@ python benchmarks/compare_responses.py \
 ## 6. D4：MTP（仅当 checkpoint 有 MTP）
 
 ```bash
-vllm serve "$MODEL" \
+vllm serve "$SHIM" \
   --served-model-name nemotron \
   --max-model-len 8192 \
   --max-num-seqs 1 \

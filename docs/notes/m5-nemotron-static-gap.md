@@ -24,6 +24,9 @@
 | F9 | vllm-ascend 有 Mamba 相关 Triton 算子目录 | `.venv_v3/.../vllm_ascend/ops/triton/mamba/`（`causal_conv1d.py`、`lightning_attn.py`、`postprocess.py`） |
 | F10 | vllm-ascend 补了 hybrid attention/Mamba 的 cache config，并替换了 `causal_conv1d_update` | `patch/platform/patch_mamba_config.py:149`；`patch/worker/patch_triton.py:10` |
 | F11 | **没有**找到 Ascend 对 `MambaMixer2`/`ssd_combined`/`mamba_chunk_scan` 的替换 | `vllm_ascend` 全树搜索这些符号为空；Mamba 目录只有 conv/lightning/postprocess，不含 SSD chunk-scan |
+| F12 | 目标 checkpoint 的 config 用 `layers_block_type`，没有 `hybrid_override_pattern`；52 层 = 23 Mamba + 23 MoE + 6 attention；`mtp_layers_block_type=["attention","moe"]`；上下文 262144 | [`m5-nemotron-config.json`](m5-nemotron-config.json)（仅 config 快照，未下载权重；来源见 [`m5-nemotron-config.md`](m5-nemotron-config.md)） |
+| F13 | vLLM 0.23 的 `NemotronHConfig` 直接加载该 config 会抛 `AttributeError: property 'layers_block_type' has no setter`；即使绕过，默认 `hybrid_override_pattern` 是 24 M / 24 MLP / 4 attention、无 MoE，与目标 23/23/6 不一致 | `.venv_v3/bin/python` 实测；见 G0 |
+| F14 | 用 `normalize_config()` 把 `layers_block_type`/`mtp_layers_block_type` 转成 `hybrid_override_pattern`/`mtp_hybrid_override_pattern` 后，`NemotronHConfig` 能加载，层型和 MTP pattern 与目标一致 | `tools/nemotron/config_to_manifest.py`；测试 `test_normalized_config_loads_in_vllm_without_npu` |
 
 ---
 
@@ -38,16 +41,19 @@
 | U5 | 混合 KV/Mamba state 的分配与 page 约束 | 错则 OOM/错数 | 读 `MambaSpec`/Ascend platform；上机验 |
 | U6 | 权重名映射（`mixer.{k,v}_proj` 等） | 错则加载失败/静默错 | 读 `weight_utils.py` 与 Ascend loader；上机验 |
 | U7 | 参考实现可执行性 | 无厂商基线，C2 只能对 HF/transformers | 权重到位后 CPU 小样例；太慢则分层 oracle |
+| U8 | MTP 权重 key 是否真的存在 | config 声明 1 层 MTP，不等于权重带 MTP heads | 权重到位后查 `*.mtp*`/`nextn` key；无则 D4 上报 |
 
 ---
 
 ## 3. 缺口先验（静态，不是最终 gap report）
 
 > 结论：**`servable=False`（先验）**。不是说“永远不能”，而是当前没有证据它能在这套
-> Ascend 栈上跑；必须上机或补 provider 后才能改。
+> Ascend 栈上跑；必须上机或补 provider 后才能改。G0 是本轮新确认的第一道硬门：
+> 不先做 config shim，模型在加载 config 阶段就会失败，轮不到算子。
 
 | # | 能力/缺口 | 性质 | 候选 provider | `delete_when` |
 |---|---|---|---|---|
+| G0 | **目标 config 与 vLLM 0.23 schema 不兼容** | **已实测**：raw config 直接 `AttributeError`；默认 pattern 也不是目标 pattern | config shim（`normalize_config`，不改上游） | vLLM/上游接受 `layers_block_type` 或升级 |
 | G1 | NemotronH 模型在 Ascend 的注册/加载 | 未知（可能 vLLM 通用路径可接） | model table / 模型包装 | vllm-ascend 原生注册 NemotronH |
 | G2 | Mamba2 mixer 的 SSD/chunk-scan 执行路径 | **静态缺候选**：有 conv/lightning 算子，但没有 `MambaMixer2`/`ssd_combined` 的 Ascend 替换 | `state.linear` + `Mamba2Contract` provider | 厂商 Mamba2/SSD backend 覆盖该形状 |
 | G3 | 混合 attention（full + Mamba）的 KV/state 布局 | 未知 | state/KV provider 或 bridge | 厂商支持混合 KV/MambaSpec |
