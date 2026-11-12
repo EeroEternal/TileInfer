@@ -6,6 +6,17 @@
 
 ---
 
+## 0. 转换工具
+
+权重到位后先跑：
+
+```bash
+python tools/nemotron/config_to_manifest.py \
+  --config /path/to/config.json --out /tmp/nemotron-draft.json
+```
+
+它只做机械映射（`M/*/-/E` → `mamba/full_attention/mlp/moe`），**不填** benchmark top5、KV 布局或最终能力清单；这些仍标 `unresolved`。
+
 ## 1. 声明必须覆盖的字段
 
 对齐 [`tileinfer/contracts/manifest.py`](../../tileinfer/contracts/manifest.py)：

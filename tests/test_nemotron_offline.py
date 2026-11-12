@@ -99,6 +99,59 @@ def test_manifest_rejects_mamba_spec_without_layer() -> None:
 
 
 @pytest.mark.skipif(not PREFIX.is_dir(), reason="vendored v3 site-packages not present")
+def _config_dict(pattern: str = "M-*E") -> dict:
+    return {
+        "architectures": ["NemotronHForCausalLM"],
+        "model_type": "nemotron_h",
+        "num_hidden_layers": len(pattern),
+        "hybrid_override_pattern": pattern,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "mamba_num_heads": 128,
+        "mamba_head_dim": 64,
+        "ssm_state_size": 128,
+        "mamba_n_groups": 8,
+        "mamba_d_conv": 4,
+        "mamba_expand": 2,
+        "max_position_embeddings": 131072,
+        "num_nextn_predict_layers": 1,
+        "n_routed_experts": 64,
+        "num_experts_per_tok": 4,
+        "moe_intermediate_size": 512,
+    }
+
+
+def test_config_to_manifest_maps_layer_characters(tmp_path: Path) -> None:
+    cfg = tmp_path / "config.json"
+    out = tmp_path / "draft.json"
+    cfg.write_text(json.dumps(_config_dict("M-*E")), encoding="utf-8")
+    subprocess.run(
+        [sys.executable, "tools/nemotron/config_to_manifest.py", "--config", str(cfg), "--out", str(out)],
+        cwd=ROOT,
+        check=True,
+    )
+    data = json.loads(out.read_text(encoding="utf-8"))
+    assert data["layer_types"] == ["mamba", "mlp", "full_attention", "moe"]
+    assert data["mamba"]["n_groups"] == 8
+    assert data["moe"]["top_k"] == 4
+    assert data["num_nextn_predict_layers"] == 1
+    assert data["unresolved"]
+
+
+def test_config_to_manifest_rejects_unknown_pattern_character() -> None:
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "config_to_manifest", ROOT / "tools/nemotron/config_to_manifest.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+    with pytest.raises(ValueError, match="unknown pattern"):
+        mod.parse_config(_config_dict("M?"))
+
+
 def test_no_vendor_decision_reports_all_gaps_without_hardware(tmp_path: Path) -> None:
     m = ModelManifest(
         name="nemotron-synthetic",
