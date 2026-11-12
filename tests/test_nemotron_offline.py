@@ -14,9 +14,11 @@ from pathlib import Path
 
 import pytest
 
-from tileinfer.contracts.capabilities import Mamba2Contract
-from tileinfer.contracts.manifest import AttentionSpec, MambaSpec, ModelManifest
+from tileinfer.contracts.capabilities import CAPABILITIES, Mamba2Contract
+from tileinfer.contracts.manifest import AttentionSpec, MambaSpec, ModelManifest, MoESpec
 from tileinfer.manifests import QWEN3_6
+from tileinfer.resolve.decide import decide
+from tileinfer.resolve.probe import Environment
 
 ROOT = Path(__file__).resolve().parents[1]
 PREFIX = ROOT / ".venv_v3/lib/python3.12/site-packages"
@@ -79,6 +81,39 @@ def test_manifest_rejects_mamba_spec_without_layer() -> None:
 
 
 @pytest.mark.skipif(not PREFIX.is_dir(), reason="vendored v3 site-packages not present")
+def test_no_vendor_decision_reports_all_gaps_without_hardware(tmp_path: Path) -> None:
+    m = ModelManifest(
+        name="nemotron-synthetic",
+        manifest_id="nemotron-synthetic",
+        arch="NemotronHForCausalLM",
+        model_type="nemotron_h",
+        num_layers=4,
+        layer_types=("mamba", "mlp", "full_attention", "mlp"),
+        attention=AttentionSpec(kind="gqa", num_heads=32, num_kv_heads=8, head_dim=128),
+        mamba=MambaSpec(num_heads=128, n_groups=8),
+        moe=MoESpec(num_experts=64, top_k=4),
+        required_capabilities=tuple(c.value for c in CAPABILITIES),
+        benchmark={"prompt": "hi", "max_tokens": 1, "top5": []},
+    )
+    m.validate()
+    env = Environment(
+        vllm="0.23.0", vllm_ascend=None, torch="2.10.0+cpu", device_type="A5", has_vendor=False
+    )
+    plan, report = decide(m, env, policy="vendor_first")
+    assert report.servable is False
+    assert len(report.gaps) == len(CAPABILITIES)
+    assert all(g.required for g in report.gaps)
+    assert plan.selections == []
+    plan.validate()
+
+    target = tmp_path / "gaps.json"
+    report.write(str(target))
+    from tileinfer.contracts.gaps import GapReport
+
+    restored = GapReport.load(str(target))
+    assert restored.as_dict() == report.as_dict()
+
+
 def test_nemotron_static_audit_is_read_only_and_reports_unknowns(tmp_path: Path) -> None:
     out = tmp_path / "nemotron.json"
     subprocess.run(
