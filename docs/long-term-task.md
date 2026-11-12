@@ -103,6 +103,12 @@ M0 不依赖它们；**M1 依赖**。没有它们，写代码的人只能现场�
 7. **禁止静默回退。** 回退要计数、进日志、能被测试断言为"不允许发生"。
 8. **入口函数绝不向外抛异常。** 上游只 catch 模块导入，不 catch 函数执行；抛出去就是整个进程起不来。
 9. **单一真相。** 每个模型一份声明，每个决策一个产物；文档提到的目录必须真实存在。
+10. **每个模型都过同一张验证矩阵。** 长上下文、图模式、投机解码（含组合）、并发、冷启动、
+    算子级回退都要验；不能只验"能跑"。矩阵见
+    [`verification-matrix.md`](verification-matrix.md)。
+11. **共享环境，部署先获同意。** 不在未告知的情况下起服务、重启、绑端口或占卡；部署前先
+    `npu-smi info` 确认空闲，说明命令/端口/预计时长，得到使用者明确同意后再执行；不 kill
+    他人进程。
 
 ---
 
@@ -168,6 +174,7 @@ M0 不依赖它们；**M1 依赖**。没有它们，写代码的人只能现场�
 | 搬代码 | [`migration-m0.md`](migration-m0.md) |
 | 接进上游 | [`integration.md`](integration.md) §2、§5 |
 | 判断做到没有 | [`acceptance.md`](acceptance.md) §2 |
+| 每个模型要验哪些点 | [`verification-matrix.md`](verification-matrix.md) |
 | 加模型 / 加实现 | [`extending.md`](extending.md) |
 | 上机点亮 | [`hardware-checklist.md`](hardware-checklist.md) |
 | 踩过的坑 | [`known-issues.md`](known-issues.md) |

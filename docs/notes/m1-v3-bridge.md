@@ -183,7 +183,9 @@ TILEINFER_METRICS_PATH=/tmp/tileinfer-v3-metrics.json \
 * **补缺口还是空的**：`tileinfer/providers/` 没有 provider，8/8 都是厂商实现；gap=0 是因为
   厂商全覆盖，不是因为我们补上了。`impl_table` 遇到非 vendor 选择会返回 False 并记录，
   不会静默装错。
-* **MTP / 投机解码**：未接；Qwen3.6 的 MTP 头在权重里，但批语义与 vLLM 0.23 的耦合还没做。
+* **MTP / 投机解码**：厂商侧已具备（MTP 头 1 层、vLLM 有 `qwen3_5_mtp`、vllm-ascend 有
+  `qwen3_5_moe -> qwen3_5_mtp` 补丁），但本轮**未启用、未验证**；不是"批语义做不了"，
+  是还没打开跑过。
 * **8K/16K**：M1 只测到 3939 prompt tokens；`max-model-len=9216`，16K 场景会直接被拒。
 * **冷缓存 A/B**：两臂共用 `.venv_baseline` 的编译缓存，且 v3 复制同一份；这让 A/B 公平，
   但没有回答"全新机器第一次启动"的 TTFT。M2 的预编译门要单独测冷启动。
