@@ -4,7 +4,7 @@
 > 目标形态见 [`architecture.md`](architecture.md)，验收口径见 [`acceptance.md`](acceptance.md)，
 > 数字见 [`performance.md`](performance.md)。
 >
-> 最后核对：**2026-11-12 21:01**，代码 `2f83d58`（M5 Nemotron 离线任务；v3 主体 `6f41866`），
+> 最后核对：**2026-11-12 21:03**，代码 `aa97b16`（M5 Nemotron 离线任务；v3 主体 `6f41866`），
 > 单卡 Ascend950PR，CANN 9.3.0。
 
 ---
