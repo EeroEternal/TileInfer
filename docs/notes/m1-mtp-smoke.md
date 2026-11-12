@@ -75,12 +75,14 @@ MTP 接受率（日志）：
 4K 也分叉，说明这不是"长上下文/cascade 只在长 prompt 才触发"的问题；投机路径在短
 prompt 上就已经改变输出。MTP 自身是确定的（两次完全一致），所以不是采样噪声。
 
-候选原因（相关性，未证明因果）：
+候选原因验证（2026-11-12 加跑）：
 
-- 投机路径日志明确写 `Disabling cascade attention (not yet compatible with async
-  speculative decoding)`；非投机默认启用 cascade attention。
-- MTP 下 `cudagraph_mode` 从 `FULL_AND_PIECEWISE` 降为 `PIECEWISE`，FULL=0；
-  非投机走 FULL 图。不同执行路径会改变浮点归约顺序。
+- 用 `--no-async-scheduling` 重跑 MTP：启动日志不再出现 `Disabling cascade attention`，
+  但输出与异步 MTP **完全一致**（`same=true`），仍与非投机在第 58 token 分叉；
+  4K 也仍在 char 71 分叉。**async scheduling / cascade 假设被排除（至少不是唯一原因）。**
+- 该次 metrics 仍是 PIECEWISE、FULL=0，说明 MTP 下 FULL 图没有捕获，和 async 开关无关。
+- 剩余候选：MTP draft/verify 的采样路径、PIECEWISE 图与 eager 的数值差、MoE/GDN 的
+  归约顺序；尚未证明。
 
 在这台 MoE/GDN 模型上，早期 token 的分叉就足以翻转 top-1，所以不能拿"答案看起来对"
 代替逐位。矩阵原口径是"先按逐位一致跑，不一致就查，不调容差"；现在就是"不一致"。

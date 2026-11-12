@@ -98,6 +98,8 @@ prompt 用 `benchmarks/make_long_prompt.py --tokens N --out /tmp/prompt-Nk.txt` 
 - **严格逐位未过**：同 cap 下 MTP 与不启用投机在 8K 第 58 token 分叉（max logprob 0.76）；
   ngram 与不启用投机在第 10 token 分叉；MTP 与 ngram 也互不相同；MTP 自身两次一致。
 - 投机路径会禁用 cascade attention，并把图模式降为 PIECEWISE；这是候选原因，未证明因果。
+  但用 `--no-async-scheduling` 重跑后，MTP 输出与异步版**完全一致**、仍与非投机分叉，
+  因此 async/cascade 假设被排除（至少不是唯一原因）；该次 FULL 仍为 0。
 - 因此 S2 不能判过。先选口径：**(A) 严格逐位**（当前不合格，查厂商/改路径）、
   **(B) 定义容差**（写进 manifest，不能临时放宽）、**(C) 暂不判投机**，先做并发/冷启动。
 
