@@ -135,7 +135,7 @@ prompt 用 `benchmarks/make_long_prompt.py --tokens N --out /tmp/prompt-Nk.txt` 
 |---|---|---|---|---|
 | O1 | 算子级审计 | `TILEINFER_AUDIT` JSON：类、impl、实例数、调用数 | 热路径无非厂商实现，或有解释 | ✅ 23 类 / 903 实例（类级） |
 | O2 | 设备侧 profiler | `torch_npu.profiler` / msprof 的 kernel 列表 | 覆盖 decode 稳态 | ⬜ |
-| O3 | 回退计数 | `fallbacks`、`errors` | 稳态 = 0 | ✅ 4K；长上下文/投机 ⬜ |
+| O3 | 回退计数 | `fallbacks`、`errors` | 稳态 = 0 | ✅ 4K / 32K / 128K / 262K / MTP 均 0 回退（图 8/6/2/2/6 张） |
 
 ### 1.8 范围声明（不许默认"支持"）
 
