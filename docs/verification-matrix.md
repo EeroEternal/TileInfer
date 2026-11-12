@@ -201,7 +201,7 @@ Qwen3.6 按以下顺序推进：
 2. ✅ 投机质量门：S2（4K）Q1/Q2/Q3 过；S3 图 6 图/0 回退过；S4 32K 部分，128K 未测。
 3. 组合：S3 已跑；S4 32K 已跑；S4 128K/262K 未测，控制模型不做。
 4. 控制模型免测：P2/P3、K1/K2、O2（见 §1.9）；M5 新模型仍全验。
-5. 下一步：等用户指定 M5 模型，先做静态 gap report，不下载、不占卡。
+5. 下一步：M5 目标已定 `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16`；先做离线静态 gap report，不下载、不占卡；任务书见 [`notes/m5-nemotron-task.md`](notes/m5-nemotron-task.md)。
 
 ---
 

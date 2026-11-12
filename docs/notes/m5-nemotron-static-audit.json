@@ -1,0 +1,66 @@
+{
+  "model": "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
+  "static_only": true,
+  "hardware_used": false,
+  "prefix": ".venv_v3/lib/python3.12/site-packages",
+  "checks": [
+    {
+      "id": "vllm_model_registry",
+      "ok": true,
+      "evidence": ".venv_v3/lib/python3.12/site-packages/vllm/model_executor/models/registry.py:180: \"NemotronHForCausalLM\": (\"nemotron_h\", \"NemotronHForCausalLM\"),",
+      "meaning": "vLLM 0.23 has the NemotronH model class"
+    },
+    {
+      "id": "vllm_mtp_registry",
+      "ok": true,
+      "evidence": ".venv_v3/lib/python3.12/site-packages/vllm/model_executor/models/registry.py:631: \"NemotronHMTPModel\": (\"nemotron_h_mtp\", \"NemotronHMTP\"),",
+      "meaning": "vLLM 0.23 has the NemotronH MTP class"
+    },
+    {
+      "id": "vllm_model_file",
+      "ok": true,
+      "evidence": ".venv_v3/lib/python3.12/site-packages/vllm/model_executor/models/nemotron_h.py",
+      "meaning": "model forward includes the Mamba2 mixer"
+    },
+    {
+      "id": "vllm_mtp_file",
+      "ok": true,
+      "evidence": ".venv_v3/lib/python3.12/site-packages/vllm/model_executor/models/nemotron_h_mtp.py",
+      "meaning": "MTP model file is present"
+    },
+    {
+      "id": "vllm_config",
+      "ok": true,
+      "evidence": ".venv_v3/lib/python3.12/site-packages/vllm/transformers_utils/configs/nemotron_h.py:144: model_type = \"nemotron_h\"",
+      "meaning": "NemotronHConfig is present"
+    },
+    {
+      "id": "ascend_spec_patch",
+      "ok": true,
+      "evidence": ".venv_v3/lib/python3.12/site-packages/vllm_ascend/patch/platform/patch_speculative_config.py:87: hf_config.model_type = \"nemotron_h_mtp\"",
+      "meaning": "Ascend spec patch maps nemotron_h to MTP"
+    },
+    {
+      "id": "ascend_model_registration",
+      "ok": false,
+      "evidence": "",
+      "meaning": "Ascend registers a Nemotron model class (currently expected: absent)"
+    },
+    {
+      "id": "ascend_mamba_ops",
+      "ok": true,
+      "evidence": ".venv_v3/lib/python3.12/site-packages/vllm_ascend/ops/triton/mamba",
+      "meaning": "Ascend has Mamba Triton op files (model-level support still unknown)"
+    }
+  ],
+  "unknown": [
+    "target checkpoint config.json (layers/pattern/MTP/context)",
+    "whether the checkpoint actually contains MTP heads/weights",
+    "whether Ascend can execute the NemotronH model end to end",
+    "graph capture for Mamba state / hybrid attention",
+    "hybrid KV/MambaSpec and weight mapping on Ascend",
+    "reference implementation runtime on CPU"
+  ],
+  "static_servable": false,
+  "note": "static prior only: absence of Ascend registration does not prove the model cannot run; it means no positive evidence yet"
+}
