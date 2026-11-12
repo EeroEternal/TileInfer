@@ -45,6 +45,13 @@ def main() -> int:
     spec_patch = asc / "patch/platform/patch_speculative_config.py"
     asc_models = asc / "models/__init__.py"
     mamba = asc / "ops/triton/mamba"
+    mamba_config = asc / "patch/platform/patch_mamba_config.py"
+    triton_patch = asc / "patch/worker/patch_triton.py"
+    mamba2_hits = [
+        str(path.relative_to(root))
+        for path in asc.rglob("*.py")
+        if "mamba_mixer2" in _read(path) or "ssd_combined" in _read(path)
+    ]
 
     checks = [
         {
@@ -94,6 +101,27 @@ def main() -> int:
             "ok": mamba.is_dir() and any(mamba.glob("*.py")),
             "evidence": str(mamba) if mamba.is_dir() else "",
             "meaning": "Ascend has Mamba Triton op files (model-level support still unknown)",
+        },
+        {
+            "id": "ascend_hybrid_mamba_config",
+            "ok": mamba_config.is_file() and "HybridAttentionMambaModelConfig" in _read(mamba_config),
+            "evidence": _line(mamba_config, "HybridAttentionMambaModelConfig"),
+            "meaning": "Ascend patches hybrid attention/Mamba cache config (GDN-oriented)",
+        },
+        {
+            "id": "ascend_causal_conv1d_patch",
+            "ok": triton_patch.is_file() and "causal_conv1d_update_npu" in _read(triton_patch),
+            "evidence": _line(triton_patch, "causal_conv1d_update_npu"),
+            "meaning": "Ascend replaces causal_conv1d update for NPU",
+        },
+        {
+            "id": "ascend_mamba2_mixer_patch",
+            "ok": bool(mamba2_hits),
+            "evidence": ", ".join(mamba2_hits[:5]),
+            "meaning": (
+                "Ascend has a Mamba2 mixer/SSD path (expected: absent; absence is a gap "
+                "candidate, not proof that the model cannot run)"
+            ),
         },
     ]
 

@@ -78,6 +78,8 @@ MTP 投机、长上下文（8K/16K/32K/128K，262K 仅在 config 支持时）、
 | vllm-ascend 的 `patch_speculative_config.py` 会把 `nemotron_h` 映射为 `nemotron_h_mtp` | `.venv_v3/.../vllm_ascend/patch/platform/patch_speculative_config.py` |
 | vllm-ascend 的 `models/__init__.py` **没有** Nemotron 注册 | 该文件只注册 DeepSeek V4 / Eagle3 等 |
 | vllm-ascend 有 Mamba 相关 Triton 算子文件 | `.venv_v3/.../vllm_ascend/ops/triton/mamba/` |
+| vllm-ascend **没有** `MambaMixer2`/`ssd_combined` 替换 | 全树搜索这些符号为空；Mamba 目录只有 conv/lightning/postprocess |
+| vllm-ascend 补了 hybrid Mamba cache config 和 `causal_conv1d_update` | `patch_mamba_config.py`、`patch_triton.py` |
 
 ### 3.2 未知（必须在离线阶段查清，不能猜）
 

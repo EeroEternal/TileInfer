@@ -24,7 +24,7 @@
 | # | 缺口 | 候选能力 | 实现形态 | graphable | parallel | evidence | delete_when |
 |---|---|---|---|---|---|---|---|
 | P1 | Ascend 没有 NemotronH 模型注册/加载 | 模型路由（model table） | 注册/包装 `NemotronHForCausalLM`，不改上游 | 待测 | single | `candidate`（无） | vllm-ascend 原生注册 NemotronH |
-| P2 | Mamba2 mixer 的 Ascend 执行 | `state.linear`（`Mamba2Contract` 子契约） | Mamba2 conv/SSM/state provider | 待测 | single | `candidate`（无） | 厂商 Mamba2 backend 覆盖 |
+| P2 | Mamba2 mixer 的 SSD/chunk-scan 执行 | `state.linear`（`Mamba2Contract` 子契约） | Mamba2 conv/SSM/state provider | 待测 | single | `candidate`（静态未见 Ascend SSD 替换） | 厂商 Mamba2/SSD backend 覆盖 |
 | P3 | 混合 full-attention + Mamba state 的 KV/布局 | `attention.full` + `state.linear` | 状态/KV 适配；不重写 KV 池 | 待测 | single | `candidate`（无） | 厂商支持混合 KV/MambaSpec |
 | P4 | MTP `NemotronHMTPModel` 的 Ascend 注册/执行 | MTP/模型路由 | 复用 vLLM MTP，仅补注册/包装 | 待测 | single | `candidate`（无） | 厂商注册并验证 NemotronHMTP |
 | P5 | Mamba/混合 attention 图捕获 | graph hook（不是 provider） | 捕获前检查 bucket，捕获后计数回退 | 待测 | — | `candidate`（无） | 厂商图路径覆盖 |

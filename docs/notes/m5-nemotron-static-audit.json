@@ -51,6 +51,24 @@
       "ok": true,
       "evidence": ".venv_v3/lib/python3.12/site-packages/vllm_ascend/ops/triton/mamba",
       "meaning": "Ascend has Mamba Triton op files (model-level support still unknown)"
+    },
+    {
+      "id": "ascend_hybrid_mamba_config",
+      "ok": true,
+      "evidence": ".venv_v3/lib/python3.12/site-packages/vllm_ascend/patch/platform/patch_mamba_config.py:149: vllm.model_executor.models.config.HybridAttentionMambaModelConfig.verify_and_update_config = verify_and_update_config",
+      "meaning": "Ascend patches hybrid attention/Mamba cache config (GDN-oriented)"
+    },
+    {
+      "id": "ascend_causal_conv1d_patch",
+      "ok": true,
+      "evidence": ".venv_v3/lib/python3.12/site-packages/vllm_ascend/patch/worker/patch_triton.py:10: from vllm_ascend.ops.triton.mamba.causal_conv1d import causal_conv1d_update_npu",
+      "meaning": "Ascend replaces causal_conv1d update for NPU"
+    },
+    {
+      "id": "ascend_mamba2_mixer_patch",
+      "ok": false,
+      "evidence": "",
+      "meaning": "Ascend has a Mamba2 mixer/SSD path (expected: absent; absence is a gap candidate, not proof that the model cannot run)"
     }
   ],
   "unknown": [

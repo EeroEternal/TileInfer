@@ -130,5 +130,8 @@ def test_nemotron_static_audit_is_read_only_and_reports_unknowns(tmp_path: Path)
     assert checks["vllm_model_registry"]["ok"] is True
     assert checks["vllm_mtp_registry"]["ok"] is True
     assert checks["ascend_spec_patch"]["ok"] is True
-    # This is the gap, not a pass: the audit records it as False until proven otherwise.
+    assert checks["ascend_hybrid_mamba_config"]["ok"] is True
+    assert checks["ascend_causal_conv1d_patch"]["ok"] is True
+    # These are gaps, not passes: recorded False until proven otherwise.
     assert checks["ascend_model_registration"]["ok"] is False
+    assert checks["ascend_mamba2_mixer_patch"]["ok"] is False

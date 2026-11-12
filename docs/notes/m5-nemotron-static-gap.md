@@ -4,8 +4,8 @@
 > 目的：在权重/实机到位前，把“确定的事实、确定的未知、候选 provider”分开。
 > 任何 `unknown` 都不能写成 `gap=0`，也不能写成“不支持”。
 >
-> 原始输出：[`m5-nemotron-static-audit.json`](m5-nemotron-static-audit.json)（8 项检查，7 项确认；
-> 唯一失败项是“Ascend 没有 Nemotron 注册”，这正是待验证的缺口，不是结论）。
+> 原始输出：[`m5-nemotron-static-audit.json`](m5-nemotron-static-audit.json)（11 项检查，9 项确认；
+> 失败项是“Ascend 没有 Nemotron 注册”和“没有 Mamba2 mixer/SSD patch”，这是待验证的缺口，不是结论）。
 
 ---
 
@@ -22,6 +22,8 @@
 | F7 | vllm-ascend 的 spec patch 会把 `nemotron_h` 改写成 `nemotron_h_mtp` | `.venv_v3/.../vllm_ascend/patch/platform/patch_speculative_config.py:82-88` |
 | F8 | vllm-ascend 的 `models/__init__.py` **没有** Nemotron 注册 | 该文件只注册 DeepSeek V4 / Eagle3 等 |
 | F9 | vllm-ascend 有 Mamba 相关 Triton 算子目录 | `.venv_v3/.../vllm_ascend/ops/triton/mamba/`（`causal_conv1d.py`、`lightning_attn.py`、`postprocess.py`） |
+| F10 | vllm-ascend 补了 hybrid attention/Mamba 的 cache config，并替换了 `causal_conv1d_update` | `patch/platform/patch_mamba_config.py:149`；`patch/worker/patch_triton.py:10` |
+| F11 | **没有**找到 Ascend 对 `MambaMixer2`/`ssd_combined`/`mamba_chunk_scan` 的替换 | `vllm_ascend` 全树搜索这些符号为空；Mamba 目录只有 conv/lightning/postprocess，不含 SSD chunk-scan |
 
 ---
 
@@ -47,7 +49,7 @@
 | # | 能力/缺口 | 性质 | 候选 provider | `delete_when` |
 |---|---|---|---|---|
 | G1 | NemotronH 模型在 Ascend 的注册/加载 | 未知（可能 vLLM 通用路径可接） | model table / 模型包装 | vllm-ascend 原生注册 NemotronH |
-| G2 | Mamba2 mixer 的 Ascend 执行路径 | 未知（已有 Triton mamba 算子，但未证模型级） | `attention.linear` / `state.linear` provider | 厂商 Mamba2 backend 覆盖该形状 |
+| G2 | Mamba2 mixer 的 SSD/chunk-scan 执行路径 | **静态缺候选**：有 conv/lightning 算子，但没有 `MambaMixer2`/`ssd_combined` 的 Ascend 替换 | `state.linear` + `Mamba2Contract` provider | 厂商 Mamba2/SSD backend 覆盖该形状 |
 | G3 | 混合 attention（full + Mamba）的 KV/state 布局 | 未知 | state/KV provider 或 bridge | 厂商支持混合 KV/MambaSpec |
 | G4 | MTP（`NemotronHMTPModel`）在 Ascend 的注册/执行 | 未知（patch 有映射，注册未见） | MTP provider / model table | 厂商注册并验证 NemotronHMTP |
 | G5 | 图捕获（Mamba state + 混合 attention） | 未知 | graph hook（不是 provider） | 厂商图路径覆盖 |
