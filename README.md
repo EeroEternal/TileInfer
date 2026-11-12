@@ -60,6 +60,7 @@ vllm-ascend 已经适配的模型走它；它没适配的模型，我们把缺�
 | | |
 |---|---|
 | [`docs/integration.md`](docs/integration.md) | 与 vLLM / vllm-ascend 的接入关系（机制层，不含代码） |
+| [`docs/migration-m0.md`](docs/migration-m0.md) | 现有代码怎么搬进新分层（M0：只搬不改，每步有门） |
 | [`docs/extending.md`](docs/extending.md) | 加一个模型 / 一个实现提供者 / 一个接入点 |
 | [`docs/hardware-checklist.md`](docs/hardware-checklist.md) | 上机点亮清单（操作手册，不是架构） |
 | [`docs/known-issues.md`](docs/known-issues.md) | 踩过的坑与复盘（读它能省几天） |
@@ -79,7 +80,7 @@ vllm-ascend 已经适配的模型走它；它没适配的模型，我们把缺�
 | `tileinfer/vllm/` | **v2 形态**的后端本体（平台层、worker hook、attention 后端、图捕获）——v3 会拆进分层 |
 | `tileinfer/models/` | 上游没有的模型实现（DeepSeek-V4.1 是样例） |
 | `tileinfer/serving/` | serving 侧工具（分相计时、bucket、planner） |
-| `legacy/` | 冻结的 vllm-ascend 时代代码：不打包、不测试、不再增长，是 v3 接入点的素材库 |
+| `legacy/` | 冻结的 vllm-ascend 时代代码：不打包、不测试、不再增长，是 v3 接入层的素材库 |
 | `reference/vllm-0.23/` | vLLM 0.23 关键模块逐字副本，只为让 `file:line` 引用可核对，**不许改** |
 | `benchmarks/`、`scripts/` | A/B harness、探针、统一剖析入口 `scripts/ti_trace.py` |
 | `docs/` | 见上面的文档地图 |
