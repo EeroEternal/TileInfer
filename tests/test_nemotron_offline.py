@@ -298,6 +298,50 @@ def test_preflight_detects_incomplete_shards(tmp_path: Path) -> None:
     assert second["ready_to_load"] is True
 
 
+def test_make_shim_replaces_only_config(tmp_path: Path) -> None:
+    model = tmp_path / "model"
+    shim = tmp_path / "shim"
+    model.mkdir()
+    cfg = {
+        "architectures": ["NemotronHForCausalLM"],
+        "model_type": "nemotron_h",
+        "num_hidden_layers": 2,
+        "layers_block_type": ["mamba", "moe"],
+        "num_attention_heads": 32,
+        "num_key_value_heads": 2,
+        "head_dim": 128,
+        "mamba_num_heads": 64,
+        "mamba_head_dim": 64,
+        "ssm_state_size": 128,
+        "n_groups": 8,
+        "conv_kernel": 4,
+        "expand": 2,
+        "max_position_embeddings": 262144,
+        "num_nextn_predict_layers": 1,
+        "mtp_layers_block_type": ["attention", "moe"],
+        "n_routed_experts": 128,
+        "num_experts_per_tok": 6,
+        "moe_intermediate_size": 1856,
+    }
+    (model / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+    (model / "tokenizer.json").write_text("{}", encoding="utf-8")
+    (model / "model-1.safetensors").write_bytes(b"x")
+    subprocess.run(
+        [sys.executable, "tools/nemotron/make_shim.py", "--model", str(model), "--shim", str(shim)],
+        cwd=ROOT,
+        check=True,
+    )
+    normalized = json.loads((shim / "config.json").read_text(encoding="utf-8"))
+    assert normalized["hybrid_override_pattern"] == "ME"
+    assert normalized["mtp_hybrid_override_pattern"] == "*E"
+    assert (shim / "tokenizer.json").is_symlink()
+    assert (shim / "model-1.safetensors").is_symlink()
+    assert json.loads((model / "config.json").read_text(encoding="utf-8"))["layers_block_type"] == [
+        "mamba",
+        "moe",
+    ]
+
+
 def test_no_vendor_decision_reports_all_gaps_without_hardware(tmp_path: Path) -> None:
     m = ModelManifest(
         name="nemotron-synthetic",

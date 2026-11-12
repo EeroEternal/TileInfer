@@ -55,15 +55,10 @@ python tools/nemotron/preflight_model.py --model "$MODEL"
 shim 目录启动（权重文件用 symlink，不复制、不修改原目录）：
 
 ```bash
-mkdir -p "$SHIM"
-python tools/nemotron/config_to_manifest.py \
-  --config "$MODEL/config.json" --normalized-out "$SHIM/config.json"
-
-# 除 config.json 外的文件全部软链到 shim（tokenizer、权重索引、safetensors 等）
-for f in "$MODEL"/*; do
-  [ "$(basename "$f")" = "config.json" ] || ln -s "$f" "$SHIM/"
-done
+python tools/nemotron/make_shim.py --model "$MODEL" --shim "$SHIM"
 ```
+
+它只替换 `config.json`，其余文件全部软链到原目录；不会复制/修改权重。
 
 验证：
 
