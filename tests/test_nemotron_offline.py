@@ -249,6 +249,27 @@ def test_real_nemotron_draft_reports_its_seven_required_gaps() -> None:
     assert plan.selections == []
 
 
+def _mtp_module():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("mtp_probe", ROOT / "tools/nemotron/mtp_probe.py")
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_mtp_probe_detects_extra_layer_and_absent_mtp() -> None:
+    mod = _mtp_module()
+    base = {f"backbone.layers.{i}.mixer.in_proj.weight": "m.safetensors" for i in range(52)}
+    assert mod.inspect_index({"weight_map": base}, 52)["mtp_weights_found"] is False
+    base["backbone.layers.52.mixer.in_proj.weight"] = "m.safetensors"
+    found = mod.inspect_index({"weight_map": base}, 52)
+    assert found["mtp_weights_found"] is True
+    assert found["max_layer_index"] == 52
+    assert found["extra_layer_count"] == 1
+
+
 def test_no_vendor_decision_reports_all_gaps_without_hardware(tmp_path: Path) -> None:
     m = ModelManifest(
         name="nemotron-synthetic",

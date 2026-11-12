@@ -95,7 +95,7 @@ n_groups/conv_kernel/expand/chunk_size -> mamba_n_groups/mamba_d_conv/...
 ## 5. 完成 O2 的判据
 
 - benchmark top5 由 HF/transformers 参考实现填上，`BENCHMARK_PENDING=False`；
-- MTP 权重 key 查清，有/无都记录；
+- MTP 权重 key 用 [`mtp_probe.py`](../../tools/nemotron/mtp_probe.py) 查清，有/无都记录；
 - 声明通过 `ModelManifest.validate()` 并注册进 `MANIFESTS`；
 - 声明里没有出现“用 vllm_ascend / 用某 provider”的字样；
 - config shim 的 `delete_when` 已记录：上游接受 `layers_block_type` 或升级后删除。

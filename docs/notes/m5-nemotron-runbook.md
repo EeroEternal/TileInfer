@@ -162,6 +162,16 @@ python benchmarks/compare_responses.py \
 
 ## 6. D4：MTP（仅当 checkpoint 有 MTP）
 
+先查权重索引，不靠 config 声明：
+
+```bash
+python tools/nemotron/mtp_probe.py \
+  --index "$MODEL/model.safetensors.index.json" --num-layers 52
+```
+
+- `mtp_weights_found=false` → 记录“无 MTP”，跳到 D5，**不要**用 ngram 替代；
+- `true` → 再启动下面的 MTP 服务。
+
 ```bash
 vllm serve "$SHIM" \
   --served-model-name nemotron \
@@ -191,7 +201,7 @@ vllm serve "$SHIM" \
 | 16K | 16384 | ~16K | |
 | 32K | 32768 | ~32K | |
 | 128K | 131072 | ~128K | 单流 |
-| 262K | 262144 | ~261K | **仅 config 支持时** |
+| 262K | 262144 | ~261K | config 支持 262144；HBM/图/质量通过才留 |
 
 每档记录：`usage.prompt_tokens`、TTFT、TPOT、HBM 峰值、chunked prefill、回退、完整输出。
 
