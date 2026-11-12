@@ -22,8 +22,10 @@ ngram 的 capture sizes 为 `[1,2,4,8]`，图内存 0.16 GiB。
 
 - 4K 与 8K 都能起来并返回完整回答；4K needle `ok=true`（含 `TIGER-7421`）。
 - `capture sizes` 从 `[1,2,4]` 变为 `[1,2,4,8]`，说明投机槽位被计入图捕获。
-- **未采集到 ngram 的投机 token 统计**（服务已停，没抓 `/metrics`）；S1 的
-  "投机 token 统计"证据缺一块，因此只算 **C1 通过**，不算完整 S1。
+- 服务端指标已从日志补齐：4K **60.8%** draft acceptance（mean 1.61，accepted 45 /
+  drafted 74）；16K **56.9%**（mean 1.57，29 / 51）。原始日志
+  `/tmp/v3-ngram-4k.log`、`/tmp/v3-ngram-16k.log`。
+- S1 只要求 C1（服务起、输出、token 统计），不要求加速；**S1 判过**。
 
 ## 3. S2：MTP k=1 的速度
 
@@ -121,7 +123,7 @@ ngram 在前 6 步的 logprob 与非投机**完全相同**，直到第 10 个 to
 
 | 项 | 结果 |
 |---|---|
-| S1 ngram | ⚠️ C1 通过；投机 token 统计未采集 |
+| S1 ngram | ✅ C1；4K/16K acceptance 60.8% / 56.9%，mean 1.61 / 1.57 |
 | S2 MTP k=1 | ⚠️ 可跑、93.9% 接受率、约 1.35×；严格 C2 未过 |
 | S3 MTP + 图 | ⚠️ 6 图/0 回退，但依赖 S2 |
 | S4 MTP + 长上下文 | ⬜ 未跑 |

@@ -75,7 +75,7 @@ prompt 用 `benchmarks/make_long_prompt.py --tokens N --out /tmp/prompt-Nk.txt` 
 
 | # | 场景 | 证据 | 门 | Qwen3.6 |
 |---|---|---|---|---|
-| S1 | ngram 冒烟（无 draft 权重） | 服务起、输出、投机 token 统计 | C1；不要求加速 | ⚠️ 4K/8K 服务与输出通过；token 统计未采集（2026-11-12） |
+| S1 | ngram 冒烟（无 draft 权重） | 服务起、输出、投机 token 统计 | C1；不要求加速 | ✅ 2026-11-12：4K/16K 服务与输出通过；acceptance 60.8% / 56.9%（mean 1.61 / 1.57）；不要求加速 |
 | S2 | MTP k=1，4K | 套件、needle、接受率、TPOT | Q1 任务正确 + Q3 性能（非逐位） | ✅ 2026-11-12：套件 8/8、needle 9/9、Q2 两次一致、Q3 93.9% / 1.35×；非逐位；[证据](notes/m1-spec-quality.md) |
 | S3 | MTP k=1 + 图 | `captured_graphs`、`fallbacks` | 回退 = 0 | ✅ 6 图（PIECEWISE 3 / FULL 0）、0 回退；MTP+32K Q5 已跑 |
 | S4 | MTP k=1 + 长上下文 32K/128K | 同上 + HBM | Q1 + 回退 = 0；长上下文单列 | ⚠️ 32K：9/9、TTFT 1.037×、6 图/0 回退；acceptance 81–88%；128K 未测 |
