@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from tileinfer.contracts.capabilities import Mamba2Contract
 from tileinfer.contracts.manifest import AttentionSpec, MambaSpec, ModelManifest
 from tileinfer.manifests import QWEN3_6
 
@@ -34,6 +35,18 @@ def _mamba_manifest(*, layer_types: tuple[str, ...], mamba: MambaSpec | None) ->
         required_capabilities=("attention.full", "state.linear"),
         benchmark={"prompt": "hi", "max_tokens": 1, "top5": []},
     )
+
+
+class _Mamba2Stub:
+    def forward(self, hidden_states, mup_vector=None):
+        return hidden_states
+
+    def state_shape(self, spec):
+        return (1,)
+
+
+def test_mamba2_provider_contract_is_structural() -> None:
+    assert isinstance(_Mamba2Stub(), Mamba2Contract)
 
 
 def test_qwen_manifest_shape_is_unchanged_by_the_optional_mamba_field() -> None:

@@ -71,10 +71,9 @@ unknown = sorted(set(layer_types) - {"full_attention", "linear_attention"})
 
 **仍未解决：**
 
-- `required_capabilities` 的 Mamba 映射：可先复用 `state.linear`，但 provider 契约需要
-  单独定义，不能改 GDN 的语义；
-- provider 的 `LinearAttentionContract` 仍是 GDN 的 `chunk/recurrent(q,k,v,g,beta)`，
-  Mamba2 不能直接复用；这是 O4 的剩余设计项。
+- `required_capabilities` 的 Mamba 映射：暂用 `state.linear`，并新增
+  `Mamba2Contract` 作为其子契约（`forward` + `state_shape`），不改 GDN 的
+  `LinearAttentionContract`；决策层仍是 8 个能力，不新增第 9 个 capability。
 - 真实 config 字段仍未到位；声明草案里的 `TODO(config)` 不能填默认值。
 
 在这些剩余项落地前，O2 **不能**产出最终 Nemotron 声明；但 schema 已能表达

@@ -1,4 +1,8 @@
-"""The eight capability contracts, and the shape of a provider declaration.
+"""The eight top-level capability contracts, plus the Mamba2 sub-contract.
+
+The eight ``Capability`` values stay closed (the decision layer and its tests depend on
+that).  ``Mamba2Contract`` is a sub-contract selected through ``state.linear``; it is not a
+ninth capability, so adding it does not change plan routing.
 
 Why protocols and not base classes
 ----------------------------------
@@ -107,6 +111,23 @@ class StateContract(Protocol):
 
     def update(self, state: Any, *args: Any, **kwargs: Any) -> Any:
         """Advance the state by one step and return it."""
+
+
+@runtime_checkable
+class Mamba2Contract(Protocol):
+    """Mamba2 mixer compute, a sub-contract of ``state.linear``.
+
+    Kept separate from :class:`LinearAttentionContract` (GDN's q/k/v/g/beta) because the
+    two have different math and state shapes.  The decision layer still selects this through
+    the existing ``state.linear`` capability; the provider's ``covers`` map declares
+    ``{"mixer": "mamba2"}`` so a GDN implementation cannot be mistaken for it.
+    """
+
+    def forward(self, hidden_states: Any, mup_vector: Any | None = None) -> Any:
+        """Run the conv/SSM/gated-norm/out-proj path for this mixer."""
+
+    def state_shape(self, spec: Any) -> Any:
+        """Return the shapes the engine must allocate for conv + SSM state."""
 
 
 @runtime_checkable
