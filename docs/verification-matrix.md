@@ -98,8 +98,9 @@ prompt 用 `benchmarks/make_long_prompt.py --tokens N --out /tmp/prompt-Nk.txt` 
 - **严格逐位未过**：同 cap 下 MTP 与不启用投机在 8K 第 58 token 分叉（max logprob 0.76）；
   ngram 与不启用投机在第 10 token 分叉；MTP 与 ngram 也互不相同；MTP 自身两次一致。
 - 图/async/cascade 已排除：非投机 FULL 与 PIECEWISE 输出完全相同；MTP eager 与
-  PIECEWISE 输出完全相同；但 MTP 与 ngram 仍与非投机在 8K/4K 分叉。分叉在投机
-  执行/验证本身（target logits 取位、draft 接受/拒绝、GDN spec state 待查）。
+  PIECEWISE 输出完全相同；但 MTP 与 ngram 仍与非投机在 8K/4K 分叉。MTP 从第 2 个
+  token 起 logprob 漂移，ngram 到第 10 个 token 才分叉，指向 GDN spec 多 token 前向；
+  不是启动参数能修的，继续需插桩/厂商修复。
 - 因此 S2 不能判过。先选口径：**(A) 严格逐位**（当前不合格，查厂商/改路径）、
   **(B) 定义容差**（写进 manifest，不能临时放宽）、**(C) 暂不判投机**，先做并发/冷启动。
 

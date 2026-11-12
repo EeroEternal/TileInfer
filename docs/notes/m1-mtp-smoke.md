@@ -96,6 +96,24 @@ prompt 上就已经改变输出。MTP 自身是确定的（两次完全一致）
 spec（MTP 或 ngram）就与非投机分叉**。分叉在投机执行/验证本身，最可能在 target
 logits 的取位、draft 接受/拒绝，或 GDN 的 spec state 更新；尚未定位到具体一行。
 
+### 5.2 数值漂移的起点
+
+| 生成步 | MTP vs 非投机（logprob 差） | ngram vs 非投机 |
+|---|---|---|
+| 0 | 0.0 | 0.0 |
+| 1 | 5.36e-6 | 0.0 |
+| 2 | **4.36e-4** | 0.0 |
+| 3 | 5.25e-6 | 0.0 |
+| 4 | 3.61e-5 | 0.0 |
+| 5 | 8.3e-7 | 0.0 |
+| 首个 token 分叉 | **58** | **10** |
+
+ngram 在前 6 步的 logprob 与非投机**完全相同**，直到第 10 个 token 才分叉；MTP 从
+第 2 个 token 起就有微小差异。两者都指向"投机多 token forward 改变了 target 的数值
+路径"，而不是采样噪声：MTP 的 draft token 从第一步就进入 batch，ngram 在首个被接受
+的 draft 之前保持精确。这与 GDN spec state / 多 token 前向的数值差一致；尚未证明是
+具体哪一行。
+
 在这台 MoE/GDN 模型上，早期 token 的分叉就足以翻转 top-1，所以不能拿"答案看起来对"
 代替逐位。矩阵原口径是"先按逐位一致跑，不一致就查，不调容差"；现在就是"不一致"。
 
@@ -114,8 +132,9 @@ logits 的取位、draft 接受/拒绝，或 GDN 的 spec state 更新；尚未�
 
 ## 7. 下一步（需要选口径）
 
-1. **严格逐位**：当前 MTP/ngram 都不合格。cascade/FULL/async 已排除，下一步查
-   target logits 的取位、draft 接受/拒绝、GDN spec state，或找厂商已知问题。
+1. **严格逐位**：当前 MTP/ngram 都不合格。cascade/FULL/async 已排除；MTP 从第 2 个
+   token 起漂移、ngram 到第 10 个 token 才漂移，指向 GDN spec 多 token 前向。继续需要
+   插桩 target logits / 改厂商代码，或报 issue；不是启动参数能修的。
 2. **定义容差**：例如前 32 token 逐位、之后 top-1 一致率 ≥ X%、或与"同 attention 路径的
    非投机"比。这必须写进 `manifest`，不能临时放宽。
 3. **先不判投机**：转去做并发 P2/P3、冷启动 K1/K2，把 S2 留作阻塞项。
