@@ -37,6 +37,38 @@
 
 ---
 
+## 1.5 vLLM 与 vllm-ascend 各做哪层
+
+不是“按层切”，而是“按接口切”：**vLLM 定义契约 + 通用实现，vllm-ascend 实现契约的
+Ascend 版本，并在必要时覆盖模型/打补丁。** 两边都可能拥有模型代码。
+
+| 层 | vLLM | vllm-ascend |
+|---|---|---|
+| 服务/引擎 | OpenAI API server、EngineCore、scheduler、tokenizer、chat template、metrics | platform 检测、worker、model runner、device config；一般不做 serving |
+| 注册/配置 | `ModelRegistry`、HF config、通用模型注册 | `vllm_ascend/models/__init__.py` 注册 Ascend 专用模型；`patch/` 覆盖 config/行为 |
+| 模型图 | 上游架构的 model 类（Qwen/Llama/DeepSeek 等）和通用层 | Ascend 专用整模型（GLM5Next、DeepSeek V4、MiniMax M3、Kimi K3、Gemma4 MM）；部分模型用 patch（Qwen3.5-VL） |
+| 权重加载 | `AutoWeightsLoader`、`WeightsMapper`、模型 `load_weights` | `model_loader/`、权重 patch、Ascend scale/布局 |
+| KV/attention | `Attention` 抽象、`KVCacheSpec`、block manager、paged metadata | `attention/` 的 MLA/SFA/DSA/FA3/CP backend、`worker/block_table.py`、KV dtype/bind patch |
+| 并行 | TP/PP/EP/DP 编排、parallel linear/embedding、`FusedMoE` 抽象 | `distributed/parallel_state.py`、HCCL、`ops/fused_moe`、EP all-to-all |
+| 量化 | `QuantizationConfig`、量化方法、CUDA kernel | `quantization/` adapter、Ascend W8A8/W4A8/MXFP8/MXFP4 kernel |
+| 投机/MTP | `SpeculativeConfig`、`MTPModelTypes`、rejection sampler | `spec_decode/` 的 Eagle/DFlash/DSpark/Medusa proposer、MTP 模型、`patch_speculative_config.py` |
+| 图/编译 | `torch.compile`、`CUDAGraphMode`、capture 接口 | `compilation/acl_graph.py`、breakable/updatable graph、`patch_cudagraph.py`、fallback |
+| 算子 | `CustomOp`/`PluggableLayer` 接口、CUDA/Triton 实现 | `ops/`、`_cann_ops_custom`、fused MoE、attention kernel |
+| 设备/内存 | `Platform` 接口、allocator 接口 | `platform.py`、`device_allocator/`、`worker/`、内存 profiling |
+| 测试/支持表 | upstream model tests、GPU CI | Ascend 支持矩阵、tutorial、accuracy/perf CI |
+
+一句话：
+
+- **vLLM 不支持某模型**：先缺的是“模型语义”（模型图/权重/KV spec）。
+  vllm-ascend 可以用 `ModelRegistry.register_model` 自己实现一个 Ascend 版本，
+  但那等于把模型维护放进 Ascend 插件，成本高、也容易和新版 vLLM 分叉。
+- **vLLM 支持、Ascend 不支持**：模型语义已有，缺的是 Ascend backend/算子/KV/graph/
+  模型注册；这是“port”，不是“从零实现”。
+- **两边都可能拥有模型代码**：GLM5Next 是 vllm-ascend 的整模型；
+  Qwen3.6 是 vLLM 模型 + Ascend patch。
+
+---
+
 ## 2. 具体例子
 
 ### Flint：vLLM main 有，0.30 没有
