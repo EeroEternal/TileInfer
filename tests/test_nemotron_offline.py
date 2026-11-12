@@ -152,6 +152,25 @@ def test_config_to_manifest_rejects_unknown_pattern_character() -> None:
         mod.parse_config(_config_dict("M?"))
 
 
+def test_config_to_manifest_rejects_bad_gqa_and_mamba_grouping() -> None:
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "config_to_manifest", ROOT / "tools/nemotron/config_to_manifest.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+    bad_gqa = _config_dict()
+    bad_gqa["num_key_value_heads"] = 7
+    with pytest.raises(ValueError, match="divisible"):
+        mod.parse_config(bad_gqa)
+    bad_mamba = _config_dict()
+    bad_mamba["mamba_n_groups"] = 7
+    with pytest.raises(ValueError, match="divisible"):
+        mod.parse_config(bad_mamba)
+
+
 def test_no_vendor_decision_reports_all_gaps_without_hardware(tmp_path: Path) -> None:
     m = ModelManifest(
         name="nemotron-synthetic",
