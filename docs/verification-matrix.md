@@ -43,7 +43,7 @@
 | L2 | 16K | 同上 | 同上 | ✅ 2026-11-12：TTFT 1.0108×、TPOT 1.0018×；9/9 needle 同 |
 | L3 | 32K | 同上 + 图回退 | 同上 | ✅ 2026-11-12：TTFT 1.0077×、TPOT 1.0019×；6 图/0 回退；32K 峰值 HBM 107,380 MB |
 | L4 | 128K | 同上 + 峰值激活 | 同上，可单独放宽并发 | ✅ 2026-11-12：单流 TTFT 0.9433×、TPOT 0.9884×、吞吐 1.0117×；3/3 needle 逐 token 同；2 图/0 回退；峰值 HBM 107,374 MB |
-| L5 | 模型上限 262,144 | 同上；记录**实际可用上限** | 同上 | ⏳ 262K 单流已起：TTFT 116.0 s、TPOT 69.1 ms；needle 进行中，未完成不判过 |
+| L5 | 模型上限 262,144 | 同上；记录**实际可用上限** | 同上 | ❌ 262K 单流：d10/d50 过，d90 两臂 256 token、v3 500 token 均未答出；C4 TPOT 1.1019×、吞吐 0.9076×；峰值 107,376 MB、2 图/0 回退 |
 
 长上下文必须记录：`max-model-len`、prompt tokens（以 usage 为准）、KV 容量、峰值 HBM、
 是否触发 chunked prefill、TTFT 随长度的斜率。模型上限 262,144 不代表单卡一定能服务到；
@@ -51,7 +51,9 @@
 
 参考：33K 配置下实测 KV 32.39 GiB / 1,383,782 tokens（约 24.5 KiB/token），
 单请求 262K 的 KV 约 6.1 GiB，容量不是最明显的墙；**真正要先量的是 262K prefill
-的峰值激活与非 torch 内存**。40,960/8 的首次尝试已在 8K 请求 OOM，说明 cap 不能直接外推。
+的峰值激活与非 torch 内存**。40,960/8 的 OOM 主要是 8 seq 放大的图/非 torch 内存，
+不能外推成 128K/1 不可行；128K 单流已过（L4）。262K 单流能起（峰值 HBM 约
+107,376 MB），但 d90 检索失败、C4 边缘失败，L5 判不过；**实际质量上限是 128K**。
 
 prompt 用 `benchmarks/make_long_prompt.py --tokens N --out /tmp/prompt-Nk.txt` 生成，
 探针用 `TI_PROMPT=/tmp/prompt-Nk.txt benchmarks/v3_long_ttft.py <port> <label> <out> [runs]`；
@@ -183,7 +185,7 @@ prompt 用 `benchmarks/make_long_prompt.py --tokens N --out /tmp/prompt-Nk.txt` 
 
 Qwen3.6 按以下顺序推进：
 
-1. ✅ 长上下文阶梯 L1 8K → L2 16K → L3 32K → L4 128K（2026-11-12，L4 单流）；L5 262K 进行中。
+1. ✅ 长上下文 L1 8K → L2 16K → L3 32K → L4 128K（2026-11-12，L4 单流）；❌ L5 262K（d90/C4 不过，质量上限 128K）。
 2. ✅ 投机质量门：S2（4K）Q1/Q2/Q3 过；S3 图 6 图/0 回退过；S4 32K 部分，128K 未测。
 3. 组合：S3 已跑；S4 32K 已跑；S4 128K/262K 未测。
 4. 并发 32 / 64（P2/P3）、冷启动（K1/K2）。
