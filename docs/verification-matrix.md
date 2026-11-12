@@ -130,6 +130,9 @@ prompt 用 `benchmarks/make_long_prompt.py --tokens N --out /tmp/prompt-Nk.txt` 
 
 ## 2. 新模型附加项（M5+）
 
+0. 先过**版本 gate V0**：确认这台 950 能否拿到更新的 vllm-ascend build；拿不到就冻结
+   当前栈，并在 gap report 里写明"pinned-stack gap"。见
+   [`notes/version-strategy.md`](notes/version-strategy.md)。
 1. 先用 `tileinfer plan build` 得到缺口报告：`servable=False` 与 required gap 列表。
 2. 每个 gap 对应一个 provider，声明五项：coverage / graphable / parallel / 证据 / `delete_when`。
 3. 跑完 §1 全表；无厂商基线时按 [`acceptance.md`](acceptance.md) §2.1 的绝对口径。
