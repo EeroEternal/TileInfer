@@ -39,7 +39,7 @@ v2 自带平台层的形态，v3 不再走那条路。本页 §1 的 v3 数字�
 | 决策层（`resolve/`） | ✅ | 纯函数；vendor 在→8/8 选 vendor、gap=0；vendor 不在→8 条 required gap、servable=False（这是"会不会服务不了"的判定，不是"要去补 8 个实现"的待办） |
 | 接入层（`bridge/`） | ✅ | 6 个具体钩子（plugin entry、dispatch、capture、attn select、config gate、init keys），4/6 类机制，预算 8 |
 | 分层禁令 | ✅ | AST 守卫：只有 `tileinfer/bridge/` 可 import `vllm_ascend`；另有测试防止 carve-out 变空 |
-| 观测 | ✅ | capture/fallback 计数落 JSON（`SIGUSR1`/500 步/atexit）；API server 的零计数不再覆盖 EngineCore |
+| 观测 | ✅ | capture/fallback 计数落 JSON（`SIGUSR1`/500 步/atexit）；API server 的零计数不再覆盖 EngineCore；算子级审计（`TILEINFER_AUDIT`）2026-11-12 跑通：23 类/903 实例，热路径全 vendor，3 个非 vendor 行均有解释，见 `notes/m1-op-audit.md` |
 | CLI / doctor | ✅ | `plan build/show/verify`、`tileinfer doctor`；doctor 在最终 metrics 上全 PASS |
 
 ### 1.1 v2 资产（冻结，v3 继续用）

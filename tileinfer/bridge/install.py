@@ -41,6 +41,18 @@ PLAN_ENV = "TILEINFER_PLAN"
 DISABLE_ENV = "TILEINFER_V3"
 STRICT_ENV = "TILEINFER_BRIDGE_STRICT"
 MANIFEST_ENV = "TILEINFER_MANIFEST"
+AUDIT_ENV = "TILEINFER_AUDIT"
+AUDIT_DEFAULT_PATH = "/tmp/tileinfer-ops.json"
+_AUDIT_OFF = {"", "0", "false", "off", "no"}
+_AUDIT_DEFAULT = {"1", "true", "on", "yes"}
+
+
+def _audit_path() -> Optional[str]:
+    """Where the op audit writes, or ``None`` when it is off (the default)."""
+    raw = os.environ.get(AUDIT_ENV, "").strip()
+    if raw.lower() in _AUDIT_OFF:
+        return None
+    return AUDIT_DEFAULT_PATH if raw.lower() in _AUDIT_DEFAULT else raw
 
 _LOCK = threading.Lock()
 _INSTALLED = False
@@ -146,6 +158,14 @@ def install() -> bool:
 
             report = seams.install_all(plan)
             _STATUS["seams"] = report["seams"]
+
+            # Diagnostic, off unless asked for: which implementation each op instance got.
+            audit_path = _audit_path()
+            if audit_path:
+                try:
+                    _STATUS["audit"] = seams.install_op_audit(audit_path)
+                except Exception as exc:  # never let a diagnostic break the install
+                    _STATUS["audit"] = {"ok": False, "detail": f"{type(exc).__name__}: {exc}"}
             # Critical seams (config gate, graph hook, attention selector) must all be in
             # place; a partial install is reported as failure so `doctor` and the caller see
             # it, even though the hooks that did install remain harmless.
@@ -159,6 +179,8 @@ def install() -> bool:
                 f"TileInfer v3 bridge: {plan.summary()} | seams={','.join(ok) or 'none'} "
                 f"| skipped={skipped} | metrics={metrics_path}"
             )
+            if audit_path:
+                message += f" | audit={audit_path}"
             logger.info(message)
             # A general plugin may run before vLLM installs its log handlers (the API server
             # path does), so the logger record can be dropped.  One stderr line is the

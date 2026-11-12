@@ -227,6 +227,95 @@ def install_method_wrappers(plan: Any) -> SeamResult:
     return SeamResult("method_wrap", True, "covered by graph_hook; no extra wrappers")
 
 
+def install_op_audit(path: str) -> Dict[str, Any]:
+    """Record which implementation every engine op instance actually got.
+
+    A diagnostic, not a plan seam: enabled only when ``TILEINFER_AUDIT`` names an output path,
+    and built on the existing ``method_wrap`` mechanism rather than a new access point.  Both
+    entry points run once per module construction, never per token, so the request path is
+    untouched.
+
+    Why both: ``CustomOp`` dispatches per op and falls back to ``forward_native`` (plain
+    torch) when the vendor registered no implementation under that class name.
+    ``PluggableLayer`` replaces a whole layer class.  Counting only the first would miss the
+    linear / MoE / attention layers, which are most of the work per token.
+    """
+    report: Dict[str, Any] = {"ok": False, "patched": [], "path": path, "detail": ""}
+    try:
+        from ..observ import opaudit
+    except Exception as exc:  # pragma: no cover - defensive
+        report["detail"] = f"opaudit unavailable: {exc}"
+        return report
+
+    try:
+        opaudit.configure(path)
+    except Exception as exc:  # pragma: no cover - defensive
+        report["detail"] = f"opaudit.configure failed: {exc}"
+        return report
+
+    try:
+        from vllm.model_executor.custom_op import CustomOp, PluggableLayer
+    except Exception as exc:
+        report["detail"] = f"vllm custom_op unavailable: {exc}"
+        return report
+
+    if not getattr(CustomOp, "_tileinfer_audited", False):
+        original_dispatch = CustomOp.dispatch_forward
+
+        def dispatch_forward(self, *args, **kwargs):
+            fn = original_dispatch(self, *args, **kwargs)
+            func = getattr(fn, "__func__", fn)
+            opaudit.record(
+                type(self).__name__,
+                base="custom_op",
+                module=type(self).__module__,
+                forward=getattr(func, "__name__", type(fn).__name__),
+                forward_module=getattr(func, "__module__", ""),
+            )
+            return fn
+
+        CustomOp.dispatch_forward = dispatch_forward
+        CustomOp._tileinfer_audited = True
+        report["patched"].append("CustomOp.dispatch_forward")
+
+        # Call counts separate "this class exists in the model" from "this class runs every
+        # token".  Only the base ``forward`` is wrapped: the suspect classes in this release
+        # (chunk rule, MoE method) do not override it, and at ~1 us per call the sample run is
+        # still cheap while the default path is untouched.
+        original_forward = CustomOp.forward
+
+        def forward(self, *args, **kwargs):
+            opaudit.record_call(type(self).__name__)
+            return original_forward(self, *args, **kwargs)
+
+        CustomOp.forward = forward
+        report["patched"].append("CustomOp.forward")
+
+    if not getattr(PluggableLayer, "_tileinfer_audited", False):
+        original_new = PluggableLayer.__new__
+
+        def __new__(cls, *args, **kwargs):
+            instance = original_new(cls, *args, **kwargs)
+            actual = type(instance)
+            opaudit.record(
+                actual.__name__,
+                base="pluggable",
+                module=actual.__module__,
+                forward="forward",
+                forward_module=actual.__module__,
+            )
+            return instance
+
+        PluggableLayer.__new__ = __new__
+        PluggableLayer._tileinfer_audited = True
+        report["patched"].append("PluggableLayer.__new__")
+
+    if not report["patched"]:
+        report["detail"] = "already installed"
+    report["ok"] = True
+    return report
+
+
 def install_all(plan: Any) -> Dict[str, Any]:
     """Install the seams named by the plan.  Returns a report; never raises."""
     report: Dict[str, Any] = {"seams": [], "ok": True}
