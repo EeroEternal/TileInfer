@@ -82,11 +82,12 @@ MTP 投机、长上下文（8K/16K/32K/128K；config 声明 262144，262K 为条
 | vllm-ascend 补了 hybrid Mamba cache config 和 `causal_conv1d_update` | `patch_mamba_config.py`、`patch_triton.py` |
 | 目标 config：52 层 = 23 Mamba + 23 MoE + 6 attention；上下文 262144；`num_nextn_predict_layers=1` | [`m5-nemotron-config.json`](m5-nemotron-config.json)（仅 config 快照） |
 | vLLM 0.23 **直接加载**目标 config 会 `AttributeError: property 'layers_block_type' has no setter`；默认 pattern 也与目标不符 | `.venv_v3/bin/python` 实测 |
+| 权重索引含 270 个 `mtp.*` key（`mtp.layers.0/.1`），MTP 权重确实存在 | [`m5-nemotron-mtp.json`](m5-nemotron-mtp.json)；索引 612207 B / 6513 keys |
 | `normalize_config()` 转成 `hybrid_override_pattern`/`mtp_hybrid_override_pattern` 后，`NemotronHConfig` 可加载，层型/MTP 与目标一致 | `tools/nemotron/config_to_manifest.py` 测试 |
 
 ### 3.2 未知（必须在离线阶段查清，不能猜）
 
-1. checkpoint 是否真的带 MTP heads/权重；config 声明 1 层 MTP 不等于权重有 MTP heads。
+1. ~~checkpoint 是否带 MTP heads/权重~~ → **已确认有**：索引含 270 个 `mtp.*` key，`mtp.layers.0/.1`；Ascend MTP 执行/图仍未知。
 2. vllm-ascend 的 Mamba2/混合 attention 是否能接住该模型，还是只在 vLLM 通用路径下能跑。
 3. 图捕获对 Mamba state / 混合 KV 是否安全；需要上机计数，不能静态断言。
 4. 参考实现路径：HF/transformers 在 CPU 上能否在可接受时间给出固定短样例 logits；

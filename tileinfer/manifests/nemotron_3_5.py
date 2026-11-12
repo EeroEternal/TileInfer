@@ -74,9 +74,9 @@ NEMOTRON_3_5_DRAFT = ModelManifest(
         "max_position_embeddings": 262144,
         "mamba_state_dtype": "float32",
         "num_nextn_predict_layers": 1,
-        "mtp_weights": "unknown (config declares one MTP layer; weight keys not inspected)",
+        "mtp_weights": "found: 270 mtp.* keys in model.safetensors.index.json; mtp.layers.0/.1 present",
         "config_snapshot": "docs/notes/m5-nemotron-config.json",
-        "note": "config uses layers_block_type; vLLM 0.23 needs a config shim",
+        "note": "config uses layers_block_type; vLLM 0.23 needs a config shim; MTP weights present but Ascend spec path unverified",
     },
     required_capabilities=tuple(
         cap.value

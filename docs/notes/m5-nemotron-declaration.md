@@ -1,7 +1,7 @@
 # Nemotron 模型声明草案（O2，离线）
 
-> 状态：**真实 config 已到手，声明结构已按 config 落成 draft；但 benchmark top5 未填、
-> MTP 权重未验，所以不注册进 `MANIFESTS`、不作为可部署声明。**
+> 状态：**真实 config 已到手，声明结构已按 config 落成 draft；MTP 权重已确认存在，
+> 但 benchmark top5 未填，所以不注册进 `MANIFESTS`、不作为可部署声明。**
 >
 > 事实来源：[`m5-nemotron-config.json`](m5-nemotron-config.json)（仅 config 快照，未下载权重）。
 > 代码草案：[`tileinfer/manifests/nemotron_3_5.py`](../../tileinfer/manifests/nemotron_3_5.py)。
@@ -83,8 +83,9 @@ n_groups/conv_kernel/expand/chunk_size -> mamba_n_groups/mamba_d_conv/...
 
 - **不注册**：`BENCHMARK_PENDING=True`，`top5=[]`；注册会让 `find_manifest` 把
   draft 当成可部署声明。
-- **不承诺 MTP**：config 有 1 层 MTP，但权重 key 未查；没有 MTP heads 就按 D4 上报，
-  不用 ngram 替代。
+- **MTP 权重已确认，但不承诺能跑**：索引含 270 个 `mtp.*` key（`mtp.layers.0/.1`），
+  见 [`m5-nemotron-mtp.json`](m5-nemotron-mtp.json)；Ascend 的 MTP 注册/执行/图仍待上机，
+  失败就按 D4 上报，不用 ngram 替代。
 - **不承诺 262K 可用**：config 支持 262144，但实际 HBM/图/性能要上机；验收先跑
   8K/16K/32K/128K，262K 作为条件档。
 - **不写 provider 默认路径**：Mamba2 的 SSD/chunk-scan 仍是候选缺口，见
@@ -95,7 +96,7 @@ n_groups/conv_kernel/expand/chunk_size -> mamba_n_groups/mamba_d_conv/...
 ## 5. 完成 O2 的判据
 
 - benchmark top5 由 HF/transformers 参考实现填上，`BENCHMARK_PENDING=False`；
-- MTP 权重 key 用 [`mtp_probe.py`](../../tools/nemotron/mtp_probe.py) 查清，有/无都记录；
+- MTP 权重 key 已用 [`mtp_probe.py`](../../tools/nemotron/mtp_probe.py) 查清（270 个 key）；
 - 声明通过 `ModelManifest.validate()` 并注册进 `MANIFESTS`；
 - 声明里没有出现“用 vllm_ascend / 用某 provider”的字样；
 - config shim 的 `delete_when` 已记录：上游接受 `layers_block_type` 或升级后删除。

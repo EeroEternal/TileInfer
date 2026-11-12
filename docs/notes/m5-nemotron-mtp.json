@@ -1,0 +1,31 @@
+{
+  "weight_keys": 6513,
+  "max_layer_index": 51,
+  "named_mtp_keys": [
+    "mtp.layers.1.mixer.experts.55.down_proj.weight",
+    "mtp.layers.1.mixer.experts.53.up_proj.weight",
+    "mtp.layers.1.mixer.experts.67.up_proj.weight",
+    "mtp.layers.1.mixer.experts.110.up_proj.weight",
+    "mtp.layers.1.mixer.experts.43.up_proj.weight",
+    "mtp.layers.1.mixer.experts.126.up_proj.weight",
+    "mtp.layers.1.mixer.experts.84.down_proj.weight",
+    "mtp.layers.1.mixer.experts.3.up_proj.weight",
+    "mtp.layers.1.mixer.experts.77.down_proj.weight",
+    "mtp.layers.0.mixer.v_proj.weight",
+    "mtp.layers.1.mixer.experts.50.down_proj.weight",
+    "mtp.layers.1.mixer.experts.125.up_proj.weight",
+    "mtp.layers.0.eh_proj.weight",
+    "mtp.layers.1.mixer.experts.12.down_proj.weight",
+    "mtp.layers.1.mixer.experts.12.up_proj.weight",
+    "mtp.layers.1.mixer.experts.96.up_proj.weight",
+    "mtp.layers.1.mixer.experts.28.up_proj.weight",
+    "mtp.layers.1.mixer.experts.94.up_proj.weight",
+    "mtp.layers.1.mixer.experts.120.up_proj.weight",
+    "mtp.layers.1.mixer.experts.100.down_proj.weight"
+  ],
+  "named_mtp_count": 270,
+  "extra_layer_keys": [],
+  "extra_layer_count": 0,
+  "mtp_weights_found": true,
+  "note": "found"
+}

@@ -27,6 +27,7 @@
 | F12 | 目标 checkpoint 的 config 用 `layers_block_type`，没有 `hybrid_override_pattern`；52 层 = 23 Mamba + 23 MoE + 6 attention；`mtp_layers_block_type=["attention","moe"]`；上下文 262144 | [`m5-nemotron-config.json`](m5-nemotron-config.json)（仅 config 快照，未下载权重；来源见 [`m5-nemotron-config.md`](m5-nemotron-config.md)） |
 | F13 | vLLM 0.23 的 `NemotronHConfig` 直接加载该 config 会抛 `AttributeError: property 'layers_block_type' has no setter`；即使绕过，默认 `hybrid_override_pattern` 是 24 M / 24 MLP / 4 attention、无 MoE，与目标 23/23/6 不一致 | `.venv_v3/bin/python` 实测；见 G0 |
 | F14 | 用 `normalize_config()` 把 `layers_block_type`/`mtp_layers_block_type` 转成 `hybrid_override_pattern`/`mtp_hybrid_override_pattern` 后，`NemotronHConfig` 能加载，层型和 MTP pattern 与目标一致 | `tools/nemotron/config_to_manifest.py`；测试 `test_normalized_config_loads_in_vllm_without_npu` |
+| F15 | 权重索引有 270 个 `mtp.*` key（`mtp.layers.0` attention / `mtp.layers.1` moe），backbone 最大层号 51；MTP 权重确实存在 | [`m5-nemotron-mtp.json`](m5-nemotron-mtp.json)；索引 612207 B / 6513 keys |
 
 ---
 
@@ -41,7 +42,7 @@
 | U5 | 混合 KV/Mamba state 的分配与 page 约束 | 错则 OOM/错数 | 读 `MambaSpec`/Ascend platform；上机验 |
 | U6 | 权重名映射（`mixer.{k,v}_proj` 等） | 错则加载失败/静默错 | 读 `weight_utils.py` 与 Ascend loader；上机验 |
 | U7 | 参考实现可执行性 | 无厂商基线，C2 只能对 HF/transformers | 权重到位后 CPU 小样例；太慢则分层 oracle |
-| U8 | MTP 权重 key 是否真的存在 | config 声明 1 层 MTP，不等于权重带 MTP heads | 权重到位后查 `*.mtp*`/`nextn` key；无则 D4 上报 |
+| U8 | ~~MTP 权重 key 是否真的存在~~ → **已确认有** 270 个 `mtp.*` key | config 声明不等于权重有；现已查索引确认 | 上机验 Ascend 的 MTP 注册/执行/图；失败按 D4 上报 |
 
 ---
 

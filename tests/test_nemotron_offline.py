@@ -185,9 +185,17 @@ def test_nemotron_declaration_matches_the_real_config_snapshot() -> None:
     assert m.moe is not None and m.moe.num_experts == 128 and m.moe.top_k == 6
     assert m.kv["max_position_embeddings"] == 262144
     assert m.kv["num_nextn_predict_layers"] == 1
+    assert "found" in m.kv["mtp_weights"]
     assert BENCHMARK_PENDING is True
     assert m.benchmark["top5"] == []
     assert m.manifest_id not in MANIFESTS
+
+
+def test_mtp_probe_artifact_confirms_weights_are_present() -> None:
+    data = json.loads((ROOT / "docs/notes/m5-nemotron-mtp.json").read_text(encoding="utf-8"))
+    assert data["mtp_weights_found"] is True
+    assert data["named_mtp_count"] == 270
+    assert data["max_layer_index"] == 51
 
 
 def test_config_normalizer_accepts_the_checkpoint_schema() -> None:

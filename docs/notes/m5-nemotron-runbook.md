@@ -170,7 +170,8 @@ python tools/nemotron/mtp_probe.py \
 ```
 
 - `mtp_weights_found=false` → 记录“无 MTP”，跳到 D5，**不要**用 ngram 替代；
-- `true` → 再启动下面的 MTP 服务。
+- `true` → 再启动下面的 MTP 服务。当前目标索引已见 270 个 `mtp.*` key（`mtp.layers.0/.1`），
+  所以应走 `true` 分支；见 [`m5-nemotron-mtp.json`](m5-nemotron-mtp.json)。
 
 ```bash
 vllm serve "$SHIM" \
