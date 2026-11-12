@@ -64,6 +64,24 @@ def test_manifest_represents_mamba_and_mlp_layers() -> None:
     assert m.as_dict()["mamba"]["kind"] == "mamba2"
 
 
+def test_manifest_represents_an_explicit_moe_layer() -> None:
+    m = ModelManifest(
+        name="nemotron-synthetic",
+        manifest_id="nemotron-synthetic",
+        arch="NemotronHForCausalLM",
+        model_type="nemotron_h",
+        num_layers=4,
+        layer_types=("mamba", "moe", "full_attention", "mlp"),
+        attention=AttentionSpec(kind="gqa", num_heads=32, num_kv_heads=8, head_dim=128),
+        mamba=MambaSpec(num_heads=128, n_groups=8),
+        moe=MoESpec(num_experts=64, top_k=4),
+        required_capabilities=("attention.full", "state.linear", "moe.routed"),
+        benchmark={"prompt": "hi", "max_tokens": 1, "top5": []},
+    )
+    m.validate()
+    assert "moe" in m.layer_types
+
+
 def test_manifest_rejects_mamba_layer_without_spec() -> None:
     m = _mamba_manifest(layer_types=("mamba", "full_attention"), mamba=None)
     with pytest.raises(ValueError, match="no mamba spec"):

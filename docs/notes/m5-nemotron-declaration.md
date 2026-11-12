@@ -61,7 +61,7 @@ unknown = sorted(set(layer_types) - {"full_attention", "linear_attention"})
 
 **已实施的离线改动（2026-11-12，CPU 测试通过）：**
 
-- `layer_types` 增加 `"mamba"`、`"mlp"`；
+- `layer_types` 增加 `"mamba"`、`"mlp"`、`"moe"`；
 - 新增 `MambaSpec`（`num_heads/head_dim/state_size/n_groups/conv_kernel/expand/dtype`），
   与 `LinearSpec` 并列；
 - 声明校验：有 `mamba` 层必须有 `MambaSpec`，有 `MambaSpec` 必须有 `mamba` 层；

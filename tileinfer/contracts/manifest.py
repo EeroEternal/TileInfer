@@ -3,7 +3,7 @@
 A declaration is the input to the decision layer and must be computable without loading
 weights or touching a device.  It therefore describes structure and requirements only:
 
-* the layer sequence (full attention, linear attention, Mamba, or MLP),
+* the layer sequence (full attention, linear attention, Mamba, MLP, or MoE),
 * the per-flavour parameters (heads, head dims, convolution width, ...),
 * the KV grouping and page constraints,
 * the quantization scheme,
@@ -181,7 +181,7 @@ class ModelManifest:
                 f"layer_types has {len(self.layer_types)} entries for {self.num_layers} layers"
             )
         unknown = sorted(
-            set(self.layer_types) - {"full_attention", "linear_attention", "mamba", "mlp"}
+            set(self.layer_types) - {"full_attention", "linear_attention", "mamba", "mlp", "moe"}
         )
         if unknown:
             raise ValueError(f"unknown layer types {unknown}")
