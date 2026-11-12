@@ -3,7 +3,7 @@
 A declaration is the input to the decision layer and must be computable without loading
 weights or touching a device.  It therefore describes structure and requirements only:
 
-* the layer sequence (full attention vs linear attention),
+* the layer sequence (full attention, linear attention, Mamba, or MLP),
 * the per-flavour parameters (heads, head dims, convolution width, ...),
 * the KV grouping and page constraints,
 * the quantization scheme,
@@ -87,6 +87,48 @@ class LinearSpec:
 
 
 @dataclass(frozen=True)
+class MambaSpec:
+    """Mamba2 mixer parameters (not GDN; keep the two separate)."""
+
+    kind: str = "mamba2"
+    num_heads: int = 128
+    head_dim: int = 64
+    state_size: int = 128
+    n_groups: int = 8
+    conv_kernel: int = 4
+    expand: int = 2
+    state_dtype: str = "float32"
+
+    def validate(self) -> None:
+        if self.kind != "mamba2":
+            raise ValueError(f"unsupported mamba kind {self.kind!r}")
+        fields = (
+            self.num_heads,
+            self.head_dim,
+            self.state_size,
+            self.n_groups,
+            self.conv_kernel,
+            self.expand,
+        )
+        if min(fields) <= 0:
+            raise ValueError("mamba head/state/group/conv/expand values must be positive")
+        if self.num_heads % self.n_groups:
+            raise ValueError("mamba num_heads must be a multiple of n_groups")
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "num_heads": self.num_heads,
+            "head_dim": self.head_dim,
+            "state_size": self.state_size,
+            "n_groups": self.n_groups,
+            "conv_kernel": self.conv_kernel,
+            "expand": self.expand,
+            "state_dtype": self.state_dtype,
+        }
+
+
+@dataclass(frozen=True)
 class MoESpec:
     """Routed-expert parameters."""
 
@@ -120,6 +162,7 @@ class ModelManifest:
     layer_types: Tuple[str, ...]
     attention: AttentionSpec
     linear: Optional[LinearSpec] = None
+    mamba: Optional[MambaSpec] = None
     moe: Optional[MoESpec] = None
     quantization: str = "none"
     kv: Dict[str, Any] = field(default_factory=dict)
@@ -137,11 +180,17 @@ class ModelManifest:
             raise ValueError(
                 f"layer_types has {len(self.layer_types)} entries for {self.num_layers} layers"
             )
-        unknown = sorted(set(self.layer_types) - {"full_attention", "linear_attention"})
+        unknown = sorted(
+            set(self.layer_types) - {"full_attention", "linear_attention", "mamba", "mlp"}
+        )
         if unknown:
             raise ValueError(f"unknown layer types {unknown}")
         if self.linear is not None and "linear_attention" not in self.layer_types:
             raise ValueError("linear spec declared but no linear_attention layer")
+        if self.mamba is not None and "mamba" not in self.layer_types:
+            raise ValueError("mamba spec declared but no mamba layer")
+        if "mamba" in self.layer_types and self.mamba is None:
+            raise ValueError("mamba layer declared but no mamba spec")
         if self.moe is not None and "moe" not in self.required_capabilities and (
             Capability.MOE_ROUTED.value not in self.required_capabilities
         ):
@@ -149,6 +198,8 @@ class ModelManifest:
         self.attention.validate()
         if self.linear is not None:
             self.linear.validate()
+        if self.mamba is not None:
+            self.mamba.validate()
         if self.moe is not None:
             self.moe.validate()
         caps = set(self.required_capabilities)
@@ -182,6 +233,7 @@ class ModelManifest:
             "layer_types": list(self.layer_types),
             "attention": self.attention.as_dict(),
             "linear": self.linear.as_dict() if self.linear else None,
+            "mamba": self.mamba.as_dict() if self.mamba else None,
             "moe": self.moe.as_dict() if self.moe else None,
             "quantization": self.quantization,
             "kv": dict(self.kv),

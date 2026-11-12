@@ -99,12 +99,12 @@ MTP 投机、长上下文（8K/16K/32K/128K，262K 仅在 config 支持时）、
 | # | 工作 | 产出 | 完成判据 |
 |---|---|---|---|
 | O1 | 静态审计：vLLM/vllm-ascend 的模型、MTP、Mamba、KV、图路径 | `docs/notes/m5-nemotron-static-gap.md` | 每条事实有文件路径/行号；未知项列明 |
-| O2 | 模型声明草案：结构、能力清单、KV/state、benchmark 占位 | `docs/notes/m5-nemotron-declaration.md` | 不写“用谁的实现”；字段与 `contracts/manifest.py` 对齐 |
-| O3 | 缺口报告（静态先验）：required gaps、候选 provider、`delete_when` | 同上/独立 JSON | 与 O1 一致；不把“未验证”写成 gap=0 |
-| O4 | provider 契约草案：coverage/graphable/parallel/evidence/delete_when | `docs/notes/m5-nemotron-provider.md` | 每个 provider 对应一个真实缺口；无证据标 candidate |
-| O5 | 参考实现方案：固定样例、tokenizer、logits/文本容差 | 文档 + 脚本骨架 | 能在 CPU 上跑小样例；不依赖 NPU |
-| O6 | 实机运行手册：命令、端口、时长、停止方式、回滚 | `docs/notes/m5-nemotron-runbook.md` | 部署前检查表完整；默认不执行 |
-| O7 | CPU/fake 测试：声明校验、gap 序列化、plan 预算 | `tests/test_nemotron_offline.py` 或等价 | `pytest` 全过；不 import NPU |
+| O2 | 模型声明草案：结构、能力清单、KV/state、benchmark 占位 | [`m5-nemotron-declaration.md`](m5-nemotron-declaration.md) | 不写“用谁的实现”；字段与 `contracts/manifest.py` 对齐 |
+| O3 | 缺口报告（静态先验）：required gaps、候选 provider、`delete_when` | [`m5-nemotron-static-gap.md`](m5-nemotron-static-gap.md) + [`m5-nemotron-static-audit.json`](m5-nemotron-static-audit.json) | 与 O1 一致；不把“未验证”写成 gap=0 |
+| O4 | provider 契约草案：coverage/graphable/parallel/evidence/delete_when | [`m5-nemotron-provider.md`](m5-nemotron-provider.md) | 每个 provider 对应一个真实缺口；无证据标 candidate |
+| O5 | 参考实现方案：固定样例、tokenizer、logits/文本容差 | [`reference_probe.py`](../../tools/nemotron/reference_probe.py) 骨架 | 能在 CPU 上跑小样例；不依赖 NPU |
+| O6 | 实机运行手册：命令、端口、时长、停止方式、回滚 | [`m5-nemotron-runbook.md`](m5-nemotron-runbook.md) | 部署前检查表完整；默认不执行 |
+| O7 | CPU/fake 测试：声明校验、gap 序列化、plan 预算 | [`test_nemotron_offline.py`](../../tests/test_nemotron_offline.py) | `pytest` 全过；不 import NPU |
 
 **不要为了等实机而停 O1–O7。** 硬件 gate 只是最后一步；离线产物先合并。
 

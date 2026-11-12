@@ -14,8 +14,50 @@ from pathlib import Path
 
 import pytest
 
+from tileinfer.contracts.manifest import AttentionSpec, MambaSpec, ModelManifest
+
 ROOT = Path(__file__).resolve().parents[1]
 PREFIX = ROOT / ".venv_v3/lib/python3.12/site-packages"
+
+
+def _mamba_manifest(*, layer_types: tuple[str, ...], mamba: MambaSpec | None) -> ModelManifest:
+    return ModelManifest(
+        name="nemotron-synthetic",
+        manifest_id="nemotron-synthetic",
+        arch="NemotronHForCausalLM",
+        model_type="nemotron_h",
+        num_layers=len(layer_types),
+        layer_types=layer_types,
+        attention=AttentionSpec(kind="gqa", num_heads=32, num_kv_heads=8, head_dim=128),
+        mamba=mamba,
+        required_capabilities=("attention.full", "state.linear"),
+        benchmark={"prompt": "hi", "max_tokens": 1, "top5": []},
+    )
+
+
+def test_manifest_represents_mamba_and_mlp_layers() -> None:
+    m = _mamba_manifest(
+        layer_types=("mamba", "mlp", "full_attention", "mlp"),
+        mamba=MambaSpec(num_heads=128, n_groups=8),
+    )
+    m.validate()
+    assert m.as_dict()["mamba"]["kind"] == "mamba2"
+
+
+def test_manifest_rejects_mamba_layer_without_spec() -> None:
+    m = _mamba_manifest(layer_types=("mamba", "full_attention"), mamba=None)
+    with pytest.raises(ValueError, match="no mamba spec"):
+        m.validate()
+
+
+def test_manifest_rejects_mamba_spec_without_layer() -> None:
+    m = _mamba_manifest(
+        layer_types=("full_attention", "mlp"),
+        mamba=MambaSpec(num_heads=128, n_groups=8),
+    )
+    with pytest.raises(ValueError, match="no mamba layer"):
+        m.validate()
+
 
 
 @pytest.mark.skipif(not PREFIX.is_dir(), reason="vendored v3 site-packages not present")

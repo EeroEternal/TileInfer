@@ -28,7 +28,7 @@ from .capabilities import (
     StateContract,
 )
 from .gaps import Gap, GapReport
-from .manifest import AttentionSpec, LinearSpec, ModelManifest, MoESpec
+from .manifest import AttentionSpec, LinearSpec, MambaSpec, ModelManifest, MoESpec
 from .plan import ModelRef, Plan, Selection, VersionTriangle
 
 __all__ = [
@@ -47,6 +47,7 @@ __all__ = [
     "GapReport",
     "AttentionSpec",
     "LinearSpec",
+    "MambaSpec",
     "ModelManifest",
     "MoESpec",
     "ModelRef",
