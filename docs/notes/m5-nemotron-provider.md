@@ -33,7 +33,8 @@
 
 > P1/P4 是“模型路由”，不是自研算子；如果 vLLM 通用路径在 Ascend 上能跑，就不应写
 > provider。P2/P3 才是真正可能需要算子的地方，但必须先上机确认 vllm-ascend 的
-> Mamba Triton 算子是否已覆盖目标形状。
+> Mamba Triton 算子是否已覆盖目标形状；逐算子清单见
+> [`m5-nemotron-op-inventory.md`](m5-nemotron-op-inventory.md)。
 
 ---
 
