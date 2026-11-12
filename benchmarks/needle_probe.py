@@ -54,13 +54,16 @@ def build(tokenizer: object, seed: str, tokens: int, depth: float, needle: str, 
     return text, len(tokenizer.encode(text, add_special_tokens=False))
 
 
-def ask(port: int, prompt: str, max_tokens: int) -> dict:
+def ask(port: int, prompt: str, max_tokens: int, logprobs: bool = False) -> dict:
     payload = {
         "model": "qwen36",
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "temperature": 0,
     }
+    if logprobs:
+        payload["logprobs"] = True
+        payload["top_logprobs"] = 5
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}/v1/chat/completions",
         data=json.dumps(payload).encode(),
@@ -83,6 +86,7 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=None)
     ap.add_argument("--out-response")
     ap.add_argument("--max-tokens", type=int, default=32)
+    ap.add_argument("--logprobs", action="store_true", help="request token logprobs for C2 comparison")
     args = ap.parse_args()
 
     seed = pathlib.Path(args.seed_file).read_text(encoding="utf-8")
@@ -106,7 +110,7 @@ def main() -> None:
         return
 
     try:
-        response = ask(args.port, text, args.max_tokens)
+        response = ask(args.port, text, args.max_tokens, args.logprobs)
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
         print(json.dumps(result, ensure_ascii=False))

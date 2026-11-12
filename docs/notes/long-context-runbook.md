@@ -28,14 +28,16 @@ ls -l /tmp/tileinfer-plan.json     # v3 臂需要
 for N in 8192 16384 32768; do
   .venv_native213/bin/python benchmarks/make_long_prompt.py \
     --tokens $N --out /tmp/prompt-$N.txt
-  .venv_native213/bin/python benchmarks/needle_probe.py \
-    --tokens $N --depth 0.5 --out-prompt /tmp/needle-$N.txt
+  for D in 10 50 90; do
+    .venv_native213/bin/python benchmarks/needle_probe.py \
+      --tokens $N --depth 0.$D --out-prompt /tmp/needle-$N-d$D.txt
+  done
 done
 ```
 
-`make_long_prompt.py` 是测速用的连续文本；`needle_probe.py` 在 50% 深度埋
-`The secret access code is TIGER-7421`，末尾问同一个问题。两者都以服务返回的
-`usage.prompt_tokens` 为准，不拿字符数冒充 token。
+`make_long_prompt.py` 是测速用的连续文本；`needle_probe.py` 在 **10% / 50% / 90%**
+三个深度各埋一次 `The secret access code is TIGER-7421`，末尾问同一个问题。
+两者都以服务返回的 `usage.prompt_tokens` 为准，不拿字符数冒充 token。
 
 ---
 
@@ -78,17 +80,20 @@ for N in 8192 16384 32768; do
 done
 ```
 
-### 2.3 正确性（needle，50% 深度）
+### 2.3 正确性（needle，10% / 50% / 90% 三个深度）
 
 ```bash
 for N in 8192 16384 32768; do
-  .venv_v3/bin/python benchmarks/needle_probe.py --tokens $N --depth 0.5 \
-    --out-prompt /tmp/needle-$N.txt --port 8322 \
-    --out-response /tmp/v3-$N-needle.json
+  for D in 10 50 90; do
+    .venv_v3/bin/python benchmarks/needle_probe.py --tokens $N --depth 0.$D \
+      --out-prompt /tmp/needle-$N-d$D.txt --port 8322 --logprobs \
+      --out-response /tmp/v3-$N-d$D-needle.json
+  done
 done
 ```
 
-每档都必须 `ok=true` 且 `answer` 含 `TIGER-7421`；否则是 C2 失败，不是"长上下文慢"。
+每档、每个深度都必须 `ok=true` 且 `answer` 含 `TIGER-7421`；否则是 C2 失败，
+不是"长上下文慢"。`--logprobs` 让响应里带 token 级 logprob，供 §4 逐 token 对比。
 
 ### 2.4 图计数与 doctor
 
@@ -128,7 +133,7 @@ setsid .venv_baseline/bin/python -m vllm.entrypoints.cli.main serve /home/models
 BASE_PID=$!
 ```
 
-重复 §2.2 与 §2.3，结果写 `/tmp/base-$N.json`、`/tmp/base-$N-needle.json`，
+重复 §2.2 与 §2.3，结果写 `/tmp/base-$N.json`、`/tmp/base-$N-d$D-needle.json`，
 然后按 §2.5 停掉。
 
 ---
@@ -146,14 +151,27 @@ for n in (8192, 16384, 32768):
           "TPOT", round(v["tpot_ms_p50"]/b["tpot_ms_p50"],3))
 EOF
 
-# 正确性：两臂的 needle 回答都必须含 TIGER-7421
-grep -h '"answer"' /tmp/v3-*-needle.json /tmp/base-*-needle.json
+# 正确性 / C2：逐 token + logprob 对比（atol 1e-4，四位小数口径）
+for N in 8192 16384 32768; do
+  for D in 10 50 90; do
+    .venv_native213/bin/python benchmarks/compare_responses.py \
+      /tmp/v3-$N-d$D-needle.json /tmp/base-$N-d$D-needle.json \
+      > /tmp/cmp-$N-d$D.json || echo "C2 DIFF: $N d$D"
+  done
+done
+python3 - <<'EOF'
+import glob, json
+for p in sorted(glob.glob("/tmp/cmp-*-d*.json")):
+    d = json.load(open(p))
+    print(p, "same=", d["same"], "max_lp=", d["max_abs_logprob_diff"])
+EOF
 ```
 
 判定（[`../acceptance.md`](../acceptance.md) §2.1，有基线走比值）：
 
 - C1：两臂都能起、都能返回完整输出。
-- C2：needle `ok=true`；同一请求两臂的 answer 一致。若不一致，先查模板/采样，不调容差。
+- C2：每个 needle 都 `ok=true`，且 `compare_responses.py` 的 `same=true`（文本、token
+  序列、logprob 都在 1e-4 内）。任一不满足先查模板/采样，不调容差。
 - C3：v3 的 `captured_graphs > 0` 且 `decode_fallbacks = 0`。
 - C4：TTFT/TPOT ≤ 1.10× 基线、吞吐 ≥ 0.95×；每档单独判，不跨档拼比值。
 
