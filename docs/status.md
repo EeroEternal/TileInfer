@@ -4,7 +4,7 @@
 > 目标形态见 [`architecture.md`](architecture.md)，验收口径见 [`acceptance.md`](acceptance.md)，
 > 数字见 [`performance.md`](performance.md)。
 >
-> 最后核对：**2026-11-12 20:57**，代码 `6e86b8f`（M5 Nemotron 离线任务；v3 主体 `6f41866`），
+> 最后核对：**2026-11-12 21:01**，代码 `2f83d58`（M5 Nemotron 离线任务；v3 主体 `6f41866`），
 > 单卡 Ascend950PR，CANN 9.3.0。
 
 ---
@@ -67,7 +67,7 @@ v2 自带平台层的形态，v3 不再走那条路。本页 §1 的 v3 数字�
 
 | 项 | 现状 | 影响 |
 |---|---|---|
-| **补缺口还是空的** | `providers/` 无 provider——**按规则它就该是空的**：Qwen3.6 的 8 项能力厂商全覆盖，没有缺口可补。gap=0 是"没有缺口"，不是"补完了" | **M5 目标已定：`nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16`**；真实 config 已取到（52 层 = 23 Mamba + 23 MoE + 6 attention，262144，MTP 1 层），声明落到 draft，benchmark top5 仍待参考实现；今晚只做离线，不占卡；任务书见 [`notes/m5-nemotron-task.md`](notes/m5-nemotron-task.md) |
+| **补缺口还是空的** | `providers/` 无 provider——**按规则它就该是空的**：Qwen3.6 的 8 项能力厂商全覆盖，没有缺口可补。gap=0 是"没有缺口"，不是"补完了" | **M5 目标已定：`nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16`**；真实 config 已取到（52 层 = 23 Mamba + 23 MoE + 6 attention，262144，MTP 权重已确认 270 key），声明落到 draft，benchmark top5 仍待参考实现；今晚只做离线，不占卡；任务书见 [`notes/m5-nemotron-task.md`](notes/m5-nemotron-task.md) |
 | **图捕获** | v3 已接上（厂商捕获 + 我们计数）；4K 8 张、32K 6 张、MTP 6 张（PIECEWISE，FULL=0），均 0 回退；MTP+32K 6 图/0 回退；`impl_table`/`model_table` 两个机制仍是空实现 | 非 vendor 实现还没有落点；128K 组合未验 |
 | **投机解码 / MTP** | S2/S3 按 B 质量等价过：套件 8/8、needle 8K/16K/32K 9/9、同请求两次 `same`、4K 93.9% / 1.35×；图 6 张、0 回退。严格逐位不成立（256 token 中 85.9% 相同、第 58 token 分叉），明确非逐位。S4 32K 部分：9/9、TTFT 1.037×、6 图/0 回退，acceptance 81–88%、128K 未测。证据见 [`notes/m1-spec-quality.md`](notes/m1-spec-quality.md) | S2/S3 过；S4 仅 32K 部分；非逐位 |
 | **TPOT / 首字** | v3 M1：单流 0.907–1.016× / 0.999–1.001×；4K 1.000× / 0.999×；长上下文 8K/16K/32K：TTFT 1.008–1.011×、TPOT 0.999–1.002× | 门已过（本机、本参数） |
