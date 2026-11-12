@@ -4,34 +4,57 @@
 > 目标形态见 [`architecture.md`](architecture.md)，验收口径见 [`acceptance.md`](acceptance.md)，
 > 数字见 [`performance.md`](performance.md)。
 >
-> 最后核对：**2026-11-12**，代码 `449d8bf`，单卡 Ascend950PR，CANN 9.3.0。
+> 最后核对：**2026-11-12 15:20**，代码 `449d8bf` + v3 M1 工作区改动（未提交），
+> 单卡 Ascend950PR，CANN 9.3.0。
 
 ---
 
 ## 0. 一句话
 
-**定位已改为 v3（vllm-ascend 之上的兼容适配层），代码仍是 v2 形态（自带平台层、不装 vllm-ascend）。**
-v3 要求的"重排分层 + 收敛接入点"重构**尚未开始**；下一节列出了 v2 已经建成的东西，
-它们不会因为定位改变而作废——内核、契约、计时、剖析工具都是 v3 的资产。
+**v3 形态已经跑通：vllm-ascend 仍是平台/worker/KV/图捕获的主人，TileInfer 只做
+"声明 → 决策 → 选实现 → 补缺口"。** Qwen3.6-35B-A3B 端到端四条验收全过：
+能跑、输出与基线逐位一致、图捕获 8 张且稳态回退 0、TPOT/首字/吞吐在 1.10×/0.95× 内。
 
-到目前为止最硬的一条事实：**v2 的性能没打平（TPOT 2.53×、TTFT 11.8×），图捕获没接上。**
-这正是把定位改回 v3 的直接原因，不是猜测。
+v2 的四项旧账（图捕获没接、TPOT 2.53×、TTFT 11.8×、MTP 未做）仍然成立；它们描述的是
+v2 自带平台层的形态，v3 不再走那条路。本页 §1 的 v3 数字与 §1.1 的 v2 资产不要混着比。
+
+| 验收 | 结论 | 凭什么相信 |
+|---|---|---|
+| **C1 能跑** | ✅ | `:8322` 服务 70 s 就绪，`/health=200`；平台插件只有 `ascend`，TileInfer 只在 general_plugins |
+| **C2 跑对** | ✅ | 与 `/tmp/baseline_fia.json` 去掉 `id/created/system_fingerprint` 后 JSON 全等；首 token `Here -0.0302655640989542` |
+| **C3 能上图** | ✅ | `captured_graphs=8`（PIECEWISE 4 + FULL 4），`decode_calls=15（门禁轮）/ 2375（压测轮，旧口径）`, `graph_hits` 同步，`fallbacks=0`；`doctor` 绿 |
+| **C4 跑得快** | ✅ | 单流 TTFT 0.907–1.016×、TPOT 0.999–1.001×；4K（3939 tok）1.000×/0.999×；conc16 吞吐 1.003×、TTFT 0.997× |
+
+证据页：[`notes/m0-baseline.md`](notes/m0-baseline.md)（v2 冻基线）、
+[`notes/m1-v3-bridge.md`](notes/m1-v3-bridge.md)（v3 设计、接入点、A/B、复现命令）。
 
 ---
 
-## 1. 已经建成（v2 形态，v3 继续用）
+## 1. v3 M1 已建成（2026-11-12）
 
 | 能力 | 状态 | 凭什么相信 |
 |---|---|---|
-| 平台层（平台插件注册、注意力后端枚举接管）**v2 形态，v3 不再使用** | ✅ | 服务能起，枚举解析出我们的类，无静默回退 |
-| worker 四个 hook（设备初始化 / 可用显存 / 配置初始化 / 编译预热） | ✅ | 有契约测试锁住形状 |
-| attention 后端四件套（后端 / 元数据 / 实现 / KV 写入） | ✅ | 设备上出 token，与参考实现对得上 |
-| 混合 KV cache（30 层线性注意力 + 10 层 full attention，单池两种页） | ✅ | 能力探测为真；设备实测不报池一致性错误 |
+| 声明层（`manifests/qwen3_6.py`） | ✅ | 40 层/30 GDN+10 full、16Q/2KV、256 experts top-8、8 项 required capability，纯数据可校验 |
+| 契约层（`contracts/`） | ✅ | 8 个 `Protocol` + plan/manifest/gap schema；未知 key、重复选择、超预算都拒绝 |
+| 决策层（`resolve/`） | ✅ | 纯函数；vendor 在→8/8 选 vendor、gap=0；vendor 不在→8 条 required gap、servable=False |
+| 接入层（`bridge/`） | ✅ | 6 个具体钩子（plugin entry、dispatch、capture、attn select、config gate、init keys），4/6 类机制，预算 8 |
+| 分层禁令 | ✅ | AST 守卫：只有 `tileinfer/bridge/` 可 import `vllm_ascend`；另有测试防止 carve-out 变空 |
+| 观测 | ✅ | capture/fallback 计数落 JSON（`SIGUSR1`/500 步/atexit）；API server 的零计数不再覆盖 EngineCore |
+| CLI / doctor | ✅ | `plan build/show/verify`、`tileinfer doctor`；doctor 在最终 metrics 上全 PASS |
+
+### 1.1 v2 资产（冻结，v3 继续用）
+
+| 能力 | 状态 | 凭什么相信 |
+|---|---|---|
+| 平台层（平台插件、注意力枚举接管）**v2 形态，v3 不用** | ⛔ | 冻结；v3 由 vllm-ascend 拥有平台槽 |
+| worker 四个 hook（设备初始化 / 可用显存 / 配置初始化 / 编译预热） | ✅ 冻结 | 有契约测试锁住形状；v3 不安装 |
+| attention 后端四件套（后端 / 元数据 / 实现 / KV 写入） | ✅ | 设备上出 token，与参考实现对得上；作为 M2+ provider 候选 |
+| 混合 KV cache（30 线性 + 10 full，单池两种页） | ✅ | 能力探测为真；v2 设备实测不报池一致性错误 |
 | 线性注意力（GDN）算子族：卷积 / chunk / kkt / wu / solve_tril / delta_h / gating / recurrent / post_conv | ✅ | 单测 + 设备对数；离线比值见 `notes/perf-candidates.md` |
 | MoE 算子族（排序路由 / bmm / 严格缓存） | ✅ | 三个候选已进默认，各有离线比值与 bench 脚本 |
 | 分相计时（主机/设备双时钟） | ✅ | 报告可复现 |
-| 一键剖析工具 | ✅ | 端到端跑通（2026-11-10）：服务 57 s 就绪，单请求首字 814.7 ms、单步 106.62 ms，报告落 `trace_out/`。**尚未做**：异常检测、单次前向全量报告、CSV 导出 |
-| "不依赖 vllm-ascend" 的守卫 | ✅ | AST + 运行时双重检查——**这条守卫在 v3 下必须拆掉**，v3 明确依赖 vllm-ascend |
+| 一键剖析工具 | ✅ | 2026-11-10：57 s 就绪、首字 814.7 ms、单步 106.62 ms。2026-11-12 复跑首请求 4963.9 ms，疑似首请求 JIT；见 M0 §3 |
+| 分层守卫（原"绝对不依赖 vllm-ascend"） | ✅ 已反转 | 改为"仅 bridge 可 import"；`test_no_vllm_ascend.py` 2 passed |
 
 ---
 
@@ -39,14 +62,15 @@ v3 要求的"重排分层 + 收敛接入点"重构**尚未开始**；下一节�
 
 | 项 | 现状 | 影响 |
 |---|---|---|
-| **v3 分层重构** | 未开始。目录与代码仍是 v2 形态 | 文档与代码短期不一致，按架构文档建目录前先看本节 |
-| **图捕获（ACLGraph）** | v2 未接上；v1 时代在引擎里跑过 | 每步固定开销吃掉大部分差距。P0 |
-| **投机解码** | 未开始。模型侧现成，卡在批语义只允许单 query token | 单 token 一步的天花板 |
-| **TPOT / 首字** | 2.53× / 11.8× 于基线；门是 1.10× | 交付门槛未过 |
-| **长上下文** | v1 在 8K 崩过（吞吐 0.213×）；v2 未系统测 | 风险组，不是当前门 |
+| **补缺口还是空的** | `providers/` 无 provider，8/8 都是厂商实现；gap=0 只因厂商全覆盖 | M2–M4 的真实工作；现在只证明了"选实现"这一半 |
+| **图捕获** | v3 已接上（厂商捕获 + 我们计数）；`impl_table`/`model_table` 两个机制仍是空实现 | 非 vendor 实现还没有落点 |
+| **投机解码 / MTP** | 未开始。模型侧现成，卡在批语义只允许单 query token | 单 token 一步的天花板 |
+| **TPOT / 首字** | v3 M1：单流 0.907–1.016× / 0.999–1.001×；4K 1.000× / 0.999× | 门已过（本机、本参数） |
+| **长上下文** | 只测到 3939 prompt tokens；`max-model-len=9216`，8K/16K 未系统测 | 风险组，不是当前门 |
 | **量化** | 只做 bf16 | 未验证组合一律不声明支持 |
 | **TP / EP / 多卡** | 明确延后 | 优先级最低 |
-| **决策层与账本** | 有候选机制雏形，没有"声明 → 缺口清单 → 提供者声明"的闭环 | v3 的主要工作 |
+| **冷缓存 / 首次启动** | 两臂共用编译缓存；冷启动 TTFT 未测 | M2 预编译门要单独回答 |
+| **8K 以上 / 16K** | 未测；`ab_qwen36_full.py` 的 16K 场景在当前 `max-model-len` 下会失败 | 不要引用未跑的场景 |
 
 ---
 
@@ -58,7 +82,7 @@ v3 要求的"重排分层 + 收敛接入点"重构**尚未开始**；下一节�
 |---|---|---|---|
 | **v1 寄生** | 是 | 短上下文与基线打平（0.91–1.09），补丁点散落十几处 | 代码冻结在 `legacy/`，作为 v3 接入点的素材 |
 | **v2 原生** | 否 | 能跑能对，但 TPOT 2.53×、TTFT 11.8×，图捕获未接 | 形态作废；内核、契约、计时、剖析工具保留 |
-| **v3 兼容层** | 是 | 未开始 | 目标形态，见 [`architecture.md`](architecture.md) |
+| **v3 兼容层** | 是 | M1 跑通：C1–C4 全过，6 个钩子/预算 8 | 目标形态，见 [`architecture.md`](architecture.md)、[`notes/m1-v3-bridge.md`](notes/m1-v3-bridge.md) |
 
 ### 3.2 已作废的结论（保留在案，防止重犯）
 

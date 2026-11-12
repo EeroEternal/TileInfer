@@ -66,6 +66,10 @@
 顺序理由：**先搬"零依赖"的（S2），最后搬"碰上游"的（S5）**。这样每一步都能独立回滚，
 且越靠后越清楚哪些代码真的需要留在接入层。
 
+> 2026-11-12 的实际推进：S0 基线见 [`notes/m0-baseline.md`](notes/m0-baseline.md)；
+> v3 分层骨架 + 决策 + bridge + 端到端验收见 [`notes/m1-v3-bridge.md`](notes/m1-v3-bridge.md)。
+> v2 冻结区与删除清单见 [`notes/m1-delete-list.md`](notes/m1-delete-list.md)。
+
 ---
 
 ## 4. 映射表（现有路径 → 目标 → 动作）
