@@ -85,7 +85,7 @@ def main() -> None:
     ap.add_argument("--expect", default=DEFAULT_ANSWER)
     ap.add_argument("--port", type=int, default=None)
     ap.add_argument("--out-response")
-    ap.add_argument("--max-tokens", type=int, default=32)
+    ap.add_argument("--max-tokens", type=int, default=256, help="Qwen3.6 reasons before answering; 32 truncates the code")
     ap.add_argument("--logprobs", action="store_true", help="request token logprobs for C2 comparison")
     args = ap.parse_args()
 

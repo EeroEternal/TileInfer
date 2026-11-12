@@ -39,18 +39,19 @@
 
 | # | 场景 | 证据 | 门 | Qwen3.6 |
 |---|---|---|---|---|
-| L1 | 8K prompt | TTFT/TPOT、HBM 峰值、输出与基线一致 | C1–C4 | ⬜（只测到 3,939） |
-| L2 | 16K | 同上 | 同上 | ⬜ |
-| L3 | 32K | 同上 + 图回退 | 同上 | ⬜ |
-| L4 | 128K | 同上 + 峰值激活 | 同上，可单独放宽并发 | ⬜ |
-| L5 | 模型上限 262,144 | 同上；记录**实际可用上限** | 同上 | ⬜ |
+| L1 | 8K prompt | TTFT/TPOT、HBM 峰值、输出与基线一致 | C1–C4 | ✅ 2026-11-12：TTFT 1.0080×、TPOT 0.9988×；9/9 needle 逐 token 同；[证据](notes/m1-long-context.md) |
+| L2 | 16K | 同上 | 同上 | ✅ 2026-11-12：TTFT 1.0108×、TPOT 1.0018×；9/9 needle 同 |
+| L3 | 32K | 同上 + 图回退 | 同上 | ✅ 2026-11-12：TTFT 1.0077×、TPOT 1.0019×；6 图/0 回退；32K 峰值 HBM 107,380 MB |
+| L4 | 128K | 同上 + 峰值激活 | 同上，可单独放宽并发 | ⬜ 当前 cap 33,792；40,960 已 OOM，需单独内存方案 |
+| L5 | 模型上限 262,144 | 同上；记录**实际可用上限** | 同上 | ⬜ 未测；KV 容量 1,383,782 tokens 不等于可服务 |
 
 长上下文必须记录：`max-model-len`、prompt tokens（以 usage 为准）、KV 容量、峰值 HBM、
 是否触发 chunked prefill、TTFT 随长度的斜率。模型上限 262,144 不代表单卡一定能服务到；
 测出来的可用上限写进声明，不写"理论上支持"。
 
-参考：当前 KV 容量 1,158,912 tokens / 39.77 GiB（折算约 36 KiB/token），单请求 262K 的
-KV 约 9 GiB，容量不是最明显的墙；**真正要先量的是 262K prefill 的峰值激活**。
+参考：33K 配置下实测 KV 32.39 GiB / 1,383,782 tokens（约 24.5 KiB/token），
+单请求 262K 的 KV 约 6.1 GiB，容量不是最明显的墙；**真正要先量的是 262K prefill
+的峰值激活与非 torch 内存**。40,960/8 的首次尝试已在 8K 请求 OOM，说明 cap 不能直接外推。
 
 prompt 用 `benchmarks/make_long_prompt.py --tokens N --out /tmp/prompt-Nk.txt` 生成，
 探针用 `TI_PROMPT=/tmp/prompt-Nk.txt benchmarks/v3_long_ttft.py <port> <label> <out> [runs]`；
@@ -63,7 +64,7 @@ prompt 用 `benchmarks/make_long_prompt.py --tokens N --out /tmp/prompt-Nk.txt` 
 | # | 场景 | 证据 | 门 | Qwen3.6 |
 |---|---|---|---|---|
 | G1 | 4K 单流 + conc16 | `captured_graphs`、`capture_keys`、`decode_hits`、`fallbacks` | 捕获 > 0，稳态回退 = 0 | ✅ 8 张（4 FULL + 4 PIECEWISE），0 回退 |
-| G2 | 32K 长上下文 | 同上 | 同上 | ⬜ |
+| G2 | 32K 长上下文 | 同上 | 同上 | ✅ 6 张（3 FULL + 3 PIECEWISE），0 回退（2026-11-12，33K cap） |
 | G3 | 投机开启 | 同上 + capture sizes 含 `num_spec_tokens + 1` 的倍数 | 同上 | ⬜ |
 | G4 | batch 1/4/16/32/64 | 每个尺寸都命中捕获图 | 回退 = 0 | 部分：1–32 已捕获，64 未验 |
 | G5 | 投机 + 长上下文 | 同上 | 同上 | ⬜ |
@@ -167,7 +168,7 @@ prompt 用 `benchmarks/make_long_prompt.py --tokens N --out /tmp/prompt-Nk.txt` 
 
 Qwen3.6 按以下顺序推进：
 
-1. 长上下文阶梯（L1 8K → L2 16K → L3 32K，再决定 L4/L5）。
+1. ✅ 长上下文阶梯（L1 8K → L2 16K → L3 32K，2026-11-12）；L4/L5 待 128K/262K 内存方案。
 2. 投机冒烟（S1 ngram → S2 MTP k=1）。
 3. 组合（S3 投机 × 图、S4 投机 × 长上下文）。
 4. 并发 32 / 64（P2/P3）、冷启动（K1/K2）。

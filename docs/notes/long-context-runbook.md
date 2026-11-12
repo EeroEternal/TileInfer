@@ -93,7 +93,9 @@ done
 ```
 
 每档、每个深度都必须 `ok=true` 且 `answer` 含 `TIGER-7421`；否则是 C2 失败，
-不是"长上下文慢"。`--logprobs` 让响应里带 token 级 logprob，供 §4 逐 token 对比。
+不是"长上下文慢"。Qwen3.6 会先输出 reasoning，32 token 会把答案截断；needle 默认
+`--max-tokens 256`，判定是"回答里含 code"，不要求它真的只输出 code。
+`--logprobs` 让响应里带 token 级 logprob，供 §4 逐 token 对比。
 
 ### 2.4 图计数与 doctor
 
