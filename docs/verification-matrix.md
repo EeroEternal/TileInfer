@@ -73,9 +73,9 @@ prompt 用 `benchmarks/make_long_prompt.py --tokens N --out /tmp/prompt-Nk.txt` 
 
 | # | 场景 | 证据 | 门 | Qwen3.6 |
 |---|---|---|---|---|
-| S1 | ngram 冒烟（无 draft 权重） | 服务起、输出、投机 token 统计 | C1；不要求加速 | ⬜ |
-| S2 | MTP k=1，4K | 输出 vs 非投机基线；接受率；TPOT/吞吐 | 输出一致（口径见下）+ 有加速比 | ⬜ |
-| S3 | MTP k=1 + 图 | `captured_graphs`、`fallbacks` | 回退 = 0 | ⬜ |
+| S1 | ngram 冒烟（无 draft 权重） | 服务起、输出、投机 token 统计 | C1；不要求加速 | ⚠️ 4K/8K 服务与输出通过；token 统计未采集（2026-11-12） |
+| S2 | MTP k=1，4K | 输出 vs 非投机基线；接受率；TPOT/吞吐 | 输出一致（口径见下）+ 有加速比 | ⚠️ 可跑、接受率 93.9%、约 1.35×；8K 第 58 token 与不启用投机不同，严格 C2 未过；[证据](notes/m1-mtp-smoke.md) |
+| S3 | MTP k=1 + 图 | `captured_graphs`、`fallbacks` | 回退 = 0 | ⚠️ 6 图（PIECEWISE 3 / FULL 0）、0 回退；依赖 S2 |
 | S4 | MTP k=1 + 长上下文 32K/128K | 同上 + HBM | C1–C4 | ⬜ |
 | S5 | 投机验收口径写进声明 | `manifests/` 里的字段 | 见下 | ⬜ |
 
@@ -90,6 +90,16 @@ prompt 用 `benchmarks/make_long_prompt.py --tokens N --out /tmp/prompt-Nk.txt` 
 厂商侧已具备的条件（2026-11-12 代码核对）：模型 `mtp_num_hidden_layers=1`、权重里
 19 个 `mtp.*` 张量；vLLM 0.23 有 `qwen3_5_mtp.py`；vllm-ascend 把 `qwen3_5_moe` 映射到
 `qwen3_5_mtp`，并注册了 GDN / KV 绑定 / 拒绝采样补丁。**这是"能力在"，不是"已验证"。**
+
+2026-11-12 实测补充（[`notes/m1-mtp-smoke.md`](notes/m1-mtp-smoke.md)）：
+
+- MTP 能加载（`Qwen3_5MoeMTP`，权重 +2.52 GiB），接受率 93.9%、mean acceptance 1.94，
+  非流式 128 token 约 **1.35×**；图 6 张、0 回退，但 FULL=0。
+- **严格逐位未过**：同 cap 下 MTP 与不启用投机在 8K 第 58 token 分叉（max logprob 0.76）；
+  ngram 与不启用投机在第 10 token 分叉；MTP 与 ngram 也互不相同；MTP 自身两次一致。
+- 投机路径会禁用 cascade attention，并把图模式降为 PIECEWISE；这是候选原因，未证明因果。
+- 因此 S2 不能判过。先选口径：**(A) 严格逐位**（当前不合格，查厂商/改路径）、
+  **(B) 定义容差**（写进 manifest，不能临时放宽）、**(C) 暂不判投机**，先做并发/冷启动。
 
 ### 1.5 并发
 
@@ -169,7 +179,7 @@ prompt 用 `benchmarks/make_long_prompt.py --tokens N --out /tmp/prompt-Nk.txt` 
 Qwen3.6 按以下顺序推进：
 
 1. ✅ 长上下文阶梯（L1 8K → L2 16K → L3 32K，2026-11-12）；L4/L5 待 128K/262K 内存方案。
-2. 投机冒烟（S1 ngram → S2 MTP k=1）。
+2. ⚠️ 投机冒烟：ngram 服务/输出过，MTP 可跑且约 1.35×，但严格 C2 未过、口径待定。
 3. 组合（S3 投机 × 图、S4 投机 × 长上下文）。
 4. 并发 32 / 64（P2/P3）、冷启动（K1/K2）。
 5. 设备侧 profiler（O2）。
