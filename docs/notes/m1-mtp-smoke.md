@@ -81,8 +81,20 @@ prompt 上就已经改变输出。MTP 自身是确定的（两次完全一致）
   但输出与异步 MTP **完全一致**（`same=true`），仍与非投机在第 58 token 分叉；
   4K 也仍在 char 71 分叉。**async scheduling / cascade 假设被排除（至少不是唯一原因）。**
 - 该次 metrics 仍是 PIECEWISE、FULL=0，说明 MTP 下 FULL 图没有捕获，和 async 开关无关。
-- 剩余候选：MTP draft/verify 的采样路径、PIECEWISE 图与 eager 的数值差、MoE/GDN 的
-  归约顺序；尚未证明。
+
+### 5.1 图路径也排除（2026-11-12 eager/PIECEWISE 对照）
+
+| 对比 | 8K | 4K |
+|---|---|---|
+| 非投机 FULL vs 非投机 PIECEWISE | same，max 0.0 | same，max 0.0 |
+| MTP eager vs MTP PIECEWISE/sync | same，max 0.0 | same，max 0.0 |
+| MTP eager vs 非投机 eager | **分叉 token 58**，max 0.764 | **分叉 char 71** |
+| MTP PIECEWISE vs 非投机 PIECEWISE | **分叉 token 58**，max 0.764 | **分叉 char 71** |
+
+图模式（FULL/PIECEWISE）、eager/compile、async scheduling、cascade attention 都已排除：
+非投机在两种图模式下输出完全相同，MTP 在 eager/PIECEWISE 下也完全相同；**只要走
+spec（MTP 或 ngram）就与非投机分叉**。分叉在投机执行/验证本身，最可能在 target
+logits 的取位、draft 接受/拒绝，或 GDN 的 spec state 更新；尚未定位到具体一行。
 
 在这台 MoE/GDN 模型上，早期 token 的分叉就足以翻转 top-1，所以不能拿"答案看起来对"
 代替逐位。矩阵原口径是"先按逐位一致跑，不一致就查，不调容差"；现在就是"不一致"。
@@ -102,8 +114,8 @@ prompt 上就已经改变输出。MTP 自身是确定的（两次完全一致）
 
 ## 7. 下一步（需要选口径）
 
-1. **严格逐位**：当前 MTP/ngram 都不合格。下一步查厂商是否已知、是否能关掉
-   cascade/FULL 差异，或把非投机基线也切到同一 attention/图路径再比。
+1. **严格逐位**：当前 MTP/ngram 都不合格。cascade/FULL/async 已排除，下一步查
+   target logits 的取位、draft 接受/拒绝、GDN spec state，或找厂商已知问题。
 2. **定义容差**：例如前 32 token 逐位、之后 top-1 一致率 ≥ X%、或与"同 attention 路径的
    非投机"比。这必须写进 `manifest`，不能临时放宽。
 3. **先不判投机**：转去做并发 P2/P3、冷启动 K1/K2，把 S2 留作阻塞项。

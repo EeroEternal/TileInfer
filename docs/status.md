@@ -4,7 +4,7 @@
 > 目标形态见 [`architecture.md`](architecture.md)，验收口径见 [`acceptance.md`](acceptance.md)，
 > 数字见 [`performance.md`](performance.md)。
 >
-> 最后核对：**2026-11-12 18:03**，代码 `f653dbe`（长上下文 + 投机冒烟；v3 主体 `6f41866`），
+> 最后核对：**2026-11-12 19:00**，代码 `02d77b3`（长上下文 + 投机查因；v3 主体 `6f41866`），
 > 单卡 Ascend950PR，CANN 9.3.0。
 
 ---
@@ -67,7 +67,7 @@ v2 自带平台层的形态，v3 不再走那条路。本页 §1 的 v3 数字�
 |---|---|---|
 | **补缺口还是空的** | `providers/` 无 provider——**按规则它就该是空的**：Qwen3.6 的 8 项能力厂商全覆盖，没有缺口可补。gap=0 是"没有缺口"，不是"补完了" | 要验证补缺口，得先选一个**厂商部署不了的模型**；给厂商已覆盖的能力写实现属于重复劳动（[`extending.md`](extending.md) §3.0） |
 | **图捕获** | v3 已接上（厂商捕获 + 我们计数）；4K 8 张、32K 6 张、MTP 6 张（PIECEWISE，FULL=0），均 0 回退；投机的组合未验；`impl_table`/`model_table` 两个机制仍是空实现 | 非 vendor 实现还没有落点；组合场景是下一步 |
-| **投机解码 / MTP** | 已试跑：`Qwen3_5MoeMTP` 加载成功，接受率 93.9%、mean 1.94、约 1.35×（非流式 128 token）；但同 cap 8K 输出第 58 token 与不启用投机不同（logprob 0.76），ngram 也在第 10 token 分叉，**严格逐位 C2 未过**；MTP 自身两次一致。`--no-async-scheduling` 重跑输出不变，cascade/async 假设排除。证据见 [`notes/m1-mtp-smoke.md`](notes/m1-mtp-smoke.md) | 能力在，但"输出一致"口径未定；S2 阻塞 |
+| **投机解码 / MTP** | 已试跑：`Qwen3_5MoeMTP` 加载成功，接受率 93.9%、mean 1.94、约 1.35×（非流式 128 token）；但同 cap 8K 输出第 58 token 与不启用投机不同（logprob 0.76），ngram 也在第 10 token 分叉，**严格逐位 C2 未过**；MTP 自身两次一致。eager/PIECEWISE 对照也分叉，图/async/cascade 已排除，分叉在投机执行/验证本身。证据见 [`notes/m1-mtp-smoke.md`](notes/m1-mtp-smoke.md) | 能力在，但"输出一致"口径未定；S2 阻塞 |
 | **TPOT / 首字** | v3 M1：单流 0.907–1.016× / 0.999–1.001×；4K 1.000× / 0.999×；长上下文 8K/16K/32K：TTFT 1.008–1.011×、TPOT 0.999–1.002× | 门已过（本机、本参数） |
 | **长上下文** | **L1–L3 已过**（8K/16K/32K，9/9 needle 逐 token 同）；当前 `max-model-len=33792`；L4/L5 未测。证据见 [`notes/m1-long-context.md`](notes/m1-long-context.md) | 128K/262K 需单独内存方案，不能外推 |
 | **量化** | 只做 bf16 | 未验证组合一律不声明支持 |

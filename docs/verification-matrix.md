@@ -74,7 +74,7 @@ prompt 用 `benchmarks/make_long_prompt.py --tokens N --out /tmp/prompt-Nk.txt` 
 | # | 场景 | 证据 | 门 | Qwen3.6 |
 |---|---|---|---|---|
 | S1 | ngram 冒烟（无 draft 权重） | 服务起、输出、投机 token 统计 | C1；不要求加速 | ⚠️ 4K/8K 服务与输出通过；token 统计未采集（2026-11-12） |
-| S2 | MTP k=1，4K | 输出 vs 非投机基线；接受率；TPOT/吞吐 | 输出一致（口径见下）+ 有加速比 | ⚠️ 可跑、接受率 93.9%、约 1.35×；8K 第 58 token 与不启用投机不同，严格 C2 未过；[证据](notes/m1-mtp-smoke.md) |
+| S2 | MTP k=1，4K | 输出 vs 非投机基线；接受率；TPOT/吞吐 | 输出一致（口径见下）+ 有加速比 | ⚠️ 可跑、接受率 93.9%、约 1.35×；8K 第 58 token / 4K char 71 与不启用投机不同，严格 C2 未过；[证据](notes/m1-mtp-smoke.md) |
 | S3 | MTP k=1 + 图 | `captured_graphs`、`fallbacks` | 回退 = 0 | ⚠️ 6 图（PIECEWISE 3 / FULL 0）、0 回退；依赖 S2 |
 | S4 | MTP k=1 + 长上下文 32K/128K | 同上 + HBM | C1–C4 | ⬜ |
 | S5 | 投机验收口径写进声明 | `manifests/` 里的字段 | 见下 | ⬜ |
@@ -97,9 +97,9 @@ prompt 用 `benchmarks/make_long_prompt.py --tokens N --out /tmp/prompt-Nk.txt` 
   非流式 128 token 约 **1.35×**；图 6 张、0 回退，但 FULL=0。
 - **严格逐位未过**：同 cap 下 MTP 与不启用投机在 8K 第 58 token 分叉（max logprob 0.76）；
   ngram 与不启用投机在第 10 token 分叉；MTP 与 ngram 也互不相同；MTP 自身两次一致。
-- 投机路径会禁用 cascade attention，并把图模式降为 PIECEWISE；这是候选原因，未证明因果。
-  但用 `--no-async-scheduling` 重跑后，MTP 输出与异步版**完全一致**、仍与非投机分叉，
-  因此 async/cascade 假设被排除（至少不是唯一原因）；该次 FULL 仍为 0。
+- 图/async/cascade 已排除：非投机 FULL 与 PIECEWISE 输出完全相同；MTP eager 与
+  PIECEWISE 输出完全相同；但 MTP 与 ngram 仍与非投机在 8K/4K 分叉。分叉在投机
+  执行/验证本身（target logits 取位、draft 接受/拒绝、GDN spec state 待查）。
 - 因此 S2 不能判过。先选口径：**(A) 严格逐位**（当前不合格，查厂商/改路径）、
   **(B) 定义容差**（写进 manifest，不能临时放宽）、**(C) 暂不判投机**，先做并发/冷启动。
 
