@@ -30,6 +30,13 @@ PACKAGE = ROOT / "tileinfer"
 ENGINE_FREE_PATHS: Tuple[str, ...] = (
     "serving",
     "attention",
+    "contracts",
+    "manifests",
+    "resolve",
+    "providers",
+    "aot",
+    "observ",
+    "cli",
     "metadata.py",
     "plan.py",
     "utils.py",
@@ -117,7 +124,7 @@ def test_engine_free_layers_keep_torch_npu_optional(path: pathlib.Path) -> None:
 def test_serving_and_attention_do_not_reach_into_the_legacy_adapters() -> None:
     """The new layers must not depend on the old ``integrations`` patch modules."""
     offenders = []
-    for entry in ("serving", "attention"):
+    for entry in ("serving", "attention", "contracts", "manifests", "resolve", "providers", "aot", "observ", "cli"):
         for path in (PACKAGE / entry).rglob("*.py"):
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
             for module, line in _all_imports(tree):

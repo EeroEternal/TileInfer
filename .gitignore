@@ -40,6 +40,7 @@ benchmarks/probes/h2[79]_perm_*.npy
 runtime/
 .venv_baseline/
 .venv_native213/
+.venv_v3/
 
 # pytest 临时缓存目录与本地调试日志（git 权限受限时无法扫描，显式忽略以防误提交）
 pytest-cache-files-*/
@@ -51,3 +52,6 @@ trace_out/
 
 # 统一剖析工具与探针的配置/产物
 !scripts/*.json
+
+# 本仓库专属推送凭据(含 PAT,禁止入库)
+.git-credentials.local

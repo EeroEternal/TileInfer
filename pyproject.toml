@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tileinfer"
-description = "A native vLLM backend for Ascend NPUs: platform plugin, attention backend and kernels"
+description = "A compatibility layer over vllm-ascend: declarations, decisions, contracts, providers and kernels"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { file = "LICENSE" }
@@ -27,27 +27,25 @@ dependencies = ["torch>=2.0"]
 [project.optional-dependencies]
 dev = ["pytest>=7", "pytest-timeout", "tabulate", "rich"]
 npu = ["torch_npu"]
-# The engine this package is a backend for.  Pinned to the 0.23 line: `tileinfer.vllm.platform`
-# and `tileinfer.vllm.attn.backend` are written against 0.23's `Platform` ABC and v1 attention API,
-# and `docs/notes/vllm-api-0.23.md` is the transcription they were checked against.
+# The engine this package adapts.  Pinned to the 0.23 line: the bridge wraps 0.23's
+# `CudagraphDispatcher` and vllm-ascend 0.23's platform hook, and `docs/notes/vllm-api-0.23.md`
+# is the transcription they were checked against.
 vllm = ["vllm>=0.23,<0.24"]
 
 [project.scripts]
-# `tileinfer` prints the bring-up checklist (docs/hardware-checklist.md steps 1-5) as
-# PASS/FAIL/SKIP with the fix hint, and exits non-zero on a hard failure — see
-# tileinfer/vllm/doctor.py.  The natural spellings `tileinfer doctor` (and the aliases
-# `tileinfer check` / `tileinfer status`) are accepted too, as are `--json` / `--help`; any
-# other argument is a usage error.  It imports nothing engine-side until a check needs it.
-tileinfer = "tileinfer.vllm.doctor:main"
+# `tileinfer doctor` checks the version triangle, the plan, the layered import rule, a dry
+# bridge install and the last graph-counter snapshot, and exits non-zero on a hard failure —
+# see tileinfer/cli/doctor.py.  `tileinfer plan build|show|verify` is the deploy-time interface;
+# `tileinfer --help` lists both.  The script imports each command lazily.
+tileinfer = "tileinfer.cli.main:main"
 
-# vLLM loads these in *every* process of a server (API server, EngineCore, workers), which is
-# exactly what a platform + attention backend need - see tileinfer/vllm/plugin.py's docstring for
-# the install sequence and the two decisions (backend registry slot, graph bridge).
-[project.entry-points."vllm.platform_plugins"]
-tileinfer = "tileinfer.vllm.platform:register"
-
+# v3 registers exactly one slot: the general plugin.  There is deliberately no
+# `vllm.platform_plugins` entry: vllm-ascend owns the platform slot and a second claimant makes
+# the process refuse to start (docs/integration.md §2).  vLLM loads general plugins in every
+# process of a server (API server, EngineCore, workers); the bridge's `install()` is idempotent
+# and never raises, so loading it everywhere is safe.
 [project.entry-points."vllm.general_plugins"]
-tileinfer = "tileinfer.vllm.plugin:install"
+tileinfer = "tileinfer.bridge.install:install"
 
 [project.urls]
 Homepage = "https://github.com/EeroEternal/TileInfer"

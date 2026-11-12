@@ -1,15 +1,14 @@
-"""Ratchet: nothing outside ``legacy/`` may reference ``vllm_ascend``.
+"""Ratchet: ``vllm_ascend`` is imported by **one** layer, and only that layer.
 
-The migration target used to be "no new dependencies" and the guard pinned an exact allowlist of
-modules that were still allowed to import the vendor package.  That list is gone: the legacy adapter,
-the opt-in patches built on its internals, and the tests that exercised them were moved into
-``legacy/`` (a frozen snapshot - see ``legacy/README.md``).  The contract is now absolute: the live
-tree contains **zero** references.
+v2 banned the vendor package everywhere because it was a standalone platform.  v3 reverses
+that premise: the platform, worker, memory, KV pool and graph capture are the vendor's, so
+the bridge must be able to call into them.  What must not change is the *direction* of the
+dependency: only ``tileinfer/bridge/`` may import upstream.  Contracts, resolution,
+declarations, providers and kernels stay engine-free, which is what keeps them testable on a
+CPU laptop and what makes "the vendor moved" a one-layer problem.
 
-``SCAN_GLOBS`` covers the live tree only; ``legacy/`` is the carve-out the goal names, and nothing in
-it is packaged or tested.  A new file that imports ``vllm_ascend`` fails this test, and so does
-re-exporting it by name (``from ... import vllm_ascend``), because the scan looks at import targets
-as well as module names.
+The check is still a ratchet: a new import outside ``bridge/`` fails, and a scan that finds
+the string only in a comment is not counted (it parses imports, not text).
 """
 
 from __future__ import annotations
@@ -26,12 +25,12 @@ SCAN_GLOBS = (
     "examples/**/*.py",
 )
 
-#: Empty on purpose - the ratchet has closed.  The name stays so a regression is a one-line diff
-#: instead of a rewrite, and so the intent of the check is still readable.
-ALLOWED: set[str] = set()
+#: The only layer allowed to touch the vendor platform.  ``legacy/`` is not scanned at all.
+ALLOWED_PREFIXES = ("tileinfer/bridge/",)
 
-#: The new backend layers must never reference it either, not even transiently.
-CLEAN_PATHS = ("tileinfer/vllm", "tileinfer/serving")
+#: Kept for compatibility with the old test signature; empty because the carve-out is now a
+#: directory rule, not a file allowlist.
+ALLOWED: set[str] = set()
 
 
 def _imported_modules(path: pathlib.Path) -> list[str]:
@@ -64,20 +63,27 @@ def _format(found: dict[str, list[str]]) -> str:
     return "; ".join(f"{path} -> {modules}" for path, modules in sorted(found.items()))
 
 
-def test_no_vllm_ascend_dependencies() -> None:
-    found = _scan()
-    assert found == {}, (
-        "vllm_ascend referenced outside legacy/: "
-        + _format(found)
-        + ". Move the module into legacy/ (keeping its repo-relative path) - the live tree must not "
-        "depend on the vendor package at all."
-    )
-
-
-def test_backend_layers_are_free_of_the_legacy_adapter() -> None:
+def test_only_the_bridge_imports_vllm_ascend() -> None:
     offenders = {
         path: modules
         for path, modules in _scan().items()
-        if any(path.startswith(prefix + "/") for prefix in CLEAN_PATHS)
+        if not any(path.startswith(prefix) for prefix in ALLOWED_PREFIXES)
     }
-    assert not offenders, f"the new layers must not reference vllm_ascend: {offenders}"
+    assert not offenders, (
+        "vllm_ascend imported outside tileinfer/bridge/: "
+        + _format(offenders)
+        + ". Move the upstream-facing code into the bridge; the decision/contract layers must "
+        "stay engine-free (docs/architecture.md, L3/L5)."
+    )
+
+
+def test_the_bridge_actually_uses_the_seam() -> None:
+    """The carve-out must not be theoretical: the bridge has to import the vendor package."""
+    found = _scan()
+    bridge_modules = [
+        modules for path, modules in found.items() if path.startswith("tileinfer/bridge/")
+    ]
+    assert bridge_modules, (
+        "the layered guard allows tileinfer/bridge/ to import vllm_ascend, but nothing there "
+        "does - either the seam was removed or the rule is stale"
+    )
