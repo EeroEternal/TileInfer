@@ -223,7 +223,10 @@ class ModelManifest:
         return hashlib.sha256(payload).hexdigest()[:16]
 
     def as_dict(self) -> Dict[str, Any]:
-        return {
+        # Keep the pre-Mamba shape byte-identical when a model has no Mamba layers:
+        # plan ids are content-addressed and must not churn for Qwen3.6 just because the
+        # schema learned a new optional field.
+        data = {
             "schema_version": self.schema_version,
             "name": self.name,
             "manifest_id": self.manifest_id,
@@ -233,7 +236,6 @@ class ModelManifest:
             "layer_types": list(self.layer_types),
             "attention": self.attention.as_dict(),
             "linear": self.linear.as_dict() if self.linear else None,
-            "mamba": self.mamba.as_dict() if self.mamba else None,
             "moe": self.moe.as_dict() if self.moe else None,
             "quantization": self.quantization,
             "kv": dict(self.kv),
@@ -241,6 +243,9 @@ class ModelManifest:
             "benchmark": dict(self.benchmark),
             "source": self.source,
         }
+        if self.mamba is not None:
+            data["mamba"] = self.mamba.as_dict()
+        return data
 
     def write(self, path: str) -> None:
         self.validate()

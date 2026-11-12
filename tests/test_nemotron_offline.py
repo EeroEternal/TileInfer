@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from tileinfer.contracts.manifest import AttentionSpec, MambaSpec, ModelManifest
+from tileinfer.manifests import QWEN3_6
 
 ROOT = Path(__file__).resolve().parents[1]
 PREFIX = ROOT / ".venv_v3/lib/python3.12/site-packages"
@@ -33,6 +34,10 @@ def _mamba_manifest(*, layer_types: tuple[str, ...], mamba: MambaSpec | None) ->
         required_capabilities=("attention.full", "state.linear"),
         benchmark={"prompt": "hi", "max_tokens": 1, "top5": []},
     )
+
+
+def test_qwen_manifest_shape_is_unchanged_by_the_optional_mamba_field() -> None:
+    assert "mamba" not in QWEN3_6.as_dict()
 
 
 def test_manifest_represents_mamba_and_mlp_layers() -> None:
