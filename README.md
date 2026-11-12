@@ -4,29 +4,43 @@
 不比基线慢；**已经跑得好的模型，一行都不碰**。
 
 ```
-                vLLM 0.23（上游，不打补丁）
-                          │
-              ┌───────────▼────────────┐
-              │   vllm-ascend 0.23     │  平台 / worker / 显存 / KV 池 / 图捕获
-              └───────────┬────────────┘
-                          │   6 个接入点（注册表替换 + 方法包装，不改源码）
-              ┌───────────▼────────────┐
-              │   TileInfer（本仓库）   │  模型声明 · 决策 · 契约 · 提供者 · 接入 · 内核
-              └───────────┬────────────┘
-                          │
-                  CANN 9.3 + Ascend 950
+                     部署期（一次）
+   tileinfer 启动器：读模型声明 + 探测本机 → 计划：这次注入哪些实现
+        ├─ 一项都不注入 → 直接起 vLLM（我们的代码不进热路径）
+        └─ 注入 N 项     → 起 vLLM，插件按计划换表
+
+                     运行期（一个进程）
+                     vLLM 引擎（上游，不打补丁）
+                        │                          │
+        A 查表类：用谁的实现                B 平台类：这台机器怎么用
+        算子 / 层 / 模型 / 注意力后端        设备 / worker / 显存 / KV / 图捕获
+                        │                          │
+                        ▼                          │
+              ┌───────────────────┐                │
+              │ TileInfer 选择性   │                │
+              │ 拦截（6 个接入点） │                │
+              └────────┬──────────┘                │
+                       └──────────────┬─────────────┘
+                                      ▼
+                            vllm-ascend 平台层（唯一平台）
+                                      ▼
+                             CANN 9.3 + Ascend 950
 ```
+
+**两个关键事实**（读任何其它文档前先记住）：
+
+1. **平台槽位始终归 vllm-ascend，我们不注册平台插件。** 一个进程只允许一个平台激活；
+   我们再去注册只会和厂商撞车，而收益为零。
+2. **B 类请求直连厂商，不经过我们。** 只有"用谁的实现"这类查表请求才经过我们。
+   所以这不是"通栏一层"，是**选择性拦截**。
 
 **一句话定位**：我们是**选择层 + 补齐层**，不是另一个推理引擎。
 vllm-ascend 已经适配的模型走它；它没适配的模型，我们把缺的那部分补上。
 
-**边界（重要）**：设备、worker、显存、KV 池、图捕获归 vllm-ascend。
-我们不重写平台层——上一个版本（v2）试过，代价是 TPOT 2.53×、TTFT 11.8×。
-
 ## 现在是什么状态
 
 - **定位已改为 v3（兼容适配层）**；**代码仍是 v2 形态**（自带平台层、不装 vllm-ascend）。
-  重构计划见架构文档的里程碑，当前进度与每条断点见 [`docs/status.md`](docs/status.md)。
+  重构尚未开始。当前进度与每条断点见 [`docs/status.md`](docs/status.md)。
 - 已有资产：注意力 / GDN / MoE / 采样四族内核、`plan/run` 注意力契约、分相计时的剖析工具、
   v1 时代在役过的 vllm-ascend 插件（冻结在 `legacy/`）。
 - 性能数字一律以 [`docs/performance.md`](docs/performance.md) 为准，**不要从 README 或旧文档引用**。
@@ -37,7 +51,7 @@ vllm-ascend 已经适配的模型走它；它没适配的模型，我们把缺�
 
 | | |
 |---|---|
-| [`docs/architecture.md`](docs/architecture.md) | 定位、分层、生命周期、两条路线、不变量、硬约束 |
+| [`docs/architecture.md`](docs/architecture.md) | 定位、分层、调用方向、层与目录的对应、生命周期、两条路线、不变量、硬约束 |
 | [`docs/acceptance.md`](docs/acceptance.md) | 目标与验收口径、KPI、红线（什么情况必须收缩） |
 | [`docs/status.md`](docs/status.md) | 现在到哪一步、凭什么相信、哪里还断着 |
 
@@ -56,14 +70,17 @@ vllm-ascend 已经适配的模型走它；它没适配的模型，我们把缺�
 
 ## 目录
 
-| 路径 | 是什么 |
+**目标形态的目录与分层对应关系见 [`docs/architecture.md`](docs/architecture.md) §3.3**——那张表是
+权威的层↔目录映射，本处只列"现在硬盘上有什么"。
+
+| 路径（当前） | 是什么 |
 |---|---|
 | `tileinfer/kernels/` | TileLang 算子（attention / GDN / MoE / sampling） |
 | `tileinfer/vllm/` | **v2 形态**的后端本体（平台层、worker hook、attention 后端、图捕获）——v3 会拆进分层 |
 | `tileinfer/models/` | 上游没有的模型实现（DeepSeek-V4.1 是样例） |
 | `tileinfer/serving/` | serving 侧工具（分相计时、bucket、planner） |
-| `legacy/` | 冻结的 vllm-ascend 时代代码：不打包、不测试、不再增长，是 v3 接入层的素材库 |
-| `reference/vllm-0.23/` | vLLM 0.23 关键模块逐字副本，只为让 `file:line` 引用可核对 |
+| `legacy/` | 冻结的 vllm-ascend 时代代码：不打包、不测试、不再增长，是 v3 接入点的素材库 |
+| `reference/vllm-0.23/` | vLLM 0.23 关键模块逐字副本，只为让 `file:line` 引用可核对，**不许改** |
 | `benchmarks/`、`scripts/` | A/B harness、探针、统一剖析入口 `scripts/ti_trace.py` |
 | `docs/` | 见上面的文档地图 |
 

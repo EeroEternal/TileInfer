@@ -308,7 +308,7 @@ enforce_eager   = True            # 图捕获尚未就绪时平台会强制 eage
 | 现象 | 指向 | 下一步 |
 |---|---|---|
 | `platform …cuda.CudaPlatform` / `cpu.CpuPlatform` / `UnspecifiedPlatform` | `tileinfer.vllm.platform.register()` 返回了 `None`：**没有可见 NPU**，vLLM 于是回落到内置插件 | 回步骤 1；`register()` 只在 `torch.npu.device_count() > 0` 时返回类路径 |
-| `RuntimeError: Only one platform plugin can be activated` | 同时还有别的 out-of-tree 平台插件（例如遗留的 vllm-ascend） | `pip uninstall vllm_ascend`，或 `pip show -f` 查同组入口点 |
+| `RuntimeError: Only one platform plugin can be activated` | 同组入口点里有两个包都声称自己提供平台 | v3 只有 vllm-ascend 该注册平台入口；`pip show -f` 查同组入口点，卸掉多出来的那个（**不要卸 vllm-ascend**） |
 | `block_size = 1024/…` 且 `user_specified True` | 命令行显式传了非 2048 倍数的 `--block-size`，平台按设计**拒绝**而不是偷偷改 | 去掉 `--block-size`（让平台对齐），或显式传 `2048` |
 | `block_size` 非 2048 且 `is_hybrid True`、无报错 | 对齐逻辑没跑到（vLLM 没调 `check_and_update_config`） | 确认 `current_platform` 是 TileInferPlatform（5.1），否则平台根本没参与 |
 | `worker_cls` 不是 `tileinfer.vllm.worker.NPUWorker` | 平台没写进 `parallel_config`。字段名现在是**已核实**的：`reference/vllm-0.23/vllm__config__parallel.py:248` 声明 `worker_cls: str = "auto"`，消费点是 `vllm__v1__worker__worker_base.py:249-253` | 回看 5.1 的 `current_platform`；若启动直接抛 `ValueError: parallel_config.worker_cls=… conflicts`，说明命令行显式传了别的 `--worker-cls`——去掉它（平台只在 `"auto"` 哨兵时改写，见 `docs/notes/handover-2026-10-28.md` §7.7） |
@@ -676,7 +676,7 @@ PY
 |---|---|---|---|
 | 1 | `ImportError: tileinfer.vllm.platform requires vLLM 0.23's platform API` | vLLM 不是 0.23.x，或入口点来自旧安装 | `pip show vllm tileinfer`，再回步骤 2 |
 | 2 | `current_platform` 是 `CudaPlatform` / `CpuPlatform` / `UnspecifiedPlatform` | `register()` 返回 `None`：没有可见 NPU | 步骤 1.2 的 `torch.npu.is_available()` |
-| 3 | `RuntimeError: Only one platform plugin can be activated` | 还有第二个 out-of-tree 平台插件（遗留 `vllm_ascend`） | `pip uninstall vllm_ascend`，再步骤 2 |
+| 3 | `RuntimeError: Only one platform plugin can be activated` | 同组入口点里有两个包都提供平台 | v3 只有 vllm-ascend 注册平台入口；查同组入口点卸掉多出来的那个（**不要卸 vllm-ascend**） |
 | 4 | `RuntimeError: Not support device type` | `parallel_config.worker_cls` 没被平台改写（机制已核实：字段默认 `"auto"`，平台在 `check_and_update_config` 里替换） | 步骤 5.2 打印 `worker_cls`，并搜日志 `TileInfer platform: … worker=` |
 | 5 | `RuntimeError: tileinfer.vllm.worker.init_device requires torch_npu` | 设备栈缺失（`torch_npu` 没装/不配对）；四个 hook 已实现，不再抛 `NotImplementedError` | 步骤 1.1 / 1.2 |
 | 6 | `block_size … is not a multiple of 2048` | 显式传了非 2048 倍数的 `--block-size` | 去掉 `--block-size`，或传 `2048` |
