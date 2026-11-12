@@ -74,17 +74,17 @@ prompt 用 `benchmarks/make_long_prompt.py --tokens N --out /tmp/prompt-Nk.txt` 
 | # | 场景 | 证据 | 门 | Qwen3.6 |
 |---|---|---|---|---|
 | S1 | ngram 冒烟（无 draft 权重） | 服务起、输出、投机 token 统计 | C1；不要求加速 | ⚠️ 4K/8K 服务与输出通过；token 统计未采集（2026-11-12） |
-| S2 | MTP k=1，4K | 输出 vs 非投机基线；接受率；TPOT/吞吐 | Q1 任务正确 + Q3 性能（非逐位） | ⚠️ 可跑、接受率 93.9%、约 1.35×；质量门 Q1/Q2 待跑；严格逐位已按 B 改为质量等价；[证据](notes/m1-mtp-smoke.md) |
-| S3 | MTP k=1 + 图 | `captured_graphs`、`fallbacks` | 回退 = 0 | ⚠️ 6 图（PIECEWISE 3 / FULL 0）、0 回退；Q5 组合未跑 |
-| S4 | MTP k=1 + 长上下文 32K/128K | 同上 + HBM | Q1/Q3 + 回退 = 0 | ⬜ |
+| S2 | MTP k=1，4K | 套件、needle、接受率、TPOT | Q1 任务正确 + Q3 性能（非逐位） | ✅ 2026-11-12：套件 8/8、needle 9/9、Q2 两次一致、Q3 93.9% / 1.35×；非逐位；[证据](notes/m1-spec-quality.md) |
+| S3 | MTP k=1 + 图 | `captured_graphs`、`fallbacks` | 回退 = 0 | ✅ 6 图（PIECEWISE 3 / FULL 0）、0 回退；MTP+32K Q5 已跑 |
+| S4 | MTP k=1 + 长上下文 32K/128K | 同上 + HBM | Q1 + 回退 = 0；长上下文单列 | ⚠️ 32K：9/9、TTFT 1.037×、6 图/0 回退；acceptance 81–88%；128K 未测 |
 | S5 | 投机验收口径写进声明 | `manifests/` 里的字段 | 见下 | ✅ 2026-11-12：S-Q Q1–Q5 写入 `acceptance.md` §2.3，明确非逐位 |
 
-**投机口径必须先定**（当前未定，属于阻塞项）：
+**投机口径已定：B 质量等价（非逐位）**，细则见 `acceptance.md` §2.3。
 
-- **正确性**：温度 0 下是否要求与非投机基线逐位一致？若个别 token 因浮点差异不同，
-  判失败还是给容差？建议先按"逐位一致"跑，不一致就查，不调容差。
-- **性能**：以 TPOT 还是吞吐为主？建议 decode 主导场景看 TPOT，服务吞吐看 tokens/s；
-  目标值写进声明（例如 TPOT ≤ 非投机 × 0.85），不写"开了就行"。
+- 4K：套件 8/8、needle 9/9、同请求两次完全一致、接受率 93.9%、TPOT 1.35× → S2 过。
+- 32K：needle 9/9、TTFT 1.037×、6 图/0 回退；acceptance 81–88%，按长上下文单列记录，
+  不套用 4K 的 90% 门 → S4 只算部分通过，128K 未测。
+- 严格逐位证据保留为诊断（8K 第 58 token、4K char 71），不再作为 S2 的门。
 - **接受率**：记录 `accepted_tokens / draft_tokens`，低接受率要能解释。
 
 厂商侧已具备的条件（2026-11-12 代码核对）：模型 `mtp_num_hidden_layers=1`、权重里
@@ -102,8 +102,9 @@ prompt 用 `benchmarks/make_long_prompt.py --tokens N --out /tmp/prompt-Nk.txt` 
   token 起 logprob 漂移，ngram 到第 10 个 token 才分叉，指向 GDN spec 多 token 前向；
   不是启动参数能修的，继续需插桩/厂商修复。
 - 2026-11-12 决议 **B（质量等价）**：投机不再要求逐位，按 `acceptance.md` §2.3 的
-  S-Q 门。S2 的 Q1/Q2 待跑；Q3 已过（93.9%、1.35×）。严格逐位证据保留为诊断，
-  不再作为 S2 的门。
+  S-Q 门。Q1 套件 8/8 + needle 9/9、Q2 两次 `same`、Q3 93.9% / 1.35× 全部过，S2 判过；
+  S4 32K 的 needle/图/TTFT 已过、acceptance 81–88%、128K 未测，只算部分通过。严格逐位
+  证据保留为诊断，不再作为门。
 
 ### 1.5 并发
 
@@ -183,8 +184,8 @@ prompt 用 `benchmarks/make_long_prompt.py --tokens N --out /tmp/prompt-Nk.txt` 
 Qwen3.6 按以下顺序推进：
 
 1. ✅ 长上下文阶梯（L1 8K → L2 16K → L3 32K，2026-11-12）；L4/L5 待 128K/262K 内存方案。
-2. ⚠️ 投机质量门：S-Q 已定；Q1/Q2 待跑，Q3 已过；S3 图机制过、Q5 待跑。
-3. 组合（S3 投机 × 图、S4 投机 × 长上下文）。
+2. ✅ 投机质量门：S2（4K）Q1/Q2/Q3 过；S3 图 6 图/0 回退过；S4 32K 部分，128K 未测。
+3. 组合：S3 已跑；S4 32K 已跑；S4 128K/262K 未测。
 4. 并发 32 / 64（P2/P3）、冷启动（K1/K2）。
 5. 设备侧 profiler（O2）。
 

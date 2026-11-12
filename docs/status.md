@@ -4,7 +4,7 @@
 > 目标形态见 [`architecture.md`](architecture.md)，验收口径见 [`acceptance.md`](acceptance.md)，
 > 数字见 [`performance.md`](performance.md)。
 >
-> 最后核对：**2026-11-12 19:15**，代码 `67ea022`（长上下文 + 投机查因；v3 主体 `6f41866`），
+> 最后核对：**2026-11-12 19:30**，代码 `259b366`（长上下文 + 投机质量门；v3 主体 `6f41866`），
 > 单卡 Ascend950PR，CANN 9.3.0。
 
 ---
@@ -66,8 +66,8 @@ v2 自带平台层的形态，v3 不再走那条路。本页 §1 的 v3 数字�
 | 项 | 现状 | 影响 |
 |---|---|---|
 | **补缺口还是空的** | `providers/` 无 provider——**按规则它就该是空的**：Qwen3.6 的 8 项能力厂商全覆盖，没有缺口可补。gap=0 是"没有缺口"，不是"补完了" | 要验证补缺口，得先选一个**厂商部署不了的模型**；给厂商已覆盖的能力写实现属于重复劳动（[`extending.md`](extending.md) §3.0） |
-| **图捕获** | v3 已接上（厂商捕获 + 我们计数）；4K 8 张、32K 6 张、MTP 6 张（PIECEWISE，FULL=0），均 0 回退；投机的组合未验；`impl_table`/`model_table` 两个机制仍是空实现 | 非 vendor 实现还没有落点；组合场景是下一步 |
-| **投机解码 / MTP** | 已试跑：`Qwen3_5MoeMTP` 加载成功，接受率 93.9%、mean 1.94、约 1.35×（非流式 128 token）；严格逐位不成立（8K 第 58 token / 4K char 71 分叉，256 token 中 85.9% 相同），已按 **B 质量等价**改为 S-Q 门；Q3 已过，Q1/Q2 待跑。图/eager/async/cascade 已排除；MTP 第 2 token 起漂移、ngram 第 10 token 才漂移，指向 GDN spec 多 token 前向。证据见 [`notes/m1-mtp-smoke.md`](notes/m1-mtp-smoke.md) | 非逐位；任务正确性待 9/9 验证 |
+| **图捕获** | v3 已接上（厂商捕获 + 我们计数）；4K 8 张、32K 6 张、MTP 6 张（PIECEWISE，FULL=0），均 0 回退；MTP+32K 6 图/0 回退；`impl_table`/`model_table` 两个机制仍是空实现 | 非 vendor 实现还没有落点；128K 组合未验 |
+| **投机解码 / MTP** | S2/S3 按 B 质量等价过：套件 8/8、needle 8K/16K/32K 9/9、同请求两次 `same`、4K 93.9% / 1.35×；图 6 张、0 回退。严格逐位不成立（256 token 中 85.9% 相同、第 58 token 分叉），明确非逐位。S4 32K 部分：9/9、TTFT 1.037×、6 图/0 回退，acceptance 81–88%、128K 未测。证据见 [`notes/m1-spec-quality.md`](notes/m1-spec-quality.md) | S2/S3 过；S4 仅 32K 部分；非逐位 |
 | **TPOT / 首字** | v3 M1：单流 0.907–1.016× / 0.999–1.001×；4K 1.000× / 0.999×；长上下文 8K/16K/32K：TTFT 1.008–1.011×、TPOT 0.999–1.002× | 门已过（本机、本参数） |
 | **长上下文** | **L1–L3 已过**（8K/16K/32K，9/9 needle 逐 token 同）；当前 `max-model-len=33792`；L4/L5 未测。证据见 [`notes/m1-long-context.md`](notes/m1-long-context.md) | 128K/262K 需单独内存方案，不能外推 |
 | **量化** | 只做 bf16 | 未验证组合一律不声明支持 |
