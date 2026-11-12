@@ -115,33 +115,72 @@
 
 ---
 
-## 5. 对 M5 选型的建议
+## 5. 选型建议
 
-> 如果 vLLM 本身没有该模型，"支持"就不只是算子/注意力，而是完整 model bring-up；
+### 5.1 只做 Ascend 后端、冻结 vLLM 0.23
+
 > 分层清单见 [`model-bringup-layers.md`](model-bringup-layers.md)。
 
-1. **首选 K2-Horizon-MoVA-36B-A4B。**
-   - 37.4B、Apache-2.0、非中国团队、有 HF/vLLM 生态；
-   - 缺口明确：MoVA attention + MoE 自定义算子，Ascend 没有；
-   - 厂商没有公开的 Ascend 支持 PR，短期不会变成"版本滞后"；
-   - 代价：不是纯 provider，可能要补 Triton/自定义算子，正好检验"填缺口"能力。
+前提：**不新增/修改 vLLM 模型类，不改 vllm-ascend 的 platform/worker/设备层，
+只加 attention backend、operator、state cache、graph 适配。**
 
-2. **备选 Raon-1 mini 28.8B。**
-   - 自定义架构、无厂商支持，缺口更"干净"；
-   - 但热度低、需申请权重、韩语为主，作为 second model 的生态价值弱。
+| 模型 | vLLM 0.23 有模型？ | Ascend 缺什么 | 判断 |
+|---|---|---|---|
+| LFM2.5-24B-A2B | ✅ `Lfm2MoeForCausalLM` | ShortConv attention backend、causal conv1d、conv state、graph | **首选** |
+| Apertus-v1.5-8B | ✅ `ApertusForCausalLM` | XIELU fused op（已有 Python fallback） | 备选/算子试点 |
+| Nemotron 3.5-30B-A3B | ✅ `NemotronHForCausalLM` | Mamba2 backend、state cache、graph | 不选：厂商 PR + 工作量大 |
+| Sarvam-30B | ✅ `SarvamMLAForCausalLM` | 可能无缺口；Ascend MLA 已存在 | 先 smoke |
+| Laguna-XS.2 | ✅ `LagunaForCausalLM` | sinks/SWA 已有；可能无缺口 | 先 smoke |
+| North / Granite 4.2 / Mellum2 | ✅ | 标准层，可能无缺口 | 不选 |
+| K2 / Flint / Clover / Raon | ❌ 0.23 没有 | 需要模型架构或引擎改动 | 不选 |
 
-3. **Clover 只在接受"diffusion 引擎级工作"时选。**
-   - 否则它会超出"provider"范围，变成改 scheduler/采样。
+**首选 LFM2.5-24B-A2B。** 理由：
 
-4. **Nemotron / Flint / LFM2 不建议作为"长期缺口"选题。**
-   - Nemotron：Ascend PR 已开；
-   - Flint：vLLM main 已支持；
-   - LFM2：Ascend PR 已看 ShortConv。
-   拿它们做 M5，等实现完厂商可能已经支持，正好踩"重复厂商工作"的红线。
+- 24B、40 层、30 个 ShortConv + 10 个 full attention、64 experts top-4、131K context；
+- vLLM 0.23 已有完整 `Lfm2MoeForCausalLM`，LFM2.5 的 config 字段（`conv_L_cache=3`、
+  `layer_types`、`num_experts=64`）与 vLLM 0.23 的实现对得上；
+- vllm-ascend 0.23 没有 ShortConv backend；`ShortConv.forward_native` 是空实现，
+  `forward` 走 `torch.ops.vllm.short_conv`，Ascend 没有对应路径。这是**硬缺口**，不是性能问题；
+- 工作正好落在后端层：新增 ShortConv attention backend/metadata、causal conv1d
+  prefill/update、conv state cache、图捕获、精度/性能测试；不改 vLLM 模型文件，
+  也不替换 vllm-ascend 的 platform/worker/设备层；
+- 单卡 950 的 131GB HBM 放 24B BF16（约 48GB）没问题，131K context 能覆盖 L4（128K）。
 
-5. **B 类先做 1 天 smoke test，再决定是否写 provider。**
-   标准 Attention + MoE 的模型可能只差一个注册/验证，不需要新算子；
-   在没有实测前，不要把它们写成"厂商不支持"。
+风险也要说清楚：
+
+- Ascend PR #21682 已关闭且写明 ShortConv 未验证，说明这件事不轻松，尤其是
+  chunked prefill + conv state + graph；
+- LFM2.5 没有 MTP/Eagle，投机只能用 ngram；如果矩阵要求 MTP，这一格会是 N/A；
+- 厂商已经看过 ShortConv，如果后续重新开 PR，存在“做完被厂商覆盖”的风险。
+
+**备选 Apertus-v1.5-8B（算子试点，不是主模型）。**
+
+- 8.9B，唯一非标准件是 `XIELU` activation；vLLM 0.23 已有 `ApertusForCausalLM`；
+- `XIELU` 是 `CustomOp`，Ascend 上默认走 `forward_native` 的 Python fallback，
+  所以 C1/C2 很可能已经能过；真正要做的是 fused Ascend XIELU，改善 C4/graph；
+- 它更像“1～2 周的算子试点”，不是“让一个跑不了的模型跑起来”；
+- 上下文较短，不适合作为长上下文主模型。
+
+**K2-Horizon 只在允许升到 0.30 时考虑。**
+
+- vLLM 0.30 有 `K2HorizonForCausalLM`，Ascend 缺 MoVA backend/自定义算子；
+  这是最干净的“只做 attention 后端”选题；
+- 但 0.30 的 PyPI 是 A2 build，本机 950 没有 0.30-950 wheel；升级还会让 M1 的
+  C1–C4 证据失效。所以在当前冻结 0.23 的前提下，K2 不成立。
+
+**不建议：**
+
+- Nemotron 3.5：厂商 PR #11656 已开，Mamba2 backend + state cache 工作量大；
+- Clover：block diffusion，需要改 scheduler/采样，属于引擎级；
+- Raon / Flint：vLLM 0.23 没有模型，必须先做模型架构或 backport；
+- Sarvam / Laguna / North / Granite / Mellum：没有确认的后端缺口，先 smoke test，
+  不要直接立项。
+
+### 5.2 MTP 的现实约束
+
+LFM2.5 和 Apertus 都没有 MTP；如果“MTP 必须过”是硬门槛，0.23 上几乎没有
+“只做后端”的合适模型——Nemotron 有 MTP，但它是 Mamba2 + 厂商 PR，正好是最不该接的。
+可行做法是：投机格用 ngram，或把 MTP 标为 N/A，不要为了 MTP 去接模型架构。
 
 ---
 
