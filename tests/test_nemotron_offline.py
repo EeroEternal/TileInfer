@@ -278,6 +278,26 @@ def test_mtp_probe_detects_extra_layer_and_absent_mtp() -> None:
     assert found["extra_layer_count"] == 1
 
 
+def test_preflight_detects_incomplete_shards(tmp_path: Path) -> None:
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("preflight_model", ROOT / "tools/nemotron/preflight_model.py")
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+    (tmp_path / "config.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "tokenizer.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"a": "model-00001.safetensors"}}), encoding="utf-8"
+    )
+    first = mod.check(tmp_path)
+    assert first["ready_to_load"] is False
+    assert first["shards_missing"] == ["model-00001.safetensors"]
+    (tmp_path / "model-00001.safetensors").write_bytes(b"x")
+    second = mod.check(tmp_path)
+    assert second["ready_to_load"] is True
+
+
 def test_no_vendor_decision_reports_all_gaps_without_hardware(tmp_path: Path) -> None:
     m = ModelManifest(
         name="nemotron-synthetic",

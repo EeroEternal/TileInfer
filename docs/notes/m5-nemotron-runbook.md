@@ -13,7 +13,8 @@
 - [ ] `config.json` 已确认：`architectures/model_type/num_hidden_layers/
       layers_block_type/mtp_layers_block_type/num_nextn_predict_layers/max_position_embeddings`；
 - [ ] 已生成 vLLM 0.23 兼容的 config shim（见 §1.1），且 `NemotronHConfig` 能加载；
-- [ ] 权重路径存在，磁盘/内存足够；
+- [ ] 权重路径存在，磁盘/内存足够；当前目录只有 config/metadata，**safetensors 未完整**，不要启动；
+- [ ] `preflight_model.py` 返回 `ready_to_load=true`（shards/tokenizer 齐全）；
 - [ ] MTP 是否存在已确认（没有就不开 MTP，不拿 ngram 冒充）；
 - [ ] `npu-smi info` 显示目标卡空闲（获准后执行）；
 - [ ] 端口 `8322` 未被占用（`ss -ltnp`）；
@@ -28,7 +29,7 @@
 cd /home/userlist/zxs/TileInfer
 source scripts/env-ascend102.sh
 
-MODEL=/home/models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16   # TODO: 确认实际路径
+MODEL=/home/models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16
 SHIM=/tmp/m5-nemotron-shim-$(date +%s)
 PORT=8322
 LOG=/tmp/m5-nemotron-serve.log
@@ -37,6 +38,14 @@ AUDIT=/tmp/m5-nemotron-opaudit.json
 ```
 
 > 如果权重不在本地，先停下来确认获取方式；**不要**在本手册里自动下载。
+
+### 1.0 文件完整性预检（不读 tensor）
+
+```bash
+python tools/nemotron/preflight_model.py --model "$MODEL"
+```
+
+`ready_to_load=false` 时不要往下走；它只查文件是否存在/非空，不会碰 NPU。
 
 ### 1.1 config shim（vLLM 0.23 不认 `layers_block_type`）
 
