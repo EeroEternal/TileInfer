@@ -32,9 +32,11 @@ from ..contracts.plan import (
 from .probe import Environment
 from .vendor import VENDOR_PROVIDERS
 
-#: Capabilities our own providers can theoretically serve.  Empty today: the v2 attention
-#: backend is written against the v2 KV layout, not vllm-ascend's, so claiming it here would
-#: create a gap report that lies.  It fills in as providers gain a vendor-compatible form.
+#: Capabilities our own providers can serve.  Empty today, and empty is correct: this table
+#: is for gaps only - a capability the vendor cannot run, or cannot run correctly at the shape
+#: a model needs.  Qwen3.6 requires nothing the vendor lacks, so claiming our v2 kernels here
+#: would invent work and make the gap report lie.  Entries appear when a model needs a
+#: capability the vendor rejects, not when we believe we could beat the vendor on speed.
 TILEINFER_PROVIDERS: dict = {}
 
 POLICIES = ("vendor_first", "tileinfer_first")

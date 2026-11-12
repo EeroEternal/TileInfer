@@ -103,6 +103,31 @@ def test_provider_needs_evidence_for_a_measured_ratio() -> None:
     spec2.validate()
 
 
+def test_provider_needs_evidence_even_without_a_ratio() -> None:
+    # No vendor arm means no ratio to divide by, but evidence is still mandatory: absolute
+    # numbers plus the reference-implementation agreement (docs/extending.md §3.0,
+    # docs/acceptance.md §2.1).  A provider without evidence is a candidate, not a default.
+    bare = ProviderSpec(
+        capability=Capability.ATTENTION_LINEAR,
+        name="x",
+        impl="x.y",
+        source="tileinfer",
+        graphable=True,
+    )
+    with pytest.raises(ValueError):
+        bare.validate()
+    documented = ProviderSpec(
+        capability=Capability.ATTENTION_LINEAR,
+        name="x",
+        impl="x.y",
+        source="tileinfer",
+        graphable=True,
+        evidence="bench/linear-gap-1",
+        delete_when="the vendor ships a linear kernel for this shape",
+    )
+    documented.validate()
+
+
 def test_decision_with_vendor_selects_every_capability_and_reports_no_gap() -> None:
     plan, report = decide(QWEN3_6, _vendor_env(), policy="vendor_first")
     assert report.servable is True

@@ -126,10 +126,20 @@ QuantContract = QuantConfigContract
 class ProviderSpec:
     """A provider's declaration (L4).  Five fields are mandatory by project rule.
 
-    ``covers`` is symbolic on purpose: a provider says which shapes/precisions it handles
-    (``{"head_dim": 256, "dtype": ["bf16"]}``), never a concrete tensor.  ``measured_ratio``
-    is the *measured* speed ratio against the vendor implementation and must have an
-    evidence id; a provider without one may only be a candidate, never a default.
+    A provider exists only for a gap the vendor cannot serve (``docs/extending.md`` §3.0):
+    when the vendor runs the capability correctly and graphably, the decision selects the
+    vendor entry and no provider is written at all.  ``covers`` is symbolic on purpose: a
+    provider says which shapes/precisions it handles (``{"head_dim": 256, "dtype":
+    ["bf16"]}``), never a concrete tensor.  ``measured_ratio`` is the speed ratio against the
+    arm this provider replaces - the vendor path, or the vendor's own fallback - and it only
+    exists when that arm runs at all.  When the vendor cannot deploy the capability there is
+    nothing to divide by: ``measured_ratio`` stays ``None`` and ``evidence`` carries the
+    absolute numbers plus the reference-implementation agreement instead.  Evidence is
+    mandatory either way; a provider without one is a candidate, never a default.
+
+    ``source`` still accepts ``vendor`` because the same shape describes the vendor entries
+    in the plan table (``resolve/vendor.py``); those are *selections*, not providers in
+    ``providers/``.
     """
 
     capability: Capability
@@ -152,6 +162,12 @@ class ProviderSpec:
         if self.measured_ratio is not None and not self.evidence:
             raise ValueError(
                 f"provider {self.name!r} declares a measured ratio without an evidence id"
+            )
+        if not self.evidence:
+            raise ValueError(
+                f"provider {self.name!r} has no evidence id; a ratio is optional (only when "
+                "the replaced arm runs), evidence is not - without it this is a candidate, "
+                "not a default"
             )
 
     def as_dict(self) -> Dict[str, Any]:

@@ -4,7 +4,7 @@
 > 目标形态见 [`architecture.md`](architecture.md)，验收口径见 [`acceptance.md`](acceptance.md)，
 > 数字见 [`performance.md`](performance.md)。
 >
-> 最后核对：**2026-11-12 15:20**，代码 `449d8bf` + v3 M1 工作区改动（未提交），
+> 最后核对：**2026-11-12 16:00**，代码 `6f41866`（v3 代码已提交，`1089388` 起为文档），
 > 单卡 Ascend950PR，CANN 9.3.0。
 
 ---
@@ -36,7 +36,7 @@ v2 自带平台层的形态，v3 不再走那条路。本页 §1 的 v3 数字�
 |---|---|---|
 | 声明层（`manifests/qwen3_6.py`） | ✅ | 40 层/30 GDN+10 full、16Q/2KV、256 experts top-8、8 项 required capability，纯数据可校验 |
 | 契约层（`contracts/`） | ✅ | 8 个 `Protocol` + plan/manifest/gap schema；未知 key、重复选择、超预算都拒绝 |
-| 决策层（`resolve/`） | ✅ | 纯函数；vendor 在→8/8 选 vendor、gap=0；vendor 不在→8 条 required gap、servable=False |
+| 决策层（`resolve/`） | ✅ | 纯函数；vendor 在→8/8 选 vendor、gap=0；vendor 不在→8 条 required gap、servable=False（这是"会不会服务不了"的判定，不是"要去补 8 个实现"的待办） |
 | 接入层（`bridge/`） | ✅ | 6 个具体钩子（plugin entry、dispatch、capture、attn select、config gate、init keys），4/6 类机制，预算 8 |
 | 分层禁令 | ✅ | AST 守卫：只有 `tileinfer/bridge/` 可 import `vllm_ascend`；另有测试防止 carve-out 变空 |
 | 观测 | ✅ | capture/fallback 计数落 JSON（`SIGUSR1`/500 步/atexit）；API server 的零计数不再覆盖 EngineCore |
@@ -62,7 +62,7 @@ v2 自带平台层的形态，v3 不再走那条路。本页 §1 的 v3 数字�
 
 | 项 | 现状 | 影响 |
 |---|---|---|
-| **补缺口还是空的** | `providers/` 无 provider，8/8 都是厂商实现；gap=0 只因厂商全覆盖 | M2–M4 的真实工作；现在只证明了"选实现"这一半 |
+| **补缺口还是空的** | `providers/` 无 provider——**按规则它就该是空的**：Qwen3.6 的 8 项能力厂商全覆盖，没有缺口可补。gap=0 是"没有缺口"，不是"补完了" | 要验证补缺口，得先选一个**厂商部署不了的模型**；给厂商已覆盖的能力写实现属于重复劳动（[`extending.md`](extending.md) §3.0） |
 | **图捕获** | v3 已接上（厂商捕获 + 我们计数）；`impl_table`/`model_table` 两个机制仍是空实现 | 非 vendor 实现还没有落点 |
 | **投机解码 / MTP** | 未开始。模型侧现成，卡在批语义只允许单 query token | 单 token 一步的天花板 |
 | **TPOT / 首字** | v3 M1：单流 0.907–1.016× / 0.999–1.001×；4K 1.000× / 0.999× | 门已过（本机、本参数） |
@@ -157,7 +157,9 @@ python3 scripts/ti_trace.py run --preset smoke
 
 ## 8. 仓库纪律
 
-- 没有实测比值和 bench 脚本的算子不许进主干。
+- 没有证据的算子不许进主干：有基线给同一窗口的成对比值，无基线给绝对数 + 与参考实现的
+  一致性（口径见 [`acceptance.md`](acceptance.md) §2.1），并且都要有 bench 脚本。
+- **厂商已能正确部署的能力不写提供者**；写了就是重复劳动，按红线删除（[`extending.md`](extending.md) §3.0）。
 - 环境产物、编译缓存、profiling dump 一律不进仓库。
 - `reference/vllm-0.23/` 下的文件不许改——它们是行号锚点。
 - `legacy/` 只减不增。

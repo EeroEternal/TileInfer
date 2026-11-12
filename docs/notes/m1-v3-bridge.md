@@ -33,9 +33,11 @@ providers / aot / observ / cli` 加进 engine-free 列表。
    capability；benchmark 里冻结了首 token `Here` 及其 top-5。
 2. **契约**：`tileinfer/contracts/capabilities.py` 的 8 个 `Protocol`（full/linear attention、
    MoE、RMSNorm、RoPE、sampling、state、quant），加 `ProviderSpec` 五项声明
-   （coverage / graphable / parallel / measured_ratio + evidence / delete_when）。
+   （coverage / graphable / parallel / 证据（有基线才带 measured_ratio）/ delete_when）。
 3. **决策**：`tileinfer/resolve/decide.py` 是纯函数；`vendor_first` 下 8/8 选厂商，
-   gap=0、servable=True。没有厂商时输出 8 条 required gap、servable=False。
+   gap=0、servable=True。没有厂商时输出 8 条 required gap、servable=False
+   （这是"这台机器能不能服务"的判定，不是"要去补 8 个实现"的待办——见
+   [`../extending.md`](../extending.md) §3.0）。
 4. **接入**：`tileinfer/bridge/install.py` + `seams.py`。入口只做四件事：读 plan → 版本门 →
    装钩子 → 记录实际生效的 seam；任何异常不外抛。
 

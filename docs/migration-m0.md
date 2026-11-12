@@ -69,6 +69,12 @@
 > 2026-11-12 的实际推进：S0 基线见 [`notes/m0-baseline.md`](notes/m0-baseline.md)；
 > v3 分层骨架 + 决策 + bridge + 端到端验收见 [`notes/m1-v3-bridge.md`](notes/m1-v3-bridge.md)。
 > v2 冻结区与删除清单见 [`notes/m1-delete-list.md`](notes/m1-delete-list.md)。
+>
+> **S4 已修订**：原计划把 fla / moe / gdn / fused_moe 等整族搬进 `providers/`。按 v3 的
+> "只补缺口"规则（[`extending.md`](extending.md) §3.0），这些是厂商**已经覆盖**的能力，
+> 搬进去等于重做一遍，因此不再搬：它们留在冻结区，按删除清单逐批清理；`providers/`
+> 只收厂商确实不能用的实现。所以 S4 的产出从"实现与声明同目录"改成**一张确认清单**：
+> 哪条形状厂商真的用不了。当前结论是"没有"，本层为空。
 
 ---
 
