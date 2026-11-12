@@ -159,7 +159,7 @@
 - `XIELU` 是 `CustomOp`，Ascend 上默认走 `forward_native` 的 Python fallback，
   所以 C1/C2 很可能已经能过；真正要做的是 fused Ascend XIELU，改善 C4/graph；
 - 它更像“1～2 周的算子试点”，不是“让一个跑不了的模型跑起来”；
-- 上下文较短，不适合作为长上下文主模型。
+- 长上下文能力要以 config 为准；它更适合作为算子试点，而不是长上下文主模型。
 
 **K2-Horizon 只在允许升到 0.30 时考虑。**
 
