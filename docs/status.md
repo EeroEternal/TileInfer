@@ -131,6 +131,7 @@ python3 scripts/ti_trace.py run --preset smoke
 | 机器 | `tileinfer-102`（10.119.5.102），`/home/userlist/zxs/TileInfer` |
 | 卡 | 1 × Ascend950PR，131072 MB HBM |
 | CANN | 9.3.0，在 `.work/cann930/install/cann` |
+| 版本策略 | 冻结 vLLM 0.23.0 / vllm-ascend 0.23.0-**950**；M5 前做 V0 gate，见 [`notes/version-strategy.md`](notes/version-strategy.md) |
 | Python（本题后端） | `.venv_native213`：torch 2.13.0+cpu、vLLM 0.23.0、tilelang 0.1.15 |
 | Python（基线 A/B） | `.venv_baseline`：vllm-ascend 0.23，不含 tileinfer |
 | TileLang 缓存 | `$HOME/tl_cache_213`（**不要放进仓库**） |
