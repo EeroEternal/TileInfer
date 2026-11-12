@@ -117,6 +117,9 @@
 
 ## 5. 对 M5 选型的建议
 
+> 如果 vLLM 本身没有该模型，"支持"就不只是算子/注意力，而是完整 model bring-up；
+> 分层清单见 [`model-bringup-layers.md`](model-bringup-layers.md)。
+
 1. **首选 K2-Horizon-MoVA-36B-A4B。**
    - 37.4B、Apache-2.0、非中国团队、有 HF/vLLM 生态；
    - 缺口明确：MoVA attention + MoE 自定义算子，Ascend 没有；
