@@ -27,5 +27,7 @@
   "extra_layer_keys": [],
   "extra_layer_count": 0,
   "mtp_weights_found": true,
-  "note": "found"
+  "note": "found",
+  "source": "https://hf-mirror.com/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16/raw/main/model.safetensors.index.json",
+  "scope": "index metadata only; no tensor/weight bytes downloaded"
 }
