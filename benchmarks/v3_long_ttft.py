@@ -1,16 +1,23 @@
-"""Long-prompt (3.9K token) TTFT/TPOT probe, streaming, median of N runs.
+"""Long-prompt TTFT/TPOT probe, streaming, median of N runs.
 
 Kept in-repo so the numbers in docs/notes/m1-v3-bridge.md can be re-derived after
-/tmp is cleaned.  Usage: python benchmarks/v3_long_ttft.py <port> <label> <out.json> [runs]
+/tmp is cleaned.  Usage:
+
+    TI_PROMPT=/tmp/prompt-8k.txt python benchmarks/v3_long_ttft.py <port> <label> <out.json> [runs]
+
+`TI_PROMPT` defaults to the 3.9K prompt used by M1; `TI_MAX_TOKENS` defaults to 32.
+Build prompts with `benchmarks/make_long_prompt.py --tokens N --out ...`.
 """
 
-import json, statistics, sys, time, urllib.request
+import json, os, statistics, sys, time, urllib.request
 PORT=int(sys.argv[1]); LABEL=sys.argv[2]; OUT=sys.argv[3]; RUNS=int(sys.argv[4]) if len(sys.argv)>4 else 3
-PROMPT=open('/tmp/long4k_prompt.txt',encoding='utf-8').read()
+PROMPT_PATH=os.environ.get("TI_PROMPT","/tmp/long4k_prompt.txt")
+MAX_TOKENS=int(os.environ.get("TI_MAX_TOKENS","32"))
+PROMPT=open(PROMPT_PATH,encoding='utf-8').read()
 BASE=f"http://127.0.0.1:{PORT}"
 
 def one():
-    payload={"model":"qwen36","messages":[{"role":"user","content":PROMPT}],"max_tokens":32,
+    payload={"model":"qwen36","messages":[{"role":"user","content":PROMPT}],"max_tokens":MAX_TOKENS,
              "temperature":0,"stream":True,"stream_options":{"include_usage":True}}
     req=urllib.request.Request(BASE+"/v1/chat/completions",data=json.dumps(payload).encode(),
                                headers={"Content-Type":"application/json"})
@@ -34,6 +41,7 @@ def one():
 one()  # warm
 res=[one() for _ in range(RUNS)]
 o={"label":LABEL,"port":PORT,"runs":RUNS,"prompt_tokens":res[0]["ptoks"],
+   "prompt":PROMPT_PATH,"max_tokens":MAX_TOKENS,
    "ttft_ms_p50":round(statistics.median([r["ttft"] for r in res])*1000,2),
    "tpot_ms_p50":round(statistics.median([r["tpot"] for r in res])*1000,3),
    "out_toks_p50":round(statistics.median([r["tokens"] for r in res]),2)}

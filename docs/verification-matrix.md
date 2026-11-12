@@ -52,6 +52,10 @@
 参考：当前 KV 容量 1,158,912 tokens / 39.77 GiB（折算约 36 KiB/token），单请求 262K 的
 KV 约 9 GiB，容量不是最明显的墙；**真正要先量的是 262K prefill 的峰值激活**。
 
+prompt 用 `benchmarks/make_long_prompt.py --tokens N --out /tmp/prompt-Nk.txt` 生成，
+探针用 `TI_PROMPT=/tmp/prompt-Nk.txt benchmarks/v3_long_ttft.py <port> <label> <out> [runs]`；
+两者都以 `usage.prompt_tokens` 为准，不拿字符数冒充 token 数。
+
 ### 1.3 图模式
 
 | # | 场景 | 证据 | 门 | Qwen3.6 |
