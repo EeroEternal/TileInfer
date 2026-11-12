@@ -54,6 +54,8 @@ KV 约 9 GiB，容量不是最明显的墙；**真正要先量的是 262K prefil
 
 prompt 用 `benchmarks/make_long_prompt.py --tokens N --out /tmp/prompt-Nk.txt` 生成，
 探针用 `TI_PROMPT=/tmp/prompt-Nk.txt benchmarks/v3_long_ttft.py <port> <label> <out> [runs]`；
+正确性用 `benchmarks/needle_probe.py`（50% 深度埋码），操作步骤见
+[`notes/long-context-runbook.md`](notes/long-context-runbook.md)。
 两者都以 `usage.prompt_tokens` 为准，不拿字符数冒充 token 数。
 
 ### 1.3 图模式
