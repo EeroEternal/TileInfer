@@ -4,7 +4,7 @@
 > 目标形态见 [`architecture.md`](architecture.md)，验收口径见 [`acceptance.md`](acceptance.md)，
 > 数字见 [`performance.md`](performance.md)。
 >
-> 最后核对：**2026-11-12 20:10**，代码 `6183c95`（长上下文 L4/L5；v3 主体 `6f41866`），
+> 最后核对：**2026-11-12 20:20**，代码 `567a669`（长上下文 L4/L5；v3 主体 `6f41866`），
 > 单卡 Ascend950PR，CANN 9.3.0。
 
 ---
