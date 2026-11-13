@@ -19,7 +19,7 @@
 | `max_position_embeddings` | 262144 |
 | attention | 32 heads / 2 KV heads / head_dim 128；RoPE theta 10000；partial rotary 1.0 |
 | Mamba2 | 64 heads / head_dim 64 / state 128 / groups 8 / conv 4 / expand 2 |
-| MoE | 128 routed experts / top-6 / intermediate 1856 / 1 shared expert |
+| MoE | 128 routed experts / top-6 / intermediate 1856 / 1 shared expert / shared intermediate 3712 |
 | `num_nextn_predict_layers` | 1 |
 | MTP 层型 | `["attention","moe"]` |
 | dtype / 量化 | bfloat16 / `none` |
@@ -67,7 +67,7 @@ n_groups/conv_kernel/expand/chunk_size -> mamba_n_groups/mamba_d_conv/...
 | `layer_types` | 23 `mamba` + 23 `moe` + 6 `full_attention` |
 | `attention` | `gqa`, 32/2 heads, head_dim 128, rope |
 | `mamba` | `MambaSpec(mamba2, 64 heads, 64 dim, state 128, groups 8, conv 4, expand 2)` |
-| `moe` | 128 experts, top_k 6, intermediate 1856, shared 1 |
+| `moe` | 128 experts, top_k 6, intermediate 1856, shared 1, shared intermediate 3712 |
 | `quantization` | `none` |
 | `kv` | hybrid；6 full attention / 23 Mamba / 23 MoE；上下文 262144；MTP 1 层 |
 | `required_capabilities` | 7 项：`attention.full`, `moe.routed`, `norm.rms`, `rotary`, `sampling.topk`, `state.linear`, `quant.verify` |

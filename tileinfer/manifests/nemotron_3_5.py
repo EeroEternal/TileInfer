@@ -64,6 +64,7 @@ NEMOTRON_3_5_DRAFT = ModelManifest(
         top_k=6,
         intermediate_size=1856,
         shared_experts=1,
+        shared_intermediate_size=3712,
     ),
     quantization="none",
     kv={

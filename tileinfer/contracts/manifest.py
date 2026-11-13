@@ -136,18 +136,28 @@ class MoESpec:
     top_k: int = 8
     intermediate_size: int = 512
     shared_experts: int = 0
+    shared_intermediate_size: int = 0
 
     def validate(self) -> None:
         if self.num_experts <= 0 or not (0 < self.top_k <= self.num_experts):
-            raise ValueError("MoE needs num_experts > 0 and 0 < top_k <= num_experts")
+            raise ValueError("MoE needs num_experts > 0 and 0 < top_k <= self.num_experts")
+        if self.shared_experts < 0 or self.shared_intermediate_size < 0:
+            raise ValueError("MoE shared expert counts/sizes must be non-negative")
+        if self.shared_experts and self.shared_intermediate_size <= 0:
+            raise ValueError("MoE with shared experts needs shared_intermediate_size > 0")
 
     def as_dict(self) -> Dict[str, Any]:
-        return {
+        data = {
             "num_experts": self.num_experts,
             "top_k": self.top_k,
             "intermediate_size": self.intermediate_size,
             "shared_experts": self.shared_experts,
         }
+        # Qwen's shared_experts=0 keeps the old byte-identical shape; Nemotron records the
+        # 3712-wide shared MLP that the checkpoint actually contains.
+        if self.shared_intermediate_size:
+            data["shared_intermediate_size"] = self.shared_intermediate_size
+        return data
 
 
 @dataclass(frozen=True)

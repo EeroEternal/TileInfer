@@ -84,6 +84,15 @@ def test_manifest_represents_an_explicit_moe_layer() -> None:
     assert "moe" in m.layer_types
 
 
+def test_moe_with_shared_expert_requires_a_shared_width() -> None:
+    with pytest.raises(ValueError, match="shared_intermediate_size"):
+        MoESpec(num_experts=8, top_k=1, shared_experts=1).validate()
+
+
+def test_qwen_moe_does_not_gain_the_shared_width_key() -> None:
+    assert "shared_intermediate_size" not in QWEN3_6.as_dict()["moe"]
+
+
 def test_manifest_rejects_recurrent_mixer_without_state_linear() -> None:
     m = _mamba_manifest(
         layer_types=("mamba", "full_attention"),
