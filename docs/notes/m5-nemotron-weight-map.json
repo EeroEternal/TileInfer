@@ -1,0 +1,40 @@
+{
+  "model_dir": "/home/models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
+  "index_present": true,
+  "weight_keys": 6513,
+  "declared_layers": 52,
+  "observed_kinds": {
+    "mamba": 23,
+    "moe": 23,
+    "attention": 6
+  },
+  "declared_kinds": {
+    "mamba": 23,
+    "moe": 23,
+    "attention": 6
+  },
+  "mtp_observed": [
+    "attention",
+    "moe"
+  ],
+  "mtp_keys": 270,
+  "other_keys": 3,
+  "shards_declared": 14,
+  "shards_present": 5,
+  "shards_missing": [
+    "model-00002-of-00014.safetensors",
+    "model-00003-of-00014.safetensors",
+    "model-00004-of-00014.safetensors",
+    "model-00007-of-00014.safetensors",
+    "model-00008-of-00014.safetensors",
+    "model-00009-of-00014.safetensors",
+    "model-00010-of-00014.safetensors",
+    "model-00011-of-00014.safetensors",
+    "model-00012-of-00014.safetensors"
+  ],
+  "shards_empty": [],
+  "mapping_ok": true,
+  "errors": [],
+  "weights_read": false,
+  "hardware_used": false
+}

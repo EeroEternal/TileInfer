@@ -32,6 +32,7 @@
 | F13 | vLLM 0.23 的 `NemotronHConfig` 直接加载该 config 会抛 `AttributeError: property 'layers_block_type' has no setter`；即使绕过，默认 `hybrid_override_pattern` 是 24 M / 24 MLP / 4 attention、无 MoE，与目标 23/23/6 不一致 | `.venv_v3/bin/python` 实测；见 G0 |
 | F14 | 用 `normalize_config()` 把 `layers_block_type`/`mtp_layers_block_type` 转成 `hybrid_override_pattern`/`mtp_hybrid_override_pattern` 后，`NemotronHConfig` 能加载，层型和 MTP pattern 与目标一致 | `tools/nemotron/config_to_manifest.py`；测试 `test_normalized_config_loads_in_vllm_without_npu` |
 | F15 | 权重索引有 270 个 `mtp.*` key（`mtp.layers.0` attention / `mtp.layers.1` moe），backbone 最大层号 51；MTP 权重确实存在 | [`m5-nemotron-mtp.json`](m5-nemotron-mtp.json)；索引 612207 B / 6513 keys |
+| F16 | 权重名与声明的 52 层完全对齐：23 Mamba / 23 MoE / 6 attention；每个 MoE 层 0..127 experts 齐全，MTP 为 attention+moe；`mapping_ok=true` | [`m5-nemotron-weight-map.json`](m5-nemotron-weight-map.json)；只读索引，不读 tensor |
 
 ---
 
