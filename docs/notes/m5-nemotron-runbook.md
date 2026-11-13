@@ -159,8 +159,12 @@ echo $! > /tmp/m5-nemotron.pid
   `gate_up_proj` 做 `up_proj` 别名。
 - **目标 dummy**：`m5-target-dummy4.log` 已通过 config、模型构造、Mamba2 warmup，随后在
   vendor 共享专家 `NemotronHMLP.gate_up_proj` 处失败；该别名已补。`m5-target-dummy5.log` 在
-  加载前因 HBM 只剩 57.85 GiB、请求 0.75×123 GiB 而退出，**没有目标 tensor、没有目标
-  请求**；这是资源等待，不是算子失败。
+  加载前因 HBM 只剩 57.85 GiB、请求 0.75×123 GiB 而退出。2026-11-13 19:38 卡空闲后，
+  `m5-target-dummy6.log` 以目标 52 层几何 + dummy 权重启动成功：加载 58.83 GB，KV 33.5 GiB，
+  `--enforce-eager`，`/health` 200；1 token prompt 和 161 token prompt 各完成 8 token
+  （`cmpl-b3d297350912e262`、`cmpl-88a043485639fdba`），没有 ACL/NotImplemented/回退错误。
+  这是**目标形状机械 smoke**，不是真权重 C1/C2/C3；服务已停止、端口已释放。证据：
+  [`m5-nemotron-target-dummy.json`](m5-nemotron-target-dummy.json)。
 
 证据：[`m5-nemotron-mamba2-ops.json`](m5-nemotron-mamba2-ops.json)。合成形状不等于目标 30B
 形状；目标 C1/C2 仍需完整权重 + 空闲卡。

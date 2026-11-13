@@ -40,6 +40,7 @@
 | F20 | vLLM 0.23.0 的 `_CONFIG_REGISTRY` 没有 `nemotron_h` 项；Transformers 4.57 下 `ModelConfig` 会在模型代码之前报 “does not recognize this architecture”。TileInfer 的 bridge 在 `ModelConfig` 之前注册 vLLM 自带的 `NemotronHConfig` 后，该错误消失 | `tileinfer/vllm/config_compat.py`；`tileinfer/bridge/install.py`；`.venv_v3` 实测 |
 | F21 | 目标 shim 的 `EngineArgs.create_engine_config()` 通过：`NemotronHForCausalLM`、attention block size 4096、Mamba page padded 4231168 B、padding 0.87%；没有加载权重、没有起服务 | [`m5-nemotron-config-load.json`](m5-nemotron-config-load.json) |
 | F22 | 合成同架构小模型（`M*`、2 层、dummy）最初在 “Warming up Mamba2 SSD Triton kernels” 阶段失败：`ssd_chunk_scan.py:238` 的 `CompilationError` / `AttributeError('NoneType' object has no attribute 'type')`，Ascend 后端报 `Currently ptr type from different source not supported`。该失败是待实现缺口，不是结论；随后 `tileinfer/vllm/ops/mamba2.py` 的 torch 替换和 op table 绑定使同一 `M*` 合成模型启动成功、`/health` 200、completion 返回 8 token | [`m5-nemotron-tiny-mamba2.json`](m5-nemotron-tiny-mamba2.json)；[`m5-nemotron-mamba2-ops.json`](m5-nemotron-mamba2-ops.json) |
+| F23 | 目标 30B 的 52 层几何 + dummy 权重也能启动：加载 58.83 GB、KV 33.5 GiB、`/health` 200；1 token 和 161 token prompt 各完成 8 token；无 ACL/NotImplemented/回退错误。因 `--enforce-eager` 且权重为 dummy，这不是 C1 正确性、C2 或 C3 证据 | [`m5-nemotron-target-dummy.json`](m5-nemotron-target-dummy.json)；`/tmp/m5-target-dummy6.log` |
 
 ---
 

@@ -79,6 +79,12 @@
       "log": "/tmp/m5-target-dummy5.log",
       "result": "not started",
       "cause": "worker saw 57.85 GiB free, below the requested 0.75 of 123.02 GiB; no model tensor allocated"
+    },
+    {
+      "log": "/tmp/m5-target-dummy6.log",
+      "result": "target 52-layer geometry started and served with dummy weights",
+      "detail": "58.83 GB dummy weights, 33.5 GiB KV, /health 200, 1+8 and 161+8 token completions; --enforce-eager so this is not C3",
+      "evidence": "m5-nemotron-target-dummy.json"
     }
   ],
   "honesty": [
