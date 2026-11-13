@@ -71,6 +71,8 @@ REQUIRED_NAMES: Tuple[str, ...] = (
     "fused_recurrent_gated_delta_rule_packed_decode",
     "chunk_local_cumsum",
     "fused_post_conv_prep",
+    "mamba_chunk_scan_combined_varlen",
+    "selective_state_update",
     "topk_softmax",
     "moe_align_block_size",
     "fused_experts",
@@ -212,7 +214,7 @@ def bind() -> List[Any]:
     # Imported here, not at module level: ``install`` imports this module, so the data class has to
     # come from the already-loaded install module (a top-level import would be circular), and the
     # operator modules import torch.
-    from tileinfer.vllm.ops import moe
+    from tileinfer.vllm.ops import mamba2, moe
     from tileinfer.vllm.ops import fused_moe_oot
     from tileinfer.vllm.ops.fla import causal_conv1d, chunk, gating, post_conv, recurrent
     from tileinfer.vllm.ops.gdn import chunk_local_cumsum, l2norm_fwd
@@ -492,6 +494,55 @@ def bind() -> List[Any]:
                 ".../fused_moe/runner/moe_runner.py:369-374, :498-539, :682-706; "
                 ".../fused_moe/runner/shared_experts.py:92-112; "
                 "model_executor/custom_op.py:109-128, :204-205, :322-353"
+            ),
+        ),
+        # Nemotron's Mamba2 path.  These two records live in the gdn-moe family until a dedicated
+        # Nemotron profile exists: the family is the op table the target plan currently resolves,
+        # and both names are absent from Qwen's execution path, so binding them is inert there.
+        OpBinding(
+            op="mamba_chunk_scan_combined_varlen",
+            family="gdn",
+            targets=(f"{_MAMBA}.ssd_combined.mamba_chunk_scan_combined_varlen",),
+            aliases=(f"{_MAMBA.rsplit('.', 1)[0]}.mamba_mixer2.mamba_chunk_scan_combined_varlen",),
+            impl=mamba2.mamba_chunk_scan_combined_varlen,
+            why=(
+                "Mamba2 prefill's SSD chunk scan. vLLM 0.23 implements it with four Triton kernels; "
+                "on Ascend the first compile fails in ssd_chunk_scan.py:238 with 'Currently ptr type "
+                "from different source not supported'. Our torch implementation keeps the same "
+                "varlen/cu_seqlens/initial_states ABI and is checked against the scalar recurrence "
+                "on CPU (tests/test_mamba2_ops.py). It is rebound at the definition and in "
+                "mamba_mixer2, which imports the name by value."
+            ),
+            remove_when=(
+                "when vllm-ascend ships a working Mamba2 SSD kernel for this shape, or vLLM's "
+                "mamba path gains a torch fallback."
+            ),
+            upstream_ref=(
+                "vllm/model_executor/layers/mamba/ops/ssd_combined.py:157-213; "
+                "ssd_chunk_scan.py:238; mamba_mixer2.py:35-37, :848"
+            ),
+        ),
+        OpBinding(
+            op="selective_state_update",
+            family="gdn",
+            targets=(f"{_MAMBA}.ssu_dispatch.selective_state_update",),
+            aliases=(
+                f"{_MAMBA.rsplit('.', 1)[0]}.mamba_mixer2.selective_state_update",
+            ),
+            impl=mamba2.selective_state_update,
+            why=(
+                "Mamba2 decode state update; vLLM dispatches to its Triton SSU backend. The torch "
+                "implementation updates the selected state block and writes the D/z-corrected "
+                "output in place, with the same signature and state_batch_indices contract. "
+                "Checked against the scalar recurrence on CPU."
+            ),
+            remove_when=(
+                "when vllm-ascend's SSU backend supports MAMBA2 on this device, or vLLM ships a "
+                "torch SSU fallback."
+            ),
+            upstream_ref=(
+                "vllm/model_executor/layers/mamba/ops/ssu_dispatch.py:237-270; "
+                "ops/mamba_ssm.py:496-620; mamba_mixer2.py:36-37"
             ),
         ),
         OpBinding(

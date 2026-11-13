@@ -526,3 +526,32 @@ def test_nemotron_h_config_alias_is_resolvable_by_autoconfig(tmp_path: Path) -> 
     assert type(config).__name__ == "NemotronHConfig"
     assert config.num_hidden_layers == 52
     assert config.model_type == "nemotron_h"
+
+
+def test_raw_layers_block_type_is_normalised_before_vllm_config_init(tmp_path: Path) -> None:
+    """Nemotron checkpoints export a list, vLLM exposes a read-only property derived from a string.
+
+    This is the shape that made a raw 30B config fail with
+    ``AttributeError: property 'layers_block_type' ... has no setter``; the adapter must convert it
+    before the vendor class sees it.
+    """
+    from tileinfer.vllm.config_compat import register_nemotron_h_alias
+
+    info = register_nemotron_h_alias()
+    if not info["registered"]:
+        pytest.skip(f"vLLM/Transformers unavailable: {info['detail']}")
+
+    raw = json.loads((ROOT / "docs/notes/m5-nemotron-config.json").read_text(encoding="utf-8"))
+    raw["layers_block_type"] = ["mamba", "moe", "mamba", "attention"] * 13
+    raw["num_hidden_layers"] = len(raw["layers_block_type"])
+    raw["mtp_layers_block_type"] = ["attention", "moe"]
+    raw.pop("hybrid_override_pattern", None)
+    (tmp_path / "config.json").write_text(json.dumps(raw), encoding="utf-8")
+
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained(str(tmp_path), local_files_only=True)
+    assert type(config).__name__ == "NemotronHConfig"
+    assert config.hybrid_override_pattern == "MEM*" * 13
+    assert config.mtp_hybrid_override_pattern == "*E"
+    assert config.layers_block_type[:4] == ["mamba", "moe", "mamba", "attention"]

@@ -39,7 +39,7 @@
 | F19 | 已在盘上的 5 个分片里，1950 个 tensor 的 header shape 与 config 推导值一致；0 处不匹配；18 个非 mixer/norm 类 key 未做形状检查 | [`m5-nemotron-shapes.json`](m5-nemotron-shapes.json)；只读 header，不读 tensor payload |
 | F20 | vLLM 0.23.0 的 `_CONFIG_REGISTRY` 没有 `nemotron_h` 项；Transformers 4.57 下 `ModelConfig` 会在模型代码之前报 “does not recognize this architecture”。TileInfer 的 bridge 在 `ModelConfig` 之前注册 vLLM 自带的 `NemotronHConfig` 后，该错误消失 | `tileinfer/vllm/config_compat.py`；`tileinfer/bridge/install.py`；`.venv_v3` 实测 |
 | F21 | 目标 shim 的 `EngineArgs.create_engine_config()` 通过：`NemotronHForCausalLM`、attention block size 4096、Mamba page padded 4231168 B、padding 0.87%；没有加载权重、没有起服务 | [`m5-nemotron-config-load.json`](m5-nemotron-config-load.json) |
-| F22 | 合成同架构小模型（`M*`、2 层、dummy）能构造 Mamba2 层、加载 0.1253 GB dummy 权重，但在 “Warming up Mamba2 SSD Triton kernels” 阶段失败：`ssd_chunk_scan.py:238` 的 `CompilationError` / `AttributeError('NoneType' object has no attribute 'type')`，Ascend 后端报 `Currently ptr type from different source not supported`；服务未监听 `/health` | [`m5-nemotron-tiny-mamba2.json`](m5-nemotron-tiny-mamba2.json)；只跑合成模型，不碰目标权重 |
+| F22 | 合成同架构小模型（`M*`、2 层、dummy）最初在 “Warming up Mamba2 SSD Triton kernels” 阶段失败：`ssd_chunk_scan.py:238` 的 `CompilationError` / `AttributeError('NoneType' object has no attribute 'type')`，Ascend 后端报 `Currently ptr type from different source not supported`。该失败是待实现缺口，不是结论；随后 `tileinfer/vllm/ops/mamba2.py` 的 torch 替换和 op table 绑定使同一 `M*` 合成模型启动成功、`/health` 200、completion 返回 8 token | [`m5-nemotron-tiny-mamba2.json`](m5-nemotron-tiny-mamba2.json)；[`m5-nemotron-mamba2-ops.json`](m5-nemotron-mamba2-ops.json) |
 
 ---
 
@@ -68,7 +68,7 @@
 |---|---|---|---|---|
 | G0 | **目标 config 与 vLLM 0.23 schema 不兼容** | **已实测**：raw config 直接 `AttributeError`；默认 pattern 也不是目标 pattern | config shim（`normalize_config`，不改上游） | vLLM/上游接受 `layers_block_type` 或升级 |
 | G1 | NemotronH 模型在 Ascend 的注册/加载 | 未知（可能 vLLM 通用路径可接） | model table / 模型包装 | vllm-ascend 原生注册 NemotronH |
-| G2 | Mamba2 mixer 的 SSD/chunk-scan 执行路径 | **已有机械失败证据**：合成同架构模型在 `ssd_chunk_scan.py:238` Triton 编译失败；目标形状未测。`state.linear` 路由已按 `covers["mixer"]` 区分 GDN，Mamba2 仍无 provider | `state.linear` + `Mamba2Contract` provider | 厂商 Mamba2/SSD backend 覆盖该形状 |
+| G2 | Mamba2 mixer 的 SSD/chunk-scan 执行路径 | 厂商 Triton 在 `ssd_chunk_scan.py:238` 编译失败；已用 torch 实现 `mamba_chunk_scan_combined_varlen` / `selective_state_update`，在合成 `M*` 和 `M*E` 模型上启动并完成请求；目标 30B 形状未测，`state.linear` provider 尚未登记 | `state.linear` + `Mamba2Contract` provider | 目标 C1/C2 通过后才把 provider 写进默认表；否则保持 gap |
 | G3 | 混合 attention（full + Mamba）的 KV/state 布局 | 未知 | state/KV provider 或 bridge | 厂商支持混合 KV/MambaSpec |
 | G4 | MTP（`NemotronHMTPModel`）在 Ascend 的注册/执行 | 权重已确认（270 个 `mtp.*` key）；Ascend 注册/执行/图仍未知 | MTP provider / model table | 厂商注册并验证 NemotronHMTP |
 | G5 | 图捕获（Mamba state + 混合 attention） | 未知 | graph hook（不是 provider） | 厂商图路径覆盖 |

@@ -148,9 +148,14 @@ MTP 投机、长上下文（8K/16K/32K/128K；config 声明 262144，262K 为条
 已执行（2026-11-13，授权后）：
 
 - 目标 shim 的 `EngineArgs.create_engine_config()`：通过，block 4096 / Mamba page 4231168；
-- 合成 2 层 `M*` 小模型 dummy：Mamba2 SSD Triton 编译失败，服务未起；证据见
-  [`m5-nemotron-tiny-mamba2.json`](m5-nemotron-tiny-mamba2.json)；
-- 卡上已有他人的 `VLLM::EngineCore`（约 103 GB HBM），未终止、未抢占。
+- 合成 2 层 `M*` 小模型 dummy：厂商 Mamba2 SSD Triton 编译失败；随后 torch 替换使其启动成功，
+  `/health` 200，completion 8 token；证据见 [`m5-nemotron-tiny-mamba2.json`](m5-nemotron-tiny-mamba2.json)、
+  [`m5-nemotron-mamba2-ops.json`](m5-nemotron-mamba2-ops.json)；
+- 合成 3 层 `M*E` 小模型（非门控 relu2 experts）：启动成功，completion 6 token；同一证据文件；
+- 目标 dummy 已通过 config / 模型构造 / Mamba2 warmup，后在 vendor 共享专家
+  `NemotronHMLP.gate_up_proj` 处失败，已补别名；下一次目标 dummy 因 HBM 不足（57.85 GiB free）
+  在加载前退出，没有目标 tensor/请求；
+- 卡上已有他人的 `VLLM::EngineCore` 或其他服务（约 103 GB HBM），未终止、未抢占。
 
 仍未做：
 
@@ -192,10 +197,11 @@ MTP 投机、长上下文（8K/16K/32K/128K；config 声明 262144，262K 为条
 | 阻塞 | 影响 | 今晚能否绕过 |
 |---|---|---|
 | 目标权重 5/14 | 目标 C1/C2 不能执行；dummy 可做但占完整 HBM | 补齐 9 个分片后 `ready_to_load=true` |
-| 目标卡被他人 `VLLM::EngineCore` 占用（约 103 GB） | 目标 30B dummy/服务无法安全启动 | 等卡空闲，或由用户协调；不 kill |
-| Mamba2 SSD Triton 在合成模型上编译失败 | G2 已有机械失败证据；目标形状未测 | 需要 `state.linear`/Mamba2 provider 或厂商 SSD kernel |
+| 目标卡被他人 `VLLM::EngineCore` / 其他服务占用 | 目标 30B dummy/服务无法安全启动；最近一次只剩 57.85 GiB free | 等卡空闲，或由用户协调；不 kill |
+| Mamba2 SSD Triton 在合成模型上编译失败 | 已由 torch provider 绕过；合成 `M*`/`M*E` 启动成功；目标形状未测 | 目标 C1 验证数值/图；目标通过前不把 provider 登记为默认 |
 | 目标 `nemotron_h` 不在 vLLM AutoConfig 注册表 | 无别名时 `ModelConfig` 直接失败 | bridge 已补别名；不要关 `TILEINFER_V3` |
 | 参考实现未跑 | C2 top5 未产生 | 完整权重后 CPU HF probe |
 
-**下一步**：等目标卡空闲且权重补齐；先做目标 dummy（带 `TILEINFER_PLAN` 和
-`--enforce-eager`），确认是否仍在 Mamba2 SSD kernel 失败；再决定是否补 provider/换路径。
+**下一步**：等目标卡空闲且权重补齐；先用已补的共享专家别名 + torch Mamba2 做目标 dummy
+（带 `TILEINFER_PLAN` 和 `--enforce-eager`），确认目标形状能完成 C1；目标 C1/C2 通过前，
+`state.linear` 仍保持 gap，不把 provider 写成默认支持。

@@ -137,20 +137,33 @@ echo $! > /tmp/m5-nemotron.pid
 
 结果只记“机械链路通过/失败 + 首个错误”，不要写成“模型可用”。
 
-### 2.1 已记录的合成小模型结果（2026-11-13）
+### 2.1 合成小模型结果与 Torch 算子替换（2026-11-13）
 
-目标卡当时被他人 `VLLM::EngineCore` 占用（约 103 GB HBM），没有抢占，也没有起目标 30B
-dummy。改用 2 层、`M*`、hidden 256 的合成同架构模型做机械 smoke：
+目标卡多次被他人 `VLLM::EngineCore` / 其他服务占用，没有抢占、没有 kill 他人进程。为了把
+“厂商 Mamba2 SSD 编译失败”从阻塞变成可执行缺口，我们补了 torch 参考算子并先在合成同架构
+模型上验证：
 
-- 能构造模型、加载 0.1253 GB dummy 权重；
-- 进入 `Warming up Mamba2 SSD Triton kernels` 后失败：
-  `ssd_chunk_scan.py:238` 的 `CompilationError` / `AttributeError('NoneType' object has no
-  attribute 'type')`，Ascend 后端报 `Currently ptr type from different source not supported`；
-- 服务没有监听 `/health`，自己的进程已停止；
-- 证据：[`m5-nemotron-tiny-mamba2.json`](m5-nemotron-tiny-mamba2.json)。
+- **厂商失败证据**（保留）：2 层 `M*`、hidden 256，进入
+  `Warming up Mamba2 SSD Triton kernels` 后，`ssd_chunk_scan.py:238` 的
+  `CompilationError` / `AttributeError('NoneType' object has no attribute 'type')`，Ascend 后端
+  报 `Currently ptr type from different source not supported`；服务未监听 `/health`。证据
+  [`m5-nemotron-tiny-mamba2.json`](m5-nemotron-tiny-mamba2.json)。
+- **替换后**：`tileinfer/vllm/ops/mamba2.py` 实现 `mamba_chunk_scan_combined_varlen` 和
+  `selective_state_update`；op table 在 `ssd_combined`、`mamba_mixer2`、`ssu_dispatch` 三处
+  绑定。2 层 `M*` 合成模型启动成功，`/health` 200，chat completion 返回 8 token
+  （`chatcmpl-90bbd5d4088b9a52`）。
+- **非门控 MoE**：目标专家 MLP 是 `relu2_no_mul`、`w1=[E,inter,hidden]`，不是 SwiGLU。扩展
+  `fused_experts` 后，3 层 `M*E`、4 experts、top-2 的合成模型启动成功，completion 返回 6 token
+  （`cmpl-b01b37e4b878290f`）。同时绕过 vLLM `FusedMoE` 的
+  `is_act_and_mul=False` 平台 guard，只在该构造调用期间生效；NemotronHMLP 的共享专家
+  `gate_up_proj` 做 `up_proj` 别名。
+- **目标 dummy**：`m5-target-dummy4.log` 已通过 config、模型构造、Mamba2 warmup，随后在
+  vendor 共享专家 `NemotronHMLP.gate_up_proj` 处失败；该别名已补。`m5-target-dummy5.log` 在
+  加载前因 HBM 只剩 57.85 GiB、请求 0.75×123 GiB 而退出，**没有目标 tensor、没有目标
+  请求**；这是资源等待，不是算子失败。
 
-这说明当前 vllm-ascend 的 Mamba2 SSD chunk-scan 路径不可用；但合成形状不是目标 30B 形状，
-不能直接写成“目标确认不支持”。目标 C1 仍需完整权重 + 空闲卡 + 目标 dummy。
+证据：[`m5-nemotron-mamba2-ops.json`](m5-nemotron-mamba2-ops.json)。合成形状不等于目标 30B
+形状；目标 C1/C2 仍需完整权重 + 空闲卡。
 
 停止：
 

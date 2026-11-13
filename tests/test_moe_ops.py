@@ -571,6 +571,27 @@ def test_fused_experts_matches_per_token_loop():
     torch.testing.assert_close(out, ref, **FP32_TOL)
 
 
+def test_fused_experts_non_gated_relu2_matches_per_token_loop():
+    """Nemotron's expert MLP has no gate half: w1 is [E, inter, hidden] and activation is relu2."""
+    torch.manual_seed(0)
+    g = torch.Generator().manual_seed(31)
+    hidden, inter, num_experts = 16, 12, 5
+    w1 = torch.randn((num_experts, inter, hidden), generator=g) * 0.05
+    w2 = torch.randn((num_experts, hidden, inter), generator=g) * 0.05
+    x = torch.randn((6, hidden), generator=g)
+    ids = torch.randint(0, num_experts, (6, 2), generator=g)
+    weights = _weights_and_ids(ids, 32)
+
+    out = moe_ops.fused_experts(x, w1, w2, weights, ids, activation="relu2_no_mul")
+    ref = torch.zeros_like(x)
+    for t in range(x.shape[0]):
+        for k in range(ids.shape[1]):
+            e = int(ids[t, k])
+            h = torch.relu(x[t] @ w1[e].T).square()
+            ref[t] += weights[t, k] * (h @ w2[e].T)
+    torch.testing.assert_close(out, ref, **FP32_TOL)
+
+
 def test_fused_experts_256_experts_top8():
     g = torch.Generator().manual_seed(23)
     hidden, inter, num_experts, top_k = 16, 8, 256, 8
@@ -758,6 +779,9 @@ def test_fused_experts_empty_batch():
 
 
 def test_fused_experts_validation():
+    # Validation is cached per (device, expert count); earlier tests in this module may have
+    # populated the cache. The invalid-id assertions below must see a fresh check.
+    moe_ops._VALIDATED_ID_BOUNDS.clear()
     w1, w2 = _random_moe(48, 4, 8, 4)
     x = torch.randn(3, 8)
     ids = torch.zeros((3, 2), dtype=torch.int64)

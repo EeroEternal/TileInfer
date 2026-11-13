@@ -1,0 +1,89 @@
+{
+  "evidence_id": "m5-nemotron-mamba2-ops-2026-11-13",
+  "date": "2026-11-13",
+  "timezone": "Asia/Shanghai",
+  "scope": "synthetic-only operator bring-up; NOT a target 30B C1/C2 result",
+  "target": {
+    "model": "/home/models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
+    "shards_on_disk": 5,
+    "shards_expected": 14,
+    "ready_to_load": false,
+    "ready_for_dummy": true,
+    "target_request_sent": false,
+    "target_tensor_read": false
+  },
+  "implemented": {
+    "file": "tileinfer/vllm/ops/mamba2.py",
+    "entry_points": [
+      "mamba_chunk_scan_combined_varlen",
+      "selective_state_update"
+    ],
+    "math": "float32 scalar-recurrence arithmetic; softplus(dt + dt_bias); exp(dt*A) state decay; B-weighted state add; C readout; D skip; optional z gate; varlen chunk boundaries from cu_chunk_seqlens/seq_idx",
+    "not_graphable": true,
+    "request_time_compile": false
+  },
+  "cpu_checks": {
+    "command": ".venv_native213/bin/python -m pytest tests/test_mamba2_ops.py -q",
+    "tests": [
+      "chunk scan vs scalar recurrence with initial state",
+      "varlen boundaries + intermediate chunk states",
+      "decode selective_state_update vs one-token recurrence"
+    ],
+    "result": "3 passed"
+  },
+  "synthetic_npu": {
+    "mamba_only": {
+      "config": "2 layers M*, hidden 256, vocab 131072",
+      "service": "http://127.0.0.1:18080",
+      "health": "ok",
+      "completion_id": "chatcmpl-90bbd5d4088b9a52",
+      "completion_tokens": 8,
+      "warmup": "Mamba2 SSD Triton kernels warmed through the torch replacement"
+    },
+    "mamba_plus_non_gated_moe": {
+      "config": "3 layers M*E, 4 routed experts, top-2, moe_intermediate_size 64, mlp_hidden_act relu2",
+      "service": "http://127.0.0.1:18082",
+      "health": "ok",
+      "completion_id": "cmpl-b01b37e4b878290f",
+      "completion_tokens": 6,
+      "notes": [
+        "vLLM FusedMoE guard is_act_and_mul=False bypassed only for the constructor call",
+        "AscendUnquantizedFusedMoEMethod.apply routed through tileinfer.vllm.ops.moe.fused_experts with relu2_no_mul",
+        "NemotronHMLP.gate_up_proj aliased to up_proj for the Ascend shared-expert branch",
+        "shared expert path validated separately with n_shared_experts=1"
+      ]
+    },
+    "shared_expert": {
+      "config": "3 layers M*E, 4 routed experts, top-2, n_shared_experts=1, shared intermediate 64, relu2",
+      "service": "http://127.0.0.1:18083",
+      "health": "ok",
+      "completion_id": "cmpl-98a054a78c698130",
+      "completion_tokens": 4,
+      "notes": [
+        "NemotronHMLP.gate_up_proj alias exercised by the Ascend shared-expert branch"
+      ]
+    }
+  },
+  "target_attempts": [
+    {
+      "log": "/tmp/m5-target-dummy3.log",
+      "result": "failed before model load",
+      "cause": "vLLM FusedMoE layer.py:367-372 rejects is_act_and_mul=False on Ascend"
+    },
+    {
+      "log": "/tmp/m5-target-dummy4.log",
+      "result": "model init and Mamba2 warmup passed; failed in the first forward",
+      "cause": "vendor Ascend shared-expert path assumed NemotronHMLP.gate_up_proj"
+    },
+    {
+      "log": "/tmp/m5-target-dummy5.log",
+      "result": "not started",
+      "cause": "worker saw 57.85 GiB free, below the requested 0.75 of 123.02 GiB; no model tensor allocated"
+    }
+  ],
+  "honesty": [
+    "No claim that the target 30B is servable: weights are 5/14 and no target request has run.",
+    "The synthetic runs prove the Mamba2 and non-gated MoE paths execute on NPU for small shapes; they do not prove target shape numerics, graph capture, MTP or C2 agreement.",
+    "The operator remains eager torch and is declared non-graphable; no request-time compile is added."
+  ]
+}

@@ -155,7 +155,11 @@ def _announce(moe: Any, backend_name: str) -> None:
 
 
 def check_unquantized_config(moe: Any) -> None:
-    """Refuse anything but an unquantised, single-rank, gated-MLP bf16/fp16 MoE config.
+    """Refuse anything but an unquantised, single-rank, bf16/fp16 MoE config.
+
+    Non-gated MLPs (``is_act_and_mul=False``, e.g. Nemotron's relu2 experts) are accepted: the
+    expert compute in ``tileinfer.vllm.ops.moe.fused_experts`` handles both the gated SwiGLU and
+    the non-gated relu2/silu forms.
 
     Attribute names are read defensively (``getattr`` with the upstream default), so this works on
     the real ``FusedMoEConfig`` (``.../fused_moe/config.py:1235-1269``) and on a stub in a test.  The
@@ -163,8 +167,8 @@ def check_unquantized_config(moe: Any) -> None:
 
     Raise ``NotImplementedError`` (a *refusal*, not a degradation) for:
 
-    * ``is_act_and_mul=False`` - ``layer.py:367-372`` already refuses a non-gated MLP on a
-      non-CUDA/non-XPU platform before any kernel runs, and our port is the gated SwiGLU MLP only;
+    * (removed) ``is_act_and_mul=False`` used to be refused here; the torch expert path now
+      implements the non-gated MLP as well, so Nemotron's relu2 experts are supported;
     * ``has_bias`` - upstream folds the expert bias into the quant config
       (``unquantized_fused_moe_method.py:275-282``); ``fused_experts`` has no bias argument, so
       accepting the config would silently drop it;
@@ -177,13 +181,6 @@ def check_unquantized_config(moe: Any) -> None:
       (``quant_dtype``/``weight_quant_dtype``, or any of ``moe._QUANT_BOOL_ATTRS`` /
       ``moe._QUANT_VALUE_ATTRS``) - that is a quantised config.
     """
-    if getattr(moe, "is_act_and_mul", True) is not True:
-        raise NotImplementedError(
-            "TileInfer OOT MoE: moe.is_act_and_mul=False (the non-gated MLP) is not implemented; "
-            "vLLM refuses it on a non-CUDA/non-XPU platform itself "
-            "(model_executor/layers/fused_moe/layer.py:367-372) and this port only implements the "
-            "gated SwiGLU expert MLP (tileinfer/vllm/ops/moe.py: fused_experts)."
-        )
     if getattr(moe, "has_bias", False):
         raise NotImplementedError(
             "TileInfer OOT MoE: moe.has_bias=True is not implemented; upstream folds w13_bias/"

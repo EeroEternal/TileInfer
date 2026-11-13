@@ -899,19 +899,23 @@ def fused_experts(
     # The enum member and the bare string are the same request; compare the name so a call from
     # either side of the wrapper (fused_moe.py:1480 passes the enum, :1496 the string) agrees.
     activation_name = str(getattr(activation, "value", activation)).strip().lower()
-    if activation_name != "silu":
+    # vLLM spells a non-gated expert MLP as ``<activation>_no_mul`` (activation.py:53-101); the
+    # suffix is the contract, not a guess from the weight shape.  Nemotron's route is relu2_no_mul.
+    gated = not activation_name.endswith("_no_mul")
+    base_activation = activation_name[: -len("_no_mul")] if not gated else activation_name
+    if base_activation not in ("silu", "relu2"):
         raise NotImplementedError(
-            f"activation={activation!r} is not implemented; only 'silu' (SwiGLU) is, because the "
-            "gelu variant's exact kernel formula could not be verified offline"
+            f"activation={activation!r} is not implemented; this port supports the gated/non-gated "
+            "'silu' and 'relu2' expert MLPs only (relu2 is Nemotron's non-gated MLP)"
         )
 
     num_tokens, hidden = hidden_states.shape
     num_experts, two_i, w1_hidden = w1.shape
     if w1_hidden != hidden:
         raise ValueError(f"w1 has hidden={w1_hidden}, expected {hidden}")
-    if two_i % 2 != 0:
-        raise ValueError(f"w1's second dimension must be 2*inter (even), got {two_i}")
-    inter = two_i // 2
+    if gated and two_i % 2 != 0:
+        raise ValueError(f"gated w1's second dimension must be 2*inter (even), got {two_i}")
+    inter = two_i // 2 if gated else two_i
     if tuple(w2.shape) != (num_experts, hidden, inter):
         raise ValueError(f"w2 must be [{num_experts}, {hidden}, {inter}], got {tuple(w2.shape)}")
 
@@ -1004,7 +1008,7 @@ def fused_experts(
         # branch, so the ``top_k`` reduction cannot pick up uninitialised memory.
         slot_out = torch.empty((num_tokens * top_k, hidden), dtype=torch.float32, device=device)
         dead = (local < 0).nonzero(as_tuple=False).reshape(-1)
-        if _sorted_path_enabled() and not apply_router_weight_on_input:
+        if _sorted_path_enabled() and gated and not apply_router_weight_on_input:
             _routed_sorted_into(
                 slot_out,
                 x_slot,
@@ -1022,9 +1026,19 @@ def fused_experts(
                 slots = torch.nonzero(active & (local == e), as_tuple=False).reshape(-1)
                 h = x_slot.index_select(0, slots)
                 gate_up = h @ w1[e].to(compute).T
-                # ``silu_and_mul`` forms the product in fp32 and stores it in ``x.dtype``, so it is
-                # the right activation for both modes (in fp32 mode the cast is a no-op).
-                act = _swiglu(gate_up)
+                if gated:
+                    if base_activation == "silu":
+                        # ``silu_and_mul`` forms the product in fp32; right for both modes.
+                        act = _swiglu(gate_up)
+                    else:
+                        # Gated relu2: gate half passes through relu(x)^2, up half multiplies it.
+                        half = gate_up.shape[-1] // 2
+                        act = torch.relu(gate_up[..., :half]).square() * gate_up[..., half:]
+                elif base_activation == "silu":
+                    act = torch.nn.functional.silu(gate_up)
+                else:
+                    # Non-gated Nemotron expert MLP: relu2(x) = relu(x)^2 (activation.py:144-146).
+                    act = torch.relu(gate_up).square()
                 y = act @ w2[e].to(compute).T
                 if apply_router_weight_on_input:
                     slot_out[slots] = y
