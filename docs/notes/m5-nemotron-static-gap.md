@@ -43,6 +43,7 @@
 | F23 | 目标 30B 的 52 层几何 + dummy 权重也能启动：加载 58.83 GB、KV 33.5 GiB、`/health` 200；1 token 和 161 token prompt 各完成 8 token；无 ACL/NotImplemented/回退错误。因 `--enforce-eager` 且权重为 dummy，这不是 C1 正确性、C2 或 C3 证据 | [`m5-nemotron-target-dummy.json`](m5-nemotron-target-dummy.json)；`/tmp/m5-target-dummy6.log` |
 | F24 | 同一目标 dummy 去掉 `--enforce-eager` 后，图捕获通过：PIECEWISE 1 + FULL 1，图内存 2.68 GiB，日志出现 `Replaying aclgraph`；这依赖非门控 MoE 的 grouped-matmul 路径和 decode state 的 tensor 索引化。仍不是完整 C3：权重 dummy，`decode_calls` 计数未推进 | [`m5-nemotron-target-graph.json`](m5-nemotron-target-graph.json)；`/tmp/m5-target-graph.log` |
 | F25 | 目标 dummy 的 MTP 执行路径可用：解析为 `NemotronHMTPModel`，加载 drafter 并共享 target embedding；161-token prompt 完成 8 token，metrics 为 7 drafts / 7 draft tokens / 0 accepted。0 accepted 是随机权重的预期结果；MTP 图捕获与真权重接受率未测 | [`m5-nemotron-target-mtp.json`](m5-nemotron-target-mtp.json)；`/tmp/m5-target-mtp.log` |
+| F26 | 目标 dummy 以 `max-num-seqs 4` 并发跑 4 个请求：164/204/244/284 prompt token 各完成 8 token，4/4 `finish_reason=length`，约 5.1–5.2 s；`request_success_total{length}=4`。这是 eager 机械并发，不是真权重正确性、图并发或吞吐结论 | [`m5-nemotron-target-concurrency.json`](m5-nemotron-target-concurrency.json)；`/tmp/m5-target-conc.log` |
 
 ---
 

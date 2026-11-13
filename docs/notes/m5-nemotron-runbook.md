@@ -249,6 +249,11 @@ python benchmarks/compare_responses.py \
 > 共享 target embedding，161-token prompt 的请求完成 8 token；metrics 有 7 次 draft、7 个 draft
 > token、0 个 accepted。0 accepted 是随机 dummy 权重的预期结果，不是质量结论；MTP 图捕获和真权重
 > 接受率未测。证据：[`m5-nemotron-target-mtp.json`](m5-nemotron-target-mtp.json)。
+>
+> 目标 dummy 还跑过 8K 上下文（6001 prompt token，eager，4 s）和 `max-num-seqs 4` 的 4 路并发
+> （164–284 prompt token，4/4 完成，约 5.1–5.2 s）。两者都是机械通路，不是真权重正确性、图并发
+> 或 SLA 结论。证据：[`m5-nemotron-target-long.json`](m5-nemotron-target-long.json)、
+> [`m5-nemotron-target-concurrency.json`](m5-nemotron-target-concurrency.json)。
 
 保持服务运行，观察日志/指标：
 

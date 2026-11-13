@@ -1,0 +1,35 @@
+{
+  "evidence_id": "m5-nemotron-target-long-2026-11-13",
+  "date": "2026-11-13",
+  "timezone": "Asia/Shanghai",
+  "scope": "target-shape 8K-context prefill/decode with dummy weights; mechanical only",
+  "service": {
+    "port": 18088,
+    "load_format": "dummy",
+    "max_model_len": 8192,
+    "max_num_seqs": 1,
+    "enforce_eager": true,
+    "gpu_memory_utilization": 0.75,
+    "health": 200,
+    "weights_loaded_gb": 58.8333,
+    "kv_cache_gib": 30.43,
+    "kv_cache_tokens": 1757184,
+    "plan_id": "abd6348895c2d65d"
+  },
+  "request": {
+    "id": "cmpl-b99e075df77bdba1",
+    "prompt_tokens": 6001,
+    "completion_tokens": 8,
+    "finish_reason": "length",
+    "wall_seconds": 4
+  },
+  "not_proven": [
+    "long-context correctness with real weights",
+    "8K graph capture (this run was eager)",
+    "concurrency",
+    "C1/C2"
+  ],
+  "logs": "/tmp/m5-target-long.log",
+  "response": "/tmp/m5-target-long-resp.json",
+  "cleanup": {"port_18088_free": true, "process_running": false}
+}
