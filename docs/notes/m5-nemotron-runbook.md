@@ -227,8 +227,15 @@ python benchmarks/compare_responses.py \
 ## 5. C3：图捕获
 
 > 当前 Mamba2 替换是 eager torch（`graphable=False`），C1 只能用 `--enforce-eager` 跑通；
-> **这不能作为 C3 证据**。C3 需要重新设计可捕获的 Mamba2 路径，或等厂商 Mamba2/SSD
-> backend 支持；在拿到 `captured_graphs > 0` 且稳态 `fallbacks = 0` 前，C3 保持未验证。
+> **这不能作为 C3 证据**。C3 需要重新设计可捕获的 Mamba2/MoE 路径，或等厂商 backend 支持；
+> 在拿到 `captured_graphs > 0` 且稳态 `fallbacks = 0` 前，C3 保持未验证。
+>
+> 合成 `M*E` 的首次图捕获实测（端口 18084，无 `--enforce-eager`）在 PIECEWISE 0/1 阶段失败：
+> `aclnnNonzero` 错误码 107027，位置 `tileinfer/vllm/ops/moe.py:1010`
+> （`(local < 0).nonzero(...)`）。这说明**非门控 MoE 的数据依赖路径先于 Mamba2 断图**；
+> 只修这一个 `nonzero` 会继续撞到 `torch.unique(...).tolist()` / `torch.nonzero`，需要
+> grouped/dense kernel，不是单行修补。证据：
+> [`m5-nemotron-c3-attempt.json`](m5-nemotron-c3-attempt.json)。
 
 保持服务运行，观察日志/指标：
 

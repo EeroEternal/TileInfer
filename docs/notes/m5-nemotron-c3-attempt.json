@@ -1,0 +1,41 @@
+{
+  "evidence_id": "m5-nemotron-c3-attempt-2026-11-13",
+  "date": "2026-11-13",
+  "timezone": "Asia/Shanghai",
+  "scope": "synthetic M*E graph-capture attempt; NOT target C3 evidence",
+  "model": "/tmp/m5-nemotron-tiny-moe",
+  "config": "3 layers M*E, 4 routed experts, top-2, n_shared_experts=1, relu2, hidden 256",
+  "service": {
+    "host": "127.0.0.1",
+    "port": 18084,
+    "load_format": "dummy",
+    "max_model_len": 256,
+    "max_num_seqs": 1,
+    "enforce_eager": false,
+    "gpu_memory_utilization": 0.08
+  },
+  "result": "capture failed before /health; no service traffic",
+  "first_failure": {
+    "phase": "Capturing CUDA graphs (mixed prefill-decode, PIECEWISE) 0/1",
+    "operator": "aclnnNonzero",
+    "error_code": 107027,
+    "python_site": "tileinfer/vllm/ops/moe.py:1010",
+    "python_line": "dead = (local < 0).nonzero(as_tuple=False).reshape(-1)",
+    "caller": "tileinfer/vllm/ops/moe_guard.py:147 -> Ascend non-gated fused_experts"
+  },
+  "interpretation": [
+    "C3 fails in the non-gated MoE data-dependent path, not in Mamba2.",
+    "The eager target dummy service used --enforce-eager and therefore cannot be cited as C3.",
+    "A graphable path needs a grouped/dense MoE kernel; removing this single nonzero would only move the failure to the next torch.unique(...).tolist()/nonzero."
+  ],
+  "not_proven": [
+    "target 30B graph capture",
+    "zero steady-state fallback",
+    "Mamba2 graph capture (the first observed failure was MoE)"
+  ],
+  "cleanup": {
+    "port_18084_free": true,
+    "process_running": false
+  },
+  "logs": "/tmp/m5-tiny-graph.log"
+}
