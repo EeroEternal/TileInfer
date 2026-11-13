@@ -302,10 +302,36 @@ def test_preflight_detects_incomplete_shards(tmp_path: Path) -> None:
     )
     first = mod.check(tmp_path)
     assert first["ready_to_load"] is False
+    assert first["ready_for_dummy"] is True
     assert first["shards_missing"] == ["model-00001.safetensors"]
     (tmp_path / "model-00001.safetensors").write_bytes(b"x")
     second = mod.check(tmp_path)
     assert second["ready_to_load"] is True
+    assert second["ready_for_dummy"] is True
+    (tmp_path / "tokenizer.json").unlink()
+    assert mod.check(tmp_path)["ready_for_dummy"] is False
+
+
+def test_static_gap_snapshot_is_vendor_gap_only_for_state_linear() -> None:
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "gap_snapshot", ROOT / "tools/nemotron/gap_snapshot.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+    payload = mod.build()
+    assert payload["hardware_used"] is False
+    assert payload["weights_read"] is False
+    present = payload["scenarios"]["vendor-present-static"]
+    assert present["servable"] is False
+    assert [g["capability"] for g in present["gap_report"]["gaps"] if g["required"]] == [
+        "state.linear"
+    ]
+    absent = payload["scenarios"]["vendor-absent"]
+    assert absent["servable"] is False
+    assert len(absent["gap_report"]["gaps"]) == len(NEMOTRON_3_5_DRAFT.required_capabilities)
 
 
 def test_make_shim_replaces_only_config(tmp_path: Path) -> None:

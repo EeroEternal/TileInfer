@@ -6,6 +6,10 @@
 >
 > 原始输出：[`m5-nemotron-static-audit.json`](m5-nemotron-static-audit.json)（11 项检查，9 项确认；
 > 失败项是“Ascend 没有 Nemotron 注册”和“没有 Mamba2 mixer/SSD patch”，这是待验证的缺口，不是结论）。
+>
+> 决策层快照：[`m5-nemotron-gap.json`](m5-nemotron-gap.json)。在“厂商已安装、静态覆盖”
+> 的假设下，7 项 required capability 里只有 `state.linear` 是 gap；原因是厂商 GDN state
+> 只 `covers={"mixer":"gdn"}`，不会覆盖 Mamba2。该快照不读权重、不碰设备。
 
 ---
 

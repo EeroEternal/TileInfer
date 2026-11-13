@@ -45,7 +45,9 @@ AUDIT=/tmp/m5-nemotron-opaudit.json
 python tools/nemotron/preflight_model.py --model "$MODEL"
 ```
 
-`ready_to_load=false` 时不要往下走；它只查文件是否存在/非空，不会碰 NPU。
+`ready_to_load=false` 时不要做真权重加载；它只查文件是否存在/非空，不会碰 NPU。
+`ready_for_dummy=true` 表示 config/tokenizer 已齐，可以做 §2 的随机权重机械 smoke；
+它仍然**不能**替代 `ready_to_load`，也不能产生 C1/C2/C3/C4 证据。
 
 ### 1.1 config shim（vLLM 0.23 不认 `layers_block_type`）
 

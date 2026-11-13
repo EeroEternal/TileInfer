@@ -1,0 +1,225 @@
+{
+  "model": "Nemotron-3.5-Lightning-30B-A3B",
+  "manifest_id": "nemotron_3_5_lightning",
+  "benchmark_pending": true,
+  "hardware_used": false,
+  "weights_read": false,
+  "note": "static prior only; the vendor-present scenario is a declaration of advertised coverage, not a live service result",
+  "scenarios": {
+    "vendor-absent": {
+      "environment": {
+        "vllm": "0.23.0",
+        "vllm_ascend": null,
+        "torch": "2.10.0+cpu",
+        "python": "3.12",
+        "device_type": "A5",
+        "has_vendor": false,
+        "has_tileinfer": true,
+        "vendor_backend": null,
+        "notes": {
+          "provenance": "static version anchors; no device probe"
+        }
+      },
+      "servable": false,
+      "gap_report": {
+        "model": "Nemotron-3.5-Lightning-30B-A3B",
+        "manifest_id": "nemotron_3_5_lightning",
+        "servable": false,
+        "gaps": [
+          {
+            "capability": "attention.full",
+            "required": true,
+            "reason": "vllm-ascend is not installed, so no vendor provider exists",
+            "candidates": []
+          },
+          {
+            "capability": "moe.routed",
+            "required": true,
+            "reason": "vllm-ascend is not installed, so no vendor provider exists",
+            "candidates": []
+          },
+          {
+            "capability": "norm.rms",
+            "required": true,
+            "reason": "vllm-ascend is not installed, so no vendor provider exists",
+            "candidates": []
+          },
+          {
+            "capability": "rotary",
+            "required": true,
+            "reason": "vllm-ascend is not installed, so no vendor provider exists",
+            "candidates": []
+          },
+          {
+            "capability": "sampling.topk",
+            "required": true,
+            "reason": "vllm-ascend is not installed, so no vendor provider exists",
+            "candidates": []
+          },
+          {
+            "capability": "state.linear",
+            "required": true,
+            "reason": "vllm-ascend is not installed, so no vendor provider exists",
+            "candidates": []
+          },
+          {
+            "capability": "quant.verify",
+            "required": true,
+            "reason": "vllm-ascend is not installed, so no vendor provider exists",
+            "candidates": []
+          }
+        ],
+        "notes": [
+          "policy=vendor_first",
+          "vendor=missing",
+          "device=A5",
+          "the layer selects implementations; it does not own platform/worker/KV/graph"
+        ]
+      },
+      "plan": {
+        "schema_version": 1,
+        "plan_id": "a718a9a27319f014",
+        "created_at": "2026-11-13T09:06:25+00:00",
+        "model": {
+          "name": "Nemotron-3.5-Lightning-30B-A3B",
+          "manifest": "nemotron_3_5_lightning",
+          "arch": "NemotronHForCausalLM",
+          "fingerprint": "fcff1723fe1b1e6d"
+        },
+        "versions": {
+          "vllm": "0.23.0",
+          "vllm_ascend": "missing",
+          "python": "3.12",
+          "torch": "2.10.0+cpu"
+        },
+        "selections": [],
+        "access_points": [
+          "plugin_entry",
+          "attn_select",
+          "method_wrap",
+          "graph_hook"
+        ],
+        "instrumentation": {
+          "graph_counters": true,
+          "metrics_path": "/tmp/tileinfer-v3-metrics.json",
+          "dump_every_decode_steps": 500
+        },
+        "fallback_policy": "forbid"
+      }
+    },
+    "vendor-present-static": {
+      "environment": {
+        "vllm": "0.23.0",
+        "vllm_ascend": "0.23.0",
+        "torch": "2.10.0+cpu",
+        "python": "3.12",
+        "device_type": "A5",
+        "has_vendor": true,
+        "has_tileinfer": true,
+        "vendor_backend": null,
+        "notes": {
+          "provenance": "static version anchors; no device probe"
+        }
+      },
+      "servable": false,
+      "gap_report": {
+        "model": "Nemotron-3.5-Lightning-30B-A3B",
+        "manifest_id": "nemotron_3_5_lightning",
+        "servable": false,
+        "gaps": [
+          {
+            "capability": "state.linear",
+            "required": true,
+            "reason": "vllm-ascend is installed but does not advertise this capability",
+            "candidates": []
+          }
+        ],
+        "notes": [
+          "policy=vendor_first",
+          "vendor=0.23.0",
+          "device=A5",
+          "the layer selects implementations; it does not own platform/worker/KV/graph"
+        ]
+      },
+      "plan": {
+        "schema_version": 1,
+        "plan_id": "477adf745a8a07af",
+        "created_at": "2026-11-13T09:06:25+00:00",
+        "model": {
+          "name": "Nemotron-3.5-Lightning-30B-A3B",
+          "manifest": "nemotron_3_5_lightning",
+          "arch": "NemotronHForCausalLM",
+          "fingerprint": "fcff1723fe1b1e6d"
+        },
+        "versions": {
+          "vllm": "0.23.0",
+          "vllm_ascend": "0.23.0",
+          "python": "3.12",
+          "torch": "2.10.0+cpu"
+        },
+        "selections": [
+          {
+            "capability": "attention.full",
+            "provider": "vllm_ascend.attention",
+            "impl": "vllm_ascend.attention.attention_v1.AscendAttentionBackend",
+            "reason": "vendor_first: vendor advertises the capability",
+            "source": "vendor",
+            "graphable": true
+          },
+          {
+            "capability": "moe.routed",
+            "provider": "vllm_ascend.fused_moe",
+            "impl": "vllm_ascend.ops.fused_moe",
+            "reason": "vendor_first: vendor advertises the capability",
+            "source": "vendor",
+            "graphable": true
+          },
+          {
+            "capability": "norm.rms",
+            "provider": "vllm_ascend.layernorm",
+            "impl": "vllm_ascend.ops.layernorm",
+            "reason": "vendor_first: vendor advertises the capability",
+            "source": "vendor",
+            "graphable": true
+          },
+          {
+            "capability": "rotary",
+            "provider": "vllm_ascend.rotary",
+            "impl": "vllm_ascend.ops.rotary_embedding",
+            "reason": "vendor_first: vendor advertises the capability",
+            "source": "vendor",
+            "graphable": true
+          },
+          {
+            "capability": "sampling.topk",
+            "provider": "vllm_ascend.sample",
+            "impl": "vllm_ascend.sample",
+            "reason": "vendor_first: vendor advertises the capability",
+            "source": "vendor",
+            "graphable": true
+          },
+          {
+            "capability": "quant.verify",
+            "provider": "vllm_ascend.quantization",
+            "impl": "vllm_ascend.quantization",
+            "reason": "vendor_first: vendor advertises the capability",
+            "source": "vendor",
+            "graphable": true
+          }
+        ],
+        "access_points": [
+          "plugin_entry",
+          "attn_select",
+          "method_wrap",
+          "graph_hook"
+        ],
+        "instrumentation": {
+          "graph_counters": true,
+          "metrics_path": "/tmp/tileinfer-v3-metrics.json",
+          "dump_every_decode_steps": 500
+        },
+        "fallback_policy": "forbid"
+      }
+    }
+  }
+}

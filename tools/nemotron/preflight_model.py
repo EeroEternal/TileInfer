@@ -28,6 +28,7 @@ def check(model_dir: Path) -> dict:
     tokenizer_candidates = [
         name for name in ("tokenizer.json", "tokenizer.model", "tokenizer_config.json") if (model_dir / name).is_file()
     ]
+    shards_on_disk = sorted(p.name for p in model_dir.glob("*.safetensors"))
     return {
         "model_dir": str(model_dir),
         "config_present": (model_dir / "config.json").is_file(),
@@ -36,7 +37,11 @@ def check(model_dir: Path) -> dict:
         "shards_missing": missing,
         "shards_empty": empty,
         "tokenizer_files": tokenizer_candidates,
+        "shards_on_disk": shards_on_disk,
         "ready_to_load": not missing and not empty and bool(tokenizer_candidates),
+        # Dummy loading needs config + tokenizer only; it deliberately does not claim the
+        # random-weight run is a correctness check.
+        "ready_for_dummy": (model_dir / "config.json").is_file() and bool(tokenizer_candidates),
         "hardware_used": False,
     }
 
