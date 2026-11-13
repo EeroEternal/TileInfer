@@ -37,8 +37,8 @@
       "service": "http://127.0.0.1:18080",
       "health": "ok",
       "completion_id": "chatcmpl-90bbd5d4088b9a52",
-      "completion_tokens": 8,
-      "warmup": "Mamba2 SSD Triton kernels warmed through the torch replacement"
+      "warmup": "Mamba2 SSD Triton kernels warmed through the torch replacement",
+      "completion_returned": true
     },
     "mamba_plus_non_gated_moe": {
       "config": "3 layers M*E, 4 routed experts, top-2, moe_intermediate_size 64, mlp_hidden_act relu2",
