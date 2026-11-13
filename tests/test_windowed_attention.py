@@ -475,6 +475,43 @@ def test_full_attention_prefill_is_unchanged_by_the_window_code():
 # ---------------------------------------------------------------------------------------
 
 
+def test_same_geometry_layers_share_one_stager_and_skip_the_second_gather():
+    """All windowed layers of a model share the window and the pool: one gather per step.
+
+    The shared stager keys on geometry (heads, head_size, window), and skips the gather when
+    the scratch already holds the step's window — the engine hands every layer of a group the
+    same metadata *object*, so identity is the step key.  The second layer must observe the
+    staged result without re-gathering, and both layers' own state dicts must validate against
+    the shared scratch (same data pointer).
+    """
+    from tileinfer.vllm.attn.window import reset_shared_stagers
+
+    reset_shared_stagers()
+    impl_a = _impl(sliding_window=256)
+    impl_b = _impl(sliding_window=256)
+    assert impl_a._stager is impl_b._stager
+
+    pool = _pool()
+    meta = _meta(query_lens=(1, 1), seq_lens=(4, 7), sliding_window=256)
+    n = 2
+    for impl in (impl_a, impl_b):
+        impl.forward(
+            None,
+            torch.zeros(n, 16, 256, dtype=torch.bfloat16),
+            torch.zeros(n, 2, 256, dtype=torch.bfloat16),
+            torch.zeros(n, 2, 256, dtype=torch.bfloat16),
+            pool,
+            meta,
+            torch.zeros(n, 16 * 256),
+        )
+    scratch_a = impl_a._window_states[2].k_pool
+    scratch_b = impl_b._window_states[2].k_pool
+    assert scratch_a.data_ptr() == scratch_b.data_ptr(), (
+        "the shared stager must hand both layers the same scratch pool"
+    )
+    assert impl_a._stager._staged_for is meta  # one gather for the step
+
+
 def test_windowed_spec_downgrades_cudagraph_support():
     windowed = _builder(sliding_window=4096)
     assert windowed.get_cudagraph_support(None, _Spec(2048, 4096)) is AttentionCGSupport.NEVER

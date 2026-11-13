@@ -106,7 +106,7 @@ from .backend import SUPPORTED_KV_CACHE_DTYPES, TileInferAttentionBackend
 from .kv_cache import write_kv_cache
 from .metadata import TileInferMetadata
 from .prefill import PrefillPath, PrefillUnsupported
-from .window import WindowedDecodeStager
+from .window import reset_shared_stagers, shared_stager
 
 __all__ = [
     "TileInferAttentionImpl",
@@ -215,6 +215,7 @@ def reset_runtime_state() -> None:
         _PREFILL_WARNED.clear()
         _WINDOW_WARNED.clear()
         _SHARED_STEPS.clear()
+        reset_shared_stagers()
 
 
 def _step_share_enabled() -> bool:
@@ -523,15 +524,16 @@ class TileInferAttentionImpl(AttentionImpl):
                     "step will use the reference backend"
                 )
                 self._prefill_enabled = False
-        # Windowed decode: the scratch stager + its own per-bucket state dict, so the scratch
-        # pools never share a bucket key (or a plan key) with the real-pool states.  Built here
-        # (pure geometry, no device), never lazily — same dynamo reasoning as ``_prefill``.
+        # Windowed decode: the shared scratch stager + this layer's own per-bucket state dict,
+        # so the scratch pools never share a bucket key (or a plan key) with the real-pool
+        # states.  The stager is shared across same-geometry layers (they all stage the same
+        # window from the same pool - one gather per step instead of one per layer); the states
+        # stay per-layer because the query/output buffers are per-layer.  Built here (pure
+        # geometry, no device), never lazily — same dynamo reasoning as ``_prefill``.
         self._window_states: Dict[int, _BucketState] = {}
-        self._stager: Optional[WindowedDecodeStager] = None
+        self._stager = None
         if self.window_size is not None:
-            self._stager = WindowedDecodeStager(
-                self.num_kv_heads, self.head_size, self.window_size
-            )
+            self._stager = shared_stager(self.num_kv_heads, self.head_size, self.window_size)
 
     # ------------------------------------------------------------------ vLLM contract
 
