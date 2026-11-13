@@ -307,6 +307,38 @@ def _dummy_profile() -> ModelProfile:
     )
 
 
+def _dummy_mixed_profile() -> ModelProfile:
+    """The dummy with ``mixed_attention_specs``: same shape, different group decision."""
+    return ModelProfile(
+        name="dummy-mixed-profile",
+        archs=("DummyMixedForCausalLM",),
+        head_size=(64,),
+        group_min=4,
+        block_size_policy=BlockSizePolicy(kernel_page_size=64, hybrid_align=None),
+        kv_shape=KvShape(shape_fn=_dummy_kv_shape, stride_order=(0, 1, 2, 3, 4), block_dim=1),
+        hybrid=None,
+        op_family="dummy-family",
+        unsupported_features=(),
+        notes="test-only: attention-only but full+sliding spec mix (iRoPE-shaped)",
+        mixed_attention_specs=True,
+    )
+
+
+def test_mixed_attention_specs_turns_the_hybrid_kv_manager_on() -> None:
+    """``mixed_attention_specs`` answers True despite ``hybrid is None``.
+
+    This is the MuseGlimmer decision: one group per attention spec type, so the sliding-window
+    allocator can drop out-of-window blocks instead of pinning every layer's full context.
+    """
+    mixed = profiles.register_profile(_dummy_mixed_profile())
+    try:
+        platform_mod.set_active_profile(mixed)
+        assert platform_mod.TileInferPlatform.support_hybrid_kv_cache() is True
+    finally:
+        platform_mod.set_active_profile(platform_mod.default_profile())
+        profiles.unregister_profile("dummy-mixed-profile")
+
+
 def test_a_dummy_profile_drives_platform_and_backend() -> None:
     dummy = profiles.register_profile(_dummy_profile())
     config = _config(

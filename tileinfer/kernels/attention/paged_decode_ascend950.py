@@ -3104,23 +3104,20 @@ def declared_pool_cap(pool_pages: int) -> int:
 
     Pages outside ``kv_indptr``/``kv_indices`` spans are never dereferenced, so the declared
     capacity of ``KCache``/``VCache``/``kv_indices`` only has to *cover* the real pool — its
-    exact value is free.  Rounding up to a power of two (or pinning it with
-    ``TILEINFER_POOL_CAP``) removes the pool size from the kernel/plan/pre-warm keys: vLLM
-    derives the pool from a memory snapshot, so it drifts run to run (9425 vs 9899 pages) and
-    used to silently invalidate an out-of-process pre-warm.  ``cap >= pool`` always holds; the
-    caller presents the pool through :func:`pool_view`, which is a zero-copy capacity view.
+    exact value is free.  Quantizing it removes the pool size from the kernel/plan/pre-warm
+    keys: vLLM derives the pool from a memory snapshot, so it drifts run to run (9425 vs 9899
+    pages) and used to silently invalidate an out-of-process pre-warm.  ``cap >= pool`` always
+    holds; the caller presents the pool through :func:`pool_view`, which is a zero-copy
+    capacity view.
+
+    This is :func:`tileinfer.serving.buckets.declared_pool_cap` — the same grid, one source of
+    truth.  (This module used to carry its own pow2 copy; the divergence mattered the day the
+    grid changed, because the *kernel* path would have kept rounding to pow2 and re-demanded
+    the up-to-2x storage extension the grid exists to avoid.)
     """
-    pool_pages = int(pool_pages)
-    pinned = os.environ.get("TILEINFER_POOL_CAP", "").strip()
-    if pinned:
-        cap = int(pinned)
-        if cap < pool_pages:
-            raise ValueError(
-                f"TILEINFER_POOL_CAP={cap} is below the real pool ({pool_pages} pages); "
-                "the declared capacity must cover every live page"
-            )
-        return cap
-    return 1 if pool_pages <= 1 else 1 << (pool_pages - 1).bit_length()
+    from ...serving.buckets import declared_pool_cap as _grid_cap
+
+    return _grid_cap(pool_pages)
 
 
 def pool_view(k_cache: torch.Tensor, cap: int) -> torch.Tensor:

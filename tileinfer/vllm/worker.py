@@ -763,6 +763,59 @@ class TileInferModelRunner(GPUModelRunner):
             list(NPU_CORE_COUNT_ATTRS),
         )
 
+    def _allocate_kv_cache_tensors(self, kv_cache_config: Any) -> dict:
+        """Pad every attention KV buffer up to the declared-capacity grid.
+
+        The kernel ABI declares a quantized page capacity (:func:`declared_pool_cap`, the
+        eighth-of-a-pow2 grid) and ``capacity_view`` realises the gap between that capacity and
+        the real pool as a storage re-bind.  On torch_npu a grown storage is *re-allocated in
+        full* — a whole-pool allocation at the first serving step, which OOMed a hybrid
+        two-group deployment at 0.82 utilisation (the headroom vLLM reserves cannot cover a
+        second copy of a multi-GiB pool).
+
+        Allocating the buffer on the grid closes the gap at birth: the reshaped pool's page
+        count is already the declared capacity, every ``capacity_view`` hits its
+        ``cap == pages`` fast path, and nothing ever grows at serving time.  The padded pages
+        are never scheduled (``kv_cache_config.num_blocks`` is untouched) and cost at most 1/8
+        of the pool — inside the utilisation headroom.  Only attention buffers are padded:
+        mamba state buffers are reshaped from their raw numel by a different branch, and a
+        mamba group is not part of this ABI.
+        """
+        from tileinfer.serving.buckets import grid_round
+
+        tensors = super()._allocate_kv_cache_tensors(kv_cache_config)
+        from vllm.v1.kv_cache_interface import AttentionSpec
+
+        attention_page_sizes = []
+        for group in kv_cache_config.kv_cache_groups:
+            spec = group.kv_cache_spec
+            if isinstance(spec, AttentionSpec):
+                attention_page_sizes.append((set(group.layer_names), spec.page_size_bytes))
+        for tensor_spec in kv_cache_config.kv_cache_tensors:
+            shared = set(tensor_spec.shared_by)
+            page_size = next(
+                (size for names, size in attention_page_sizes if names & shared), None
+            )
+            if page_size is None or page_size <= 0 or tensor_spec.size % page_size:
+                continue
+            pages = tensor_spec.size // page_size
+            rounded = grid_round(pages)
+            if rounded == pages:
+                continue
+            raw = tensors[tensor_spec.shared_by[0]]
+            padded = torch.zeros(rounded * page_size, dtype=raw.dtype, device=raw.device)
+            for layer_name in tensor_spec.shared_by:
+                tensors[layer_name] = padded
+            logger.info(
+                "TileInfer: KV buffer for %s grid-rounded %d -> %d pages (%d KiB slack) so the "
+                "kernel's declared capacity needs no serving-time storage growth",
+                list(tensor_spec.shared_by),
+                pages,
+                rounded,
+                (rounded - pages) * page_size // 1024,
+            )
+        return tensors
+
     def _init_kv_zero_meta(self) -> None:
         """Decline vLLM's ``KVBlockZeroer``: on this pool it would zero the wrong bytes.
 
@@ -1266,6 +1319,23 @@ class NPUWorker(Worker):
         from tileinfer.serving.buckets import declared_pool_cap, sub_pages
         from tileinfer.vllm.attn.impl import PLAN_CACHE
         from tileinfer.vllm.attn.metadata import TileInferMetadata
+
+        # Windowed layers decode on the *scratch* staging (attn/window.py): their per-bucket
+        # states live in a separate dict and their pools are the layer's own scratch pages, so
+        # the real-pool pre-warm below would prepare a state (and compile a plan) the staged
+        # step never looks up.  Drive their warm-up through the stager instead.
+        if getattr(impl, "window_size", None) and getattr(impl, "_stager", None) is not None:
+            # dtype/device come from the bound pool when there is one; fall back to the model
+            # dtype on this worker's device (the scratch pools are allocated for that pair).
+            bound = getattr(module, "kv_cache", None)
+            if bound is not None and int(bound.numel()) > 0:
+                dtype, device = bound.dtype, bound.device
+            else:
+                dtype, device = self.model_config.dtype, self.device
+            buckets = tuple(int(b) for b in spec["buckets"])
+            built = impl.prepare_windowed_buckets(buckets, dtype, device)
+            pages = int(impl._stager.window_pages) * max(buckets) + 2
+            return built, 0, declared_pool_cap(pages), buckets
 
         sub = sub_pages(int(spec["block_size"]))
         pool = self._prewarm_layer_pool(module, spec, sub)
