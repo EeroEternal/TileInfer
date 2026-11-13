@@ -77,7 +77,11 @@ PY
 
 ---
 
-## 2. Dummy 加载（先判机械链路）
+## 2. Dummy 加载（先判机械链路，不是验收）
+
+> **只用于判断“config/model 构造/服务入口”是否通，不能作为 C1/C2/C3/C4 证据。**
+> 随机权重没有语义，不能拿它的输出算 top5、loss 或质量；它的 timing 也不进性能结论。
+> 仍然需要完整 tokenizer 和显式实机授权。
 
 ```bash
 TILEINFER_AUDIT=$AUDIT \
@@ -98,6 +102,8 @@ echo $! > /tmp/m5-nemotron.pid
 - 日志出现模型类/架构识别、KV/Mamba state 分配；
 - 没有 `NotImplementedError` / 缺算子；
 - `TILEINFER_AUDIT` 能落盘（若无 TileInfer 注入，至少确认厂商路径）。
+
+结果只记“机械链路通过/失败 + 首个错误”，不要写成“模型可用”。
 
 停止：
 
