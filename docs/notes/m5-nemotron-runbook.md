@@ -244,6 +244,11 @@ python benchmarks/compare_responses.py \
 > 但这仍不是完整 C3：权重是 dummy，且 bridge 的 `decode_calls` 计数在图 replay 路径上没有推进
 > （`decode_calls=0`），所以不能用它证明稳态 `fallbacks=0`。真权重 C1/C2 和长上下文/并发/MTP
 > 的图行为仍未测。
+>
+> MTP 单独跑过一遍（仍为 dummy，`--enforce-eager`）：`NemotronHMTPModel` 被解析、drafter 加载并
+> 共享 target embedding，161-token prompt 的请求完成 8 token；metrics 有 7 次 draft、7 个 draft
+> token、0 个 accepted。0 accepted 是随机 dummy 权重的预期结果，不是质量结论；MTP 图捕获和真权重
+> 接受率未测。证据：[`m5-nemotron-target-mtp.json`](m5-nemotron-target-mtp.json)。
 
 保持服务运行，观察日志/指标：
 

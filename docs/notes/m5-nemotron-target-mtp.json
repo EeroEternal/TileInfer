@@ -1,0 +1,45 @@
+{
+  "evidence_id": "m5-nemotron-target-mtp-2026-11-13",
+  "date": "2026-11-13",
+  "timezone": "Asia/Shanghai",
+  "scope": "target-shape MTP execution with dummy weights; NOT numerical correctness or acceptance quality",
+  "model": "/home/models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
+  "service": {
+    "port": 18087,
+    "load_format": "dummy",
+    "max_model_len": 2048,
+    "max_num_seqs": 1,
+    "enforce_eager": true,
+    "gpu_memory_utilization": 0.75,
+    "speculative_config": {"method": "mtp", "num_speculative_tokens": 1},
+    "health": 200,
+    "plan_id": "abd6348895c2d65d"
+  },
+  "mtp_path": {
+    "resolved_architecture": "NemotronHMTPModel",
+    "drafter_loaded": true,
+    "log": "Loading draft model: method=mtp ... Detected MTP model. Sharing target model embedding weights with the draft model."
+  },
+  "request": {
+    "id": "cmpl-801290960a52f65b",
+    "prompt_tokens": 161,
+    "completion_tokens": 8,
+    "finish_reason": "length"
+  },
+  "metrics": {
+    "spec_decode_num_drafts_total": 7.0,
+    "spec_decode_num_draft_tokens_total": 7.0,
+    "spec_decode_num_accepted_tokens_total": 0.0
+  },
+  "interpretation": "The MTP drafter and speculative path execute end to end. Zero accepted tokens is expected with random dummy weights and is not a quality result.",
+  "not_proven": [
+    "MTP acceptance with real weights",
+    "MTP numerical correctness or speedup",
+    "MTP graph capture",
+    "real-weight C1/C2"
+  ],
+  "logs": "/tmp/m5-target-mtp.log",
+  "metrics_file": "/tmp/m5-target-mtp-metrics.txt",
+  "response": "/tmp/m5-target-mtp-resp.json",
+  "cleanup": {"port_18087_free": true, "process_running": false}
+}

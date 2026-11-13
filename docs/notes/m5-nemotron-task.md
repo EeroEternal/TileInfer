@@ -208,4 +208,6 @@ MTP 投机、长上下文（8K/16K/32K/128K；config 声明 262144，262K 为条
 **下一步**：目标 dummy 的 eager 与 graph 两条路径都已跑通；graph 捕获为 PIECEWISE+FULL、
 目标图内存 2.68 GiB、日志有 `Replaying aclgraph`。但权重是 dummy，`decode_calls` 计数未推进，
 不能据此证明真权重 C3/稳态 0 回退。等 9 个缺失分片补齐后做真权重 C1，再做 CPU HF 参考 C2；
-目标 C1/C2 通过前，`state.linear` 仍保持 gap，不把 provider 写成默认支持。
+MTP 也已用 dummy 跑通执行路径（`NemotronHMTPModel`、drafter 共享 embedding、7 drafts/0 accepted），
+但 0 accepted 是随机权重预期，MTP 图捕获和真权重接受率未测。目标 C1/C2 通过前，`state.linear`
+仍保持 gap，不把 provider 写成默认支持。
