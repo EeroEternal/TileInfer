@@ -296,6 +296,16 @@ class MuseGlimmerAttention(nn.Module):
         if self.rotary_emb is not None:
             q, k = self.rotary_emb(positions, q, k)
 
+        # NOTE (port workaround, not upstream): the fused-qkv ``split`` above leaves ``v`` a
+        # strided view for multi-token prefill (single-token decode is contiguous).  vllm-ascend
+        # 0.23.0's sliding-window branch calls CANN's FIA without making the inputs contiguous,
+        # and the operator's non-PA checker rejects a strided ``value`` (ACLNN tiling error
+        # 561002, ``paged_attention_checker.cpp: "In non-PA scenarios, value tensors must be
+        # contiguous"``).  Upstream fixed the vendor side in cfb01b1c8 (#17925, first in
+        # v0.30.0); this copy is the model-side equivalent for pinned stacks and is harmless on
+        # the v2 native backend.
+        v = v.contiguous()
+
         attn_output = self.attn(q, k, v)
 
         # Gate reads the layer input hidden states (not the attn output).

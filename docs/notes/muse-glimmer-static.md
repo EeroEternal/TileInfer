@@ -13,6 +13,18 @@ backends, and `install.py` wraps `vllm_ascend.platform.NPUPlatform`. vllm-ascend
 the Muse work is executed on the v2 runtime; its v3 home (if/when that environment exists) is the
 `model_table` seam plus a manifest — see "v3 mapping" at the bottom.
 
+**Vendor route update (2026-11-13, device-verified).** vllm-ascend 0.23.0 *can* serve this
+model — the earlier "sliding window unsupported" conclusion was wrong. The failure was
+`ACLNN_ERR_INNER_TILING_ERROR (561002)` whose plog reason is
+``In non-PA scenarios, value tensors must be contiguous``: the fused-qkv ``split`` leaves ``v``
+a strided view for multi-token prefill, and vllm-ascend's sliding-window branch calls CANN's FIA
+without making the inputs contiguous (the full-attention branch goes through
+``DeviceOperator``, which does). Upstream fixed the vendor side in ``cfb01b1c8`` (#17925, first
+in v0.30.0); the model-side equivalent (``v = v.contiguous()`` with a comment) is now in the
+port and is harmless on the v2 backend. With it, the read-only-registered model on the vendor
+stack returns HTTP 200, produces clean chat content, recalls the 3,460-token secret exactly, and
+decodes at **37 ms/tok** (vs 75–78 ms/tok on the v2 stack, both eager, single sequence).
+
 ## Status ledger
 
 | # | Item | State |
@@ -21,7 +33,7 @@ the Muse work is executed on the v2 runtime; its v3 home (if/when that environme
 | 1 | Sliding-window compute (decode kernel path + prefill reference) | CLOSED |
 | 1b | Out-of-window KV reclamation (per-group pools) | CLOSED |
 | 2 | Hybrid KV manager for attention-only profiles | CLOSED (folded into 1b) |
-| 3 | Vendor (vllm-ascend) route | BLOCKED (no adaptation + torch 2.10 ABI) |
+| 3 | Vendor (vllm-ascend) route | RESOLVED (root cause found + model-side fix; 37 ms/tok) |
 | 4 | ATEM reasoning parser | CLOSED |
 | 5 | Real weights end-to-end | DONE |
 | 6 | Concurrency (8 seqs, mixed lengths) | VALIDATED |
@@ -91,6 +103,29 @@ pool, block table and slot mapping; the sliding-window allocator keeps only in-w
 windowed compute masks out. Device-validated: two groups, 3,706-token prompt HTTP 200 (dummy),
 3,460-token recall exact (real weights).
 
+## #3 vendor (vllm-ascend) route (RESOLVED)
+
+- **Environment**: `/home/userlist/ww/py_venv` (torch 2.10.0 + torch_npu 2.10.0.post4 +
+  triton-ascend 3.2.2 + vllm 0.23.0 + vllm-ascend 0.23.0-950), used **read-only**: the model is
+  registered by a ``vllm.general_plugins`` entry point shipped from a `/tmp` directory on
+  ``PYTHONPATH`` (no install, no venv edits). Verified live: ``[muse-vendor] registered ...`` in
+  both the API server and the EngineCore process.
+- **Root cause** (from ``/root/ascend/log/debug/plog``):
+  ``paged_attention_checker.cpp:1001 ... Reason: In non-PA scenarios, value tensors must be
+  contiguous`` → ``NnopbaseExecutorDoTiling`` → errno 561002. Non-PA = prefill with
+  ``block_table is None``. ``v`` is a strided view because of the fused-qkv split; ``k`` becomes
+  contiguous through ``qk_norm``/``reshape``; single-token decode is contiguous (size-1 stride
+  is irrelevant), which is why only prefill failed.
+- **Code paths**: full-attention prefill uses ``DeviceOperator.npu_fused_infer_attention_score``
+  (``device_op.py:1150`` — calls ``.contiguous()``) → fine; the sliding-window branch calls raw
+  ``torch_npu.npu_fused_infer_attention_score`` (``attention_v1.py:1315-1331``) without it →
+  fails. That asymmetry explains the "sliding window off = 200" control exactly.
+- **Fix**: vendor side ``cfb01b1c8`` (2026-10-06, PR #17925) adds
+  ``if block_table is None: key/value = .contiguous()``; first release v0.30.0. Model side (this
+  repo): ``v = v.contiguous()`` in ``muse_glimmer.py`` before ``self.attn``.
+- **Validation on the vendor stack** (real weights, eager): clean content (``中国首都北京。``),
+  3,460-token secret recalled (``7391``), TPOT 37 ms/tok.
+
 ## #4 ATEM reasoning parser (CLOSED)
 
 The checkpoint's chat template ends the generation prompt at a bare `<|start|>assistant`; the
@@ -153,6 +188,9 @@ exact, TPOT unchanged.
   bottleneck — it saves ~90 MiB of duplicate scratch pools and 38 redundant gathers per step).
 - windowed **prefill** still runs the masked reference path; long-prompt TTFT is the remaining
   performance item.
+- **Vendor stack (vllm-ascend 0.23.0-950, read-only registration, same model): 37 ms/tok** —
+  roughly 2x the v2 stack. Its attention path is the vendor's optimized FIA; the v2 stack's
+  windowed staging + reference prefill is what costs the difference.
 
 ## Launch recipe (current, everything on)
 
