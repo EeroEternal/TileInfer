@@ -14,11 +14,11 @@ from pathlib import Path
 
 import pytest
 
-from tileinfer.contracts.capabilities import CAPABILITIES, Mamba2Contract
+from tileinfer.contracts.capabilities import CAPABILITIES, Capability, Mamba2Contract, ProviderSpec
 from tileinfer.contracts.manifest import AttentionSpec, MambaSpec, ModelManifest, MoESpec
 from tileinfer.manifests import MANIFESTS, QWEN3_6
 from tileinfer.manifests.nemotron_3_5 import BENCHMARK_PENDING, NEMOTRON_3_5_DRAFT
-from tileinfer.resolve.decide import decide
+from tileinfer.resolve.decide import TILEINFER_PROVIDERS, decide
 from tileinfer.resolve.probe import Environment
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -82,6 +82,16 @@ def test_manifest_represents_an_explicit_moe_layer() -> None:
     )
     m.validate()
     assert "moe" in m.layer_types
+
+
+def test_manifest_rejects_recurrent_mixer_without_state_linear() -> None:
+    m = _mamba_manifest(
+        layer_types=("mamba", "full_attention"),
+        mamba=MambaSpec(num_heads=128, n_groups=8),
+    )
+    object.__setattr__(m, "required_capabilities", ("attention.full",))
+    with pytest.raises(ValueError, match="state.linear is not required"):
+        m.validate()
 
 
 def test_manifest_rejects_mamba_layer_without_spec() -> None:
@@ -340,6 +350,64 @@ def test_make_shim_replaces_only_config(tmp_path: Path) -> None:
         "mamba",
         "moe",
     ]
+
+
+def test_vendor_gdn_state_does_not_cover_a_mamba2_declaration() -> None:
+    env = Environment(
+        vllm="0.23.0",
+        vllm_ascend="0.23.0",
+        python="3.12",
+        torch="2.10.0",
+        device_type="A5",
+        has_vendor=True,
+    )
+    plan, report = decide(NEMOTRON_3_5_DRAFT, env, policy="vendor_first")
+    assert not any(s.capability == Capability.STATE_LINEAR.value for s in plan.selections)
+    assert any(g.capability == Capability.STATE_LINEAR.value for g in report.gaps)
+    assert report.servable is False
+
+
+def test_qwen_still_selects_the_vendor_gdn_state() -> None:
+    env = Environment(
+        vllm="0.23.0",
+        vllm_ascend="0.23.0",
+        python="3.12",
+        torch="2.10.0",
+        device_type="A5",
+        has_vendor=True,
+    )
+    plan, report = decide(QWEN3_6, env, policy="vendor_first")
+    selected = plan.selection(Capability.STATE_LINEAR.value)
+    assert selected is not None
+    assert selected.provider == "vllm_ascend.gdn_state"
+    assert report.servable is True
+
+
+def test_a_mamba2_provider_with_the_right_covers_can_fill_state_linear(monkeypatch) -> None:
+    env = Environment(
+        vllm="0.23.0",
+        vllm_ascend="0.23.0",
+        python="3.12",
+        torch="2.10.0",
+        device_type="A5",
+        has_vendor=True,
+    )
+    provider = ProviderSpec(
+        capability=Capability.STATE_LINEAR,
+        name="tileinfer.mamba2_state",
+        impl="tileinfer.providers.mamba2:Mamba2State",
+        source="tileinfer",
+        graphable=False,
+        covers={"mixer": "mamba2"},
+        evidence="unit-test-only",
+        delete_when="vendor Mamba2 state lands",
+    )
+    monkeypatch.setitem(TILEINFER_PROVIDERS, Capability.STATE_LINEAR, provider)
+    plan, report = decide(NEMOTRON_3_5_DRAFT, env, policy="vendor_first")
+    selected = plan.selection(Capability.STATE_LINEAR.value)
+    assert selected is not None
+    assert selected.source == "tileinfer"
+    assert report.servable is True
 
 
 def test_no_vendor_decision_reports_all_gaps_without_hardware(tmp_path: Path) -> None:

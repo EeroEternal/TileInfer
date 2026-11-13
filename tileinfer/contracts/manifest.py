@@ -191,6 +191,10 @@ class ModelManifest:
             raise ValueError("mamba spec declared but no mamba layer")
         if "mamba" in self.layer_types and self.mamba is None:
             raise ValueError("mamba layer declared but no mamba spec")
+        if (self.mamba is not None or self.linear is not None) and (
+            Capability.STATE_LINEAR.value not in self.required_capabilities
+        ):
+            raise ValueError("recurrent mixer declared but state.linear is not required")
         if self.moe is not None and "moe" not in self.required_capabilities and (
             Capability.MOE_ROUTED.value not in self.required_capabilities
         ):
@@ -214,6 +218,20 @@ class ModelManifest:
         for key in ("prompt", "max_tokens", "top5"):
             if key not in self.benchmark:
                 raise ValueError(f"benchmark sample is missing {key!r}")
+
+    @property
+    def mixer_kinds(self) -> Tuple[str, ...]:
+        """Recurrent mixer kinds a ``state.linear`` provider must cover.
+
+        A GDN provider and a Mamba2 provider both speak ``state.linear``; the manifest's
+        mixer kind is what keeps them from being mistaken for one another.
+        """
+        kinds = []
+        if self.linear is not None:
+            kinds.append(self.linear.kind)
+        if self.mamba is not None:
+            kinds.append(self.mamba.kind)
+        return tuple(kinds)
 
     @property
     def fingerprint(self) -> str:

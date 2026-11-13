@@ -82,6 +82,7 @@ VENDOR_PROVIDERS: Dict[Capability, ProviderSpec] = {
         impl="vllm_ascend.ops.gdn",
         source="vendor",
         graphable=True,
+        covers={"mixer": "gdn"},
         measured_ratio=1.0,
         evidence="baseline",
         delete_when="never - this is the baseline",

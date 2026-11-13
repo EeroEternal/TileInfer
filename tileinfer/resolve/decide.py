@@ -42,6 +42,18 @@ TILEINFER_PROVIDERS: dict = {}
 POLICIES = ("vendor_first", "tileinfer_first")
 
 
+def _covers(provider, manifest: ModelManifest) -> bool:
+    """Honour the provider's symbolic `covers` constraints.
+
+    `state.linear` is shared by GDN and Mamba2.  Without this check a vendor GDN
+    provider is selected for a Mamba2 declaration just because both spell the same
+    capability.  Unknown cover keys are ignored here; they are evidence metadata, not
+    routing keys.
+    """
+    wanted = provider.covers.get("mixer") if provider is not None else None
+    return wanted is None or wanted in manifest.mixer_kinds
+
+
 def _select(
     manifest: ModelManifest,
     env: Environment,
@@ -57,7 +69,7 @@ def _select(
 
         chosen: Optional[Selection] = None
         for source in order:
-            if source == "vendor" and env.has_vendor and vendor is not None:
+            if source == "vendor" and env.has_vendor and vendor is not None and _covers(vendor, manifest):
                 chosen = Selection(
                     capability=capability.value,
                     provider=vendor.name,
@@ -67,7 +79,7 @@ def _select(
                     graphable=vendor.graphable,
                 )
                 break
-            if source == "tileinfer" and ours is not None:
+            if source == "tileinfer" and ours is not None and _covers(ours, manifest):
                 chosen = Selection(
                     capability=capability.value,
                     provider=ours.name,

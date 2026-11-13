@@ -56,7 +56,7 @@
 |---|---|---|---|---|
 | G0 | **目标 config 与 vLLM 0.23 schema 不兼容** | **已实测**：raw config 直接 `AttributeError`；默认 pattern 也不是目标 pattern | config shim（`normalize_config`，不改上游） | vLLM/上游接受 `layers_block_type` 或升级 |
 | G1 | NemotronH 模型在 Ascend 的注册/加载 | 未知（可能 vLLM 通用路径可接） | model table / 模型包装 | vllm-ascend 原生注册 NemotronH |
-| G2 | Mamba2 mixer 的 SSD/chunk-scan 执行路径 | **静态缺候选**：有 conv/lightning 算子，但没有 `MambaMixer2`/`ssd_combined` 的 Ascend 替换 | `state.linear` + `Mamba2Contract` provider | 厂商 Mamba2/SSD backend 覆盖该形状 |
+| G2 | Mamba2 mixer 的 SSD/chunk-scan 执行路径 | **静态缺候选**：有 conv/lightning 算子，但没有 `MambaMixer2`/`ssd_combined` 的 Ascend 替换；`state.linear` 路由已按 `covers["mixer"]` 区分 GDN，Mamba2 仍无 provider | `state.linear` + `Mamba2Contract` provider | 厂商 Mamba2/SSD backend 覆盖该形状 |
 | G3 | 混合 attention（full + Mamba）的 KV/state 布局 | 未知 | state/KV provider 或 bridge | 厂商支持混合 KV/MambaSpec |
 | G4 | MTP（`NemotronHMTPModel`）在 Ascend 的注册/执行 | 权重已确认（270 个 `mtp.*` key）；Ascend 注册/执行/图仍未知 | MTP provider / model table | 厂商注册并验证 NemotronHMTP |
 | G5 | 图捕获（Mamba state + 混合 attention） | 未知 | graph hook（不是 provider） | 厂商图路径覆盖 |

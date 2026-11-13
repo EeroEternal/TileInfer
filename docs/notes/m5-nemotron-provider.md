@@ -24,7 +24,7 @@
 | # | 缺口 | 候选能力 | 实现形态 | graphable | parallel | evidence | delete_when |
 |---|---|---|---|---|---|---|---|
 | P1 | Ascend 没有 NemotronH 模型注册/加载 | 模型路由（model table） | 注册/包装 `NemotronHForCausalLM`，不改上游 | 待测 | single | `candidate`（无） | vllm-ascend 原生注册 NemotronH |
-| P2 | Mamba2 mixer 的 SSD/chunk-scan 执行 | `state.linear`（`Mamba2Contract` 子契约） | Mamba2 conv/SSM/state provider | 待测 | single | `candidate`（静态未见 Ascend SSD 替换） | 厂商 Mamba2/SSD backend 覆盖 |
+| P2 | Mamba2 mixer 的 SSD/chunk-scan 执行 | `state.linear`（`Mamba2Contract` 子契约） | Mamba2 conv/SSM/state provider | 待测 | single | `candidate`（静态未见 Ascend SSD 替换；路由按 `covers={"mixer":"mamba2"}` 区分 GDN） | 厂商 Mamba2/SSD backend 覆盖 |
 | P3 | 混合 full-attention + Mamba state 的 KV/布局 | `attention.full` + `state.linear` | 状态/KV 适配；不重写 KV 池 | 待测 | single | `candidate`（无） | 厂商支持混合 KV/MambaSpec |
 | P4 | MTP `NemotronHMTPModel` 的 Ascend 注册/执行 | MTP/模型路由 | 复用 vLLM MTP，仅补注册/包装 | 待测 | single | `candidate`（权重已确认 270 个 `mtp.*` key；Ascend 执行未验） | 厂商注册并验证 NemotronHMTP |
 | P5 | Mamba/混合 attention 图捕获 | graph hook（不是 provider） | 捕获前检查 bucket，捕获后计数回退 | 待测 | — | `candidate`（无） | 厂商图路径覆盖 |
@@ -33,6 +33,9 @@
 
 > P1/P4 是“模型路由”，不是自研算子；如果 vLLM 通用路径在 Ascend 上能跑，就不应写
 > provider。P2/P3 才是真正可能需要算子的地方，但必须先上机确认 vllm-ascend 的
+> Mamba2/SSD 路径不能跑。`resolve.decide` 现在会检查 `ProviderSpec.covers["mixer"]`：
+> 厂商 GDN state 只覆盖 `gdn`，不会再把 Nemotron 的 `mamba2` 误选成 GDN；Mamba2 仍缺
+> provider，所以当前 vendor-first 的 gap 是 `state.linear`，不是“已有 Mamba2”。
 > Mamba Triton 算子是否已覆盖目标形状；逐算子清单见
 > [`m5-nemotron-op-inventory.md`](m5-nemotron-op-inventory.md)。
 
