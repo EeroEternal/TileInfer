@@ -69,6 +69,18 @@
       "ok": false,
       "evidence": "",
       "meaning": "Ascend has a Mamba2 mixer/SSD path (expected: absent; absence is a gap candidate, not proof that the model cannot run)"
+    },
+    {
+      "id": "tileinfer_mamba2_ops",
+      "ok": true,
+      "evidence": "/home/userlist/zxs/TileInfer/tileinfer/vllm/ops/mamba2.py",
+      "meaning": "TileInfer torch Mamba2 replacement exists (chunk scan + selective state update); target-shape numerics and graph capture are still unknown"
+    },
+    {
+      "id": "tileinfer_non_gated_moe",
+      "ok": true,
+      "evidence": "/home/userlist/zxs/TileInfer/tileinfer/vllm/ops/moe_guard.py",
+      "meaning": "TileInfer routes non-gated relu2 experts through fused_experts on Ascend; target-shape and multi-rank behaviour are still unknown"
     }
   ],
   "unknown": [
@@ -77,8 +89,10 @@
     "whether Ascend can execute the NemotronH model end to end",
     "graph capture for Mamba state / hybrid attention",
     "hybrid KV/MambaSpec and weight mapping on Ascend",
-    "reference implementation runtime on CPU"
+    "reference implementation runtime on CPU",
+    "target-shape Mamba2 numerics vs an independent implementation",
+    "target-shape non-gated MoE numerics vs an independent implementation"
   ],
   "static_servable": false,
-  "note": "static prior only: absence of Ascend registration does not prove the model cannot run; it means no positive evidence yet"
+  "note": "static prior only: absence of Ascend registration does not prove the model cannot run; presence of a TileInfer replacement is not target-shape evidence"
 }

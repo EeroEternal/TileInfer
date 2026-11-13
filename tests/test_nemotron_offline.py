@@ -499,6 +499,9 @@ def test_nemotron_static_audit_is_read_only_and_reports_unknowns(tmp_path: Path)
     # These are gaps, not passes: recorded False until proven otherwise.
     assert checks["ascend_model_registration"]["ok"] is False
     assert checks["ascend_mamba2_mixer_patch"]["ok"] is False
+    # The replacements are present, but neither is target-shape evidence: servable stays False.
+    assert checks["tileinfer_mamba2_ops"]["ok"] is True
+    assert checks["tileinfer_non_gated_moe"]["ok"] is True
 
 
 def test_nemotron_h_config_alias_is_resolvable_by_autoconfig(tmp_path: Path) -> None:

@@ -52,6 +52,9 @@ def main() -> int:
         for path in asc.rglob("*.py")
         if "mamba_mixer2" in _read(path) or "ssd_combined" in _read(path)
     ]
+    project = Path(__file__).resolve().parents[2]
+    ti_mamba = project / "tileinfer/vllm/ops/mamba2.py"
+    ti_moe = project / "tileinfer/vllm/ops/moe_guard.py"
 
     checks = [
         {
@@ -123,6 +126,28 @@ def main() -> int:
                 "candidate, not proof that the model cannot run)"
             ),
         },
+        {
+            "id": "tileinfer_mamba2_ops",
+            "ok": ti_mamba.is_file()
+            and "def mamba_chunk_scan_combined_varlen" in _read(ti_mamba)
+            and "def selective_state_update" in _read(ti_mamba),
+            "evidence": str(ti_mamba) if ti_mamba.is_file() else "",
+            "meaning": (
+                "TileInfer torch Mamba2 replacement exists (chunk scan + selective state update); "
+                "target-shape numerics and graph capture are still unknown"
+            ),
+        },
+        {
+            "id": "tileinfer_non_gated_moe",
+            "ok": ti_moe.is_file()
+            and "install_ascend_non_gated_experts" in _read(ti_moe)
+            and "relu2_no_mul" in _read(project / "tileinfer/vllm/ops/moe.py"),
+            "evidence": str(ti_moe) if ti_moe.is_file() else "",
+            "meaning": (
+                "TileInfer routes non-gated relu2 experts through fused_experts on Ascend; "
+                "target-shape and multi-rank behaviour are still unknown"
+            ),
+        },
     ]
 
     unknown = [
@@ -132,6 +157,8 @@ def main() -> int:
         "graph capture for Mamba state / hybrid attention",
         "hybrid KV/MambaSpec and weight mapping on Ascend",
         "reference implementation runtime on CPU",
+        "target-shape Mamba2 numerics vs an independent implementation",
+        "target-shape non-gated MoE numerics vs an independent implementation",
     ]
     payload = {
         "model": "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
@@ -143,7 +170,7 @@ def main() -> int:
         "static_servable": False,
         "note": (
             "static prior only: absence of Ascend registration does not prove the model "
-            "cannot run; it means no positive evidence yet"
+            "cannot run; presence of a TileInfer replacement is not target-shape evidence"
         ),
     }
 
