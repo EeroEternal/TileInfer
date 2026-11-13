@@ -201,9 +201,25 @@ def install_impl_table(plan: Any) -> SeamResult:
     """
     if plan is None:
         return SeamResult("impl_table", False, "no plan")
-    non_vendor = [s for s in plan.selections if s.source != "vendor"]
+    non_vendor = [
+        s
+        for s in plan.selections
+        if s.source != "vendor" and s.capability != "model.arch"
+    ]
     if not non_vendor:
         return SeamResult("impl_table", True, "no non-vendor selections (vendor table kept)")
+    consumed = [
+        s
+        for s in non_vendor
+        if s.provider == "tileinfer.short_conv"
+        and s.capability == "state.linear"
+    ]
+    if len(consumed) == len(non_vendor):
+        return SeamResult(
+            "impl_table",
+            True,
+            "short-conv provider is consumed inside the route-O model",
+        )
     try:
         from vllm.model_executor.custom_op import CustomOp  # noqa: F401
     except Exception as exc:
@@ -217,9 +233,62 @@ def install_impl_table(plan: Any) -> SeamResult:
     )
 
 
+def _patch_lfm3_ascend_rope() -> None:
+    """Disable vllm-ascend's single global cos/sin buffer for LFM3's two rotary dims.
+
+    The Ascend GQA rope path keeps one process-wide buffer sized from a model-wide
+    ``partial_rotary_factor``.  LFM3 has 64 rotary dims on full-attention layers and 128 on
+    sliding layers, so the global update cannot be correct; the model uses a native
+    per-layer implementation instead.
+    """
+    try:
+        import vllm_ascend.ops.rotary_embedding as ascend_rope
+
+        ascend_rope.update_cos_sin = lambda positions: None
+        ascend_rope.set_cos_and_sin = lambda *args, **kwargs: None
+    except Exception:
+        return
+    try:
+        import vllm_ascend.worker.model_runner_v1 as model_runner
+
+        if hasattr(model_runner, "update_cos_sin"):
+            model_runner.update_cos_sin = lambda positions: None
+    except Exception:
+        pass
+
+
 def install_model_table(plan: Any) -> SeamResult:
-    """Reserve the model-table seam; Qwen3.6 is a vendor-served model, so it is empty."""
-    return SeamResult("model_table", True, "no model replacement requested")
+    """Register the route-O model class named by the plan, before vLLM reads its config."""
+    if plan is None:
+        return SeamResult("model_table", False, "no plan")
+    selection = next(
+        (s for s in plan.selections if s.capability == "model.arch"), None
+    )
+    if selection is None:
+        return SeamResult("model_table", True, "no model replacement requested")
+    try:
+        from vllm.model_executor.models.registry import ModelRegistry
+    except Exception as exc:
+        return SeamResult("model_table", False, f"vLLM registry unavailable: {exc}")
+    if getattr(ModelRegistry, "_tileinfer_model_arch", None) == plan.model.arch:
+        return SeamResult(
+            "model_table", True, f"{plan.model.arch} already registered"
+        )
+    try:
+        if plan.model.arch == "Lfm3ForCausalLM":
+            from ..models.lfm3.compat import apply as apply_lfm3_compat
+
+            apply_lfm3_compat()
+            _patch_lfm3_ascend_rope()
+        ModelRegistry.register_model(plan.model.arch, selection.impl)
+    except Exception as exc:
+        return SeamResult(
+            "model_table", False, f"register {selection.impl} failed: {exc}"
+        )
+    ModelRegistry._tileinfer_model_arch = plan.model.arch
+    return SeamResult(
+        "model_table", True, f"{plan.model.arch} -> {selection.impl}"
+    )
 
 
 def install_method_wrappers(plan: Any) -> SeamResult:
@@ -328,7 +397,12 @@ def install_all(plan: Any) -> Dict[str, Any]:
         install_method_wrappers(plan),
     ]
     report["seams"] = [r.as_dict() for r in results]
+    critical = {"config_gate", "graph_hook", "attn_select"}
+    if plan is not None and any(
+        getattr(s, "capability", "") == "model.arch" for s in plan.selections
+    ):
+        critical.add("model_table")
     report["ok"] = all(
-        r.ok for r in results if r.name in {"config_gate", "graph_hook", "attn_select"}
+        r.ok for r in results if r.name in critical
     )
     return report

@@ -31,13 +31,7 @@ from ..contracts.plan import (
 )
 from .probe import Environment
 from .vendor import VENDOR_PROVIDERS
-
-#: Capabilities our own providers can serve.  Empty today, and empty is correct: this table
-#: is for gaps only - a capability the vendor cannot run, or cannot run correctly at the shape
-#: a model needs.  Qwen3.6 requires nothing the vendor lacks, so claiming our v2 kernels here
-#: would invent work and make the gap report lie.  Entries appear when a model needs a
-#: capability the vendor rejects, not when we believe we could beat the vendor on speed.
-TILEINFER_PROVIDERS: dict = {}
+from ..providers.catalog import TILEINFER_PROVIDERS
 
 POLICIES = ("vendor_first", "tileinfer_first")
 
@@ -49,10 +43,20 @@ def _select(
 ) -> Tuple[List[Selection], List[Gap]]:
     selections: List[Selection] = []
     gaps: List[Gap] = []
+    state_kind = getattr(manifest.state, "kind", None) if manifest.state else None
     for cap_name in manifest.required_capabilities:
         capability = Capability(cap_name)
         vendor = VENDOR_PROVIDERS.get(capability)
         ours = TILEINFER_PROVIDERS.get(capability)
+        if capability is Capability.STATE_LINEAR:
+            if state_kind == "short_conv":
+                # The vendor state entry is GDN.  A declaration that states a different
+                # recurrent flavour (short convolution) cannot use it.
+                vendor = None
+            else:
+                # Qwen3.6's GDN state is vendor-served; the short-conv provider must not
+                # answer a GDN declaration.
+                ours = None
         order = ("vendor", "tileinfer") if policy == "vendor_first" else ("tileinfer", "vendor")
 
         chosen: Optional[Selection] = None
@@ -108,10 +112,26 @@ def decide(
     selections, gaps = _select(manifest, env, policy)
     servable = not any(g.required for g in gaps)
 
+    # Route O: the declaration names the class that replaces the missing upstream model.
+    # This is a plan row, not a capability: it answers "who owns the model structure" while
+    # the capability rows still answer "who owns each operator/layer".
+    access = ["plugin_entry", "attn_select", "method_wrap", "graph_hook"]
+    if manifest.model_impl:
+        selections.append(
+            Selection(
+                capability="model.arch",
+                provider=manifest.model_impl.split(":", 1)[0],
+                impl=manifest.model_impl,
+                reason="route O: the declaration names the model implementation",
+                source="tileinfer",
+                graphable=False,
+            )
+        )
+        access.append("model_table")
+
     # The access points that are actually installed.  ``impl_table`` and ``model_table`` are
     # only listed when the decision selects something that needs them; an unused mechanism
     # in the budget would be noise, not capability.
-    access = ["plugin_entry", "attn_select", "method_wrap", "graph_hook"]
     for name in access:
         assert name in ACCESS_POINTS
 

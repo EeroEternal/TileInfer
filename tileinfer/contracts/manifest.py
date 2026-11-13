@@ -37,15 +37,22 @@ class AttentionSpec:
     output_gate: bool = False
     rope: str = "mrope"
     partial_rotary_factor: float = 1.0
+    sliding_window: Optional[int] = None
+    rope_by_layer: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
 
     def validate(self) -> None:
         if self.num_heads <= 0 or self.num_kv_heads <= 0 or self.head_dim <= 0:
             raise ValueError("attention head counts and head_dim must be positive")
         if self.num_heads % self.num_kv_heads:
             raise ValueError("num_heads must be a multiple of num_kv_heads (GQA grouping)")
+        if self.sliding_window is not None and self.sliding_window <= 0:
+            raise ValueError("sliding_window must be positive when set")
+        for layer_type, params in self.rope_by_layer.items():
+            if not isinstance(params, Mapping) or "rope_theta" not in params:
+                raise ValueError(f"rope_by_layer[{layer_type!r}] needs a rope_theta")
 
     def as_dict(self) -> Dict[str, Any]:
-        return {
+        data = {
             "kind": self.kind,
             "num_heads": self.num_heads,
             "num_kv_heads": self.num_kv_heads,
@@ -54,6 +61,13 @@ class AttentionSpec:
             "rope": self.rope,
             "partial_rotary_factor": self.partial_rotary_factor,
         }
+        if self.sliding_window is not None:
+            data["sliding_window"] = self.sliding_window
+        if self.rope_by_layer:
+            data["rope_by_layer"] = {
+                key: dict(value) for key, value in self.rope_by_layer.items()
+            }
+        return data
 
 
 @dataclass(frozen=True)
@@ -83,6 +97,30 @@ class LinearSpec:
             "head_v_dim": self.head_v_dim,
             "conv_kernel_dim": self.conv_kernel_dim,
             "state_dtype": self.state_dtype,
+        }
+
+
+@dataclass(frozen=True)
+class StateSpec:
+    """Recurrent state carried by a non-attention layer (for example a short convolution)."""
+
+    kind: str = "short_conv"
+    dim: int = 2048
+    kernel: int = 7
+    bias: bool = False
+
+    def validate(self) -> None:
+        if self.kind not in {"short_conv"}:
+            raise ValueError(f"unknown state kind {self.kind!r}")
+        if self.dim <= 0 or self.kernel <= 0:
+            raise ValueError("state dim and kernel must be positive")
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "dim": self.dim,
+            "kernel": self.kernel,
+            "bias": self.bias,
         }
 
 
@@ -120,12 +158,14 @@ class ModelManifest:
     layer_types: Tuple[str, ...]
     attention: AttentionSpec
     linear: Optional[LinearSpec] = None
+    state: Optional[StateSpec] = None
     moe: Optional[MoESpec] = None
     quantization: str = "none"
     kv: Dict[str, Any] = field(default_factory=dict)
     required_capabilities: Tuple[str, ...] = ()
     benchmark: Dict[str, Any] = field(default_factory=dict)
     source: str = "docs/notes/op-coverage-qwen36.md"
+    model_impl: Optional[str] = None
     schema_version: int = MANIFEST_SCHEMA_VERSION
 
     def validate(self) -> None:
@@ -137,11 +177,16 @@ class ModelManifest:
             raise ValueError(
                 f"layer_types has {len(self.layer_types)} entries for {self.num_layers} layers"
             )
-        unknown = sorted(set(self.layer_types) - {"full_attention", "linear_attention"})
+        unknown = sorted(
+            set(self.layer_types)
+            - {"full_attention", "linear_attention", "sliding_attention", "conv"}
+        )
         if unknown:
             raise ValueError(f"unknown layer types {unknown}")
         if self.linear is not None and "linear_attention" not in self.layer_types:
             raise ValueError("linear spec declared but no linear_attention layer")
+        if self.state is not None and "conv" not in self.layer_types:
+            raise ValueError("state spec declared but no conv layer")
         if self.moe is not None and "moe" not in self.required_capabilities and (
             Capability.MOE_ROUTED.value not in self.required_capabilities
         ):
@@ -149,8 +194,12 @@ class ModelManifest:
         self.attention.validate()
         if self.linear is not None:
             self.linear.validate()
+        if self.state is not None:
+            self.state.validate()
         if self.moe is not None:
             self.moe.validate()
+        if self.model_impl is not None and ":" not in self.model_impl:
+            raise ValueError("model_impl must be 'module:Class'")
         caps = set(self.required_capabilities)
         valid = {c.value for c in CAPABILITIES}
         unknown_caps = sorted(caps - valid)
@@ -172,7 +221,7 @@ class ModelManifest:
         return hashlib.sha256(payload).hexdigest()[:16]
 
     def as_dict(self) -> Dict[str, Any]:
-        return {
+        data = {
             "schema_version": self.schema_version,
             "name": self.name,
             "manifest_id": self.manifest_id,
@@ -189,6 +238,11 @@ class ModelManifest:
             "benchmark": dict(self.benchmark),
             "source": self.source,
         }
+        if self.state is not None:
+            data["state"] = self.state.as_dict()
+        if self.model_impl is not None:
+            data["model_impl"] = self.model_impl
+        return data
 
     def write(self, path: str) -> None:
         self.validate()
