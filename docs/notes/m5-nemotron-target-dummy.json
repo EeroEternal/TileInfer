@@ -62,5 +62,10 @@
     "hbm_returned": "no process on NPU 0 after stop"
   },
   "logs": "/tmp/m5-target-dummy6.log",
-  "responses": "/tmp/m5-target-c1-dummy6.json, /tmp/m5-target-c1-dummy7.json"
+  "responses": "/tmp/m5-target-c1-dummy6.json, /tmp/m5-target-c1-dummy7.json",
+  "graph_followup": {
+    "evidence": "m5-nemotron-target-graph.json",
+    "result": "without --enforce-eager the same target dummy captured PIECEWISE 1 + FULL 1, used 2.68 GiB graph memory, and logged Replaying aclgraph",
+    "caveat": "dummy weights; decode-call counter did not advance, so this is not full C3"
+  }
 }

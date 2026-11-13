@@ -803,6 +803,101 @@ def moe_align_block_size_block_first(
 # ---------------------------------------------------------------------------------------------
 
 
+_GROUPED_PATH: Optional[bool] = None
+
+
+def _grouped_path_enabled() -> bool:
+    """Whether the Ascend grouped-matmul path is usable for the non-gated expert MLP.
+
+    This path sorts the slots by local expert, calls ``npu_grouped_matmul`` for both
+    projections, and combines in slot order.  It avoids ``torch.unique`` / ``nonzero`` /
+    ``tolist`` and is therefore the path graph capture can use; the torch reference loop
+    remains the fallback on CPU and for ``apply_router_weight_on_input``.
+    """
+    global _GROUPED_PATH
+    if _GROUPED_PATH is None:
+        try:
+            import torch_npu  # noqa: F401  (registers the NPU ops)
+
+            _GROUPED_PATH = bool(
+                hasattr(torch, "npu")
+                and torch.npu.is_available()
+                and hasattr(torch_npu, "npu_grouped_matmul")
+            )
+        except Exception:  # noqa: BLE001 - CPU-only installs are expected
+            _GROUPED_PATH = False
+    return _GROUPED_PATH
+
+
+def _grouped_non_gated(
+    x: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    flat_weights: torch.Tensor,
+    local: torch.Tensor,
+    active: torch.Tensor,
+    num_tokens: int,
+    top_k: int,
+    num_experts: int,
+    compute: torch.dtype,
+) -> Optional[torch.Tensor]:
+    """Sorted grouped-matmul implementation of the non-gated expert MLP.
+
+    Layouts follow the checkpoint: ``w1`` is ``[E, I, H]`` and ``w2`` is ``[E, H, I]``;
+    ``npu_grouped_matmul`` wants the transposed views.  Dead slots (``local < 0``) are mapped
+    to expert 0 with a zero input, so they produce zeros after the second projection without a
+    data-dependent gather.  Returns the already-weighted, token-major sum, or ``None`` when the
+    caller must use the reference loop.
+    """
+    if (
+        num_tokens == 0
+        or top_k == 0
+        or num_experts <= 1
+        or local.numel() == 0
+        or x.device.type != "npu"
+        or w1.device.type != "npu"
+        or w2.device.type != "npu"
+    ):
+        return None
+    try:
+        import torch_npu
+    except Exception:  # noqa: BLE001
+        return None
+
+    n = num_tokens * top_k
+    safe = local.clamp(min=0)
+    order = torch.argsort(safe, stable=True)
+    inverse = torch.empty_like(order)
+    inverse.index_put_((order,), torch.arange(n, device=order.device, dtype=order.dtype))
+    counts = torch.zeros(num_experts, dtype=torch.int64, device=order.device)
+    counts.index_add_(0, safe, torch.ones_like(safe))
+    mask = active.index_select(0, order).unsqueeze(1).to(compute)
+
+    slot_tokens = torch.arange(num_tokens, device=x.device, dtype=torch.int64).repeat_interleave(top_k)
+    x_slot = x.index_select(0, slot_tokens).index_select(0, order) * mask
+    w1t = w1.to(compute).transpose(1, 2).contiguous()
+    w2t = w2.to(compute).transpose(1, 2).contiguous()
+    gate = torch_npu.npu_grouped_matmul(
+        x=[x_slot],
+        weight=[w1t],
+        split_item=2,
+        group_list_type=1,
+        group_type=0,
+        group_list=counts,
+    )[0]
+    act = torch.relu(gate).square()
+    y = torch_npu.npu_grouped_matmul(
+        x=[act],
+        weight=[w2t],
+        split_item=2,
+        group_list_type=1,
+        group_type=0,
+        group_list=counts,
+    )[0]
+    slot_out = y.index_select(0, inverse).to(torch.float32)
+    return (slot_out.view(num_tokens, top_k, -1) * flat_weights.view(num_tokens, top_k, 1)).sum(dim=1)
+
+
 def fused_experts(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -985,7 +1080,24 @@ def fused_experts(
     # fp32 in both modes: it is the top-k combine's accumulator, and ``y * w_e`` promotes anyway.
     out = torch.zeros((num_tokens, hidden), dtype=torch.float32, device=device)
 
-    if num_tokens and top_k:
+    grouped_done = False
+    if not gated and not apply_router_weight_on_input and _grouped_path_enabled():
+        grouped_out = _grouped_non_gated(
+            x,
+            w1,
+            w2,
+            flat_weights,
+            local,
+            active,
+            num_tokens,
+            top_k,
+            num_experts,
+            compute,
+        )
+        if grouped_out is not None:
+            out = out + grouped_out
+            grouped_done = True
+    if num_tokens and top_k and not grouped_done:
         # slot s -> its token idx; the expand is the same row expansion build_slot_layout uses
         slot_tokens = torch.arange(num_tokens, device=device, dtype=torch.int64).repeat_interleave(
             top_k

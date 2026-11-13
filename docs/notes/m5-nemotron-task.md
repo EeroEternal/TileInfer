@@ -205,7 +205,7 @@ MTP 投机、长上下文（8K/16K/32K/128K；config 声明 262144，262K 为条
 | 目标 `nemotron_h` 不在 vLLM AutoConfig 注册表 | 无别名时 `ModelConfig` 直接失败 | bridge 已补别名；不要关 `TILEINFER_V3` |
 | 参考实现未跑 | C2 top5 未产生 | 完整权重后 CPU HF probe |
 
-**下一步**：目标 dummy 已通过；等 9 个缺失分片补齐后做真权重 C1，再做 CPU HF 参考 C2。
-C3 仍未通：合成 `M*E` 的无 `--enforce-eager` 首次捕获在 PIECEWISE 0/1 断在非门控 MoE 的
-`aclnnNonzero`（`moe.py:1010`），需要 grouped/dense kernel，而不是一行修补；目标 C3 未测。
+**下一步**：目标 dummy 的 eager 与 graph 两条路径都已跑通；graph 捕获为 PIECEWISE+FULL、
+目标图内存 2.68 GiB、日志有 `Replaying aclgraph`。但权重是 dummy，`decode_calls` 计数未推进，
+不能据此证明真权重 C3/稳态 0 回退。等 9 个缺失分片补齐后做真权重 C1，再做 CPU HF 参考 C2；
 目标 C1/C2 通过前，`state.linear` 仍保持 gap，不把 provider 写成默认支持。

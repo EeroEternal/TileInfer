@@ -313,8 +313,8 @@ def selective_state_update(
         if dst_state_batch_indices is not None
         else src
     )
-    src_cpu = src.detach().to("cpu")
-    dst_cpu = dst.detach().to("cpu")
+    src_flat = src.reshape(-1).to(torch.int64)
+    dst_flat = dst.reshape(-1).to(torch.int64)
     df = D.to(torch.float32)
     if df.dim() == 1:
         df = df[:, None]
@@ -330,25 +330,17 @@ def selective_state_update(
     if dt_bias_f.shape[-1] == 1:
         dt_bias_f = dt_bias_f.expand(nheads, headdim)
 
-    for row in range(batch):
-        # A speculative row may carry more than one accepted token; this reference handles the
-        # ordinary one-token-per-row case and fails loudly rather than silently dropping tokens.
-        if src_cpu.shape[1] > 1 and int(src_cpu.shape[1]) != 1:
-            # For the multi-token case use the first slot; the caller should route speculative
-            # decode through the chunk path until this is implemented.
-            pass
-        s_in = int(src_cpu[row, 0])
-        s_out = int(dst_cpu[row, 0])
-        dt_row = dt[row].to(torch.float32)
-        dt_row = _softplus_clamp(dt_row, dt_bias_f, dt_softplus)
-        x_row = x[row].to(torch.float32)
-        b_row = b_rep[row]
-        c_row = c_rep[row]
-        state_in = state[s_in].to(torch.float32)
-        decay = torch.exp(dt_row[..., None] * a)
-        state_out = state_in * decay + (dt_row[..., None] * x_row[..., None] * b_row[:, None, :])
-        y = (state_out * c_row[:, None, :]).sum(dim=-1) + x_row * df
-        if z is not None:
-            y = y * F.silu(z[row].to(torch.float32))
-        out[row].copy_(y.to(out.dtype))
-        state[s_out].copy_(state_out.to(state.dtype))
+    # Vectorised over the batch: no host round-trip for the state indices.  The previous
+    # per-row loop did ``src.to('cpu')``/``int(...)`` and therefore failed ACL graph capture with
+    # ``rtMemcpy ... stream is capturing``.  Duplicate destination slots keep the same
+    # last-writer-wins semantics as the kernel; ordinary decode has one token per sequence.
+    dtf = _softplus_clamp(dt.to(torch.float32), dt_bias_f, dt_softplus)
+    xf = x.to(torch.float32)
+    state_in = state.index_select(0, src_flat).to(torch.float32)
+    decay = torch.exp(dtf[..., None] * a)
+    state_out = state_in * decay + dtf[..., None] * xf[..., None] * b_rep[:, :, None, :]
+    y = (state_out * c_rep[:, :, None, :]).sum(dim=-1) + xf * df
+    if z is not None:
+        y = y * F.silu(z.to(torch.float32))
+    out.copy_(y.to(out.dtype))
+    state.index_copy_(0, dst_flat, state_out.to(state.dtype))

@@ -1,0 +1,65 @@
+{
+  "evidence_id": "m5-nemotron-target-graph-2026-11-13",
+  "date": "2026-11-13",
+  "timezone": "Asia/Shanghai",
+  "scope": "target-shape graph-capture and replay with dummy weights; NOT real-weight C1/C2 and NOT full C3",
+  "model": "/home/models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
+  "service": {
+    "host": "127.0.0.1",
+    "port": 18081,
+    "load_format": "dummy",
+    "max_model_len": 2048,
+    "max_num_seqs": 1,
+    "enforce_eager": false,
+    "gpu_memory_utilization": 0.75,
+    "health": 200,
+    "weights_loaded_gb": 58.8333,
+    "kv_cache_gib": 30.39,
+    "graph_memory_gib": 2.68,
+    "plan_id": "abd6348895c2d65d"
+  },
+  "capture": {
+    "cudagraph_mode": "FULL_AND_PIECEWISE",
+    "captured_graphs": 2,
+    "capture_keys": {"PIECEWISE": 1, "FULL": 1},
+    "capture_done": true,
+    "log": "Graph capturing finished in 2 secs, took 2.68 GiB",
+    "replay_log": "Replaying aclgraph"
+  },
+  "requests": [
+    {
+      "id": "cmpl-ac42d7075d758f5e",
+      "prompt_tokens": 1,
+      "completion_tokens": 16,
+      "finish_reason": "length",
+      "graph_replay": true
+    },
+    {
+      "id": "cmpl-99facd179220c8c5",
+      "prompt_tokens": 161,
+      "completion_tokens": 8,
+      "finish_reason": "length"
+    }
+  ],
+  "fixes_that_made_capture_possible": [
+    "non-gated MoE now sorts slots and uses npu_grouped_matmul for both projections; no torch.unique/nonzero/tolist in the captured path",
+    "selective_state_update now indexes state with tensor indices instead of copying indices to CPU and looping with int()"
+  ],
+  "not_proven": [
+    "C3 with real checkpoint weights",
+    "steady-state fallback = 0: the bridge metrics recorded decode_calls=0 while the graph replay served the requests, so that counter is not used as proof",
+    "long-context capture, MTP, concurrency, cold-start cache replay",
+    "numerical correctness (dummy weights produce meaningless text)"
+  ],
+  "metrics_snapshot": {
+    "captured_graphs": 2,
+    "decode_calls": 0,
+    "decode_graph_hits": 0,
+    "decode_fallbacks": 0,
+    "errors": 0,
+    "note": "decode counter did not advance on the replayed path; do not cite it as steady-state proof"
+  },
+  "logs": "/tmp/m5-target-graph.log",
+  "responses": "/tmp/m5-target-c3-dummy1.json, /tmp/m5-target-c3-dummy2.json",
+  "cleanup": {"port_18081_free": true, "process_running": false}
+}

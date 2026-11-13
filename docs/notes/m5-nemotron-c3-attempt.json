@@ -37,5 +37,12 @@
     "port_18084_free": true,
     "process_running": false
   },
-  "logs": "/tmp/m5-tiny-graph.log"
+  "logs": "/tmp/m5-tiny-graph.log",
+  "followup": {
+    "date": "2026-11-13",
+    "result": "after moving non-gated MoE to npu_grouped_matmul and vectorising selective_state_update, the same tiny M*E model captured PIECEWISE+FULL and served a request",
+    "log": "/tmp/m5-tiny-graph3.log",
+    "target": "target 30B dummy also captured 2 graphs and replayed aclgraph; see m5-nemotron-target-graph.json",
+    "still_not_proven": "real weights, steady-state fallback counter, long context, MTP, concurrency"
+  }
 }

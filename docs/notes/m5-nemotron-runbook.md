@@ -232,10 +232,18 @@ python benchmarks/compare_responses.py \
 >
 > 合成 `M*E` 的首次图捕获实测（端口 18084，无 `--enforce-eager`）在 PIECEWISE 0/1 阶段失败：
 > `aclnnNonzero` 错误码 107027，位置 `tileinfer/vllm/ops/moe.py:1010`
-> （`(local < 0).nonzero(...)`）。这说明**非门控 MoE 的数据依赖路径先于 Mamba2 断图**；
-> 只修这一个 `nonzero` 会继续撞到 `torch.unique(...).tolist()` / `torch.nonzero`，需要
-> grouped/dense kernel，不是单行修补。证据：
-> [`m5-nemotron-c3-attempt.json`](m5-nemotron-c3-attempt.json)。
+> （`(local < 0).nonzero(...)`）。这说明**非门控 MoE 的数据依赖路径先于 Mamba2 断图**。
+>
+> 随后把非门控 MoE 改成 `npu_grouped_matmul`（按 local expert 排序，不再 `unique/nonzero/tolist`），
+> 并把 `selective_state_update` 的 state 索引改成张量 index_select/index_copy，不再 `.to("cpu")`。
+> 合成 `M*E` 与目标 30B dummy 都能捕获 **PIECEWISE 1 + FULL 1**，日志出现 `Replaying aclgraph`；
+> 目标 dummy 图内存 2.68 GiB。证据：
+> [`m5-nemotron-c3-attempt.json`](m5-nemotron-c3-attempt.json)、
+> [`m5-nemotron-target-graph.json`](m5-nemotron-target-graph.json)。
+>
+> 但这仍不是完整 C3：权重是 dummy，且 bridge 的 `decode_calls` 计数在图 replay 路径上没有推进
+> （`decode_calls=0`），所以不能用它证明稳态 `fallbacks=0`。真权重 C1/C2 和长上下文/并发/MTP
+> 的图行为仍未测。
 
 保持服务运行，观察日志/指标：
 
