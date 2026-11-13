@@ -38,6 +38,7 @@ __all__ = [
     "KERNEL_PAGE_SIZE",
     "BATCH_BUCKETS",
     "next_pow2",
+    "grid_round",
     "sub_pages",
     "sub_page_width",
     "buckets_for",
@@ -55,6 +56,11 @@ __all__ = [
 
 #: Tokens per kernel page.  Matches the kernels' ``BC`` N tile; see the module docstring.
 KERNEL_PAGE_SIZE = 128
+
+#: The declared-capacity grid between consecutive powers of two (``base*(8+j)/8``).  Eight
+#: steps bound the capacity-view extension at 1/8 of the pool while keeping a pre-warm's plan
+#: and kernel compile keys stable under the engine's page-count drift.
+_CAP_GRID_STEPS = 8
 
 #: Batch sizes the decode kernel is compiled for.  Serving batches cluster well below these
 #: ceilings, so the padding waste is far cheaper than recompiling per step.  ``max_num_seqs``
@@ -354,11 +360,15 @@ def declared_pool_cap(pool_pages: int, pinned: Optional[int] = None) -> int:
     """The kernel ABI's *declared* page capacity for a real KV pool (pool-agnostic ABI).
 
     The kernel never dereferences a page outside the ``kv_indptr``/``kv_indices`` spans, so the
-    declared capacity only has to *cover* the real pool - its exact value is free.  Rounding up to
-    a power of two (or pinning it with ``TILEINFER_POOL_CAP``) removes the pool size from the
-    kernel / plan / pre-warm keys: the engine derives its pool from a memory snapshot, so it drifts
-    between runs (9425 pages in one run, 9899 in the next) and used to silently invalidate an
-    out-of-process pre-warm.
+    declared capacity only has to *cover* the real pool - its exact value is free.  It is
+    quantized to an eighth-of-a-power-of-two grid (``base*(8+j)/8`` for the enclosing power of
+    two), which keeps a pre-warm compiled for one pool size matching a pool that drifted by a
+    few pages between runs (the engine computes its pool from a memory snapshot, so it is not
+    reproducible) *and* bounds the gap between the declared capacity and the real pool: a plain
+    power-of-two rounding can demand up to 2x the pool, and ``capacity_view`` realises that gap
+    as a storage resize - a real allocation on torch_npu, which OOMed a hybrid two-group
+    deployment at 0.82 utilisation.  On this grid the extension is at most ``pool/8``, and an
+    exactly-aligned pool gets ``cap == pool`` (no extension at all).
 
     The caller presents the pool through a zero-copy capacity view, so ``cap >= pool_pages`` is
     what keeps the kernel's fixed-shape read in bounds.
@@ -376,4 +386,28 @@ def declared_pool_cap(pool_pages: int, pinned: Optional[int] = None) -> int:
                 "the declared capacity must cover every live page"
             )
         return int(pinned)
-    return next_pow2(pool_pages)
+    return grid_round(pool_pages)
+
+
+def grid_round(pool_pages: int) -> int:
+    """Round ``pool_pages`` up to the declared-capacity grid (see :func:`declared_pool_cap`).
+
+    This is the *allocation-side* half of the contract: a pool whose page count already sits on
+    the grid makes ``declared_pool_cap(pages) == pages``, so the kernel's capacity view is a
+    no-op — no storage extension, no resize allocation at serving time (on torch_npu a grown
+    storage is re-allocated in full, which OOMed a hybrid two-group deployment at 0.82
+    utilisation).  ``TileInferAttentionBackend.get_kv_cache_shape`` rounds the pool it asks the
+    engine to allocate through this function; the extra pages are never scheduled.
+    """
+    pool_pages = int(pool_pages)
+    if pool_pages <= 1:
+        return 1
+    pow2_hi = next_pow2(pool_pages)
+    if pow2_hi == pool_pages:
+        return pool_pages
+    base = pow2_hi >> 1
+    for step in range(1, _CAP_GRID_STEPS + 1):
+        cand = base * (_CAP_GRID_STEPS + step) // _CAP_GRID_STEPS
+        if cand >= pool_pages:
+            return int(cand)
+    return int(pow2_hi)

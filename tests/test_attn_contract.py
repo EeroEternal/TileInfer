@@ -292,6 +292,9 @@ def test_get_kv_cache_shape_is_block_first_so_vllm_skips_the_hybrid_rewrite():
     shape = TileInferAttentionBackend.get_kv_cache_shape(
         num_blocks=7, block_size=2048, num_kv_heads=2, head_size=256
     )
+    # The page count is NOT rounded: the runner sizes the raw buffer from the scheduler's
+    # num_blocks and applies this shape as a view, so a rounded shape would not fit.  The
+    # declared-capacity gap is closed in capacity_view instead (no storage extension).
     assert shape == (7, 2, 2048, 2, 256)
     # The block dimension must be discoverable by the ABC's own probe (shape.index(1234567)) - and
     # must be dim 0.
@@ -312,17 +315,18 @@ def test_the_declared_stride_order_keeps_the_k_and_v_halves_contiguous():
     *default* physical order is checked too: it is the layout that cannot be viewed, which is why
     the override exists.
     """
-    blocks, block_size, heads, dim, sub = 7, 512, 2, 8, 4
+    blocks, block_size, heads, dim, sub = 8, 512, 2, 8, 4  # 8: already on the capacity grid
     shape = TileInferAttentionBackend.get_kv_cache_shape(blocks, block_size, heads, dim)
     order = TileInferAttentionBackend.get_kv_cache_stride_order()
     assert order == (1, 0, 2, 3, 4)
     assert len(order) == len(shape)
+    assert shape[0] == blocks  # a grid-aligned count is handed back unchanged
 
     # vLLM: allocate the physical order, then permute the view back to the logical shape.
     physical = tuple(shape[i] for i in order)
     inv_order = [order.index(i) for i in range(len(order))]
     raw = torch.arange(
-        blocks * 2 * block_size * heads * dim, dtype=torch.float32
+        shape[0] * 2 * block_size * heads * dim, dtype=torch.float32
     ).reshape(physical)
     pool = raw.permute(*inv_order)
     assert tuple(pool.shape) == shape
@@ -330,12 +334,12 @@ def test_the_declared_stride_order_keeps_the_k_and_v_halves_contiguous():
     k_half, v_half = pool[:, 0], pool[:, 1]
     assert k_half.is_contiguous() and v_half.is_contiguous()
     # The halves are the same allocation, one K (or V) pool apart.
-    assert v_half.storage_offset() - k_half.storage_offset() == blocks * block_size * heads * dim
+    assert v_half.storage_offset() - k_half.storage_offset() == shape[0] * block_size * heads * dim
 
     page = pool_sub_view(k_half, sub)
     assert page.data_ptr() == k_half.data_ptr(), "the sub-page view must stay zero-copy"
-    assert tuple(page.shape) == (blocks * sub, 128, heads, dim)
-    for p in (0, 1, sub, blocks * sub - 1):
+    assert tuple(page.shape) == (shape[0] * sub, 128, heads, dim)
+    for p in (0, 1, sub, shape[0] * sub - 1):
         engine_page, offset = divmod(p, sub)
         assert torch.equal(page[p, 0], k_half[engine_page, offset * 128])
 
@@ -343,7 +347,7 @@ def test_the_declared_stride_order_keeps_the_k_and_v_halves_contiguous():
     # are then strided and the zero-copy sub-page view is impossible.  This is the layout the
     # hybrid rewrite produces for a block_dim==1 backend, and it is *not* faked.
     default = torch.arange(
-        blocks * 2 * block_size * heads * dim, dtype=torch.float32
+        shape[0] * 2 * block_size * heads * dim, dtype=torch.float32
     ).reshape(shape)
     assert not default[:, 0].is_contiguous()
     with pytest.raises(ValueError, match="contiguous"):
@@ -605,7 +609,10 @@ def test_impl_accepts_the_target_model_shape():
         ({"num_heads": 16, "num_kv_heads": 6}, ValueError, "multiple of num_kv_heads"),
         ({"head_size": 64}, ValueError, "head_size"),
         ({"head_size": 192}, ValueError, "head_size"),
-        ({"sliding_window": 4096}, NotImplementedError, "sliding-window"),
+        # sliding_window is *accepted* now (windowed layers compute on the reference path —
+        # tests/test_windowed_attention.py owns that behaviour); a non-positive window is the
+        # remaining configuration error.
+        ({"sliding_window": 0}, ValueError, "positive"),
         ({"alibi_slopes": [0.1] * 16}, NotImplementedError, "alibi"),
         ({"logits_soft_cap": 30.0}, NotImplementedError, "soft capping"),
         ({"kv_sharing_target_layer_name": "model.layers.0.self_attn"}, NotImplementedError, "KV-sharing"),

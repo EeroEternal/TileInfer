@@ -283,6 +283,14 @@ class ModelProfile:
         (``tileinfer.vllm.ops.families.<op_family>``; ``gdn-moe`` today).
     ``unsupported_features``
         Everything this profile refuses, with the reason each consumer prints.
+    ``mixed_attention_specs``
+        True when the model's attention layers mix spec types that vLLM's unified-spec mode
+        would flatten (MuseGlimmer's iRoPE: full-attention + sliding-window layers).  The
+        platform answers ``support_hybrid_kv_cache() == True`` for such a profile so vLLM builds
+        one group per spec and the sliding-window allocator can drop out-of-window blocks —
+        the memory optimisation the unified path (``unify_hybrid_kv_cache_specs``) gives up.
+        The window still lives in the *compute* (the backend's reference path), not in the
+        pool layout; this flag is only about how many groups the engine creates.
     ``notes``
         Free-form provenance / scope notes; never parsed.
     """
@@ -297,6 +305,7 @@ class ModelProfile:
     op_family: str
     unsupported_features: Tuple[UnsupportedFeature, ...]
     notes: str = ""
+    mixed_attention_specs: bool = False
 
     def __post_init__(self) -> None:
         if not self.name:
