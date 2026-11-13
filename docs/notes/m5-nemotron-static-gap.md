@@ -35,6 +35,7 @@
 | F16 | 权重名与声明的 52 层完全对齐：23 Mamba / 23 MoE / 6 attention；每个 MoE 层 0..127 experts 齐全，shared expert 宽度 3712，MTP 为 attention+moe；`mapping_ok=true` | [`m5-nemotron-weight-map.json`](m5-nemotron-weight-map.json)；只读索引，不读 tensor |
 | F17 | 已在盘上的 5 个分片头部全部有效：1968 个 tensor header，文件大小与 header offset 一致，无重复 key、无 index/header 漂移；但只覆盖 5/14 分片，`complete=false` | [`m5-nemotron-shard-headers.json`](m5-nemotron-shard-headers.json)；只读 header，不读 tensor payload |
 | F18 | 用真实 checkpoint 生成的 shim config 能被 vLLM 0.23 `NemotronHConfig` 加载：52 层、`MEMEM*...`、MTP `*E`、Mamba 64/64/128/8/4/2、MoE 128/top-6/1856/shared 1/3712 | `.venv_v3/bin/python` 实测；未构造模型、未上卡 |
+| F19 | 已在盘上的 5 个分片里，1950 个 tensor 的 header shape 与 config 推导值一致；0 处不匹配；18 个非 mixer/norm 类 key 未做形状检查 | [`m5-nemotron-shapes.json`](m5-nemotron-shapes.json)；只读 header，不读 tensor payload |
 
 ---
 
