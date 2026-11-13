@@ -222,6 +222,10 @@ python benchmarks/compare_responses.py \
 
 ## 5. C3：图捕获
 
+> 当前 Mamba2 替换是 eager torch（`graphable=False`），C1 只能用 `--enforce-eager` 跑通；
+> **这不能作为 C3 证据**。C3 需要重新设计可捕获的 Mamba2 路径，或等厂商 Mamba2/SSD
+> backend 支持；在拿到 `captured_graphs > 0` 且稳态 `fallbacks = 0` 前，C3 保持未验证。
+
 保持服务运行，观察日志/指标：
 
 - `captured_graphs > 0`；
