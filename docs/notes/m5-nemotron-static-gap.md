@@ -33,6 +33,7 @@
 | F14 | 用 `normalize_config()` 把 `layers_block_type`/`mtp_layers_block_type` 转成 `hybrid_override_pattern`/`mtp_hybrid_override_pattern` 后，`NemotronHConfig` 能加载，层型和 MTP pattern 与目标一致 | `tools/nemotron/config_to_manifest.py`；测试 `test_normalized_config_loads_in_vllm_without_npu` |
 | F15 | 权重索引有 270 个 `mtp.*` key（`mtp.layers.0` attention / `mtp.layers.1` moe），backbone 最大层号 51；MTP 权重确实存在 | [`m5-nemotron-mtp.json`](m5-nemotron-mtp.json)；索引 612207 B / 6513 keys |
 | F16 | 权重名与声明的 52 层完全对齐：23 Mamba / 23 MoE / 6 attention；每个 MoE 层 0..127 experts 齐全，MTP 为 attention+moe；`mapping_ok=true` | [`m5-nemotron-weight-map.json`](m5-nemotron-weight-map.json)；只读索引，不读 tensor |
+| F17 | 已在盘上的 5 个分片头部全部有效：1968 个 tensor header，文件大小与 header offset 一致，无重复 key、无 index/header 漂移；但只覆盖 5/14 分片，`complete=false` | [`m5-nemotron-shard-headers.json`](m5-nemotron-shard-headers.json)；只读 header，不读 tensor payload |
 
 ---
 
