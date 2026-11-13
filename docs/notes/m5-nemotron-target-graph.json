@@ -21,7 +21,10 @@
   "capture": {
     "cudagraph_mode": "FULL_AND_PIECEWISE",
     "captured_graphs": 2,
-    "capture_keys": {"PIECEWISE": 1, "FULL": 1},
+    "capture_keys": {
+      "PIECEWISE": 1,
+      "FULL": 1
+    },
     "capture_done": true,
     "log": "Graph capturing finished in 2 secs, took 2.68 GiB",
     "replay_log": "Replaying aclgraph"
@@ -61,5 +64,16 @@
   },
   "logs": "/tmp/m5-target-graph.log",
   "responses": "/tmp/m5-target-c3-dummy1.json, /tmp/m5-target-c3-dummy2.json",
-  "cleanup": {"port_18081_free": true, "process_running": false}
+  "cleanup": {
+    "port_18081_free": true,
+    "process_running": false
+  },
+  "cold_start": {
+    "api_process_first_log": "19:48:52",
+    "application_startup_complete": "19:49:23",
+    "approx_seconds": 31,
+    "weights_load_seconds": 16,
+    "graph_capture_seconds": 2,
+    "caveat": "dummy load format; real 14-shard load and real tokenizer may differ"
+  }
 }
