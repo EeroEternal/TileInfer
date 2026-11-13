@@ -1,7 +1,8 @@
 # M5 交付模型任务书：Nemotron 3.5 Lightning 30B-A3B
 
-> 状态：**离线实现阶段（2026-11-12 晚）**。今晚不启动服务、不占卡、不下载权重；
-> 先把所有不依赖实机的工作做完，实机验证作为最后一个 gate。
+> 状态：**实机 gate 已开始（2026-11-13）**。离线 O1–O7 已收口；目标权重仍为 5/14，
+> 目标 30B 尚未加载。已完成目标 config/page 校验和合成同架构 Mamba2 机械探测；
+> 目标 C1/C2/C3/C4 仍未执行，不能写“支持”。
 >
 > 关联：[`long-term-task.md`](../long-term-task.md) M5、[`acceptance.md`](../acceptance.md)、
 > [`verification-matrix.md`](../verification-matrix.md)、[`model-bringup-layers.md`](model-bringup-layers.md)。
@@ -18,7 +19,7 @@
 | 厂商状态 | vLLM 0.23 已注册 `NemotronHForCausalLM`、`NemotronHMTPModel`；vllm-ascend 0.23 无 Nemotron 模型注册（待上机确认是否完全不可用） |
 | 目标栈 | **冻结** vLLM 0.23.0 / vllm-ascend 0.23.0-950；不升级，除非单独过 V0 gate |
 | 硬件 | 单卡 Ascend950PR（131072 MB HBM），共享环境 |
-| 今晚约束 | **不实机验证**：不 `vllm serve`、不 `npu-smi`、不绑端口、不占卡、不下载权重 |
+| 实机约束 | 2026-11-13 用户已授权用卡；只在空闲卡/端口上起自己的进程，不 kill 他人；目标卡被占时停 |
 | 交付目标 | 端到端推理跑通；MTP、图模式、长上下文、并发、冷启动、算子审计逐项留证；provider 只补真实缺口 |
 
 ---
@@ -120,10 +121,11 @@ MTP 投机、长上下文（8K/16K/32K/128K；config 声明 262144，262K 为条
 ### 5.1 进入条件
 
 - O1–O7 完成并 review；
-- 权重/config 已到位，`config.json` 的架构/MTP/上下文事实已确认；
+- config/索引/tokenizer 已到位；真权重 C1 需要 `preflight_model.py` 返回 `ready_to_load=true`；
+  dummy 只需 `ready_for_dummy=true`，但 30B dummy 仍占完整参数/state HBM；
+- 已生成目标 plan 并设置 `TILEINFER_PLAN`，否则默认 Qwen plan 会在 config gate 失败；
 - 用户明确同意：命令、端口（默认 8322）、预计时长、卡号/显存；
-- `npu-smi info` 预检空闲，端口未被占用；
-- 只停止自己启动的 PID；不 kill 他人进程。
+- `npu-smi info` 预检空闲，端口未被占用；只停止自己启动的 PID，不 kill 他人进程。
 
 ### 5.2 顺序（每步留证，失败即停）
 
@@ -141,11 +143,20 @@ MTP 投机、长上下文（8K/16K/32K/128K；config 声明 262144，262K 为条
 9. **D8 审计**：`TILEINFER_AUDIT` 落盘；热路径 torch 实现要有解释。
 10. **D9/D10 收口**：绝对性能地板、gap report 与实际工作量对照、provider `delete_when`。
 
-### 5.3 今晚明确不做
+### 5.3 已执行 / 仍未做
 
-- 不启动 `vllm serve`，不跑 `npu-smi`，不绑 8322，不加载权重；
-- 不清/移编译缓存，不下载模型；
-- 不把静态推断写成“已验证”。
+已执行（2026-11-13，授权后）：
+
+- 目标 shim 的 `EngineArgs.create_engine_config()`：通过，block 4096 / Mamba page 4231168；
+- 合成 2 层 `M*` 小模型 dummy：Mamba2 SSD Triton 编译失败，服务未起；证据见
+  [`m5-nemotron-tiny-mamba2.json`](m5-nemotron-tiny-mamba2.json)；
+- 卡上已有他人的 `VLLM::EngineCore`（约 103 GB HBM），未终止、未抢占。
+
+仍未做：
+
+- 目标 30B dummy / C1 / C2 / C3 / MTP / 长上下文 / 并发 / 冷启动 / 算子审计；
+- 目标权重只有 5/14，不能做 C2；
+- 不把合成小模型或静态推断写成目标结论。
 
 ---
 
@@ -167,7 +178,7 @@ MTP 投机、长上下文（8K/16K/32K/128K；config 声明 262144，262K 为条
 ## 7. 约束（违反即停）
 
 1. **共享环境**：任何部署/重启/端口/占卡先说明并取得明确同意；不 kill 他人进程。
-2. **今晚不实机**：O1–O7 只用 CPU/文件/静态分析；硬件 gate 单独审批。
+2. **实机需审批**：任何服务/端口/占卡先说明并取得明确同意；目标卡被他人占用时停，不 kill。
 3. **不阻塞开发**：O1–O7 可并行；硬件未批不影响离线产物合并。
 4. **冻结版本**：vLLM 0.23.0 / vllm-ascend 0.23.0-950；升级另过 V0 gate。
 5. **不改上游**：只允许安装期注册、启动期换表、包装方法；接入点 ≤8。
@@ -180,10 +191,11 @@ MTP 投机、长上下文（8K/16K/32K/128K；config 声明 262144，262K 为条
 
 | 阻塞 | 影响 | 今晚能否绕过 |
 |---|---|---|
-| 目标模型权重/config 不在本地 | 无法做 O2/O5 的精确字段与参考样例 | 能：先做 O1/O3/O4/O6 框架，config 到位再填 |
-| Hugging Face 网络不可达 | 不能拉 config/权重 | 能：不下载；用本地 vLLM 源码做静态审计 |
-| MTP 权重未知 | D4 不能承诺 | 能：先写“有/无”分支，实机前确认 |
-| 实机需审批 | D1–D10 全部未执行 | 能：离线产物先行，硬件 gate 最后 |
+| 目标权重 5/14 | 目标 C1/C2 不能执行；dummy 可做但占完整 HBM | 补齐 9 个分片后 `ready_to_load=true` |
+| 目标卡被他人 `VLLM::EngineCore` 占用（约 103 GB） | 目标 30B dummy/服务无法安全启动 | 等卡空闲，或由用户协调；不 kill |
+| Mamba2 SSD Triton 在合成模型上编译失败 | G2 已有机械失败证据；目标形状未测 | 需要 `state.linear`/Mamba2 provider 或厂商 SSD kernel |
+| 目标 `nemotron_h` 不在 vLLM AutoConfig 注册表 | 无别名时 `ModelConfig` 直接失败 | bridge 已补别名；不要关 `TILEINFER_V3` |
+| 参考实现未跑 | C2 top5 未产生 | 完整权重后 CPU HF probe |
 
-**下一步（离线）**：先完成 O1 静态审计和 O3 静态 gap report；再写 O2/O4/O6；
-最后跑 O7 CPU 测试。完成后再向用户申请实机 gate。
+**下一步**：等目标卡空闲且权重补齐；先做目标 dummy（带 `TILEINFER_PLAN` 和
+`--enforce-eager`），确认是否仍在 Mamba2 SSD kernel 失败；再决定是否补 provider/换路径。

@@ -13,11 +13,14 @@
 - [ ] `config.json` 已确认：`architectures/model_type/num_hidden_layers/
       layers_block_type/mtp_layers_block_type/num_nextn_predict_layers/max_position_embeddings`；
 - [ ] 已生成 vLLM 0.23 兼容的 config shim（见 §1.1），且 `NemotronHConfig` 能加载；
-- [ ] 权重路径存在，磁盘/内存足够；当前目录只有 config/metadata，**safetensors 未完整**，不要启动；
-- [ ] `preflight_model.py` 返回 `ready_to_load=true`（shards/tokenizer 齐全）；
+- [ ] 权重路径存在，磁盘/内存足够；当前是 **5/14 分片**，`ready_to_load=false`，不要做真权重 C1；
+- [ ] 若只做 dummy：`preflight_model.py` 的 `ready_for_dummy=true`（config/tokenizer 齐全）；
+- [ ] 30B dummy 仍会分配完整参数/state 的 HBM，不是“小模型 smoke”；
 - [ ] MTP 是否存在已确认（没有就不开 MTP，不拿 ngram 冒充）；
 - [ ] `npu-smi info` 显示目标卡空闲（获准后执行）；
 - [ ] 端口 `8322` 未被占用（`ss -ltnp`）；
+- [ ] `npu-smi info` 确认没有他人的 `VLLM::EngineCore` 占着目标卡；**绝不 kill 他人进程**；
+- [ ] 已生成目标 plan（§1.2），否则 bridge 会用默认 Qwen plan 并在 config gate 失败；
 - [ ] 用户同意：命令、端口、预计时长、卡号；
 - [ ] 记录开始时间、PID、命令原文。
 
@@ -31,6 +34,7 @@ source scripts/env-ascend102.sh
 
 MODEL=/home/models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16
 SHIM=/tmp/m5-nemotron-shim-$(date +%s)
+PLAN=/tmp/m5-nemotron-plan.json
 PORT=8322
 LOG=/tmp/m5-nemotron-serve.log
 METRICS=/tmp/m5-nemotron-metrics.json
@@ -48,6 +52,7 @@ python tools/nemotron/preflight_model.py --model "$MODEL"
 `ready_to_load=false` 时不要做真权重加载；它只查文件是否存在/非空，不会碰 NPU。
 `ready_for_dummy=true` 表示 config/tokenizer 已齐，可以做 §2 的随机权重机械 smoke；
 它仍然**不能**替代 `ready_to_load`，也不能产生 C1/C2/C3/C4 证据。
+2026-11-13 的现状是 5/14 分片，`ready_to_load=false`、`ready_for_dummy=true`。
 
 ### 1.1 config shim（vLLM 0.23 不认 `layers_block_type`）
 
@@ -77,6 +82,26 @@ PY
 期望：52 字符 pattern，含 23 个 `M`、23 个 `E`、6 个 `*`；MTP pattern 为 `*E`。
 **这一步只改 config 的 schema 表达，不改权重，不改上游源码。**
 
+### 1.2 vLLM 0.23 的 `nemotron_h` AutoConfig 别名
+
+vLLM 0.23.0 自带 `NemotronHConfig`，但它的 `_CONFIG_REGISTRY` 没有 `nemotron_h` 项；
+Transformers 4.57 下 `ModelConfig` 会在模型代码之前直接失败。TileInfer 的 bridge 在
+`ModelConfig` 之前注册 vLLM 自带的类（`tileinfer/vllm/config_compat.py`），不修改上游源码。
+如果 bridge 被 `TILEINFER_V3=0` 关闭，这个别名不会注册；因此目标服务不要关 bridge。
+
+### 1.3 目标 plan（不注册 draft）
+
+`NEMOTRON_3_5_DRAFT` 仍在 benchmark pending，**不在** `MANIFESTS`；但实机需要目标 plan 才能
+过 config gate。用离线工具生成临时 plan：
+
+```bash
+.venv_v3/bin/python tools/nemotron/build_plan.py --out "$PLAN"
+```
+
+输出会明确 `servable=false`、`gaps=["state.linear"]`；这是 bring-up 用的 plan，不是支持声明。
+启动时设 `TILEINFER_PLAN="$PLAN"`，否则 bridge 会按默认 Qwen 声明生成 plan，config gate
+会报 `TileInfer plan/model mismatch`。
+
 ---
 
 ## 2. Dummy 加载（先判机械链路，不是验收）
@@ -86,26 +111,46 @@ PY
 > 仍然需要完整 tokenizer 和显式实机授权。
 
 ```bash
-TILEINFER_AUDIT=$AUDIT \
-vllm serve "$SHIM" \
+TILEINFER_PLAN="$PLAN" TILEINFER_AUDIT="$AUDIT" \
+.venv_v3/bin/python -m vllm.entrypoints.openai.api_server \
+  --model "$SHIM" \
   --served-model-name nemotron \
   --load-format dummy \
   --max-model-len 8192 \
   --max-num-seqs 1 \
   --enforce-eager \
   --gpu-memory-utilization 0.82 \
-  --port "$PORT" >"$LOG" 2>&1 &
+  --host 127.0.0.1 --port "$PORT" >"$LOG" 2>&1 &
 echo $! > /tmp/m5-nemotron.pid
 ```
+
+`vllm` 脚本的 shebang 在这个 venv 里指向不存在的 `.venv/bin/python3.12`，所以手册用
+`.venv_v3/bin/python -m ...`，不要直接调用 `vllm`。
 
 判据：
 
 - `/health` 200；
 - 日志出现模型类/架构识别、KV/Mamba state 分配；
 - 没有 `NotImplementedError` / 缺算子；
-- `TILEINFER_AUDIT` 能落盘（若无 TileInfer 注入，至少确认厂商路径）。
+- `TILEINFER_AUDIT` 能落盘（若无 TileInfer 注入，至少确认厂商路径）；
+- 日志里出现 `TileInfer ... plan=... model=Nemotron-3.5...`，而不是默认 Qwen plan。
 
 结果只记“机械链路通过/失败 + 首个错误”，不要写成“模型可用”。
+
+### 2.1 已记录的合成小模型结果（2026-11-13）
+
+目标卡当时被他人 `VLLM::EngineCore` 占用（约 103 GB HBM），没有抢占，也没有起目标 30B
+dummy。改用 2 层、`M*`、hidden 256 的合成同架构模型做机械 smoke：
+
+- 能构造模型、加载 0.1253 GB dummy 权重；
+- 进入 `Warming up Mamba2 SSD Triton kernels` 后失败：
+  `ssd_chunk_scan.py:238` 的 `CompilationError` / `AttributeError('NoneType' object has no
+  attribute 'type')`，Ascend 后端报 `Currently ptr type from different source not supported`；
+- 服务没有监听 `/health`，自己的进程已停止；
+- 证据：[`m5-nemotron-tiny-mamba2.json`](m5-nemotron-tiny-mamba2.json)。
+
+这说明当前 vllm-ascend 的 Mamba2 SSD chunk-scan 路径不可用；但合成形状不是目标 30B 形状，
+不能直接写成“目标确认不支持”。目标 C1 仍需完整权重 + 空闲卡 + 目标 dummy。
 
 停止：
 
@@ -118,12 +163,14 @@ kill -TERM "$(cat /tmp/m5-nemotron.pid)"
 ## 3. C1：真权重、短请求
 
 ```bash
-vllm serve "$SHIM" \
+TILEINFER_PLAN="$PLAN" TILEINFER_AUDIT="$AUDIT" \
+.venv_v3/bin/python -m vllm.entrypoints.openai.api_server \
+  --model "$SHIM" \
   --served-model-name nemotron \
   --max-model-len 8192 \
   --max-num-seqs 1 \
   --gpu-memory-utilization 0.82 \
-  --port "$PORT" >"$LOG" 2>&1 &
+  --host 127.0.0.1 --port "$PORT" >"$LOG" 2>&1 &
 ```
 
 请求：

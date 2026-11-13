@@ -210,6 +210,7 @@ _STATE: Dict[str, Any] = {
     "graph": {},  # the dict _install_graph_bridge() returns
     "ops": {},  # the dict _install_ops() returns
     "models": {},  # the dict _install_models() returns
+    "configs": {},  # HF AutoConfig aliases registered before ModelConfig is built
 }
 
 
@@ -507,6 +508,16 @@ def _install_ops() -> Dict[str, Any]:
 # =============================================================================================
 
 
+def _install_config_aliases() -> Dict[str, Any]:
+    """Delegate to the small compatibility module so the bridge can call it too."""
+    try:
+        from tileinfer.vllm.config_compat import register_nemotron_h_alias
+
+        return register_nemotron_h_alias()
+    except Exception as exc:  # noqa: BLE001 - never abort boot
+        return {"name": "nemotron_h", "registered": False, "detail": repr(exc)}
+
+
 def _install_models() -> Dict[str, Any]:
     """Register the architectures this package implements and vLLM 0.23 does not ship.
 
@@ -614,6 +625,7 @@ def install(*, strict: Optional[bool] = None) -> bool:
             backend = _install_backend()
             graph = _install_graph_bridge()
             ops = _install_ops()
+            configs = _install_config_aliases()
             models = _install_models()
             _STATE.update(
                 installed=True,
@@ -624,6 +636,7 @@ def install(*, strict: Optional[bool] = None) -> bool:
                 graph=graph,
                 ops=ops,
                 models=models,
+                configs=configs,
             )
             logger.info(
                 "TileInfer vLLM plugin installed | %s | strict=%s | %s | backend: %s | graph: %s "
@@ -685,6 +698,7 @@ def uninstall() -> bool:
             graph={},
             ops={},
             models={},
+            configs={},
         )
         logger.info(
             "TileInfer vLLM plugin uninstalled: reverted %s; patches applied earlier stay applied "

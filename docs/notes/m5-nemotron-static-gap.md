@@ -1,6 +1,7 @@
 # Nemotron 3.5 Lightning 30B-A3B：静态缺口先验（离线，不上卡）
 
-> 状态：**静态代码审计**，不是 `tileinfer plan build` 的输出，也不是上机结论。
+> 状态：**静态代码审计 + 受限的 config/小模型机械探测**，不是目标 checkpoint 的 C1/C2 结论。
+> 目标权重仍只有 5/14 分片，没有加载过目标 tensor；小模型探测只回答“同架构 Mamba2 路径能否编译”。
 > 目的：在权重/实机到位前，把“确定的事实、确定的未知、候选 provider”分开。
 > 任何 `unknown` 都不能写成 `gap=0`，也不能写成“不支持”。
 >
@@ -36,6 +37,9 @@
 | F17 | 已在盘上的 5 个分片头部全部有效：1968 个 tensor header，文件大小与 header offset 一致，无重复 key、无 index/header 漂移；但只覆盖 5/14 分片，`complete=false` | [`m5-nemotron-shard-headers.json`](m5-nemotron-shard-headers.json)；只读 header，不读 tensor payload |
 | F18 | 用真实 checkpoint 生成的 shim config 能被 vLLM 0.23 `NemotronHConfig` 加载：52 层、`MEMEM*...`、MTP `*E`、Mamba 64/64/128/8/4/2、MoE 128/top-6/1856/shared 1/3712 | `.venv_v3/bin/python` 实测；未构造模型、未上卡 |
 | F19 | 已在盘上的 5 个分片里，1950 个 tensor 的 header shape 与 config 推导值一致；0 处不匹配；18 个非 mixer/norm 类 key 未做形状检查 | [`m5-nemotron-shapes.json`](m5-nemotron-shapes.json)；只读 header，不读 tensor payload |
+| F20 | vLLM 0.23.0 的 `_CONFIG_REGISTRY` 没有 `nemotron_h` 项；Transformers 4.57 下 `ModelConfig` 会在模型代码之前报 “does not recognize this architecture”。TileInfer 的 bridge 在 `ModelConfig` 之前注册 vLLM 自带的 `NemotronHConfig` 后，该错误消失 | `tileinfer/vllm/config_compat.py`；`tileinfer/bridge/install.py`；`.venv_v3` 实测 |
+| F21 | 目标 shim 的 `EngineArgs.create_engine_config()` 通过：`NemotronHForCausalLM`、attention block size 4096、Mamba page padded 4231168 B、padding 0.87%；没有加载权重、没有起服务 | [`m5-nemotron-config-load.json`](m5-nemotron-config-load.json) |
+| F22 | 合成同架构小模型（`M*`、2 层、dummy）能构造 Mamba2 层、加载 0.1253 GB dummy 权重，但在 “Warming up Mamba2 SSD Triton kernels” 阶段失败：`ssd_chunk_scan.py:238` 的 `CompilationError` / `AttributeError('NoneType' object has no attribute 'type')`，Ascend 后端报 `Currently ptr type from different source not supported`；服务未监听 `/health` | [`m5-nemotron-tiny-mamba2.json`](m5-nemotron-tiny-mamba2.json)；只跑合成模型，不碰目标权重 |
 
 ---
 
@@ -45,7 +49,7 @@
 |---|---|---|---|
 | U1 | 目标 checkpoint 的 `config.json` 字段 | 层数/pattern/MTP/上下文决定声明与验收 | 权重到位后读 config；今晚网络不可达，先留空 |
 | U2 | checkpoint 是否带 MTP heads/权重 | 没有就不能承诺 MTP | 查 config `num_nextn_predict_layers` + 权重 key |
-| U3 | vllm-ascend 是否能接住 `NemotronHForCausalLM` | vLLM 有模型 ≠ Ascend 能跑 | 读 Ascend attention/Mamba/状态路径；上机 dummy 判 |
+| U3 | vllm-ascend 是否能接住 `NemotronHForCausalLM` | vLLM 有模型 ≠ Ascend 能跑；已确认 config/page 层能过，Mamba2 kernel 层在合成模型上失败；目标形状仍未测 | 读 Ascend attention/Mamba/状态路径；目标 dummy/真权重判 |
 | U4 | Mamba2/混合 attention 的 Ascend 图捕获 | 不能图捕获则 C3 失败 | 上机捕获计数；静态只能列风险 |
 | U5 | 混合 KV/Mamba state 的分配与 page 约束 | 错则 OOM/错数 | 读 `MambaSpec`/Ascend platform；上机验 |
 | U6 | 权重名映射（`mixer.{k,v}_proj` 等） | 错则加载失败/静默错 | 读 `weight_utils.py` 与 Ascend loader；上机验 |
@@ -64,7 +68,7 @@
 |---|---|---|---|---|
 | G0 | **目标 config 与 vLLM 0.23 schema 不兼容** | **已实测**：raw config 直接 `AttributeError`；默认 pattern 也不是目标 pattern | config shim（`normalize_config`，不改上游） | vLLM/上游接受 `layers_block_type` 或升级 |
 | G1 | NemotronH 模型在 Ascend 的注册/加载 | 未知（可能 vLLM 通用路径可接） | model table / 模型包装 | vllm-ascend 原生注册 NemotronH |
-| G2 | Mamba2 mixer 的 SSD/chunk-scan 执行路径 | **静态缺候选**：有 conv/lightning 算子，但没有 `MambaMixer2`/`ssd_combined` 的 Ascend 替换；`state.linear` 路由已按 `covers["mixer"]` 区分 GDN，Mamba2 仍无 provider | `state.linear` + `Mamba2Contract` provider | 厂商 Mamba2/SSD backend 覆盖该形状 |
+| G2 | Mamba2 mixer 的 SSD/chunk-scan 执行路径 | **已有机械失败证据**：合成同架构模型在 `ssd_chunk_scan.py:238` Triton 编译失败；目标形状未测。`state.linear` 路由已按 `covers["mixer"]` 区分 GDN，Mamba2 仍无 provider | `state.linear` + `Mamba2Contract` provider | 厂商 Mamba2/SSD backend 覆盖该形状 |
 | G3 | 混合 attention（full + Mamba）的 KV/state 布局 | 未知 | state/KV provider 或 bridge | 厂商支持混合 KV/MambaSpec |
 | G4 | MTP（`NemotronHMTPModel`）在 Ascend 的注册/执行 | 权重已确认（270 个 `mtp.*` key）；Ascend 注册/执行/图仍未知 | MTP provider / model table | 厂商注册并验证 NemotronHMTP |
 | G5 | 图捕获（Mamba state + 混合 attention） | 未知 | graph hook（不是 provider） | 厂商图路径覆盖 |
@@ -96,3 +100,19 @@ grep -n "nemotron_h" \
 sed -n '1,20p' .venv_v3/lib/python3.12/site-packages/vllm_ascend/models/__init__.py
 ls .venv_v3/lib/python3.12/site-packages/vllm_ascend/ops/triton/mamba/
 ```
+
+---
+
+## 6. 2026-11-13 受限探测（非目标 C1）
+
+用户授权使用 NPU 后，先检查到卡上已有他人的 `VLLM::EngineCore`（约 103 GB HBM），未终止、
+未抢占；因此没有在目标 30B 上起服务。改为：
+
+1. 只用 `EngineArgs.create_engine_config()` 验证目标 shim 的 config/page 层；结果见 F21。
+2. 用 2 层、`M*`、hidden 256 的合成同架构模型做 dummy 机械 smoke，结果见 F22；服务未起来，
+   自己的 PID 已全部停止。
+3. 目标 checkpoint 仍为 5/14 分片，`preflight_model.py` 仍 `ready_to_load=false`；没有读目标
+   tensor payload，也没有产生目标 C1/C2/C3/C4 证据。
+
+因此本次把 G2 从“静态缺候选”升级为“同架构合成路径实测失败”，但**不能**写成
+“目标 30B 在 Ascend 上确认不支持”；要得到目标结论，仍需完整权重 + 空闲卡 + 目标 dummy。

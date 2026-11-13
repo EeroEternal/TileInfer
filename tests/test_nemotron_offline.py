@@ -499,3 +499,30 @@ def test_nemotron_static_audit_is_read_only_and_reports_unknowns(tmp_path: Path)
     # These are gaps, not passes: recorded False until proven otherwise.
     assert checks["ascend_model_registration"]["ok"] is False
     assert checks["ascend_mamba2_mixer_patch"]["ok"] is False
+
+
+def test_nemotron_h_config_alias_is_resolvable_by_autoconfig(tmp_path: Path) -> None:
+    from tileinfer.vllm.config_compat import register_nemotron_h_alias
+
+    info = register_nemotron_h_alias()
+    if not info["registered"]:
+        pytest.skip(f"vLLM/Transformers unavailable: {info['detail']}")
+
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "config_to_manifest_alias", ROOT / "tools/nemotron/config_to_manifest.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+    raw = json.loads((ROOT / "docs/notes/m5-nemotron-config.json").read_text(encoding="utf-8"))
+    norm = mod.normalize_config(raw)
+    (tmp_path / "config.json").write_text(json.dumps(norm), encoding="utf-8")
+
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained(str(tmp_path), local_files_only=True)
+    assert type(config).__name__ == "NemotronHConfig"
+    assert config.num_hidden_layers == 52
+    assert config.model_type == "nemotron_h"
