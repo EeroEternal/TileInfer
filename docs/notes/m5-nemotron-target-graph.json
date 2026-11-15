@@ -50,7 +50,7 @@
   ],
   "not_proven": [
     "C3 with real checkpoint weights",
-    "steady-state fallback = 0: the bridge metrics recorded decode_calls=0 while the graph replay served the requests, so that counter is not used as proof",
+    "steady-state fallback = 0: the bridge metrics recorded decode_calls=0 while the graph replay served the requests; the counter was fixed afterwards (non-NONE replay counts even when uniform_decode=False) but has not been re-run on NPU, so this run is not proof",
     "long-context capture, MTP, concurrency, cold-start cache replay",
     "numerical correctness (dummy weights produce meaningless text)"
   ],
@@ -60,7 +60,7 @@
     "decode_graph_hits": 0,
     "decode_fallbacks": 0,
     "errors": 0,
-    "note": "decode counter did not advance on the replayed path; do not cite it as steady-state proof"
+    "note": "decode counter did not advance on the replayed path in this run; instrumentation was fixed after the run, but no NPU re-run is available, so do not cite this snapshot as steady-state proof"
   },
   "logs": "/tmp/m5-target-graph.log",
   "responses": "/tmp/m5-target-c3-dummy1.json, /tmp/m5-target-c3-dummy2.json",

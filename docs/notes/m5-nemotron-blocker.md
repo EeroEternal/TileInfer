@@ -40,8 +40,9 @@ MTP/长上下文/并发/冷启动验证。** 这是宿主/驱动层问题，不�
 3. C2：同一 prompt 与参考实现逐 token/容差对齐。当前 `transformers 4.57.6` 没有 `NemotronH`
    类，不能直接 `AutoModel`；需要可用参考（升级/带 remote code 的 checkpoint，或用 vLLM 模型代码在
    CPU/第二设备上做参考），只有对齐后才能把 `tileinfer.mamba2_state` 注册为默认并改 plan 的 `servable`。
-4. C3：真实权重下确认 graph replay 与稳态 `decode_fallbacks=0`；bridge 的 `decode_calls` 计数在图
-   replay 路径上没有推进，需要先修计数器或改用 replay 计数。
+4. C3：真实权重下确认 graph replay 与稳态 `decode_fallbacks=0`。计数器已修：非 `NONE` replay
+   即使厂商传 `uniform_decode=False` 也计入 `decode_calls`/`decode_graph_hits`；严格 fallback 仍是
+   `NONE + uniform_decode + graph_allowed`。单测已过，但尚未在 NPU 上重跑。
 5. MTP、8K/16K/32K/128K、并发、冷启动、绝对性能地板。
 
 ## 不做什么

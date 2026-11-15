@@ -241,9 +241,9 @@ python benchmarks/compare_responses.py \
 > [`m5-nemotron-c3-attempt.json`](m5-nemotron-c3-attempt.json)、
 > [`m5-nemotron-target-graph.json`](m5-nemotron-target-graph.json)。
 >
-> 但这仍不是完整 C3：权重是 dummy，且 bridge 的 `decode_calls` 计数在图 replay 路径上没有推进
-> （`decode_calls=0`），所以不能用它证明稳态 `fallbacks=0`。真权重 C1/C2 和长上下文/并发/MTP
-> 的图行为仍未测。
+> 但这仍不是完整 C3：权重是 dummy。当次 `decode_calls=0` 暴露了计数缺口；现在非 `NONE` replay
+> 即使厂商传 `uniform_decode=False` 也会计数，单测见 `tests/test_bridge_metrics.py`。修复后尚未在
+> NPU 上重跑，仍不能用它证明稳态 `fallbacks=0`；真权重 C1/C2 和长上下文/并发/MTP 的图行为仍未测。
 >
 > MTP 单独跑过一遍（仍为 dummy，`--enforce-eager`）：`NemotronHMTPModel` 被解析、drafter 加载并
 > 共享 target embedding，161-token prompt 的请求完成 8 token；metrics 有 7 次 draft、7 个 draft

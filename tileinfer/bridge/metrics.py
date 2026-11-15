@@ -39,6 +39,9 @@ class Counters:
     decode_calls: int = 0
     decode_graph_hits: int = 0
     decode_fallbacks: int = 0
+    # Diagnostic only: a NONE dispatch after capture.  It is a fallback only when the
+    # dispatcher also said this is a uniform decode with graph mode allowed.
+    none_after_capture: int = 0
     attention_backend: str = ""
     plan_id: str = ""
     started_at: float = field(default_factory=time.time)
@@ -57,6 +60,7 @@ class Counters:
             "decode_calls": self.decode_calls,
             "decode_graph_hits": self.decode_graph_hits,
             "decode_fallbacks": self.decode_fallbacks,
+            "none_after_capture": self.none_after_capture,
             "attention_backend": self.attention_backend,
             "errors": self.errors,
             "uptime_s": round(time.time() - self.started_at, 3),
@@ -154,13 +158,26 @@ def record_capture_done(graphs: int) -> None:
 
 
 def record_dispatch(uniform_decode: bool, mode: str, graph_allowed: bool) -> None:
+    """Count one dispatcher decision after capture.
+
+    A non-``NONE`` mode is an observable graph replay: count it even when the vendor did
+    not set ``uniform_decode``.  Ascend's runner can report a graph replay while its
+    ``uniform_decode`` flag is false; requiring the flag made the old counter stay at zero
+    on exactly the path we need to prove.  A *fallback* is still the stricter event:
+    ``NONE`` + uniform decode + graph mode allowed.
+    """
     # Only steady state counts: before capture completes, `NONE` is expected and must not be
     # reported as a fallback.
-    if not COUNTERS.capture_done or not uniform_decode or not graph_allowed:
+    if not COUNTERS.capture_done:
+        return
+    if mode == "NONE":
+        if not graph_allowed:
+            return
+        COUNTERS.none_after_capture += 1
+        if uniform_decode:
+            COUNTERS.decode_calls += 1
+            COUNTERS.decode_fallbacks += 1
         return
     COUNTERS.decode_calls += 1
-    if mode == "NONE":
-        COUNTERS.decode_fallbacks += 1
-    else:
-        COUNTERS.decode_graph_hits += 1
+    COUNTERS.decode_graph_hits += 1
     maybe_dump()
