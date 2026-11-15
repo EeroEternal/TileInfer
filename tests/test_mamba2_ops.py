@@ -13,6 +13,8 @@ from tileinfer.vllm.ops.mamba2 import mamba_chunk_scan_combined_varlen, selectiv
 
 
 def _scalar_chunk(x, dt, A, B, C, D, dt_bias, state, group_ratio):
+    if D.dim() == 1:
+        D = D[:, None]
     out = torch.empty_like(x)
     for t in range(x.shape[0]):
         d = torch.nn.functional.softplus(dt[t] + dt_bias)
@@ -60,6 +62,8 @@ def test_mamba2_chunk_scan_matches_scalar_recurrence() -> None:
     reference, ref_state = _scalar_chunk(x, dt, A, B, C, D, dt_bias, initial_copy[0], heads // groups)
     torch.testing.assert_close(out, reference, rtol=1e-5, atol=1e-6)
     torch.testing.assert_close(final[0], ref_state, rtol=1e-5, atol=1e-6)
+    # initial_states is an input owned by the caller; the op must not write into it.
+    torch.testing.assert_close(initial, initial_copy)
 
 
 def test_mamba2_chunk_scan_respects_varlen_boundaries_and_returns_chunk_states() -> None:

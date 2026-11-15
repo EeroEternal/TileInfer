@@ -159,10 +159,15 @@ MTP 投机、长上下文（8K/16K/32K/128K；config 声明 262144，262K 为条
   不是真权重 C1/C2/C3**。证据 [`m5-nemotron-target-dummy.json`](m5-nemotron-target-dummy.json)；
 - 卡上已有他人的 `VLLM::EngineCore` 或其他服务（约 103 GB HBM），未终止、未抢占。
 
+2026-11-15：目标 14/14 分片全部到位，`preflight_model.py` 返回 `ready_to_load=true`；已做真权重
+CPU/算子级 C2 检查（MoE layer 1 全 128 experts 与参考完全一致；Mamba2 layer 0 真 A/D/dt_bias 在目标
+几何下 max abs 9.16e-4）。同日发现宿主重启后无 `/dev/davinci*`、`npu-smi` 返回 dcmi -8005，真权重
+C1/C3/MTP 仍无法启动，详见 [`m5-nemotron-blocker.md`](m5-nemotron-blocker.md)。
+
 仍未做：
 
-- 目标 30B dummy / C1 / C2 / C3 / MTP / 长上下文 / 并发 / 冷启动 / 算子审计；
-- 目标权重只有 5/14，不能做 C2；
+- 真权重 C1 / C3 / MTP / 长上下文 / 并发 / 冷启动；
+- 全模型 C2（`transformers 4.57.6` 无 `NemotronH` 类，需可用参考实现）；
 - 不把合成小模型或静态推断写成目标结论。
 
 ---
@@ -198,16 +203,18 @@ MTP 投机、长上下文（8K/16K/32K/128K；config 声明 262144，262K 为条
 
 | 阻塞 | 影响 | 今晚能否绕过 |
 |---|---|---|
-| 目标权重 5/14 | 目标 C1/C2 不能执行；dummy 可做但占完整 HBM | 补齐 9 个分片后 `ready_to_load=true` |
+| 目标 14/14 分片 | 已齐；`ready_to_load=true` | 已解除 |
 | 目标卡被他人 `VLLM::EngineCore` / 其他服务占用 | 本次已等到空闲并完成目标 dummy；共享卡随时可能再次被占 | 启动前先看 HBM；不 kill |
-| 目标权重 5/14 | 只能做 dummy；真权重 C1/C2 不能做 | 补齐 9 个分片后 `ready_to_load=true` |
+| 宿主重启后无 NPU 设备节点（`/dev/davinci*` 缺失，dcmi -8005） | 真权重 C1/C3/MTP 不能启动 | 需宿主恢复驱动/设备；不在容器内强改 |
 | Mamba2 SSD Triton 在合成模型上编译失败 | 已由 torch provider 绕过；合成 `M*`/`M*E` 启动成功；目标形状未测 | 目标 C1 验证数值/图；目标通过前不把 provider 登记为默认 |
 | 目标 `nemotron_h` 不在 vLLM AutoConfig 注册表 | 无别名时 `ModelConfig` 直接失败 | bridge 已补别名；不要关 `TILEINFER_V3` |
 | 参考实现未跑 | C2 top5 未产生 | 完整权重后 CPU HF probe |
 
-**下一步**：目标 dummy 的 eager 与 graph 两条路径都已跑通；graph 捕获为 PIECEWISE+FULL、
-目标图内存 2.68 GiB、日志有 `Replaying aclgraph`。但权重是 dummy，`decode_calls` 计数未推进，
-不能据此证明真权重 C3/稳态 0 回退。等 9 个缺失分片补齐后做真权重 C1，再做 CPU HF 参考 C2；
+**下一步**：14/14 真权重已到位，`ready_to_load=true`；CPU/算子级 C2 已开始（MoE 全 128 experts、
+Mamba2 真 A/D/dt_bias）。当前卡在宿主 NPU 设备不可见，需先恢复 `/dev/davinci*` 和 `npu-smi`，
+再取得端口/卡授权后做真权重 C1。此前 dummy 的 eager/graph 两条路径虽跑通（PIECEWISE+FULL、
+2.68 GiB、`Replaying aclgraph`），但权重是 dummy，`decode_calls` 计数未推进，不能据此证明真权重
+C3/稳态 0 回退；
 MTP 也已用 dummy 跑通执行路径（`NemotronHMTPModel`、drafter 共享 embedding、7 drafts/0 accepted），
 但 0 accepted 是随机权重预期，MTP 图捕获和真权重接受率未测。8K 上下文（6001 token，4 s）
 和 4 路并发（4/4 完成）也只是 eager 机械通路。目标 C1/C2 通过前，`state.linear` 仍保持 gap，

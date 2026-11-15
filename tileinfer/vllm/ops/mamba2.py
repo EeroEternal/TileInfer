@@ -209,7 +209,9 @@ def mamba_chunk_scan_combined_varlen(
             raise ValueError(
                 f"initial_states shape {tuple(initial_states.shape)} != {tuple(state.shape)}"
             )
-        state = initial_states.to(torch.float32)
+        # Clone: ``_chunk_output`` writes ``state[seq]`` in place, and the caller owns
+        # ``initial_states``.  An fp32 input otherwise aliases it and is silently mutated.
+        state = initial_states.to(torch.float32).clone()
 
     records: List[torch.Tensor] = []
     for start, end, seq in zip(starts, ends, seqs):

@@ -4,54 +4,47 @@
 
 目标目录：`/home/models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16`
 
-`model.safetensors.index.json` 声明 14 个分片；磁盘上只有 5 个：
+2026-11-15 复核：`model.safetensors.index.json` 声明的 14 个分片**全部到位**，没有缺失、没有空文件；
+`tools/nemotron/preflight_model.py` 返回 `ready_to_load=true`。证据：
+[`m5-nemotron-real-weights.json`](m5-nemotron-real-weights.json)。
 
-```
-model-00001-of-00014.safetensors
-model-00005-of-00014.safetensors
-model-00006-of-00014.safetensors
-model-00013-of-00014.safetensors
-model-00014-of-00014.safetensors
-```
+## 已验证（真权重，CPU/算子级）
 
-缺失：
+- MoE layer 1 的真实 128 个 expert 权重 `up_proj [128,1856,2688]` / `down_proj [128,2688,1856]`
+  已加载；TileInfer 非门控 relu2 `fused_experts` 与逐 expert 直接参考**完全一致**（max abs 0.0）。
+  注意 checkpoint 存的是分离的 `up_proj`/`down_proj`，不是 fused `w13`；调用方必须 stack 成
+  `[E,I,H]` / `[E,H,I]`，不能按门控 SwiGLU 解释。
+- Mamba2 layer 0 的真实 `A_log`/`D`/`dt_bias`（A 范围 -1752.41..-5.36e-4）已在目标几何
+  64 头 × 64 head_dim × 128 state × 8 组、varlen 37/53 下与 scalar recurrence 对齐：
+  chunk 输出 max abs 9.16e-4（相对 4.0e-7），final state max abs 1.14e-4。
+- 检查中发现 `initial_states` 在已是 fp32 时会被原地写；已改为 clone 输入，并加回归断言
+  （`tests/test_mamba2_ops.py`）。
 
-```
-model-00002-of-00014.safetensors
-model-00003-of-00014.safetensors
-model-00004-of-00014.safetensors
-model-00007-of-00014.safetensors
-model-00008-of-00014.safetensors
-model-00009-of-00014.safetensors
-model-00010-of-00014.safetensors
-model-00011-of-00014.safetensors
-model-00012-of-00014.safetensors
-```
+## 新阻塞：宿主重启后 NPU 设备不可见
 
-`tools/nemotron/preflight_model.py` 因而是 `ready_to_load=false`、`ready_for_dummy=true`。
-`--load-format dummy` 能启动，但权重是随机的，不能用于 C1 正确性、C2 参考一致性或 MTP 接受率。
+2026-11-15 15:48（Asia/Shanghai）检查：
 
-## 已验证（不依赖真权重）
+- `uptime` 显示宿主在 2026-11-13 21:27 左右重启；重启前目标 dummy 服务还能跑。
+- `/dev/davinci*` 设备节点全部不存在；`/dev/davinci_manager`、`/dev/hisi_hdc` 也不存在。
+- `npu-smi info` 失败：`dcmi module initialize failed. ret is -8005`。
+- PCI 上没有 Huawei 加速卡（只有 62:00.0 的 NVMe 控制器）；`/sys/class/davinci*` 不存在。
+- 当前没有测试服务/端口/NPU 进程；没有 kill 任何人。
 
-- 静态 gap/plan：`state.linear` 是唯一 vendor gap；候选 `tileinfer.mamba2_state` 已实现并出现在
-  gap 的 candidates 中，但未注册为默认，plan 仍 `servable=false`。
-- CPU：Mamba2 目标几何（64 头 × 64 head_dim × 128 state × 8 组，37/53 varlen）与 scalar recurrence
-  一致；非门控 relu2 MoE 与逐 token 循环一致。
-- NPU：grouped-matmul 非门控 MoE 与 CPU 参考一致（fp32 max abs 5.96e-8，bf16 max rel 8.9e-3）。
-- 目标 dummy：eager 和 graph 两种服务都启动；graph 捕获 PIECEWISE+FULL、2.68 GiB、日志出现
-  `Replaying aclgraph`；MTP drafter 执行（7 drafts/0 accepted，随机权重）；8K 上下文 6001 token；
-  4 路并发 4/4 完成。全部是机械证据。
+结论：**真权重已就绪，但本机当前没有可用的 NPU 设备/驱动，无法启动真权重 C1 服务、图捕获或
+MTP/长上下文/并发/冷启动验证。** 这是宿主/驱动层问题，不是代码或权重问题。
 
-## 真权重到位后要做的
+## 恢复设备后要做的
 
-1. `preflight_model.py` 必须 `ready_to_load=true`。
-2. C1：启动真实 14-shard 服务，跑 1-token 和 161-token prompt，记录 token、日志、plan id。
-3. C2：同一 prompt 与 HF/transformers 参考实现逐 token/容差对齐；只有对齐后才能把候选
-   `tileinfer.mamba2_state` 注册为默认并改 plan 的 `servable`。
-4. C3：真实权重下确认 graph replay 与稳态 `decode_fallbacks=0`；当前 bridge 的 `decode_calls`
-   计数在图 replay 路径上没有推进，需要先修计数器或改用 replay 计数。
-5. MTP：真实权重接受率；长上下文/并发/冷启动/绝对地板。
+1. 宿主恢复 Ascend 驱动/设备节点，`npu-smi info` 能看到卡，且 HBM 空闲。
+2. 取得明确同意后，用指定端口/卡启动真权重 C1：1-token 与 161-token prompt，记录 token、日志、plan id。
+3. C2：同一 prompt 与参考实现逐 token/容差对齐。当前 `transformers 4.57.6` 没有 `NemotronH`
+   类，不能直接 `AutoModel`；需要可用参考（升级/带 remote code 的 checkpoint，或用 vLLM 模型代码在
+   CPU/第二设备上做参考），只有对齐后才能把 `tileinfer.mamba2_state` 注册为默认并改 plan 的 `servable`。
+4. C3：真实权重下确认 graph replay 与稳态 `decode_fallbacks=0`；bridge 的 `decode_calls` 计数在图
+   replay 路径上没有推进，需要先修计数器或改用 replay 计数。
+5. MTP、8K/16K/32K/128K、并发、冷启动、绝对性能地板。
 
 ## 不做什么
 
-不下载缺失分片、不 kill 他人进程、不改上游源码；需要用户明确提供分片或授权下载后才能继续。
+不下载/不删除权重；不 kill 他人进程；不改上游源码；没有明确同意不启动服务/占端口/占卡；没有证据
+不写“支持”。

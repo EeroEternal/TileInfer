@@ -1,0 +1,50 @@
+{
+  "evidence_id": "m5-nemotron-real-weights-2026-11-15",
+  "date": "2026-11-15",
+  "timezone": "Asia/Shanghai",
+  "scope": "real checkpoint completeness and CPU/op-level C2 checks; no NPU service",
+  "model": "/home/models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
+  "preflight": {
+    "shards_declared": 14,
+    "shards_missing": [],
+    "shards_empty": [],
+    "ready_to_load": true,
+    "index_keys": 6513,
+    "source": "/tmp/m5-preflight-real.json"
+  },
+  "real_weight_checks": [
+    {
+      "check": "MoE non-gated relu2 layer 1, all 128 experts",
+      "weights": {
+        "up_proj": [128, 1856, 2688],
+        "down_proj": [128, 2688, 1856]
+      },
+      "input": {"tokens": 1, "top_k": 2, "dtype": "float32 x, bf16 weights"},
+      "tileinfer_result": "fused_experts matched direct per-expert relu2 reference exactly (max_abs=0.0)",
+      "note": "checkpoint stores separate up_proj/down_proj, not a fused w13; the caller must stack them into [E,I,H] / [E,H,I]"
+    },
+    {
+      "check": "Mamba2 layer 0 real A_log/D/dt_bias, random x/dt/B/C",
+      "shape": {"heads": 64, "head_dim": 64, "state": 128, "groups": 8, "chunk": 64, "varlen": [37, 53]},
+      "params": {"A_range": [-1752.4148, -0.0005361], "dt_bias_range": [-9.6875, 21.25]},
+      "result": "chunk output max abs 9.16e-4 (relative 4.0e-7); final states max abs 1.14e-4 vs scalar recurrence",
+      "note": "initial_states was found to be mutated when it was already fp32; fixed by cloning the input, with a regression assertion"
+    }
+  ],
+  "npu_blocker": {
+    "observed_at": "2026-11-15T15:48:54+08:00",
+    "host_uptime": "1 day 18:23 (boot about 2026-11-13T21:27+08:00)",
+    "devices": "no /dev/davinci* nodes",
+    "npu_smi": "dcmi module initialize failed. ret is -8005",
+    "pci": "no Huawei accelerator PCI device; only an NVMe controller at 62:00.0",
+    "consequence": "cannot start a real-weight NPU C1 service or graph capture",
+    "no_processes": true
+  },
+  "not_proven": [
+    "real-weight C1 service",
+    "full-model C2 against HF/transformers (transformers 4.57.6 has no NemotronH class)",
+    "real-weight C3 graph capture and steady-state fallback=0",
+    "MTP acceptance, long context, concurrency, cold start, absolute performance"
+  ],
+  "cleanup": {"service_started": false, "npu_processes": false}
+}
