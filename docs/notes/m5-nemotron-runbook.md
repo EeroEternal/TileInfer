@@ -254,6 +254,10 @@ python benchmarks/compare_responses.py \
 > （164–284 prompt token，4/4 完成，约 5.1–5.2 s）。两者都是机械通路，不是真权重正确性、图并发
 > 或 SLA 结论。证据：[`m5-nemotron-target-long.json`](m5-nemotron-target-long.json)、
 > [`m5-nemotron-target-concurrency.json`](m5-nemotron-target-concurrency.json)。
+>
+> 离线算子审计见 [`m5-nemotron-op-audit.json`](m5-nemotron-op-audit.json)；Mamba2 还加了目标几何
+> 的 CPU 参考一致性测试（64 头 × 64 head_dim × 128 state × 8 组，非 chunk 对齐的 varlen：
+> 37/53 token），这仍不是真权重 C2。
 
 保持服务运行，观察日志/指标：
 

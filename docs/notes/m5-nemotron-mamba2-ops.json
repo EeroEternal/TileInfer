@@ -91,5 +91,23 @@
     "No claim that the target 30B is servable: weights are 5/14 and no target request has run.",
     "The synthetic runs prove the Mamba2 and non-gated MoE paths execute on NPU for small shapes; they do not prove target shape numerics, graph capture, MTP or C2 agreement.",
     "The operator remains eager torch and is declared non-graphable; no request-time compile is added."
-  ]
+  ],
+  "target_geometry_cpu": {
+    "test": "tests/test_mamba2_ops.py::test_mamba2_target_geometry_matches_scalar_recurrence",
+    "date": "2026-11-15",
+    "shape": {
+      "heads": 64,
+      "head_dim": 64,
+      "state": 128,
+      "groups": 8,
+      "chunk": 64,
+      "tokens": 90,
+      "seq_lens": [
+        37,
+        53
+      ]
+    },
+    "result": "chunk output and per-sequence final states match the scalar recurrence; tolerance 1e-3 relative, 1e-4 absolute",
+    "caveat": "CPU reference check, not target weights"
+  }
 }

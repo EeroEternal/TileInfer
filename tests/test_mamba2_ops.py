@@ -158,3 +158,69 @@ def test_mamba2_selective_state_update_matches_one_token_recurrence() -> None:
         ) + x[row] * D
         torch.testing.assert_close(out[row], expected, rtol=1e-5, atol=1e-6)
         torch.testing.assert_close(state[slot], expected_state, rtol=1e-5, atol=1e-6)
+
+
+def test_mamba2_target_geometry_matches_scalar_recurrence() -> None:
+    """Target Mamba2 geometry: 64 heads x 64 head_dim x 128 state x 8 groups, chunk 64.
+
+    This is still a CPU reference check, not target-weight evidence.  It pins the exact
+    geometry the Nemotron declaration and the vLLM MambaMixer2 use, including a varlen
+    boundary that is not chunk-aligned.
+    """
+    torch.manual_seed(23)
+    total, heads, hdim, dstate, groups = 90, 64, 64, 128, 8
+    chunk = 64
+    x = torch.randn(total, heads, hdim)
+    dt = torch.randn(total, heads)
+    A = -torch.rand(heads)
+    B = torch.randn(total, groups, dstate)
+    C = torch.randn(total, groups, dstate)
+    D = torch.randn(heads, hdim)
+    dt_bias = torch.randn(heads)
+    cu_seqlens = torch.tensor([0, 37, total])
+    initial = torch.randn(2, heads, hdim, dstate)
+    initial_copy = initial.clone()
+    out = torch.empty_like(x)
+
+    final = mamba_chunk_scan_combined_varlen(
+        x,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size=chunk,
+        cu_seqlens=cu_seqlens,
+        cu_chunk_seqlens=None,
+        last_chunk_indices=None,
+        seq_idx=None,
+        out=out,
+        D=D,
+        dt_bias=dt_bias,
+        initial_states=initial,
+        dt_softplus=True,
+    )
+
+    reference = torch.empty_like(x)
+    ref_states = []
+    for seq, (start, end) in enumerate(((0, 37), (37, total))):
+        state = initial_copy[seq].clone()
+        pos = start
+        while pos < end:
+            stop = min(end, (pos // chunk + 1) * chunk)
+            part, state = _scalar_chunk(
+                x[pos:stop],
+                dt[pos:stop],
+                A,
+                B[pos:stop],
+                C[pos:stop],
+                D,
+                dt_bias,
+                state,
+                heads // groups,
+            )
+            reference[pos:stop] = part
+            pos = stop
+        ref_states.append(state)
+    torch.testing.assert_close(out, reference, rtol=1e-3, atol=1e-4)
+    for got, want in zip(final, ref_states):
+        torch.testing.assert_close(got, want, rtol=1e-3, atol=1e-4)
