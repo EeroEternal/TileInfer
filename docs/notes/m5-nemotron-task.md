@@ -1,8 +1,8 @@
 # M5 交付模型任务书：Nemotron 3.5 Lightning 30B-A3B
 
-> 状态：**实机 gate 已开始（2026-11-13）**。离线 O1–O7 已收口；目标权重仍为 5/14，
-> 目标 30B 尚未加载。已完成目标 config/page 校验和合成同架构 Mamba2 机械探测；
-> 目标 C1/C2/C3/C4 仍未执行，不能写“支持”。
+> 状态：**离线与真权重 CPU 参考已推进（2026-11-15）**。目标权重 14/14，`ready_to_load=true`；
+> 6513 个张量形状全匹配；HF/CPU 参考和 C2 比较工具已跑通。宿主重启后无 `/dev/davinci*`，
+> 目标 C1/C3/C4 仍未执行，不能写“支持”。
 >
 > 关联：[`long-term-task.md`](../long-term-task.md) M5、[`acceptance.md`](../acceptance.md)、
 > [`verification-matrix.md`](../verification-matrix.md)、[`model-bringup-layers.md`](model-bringup-layers.md)。

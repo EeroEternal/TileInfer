@@ -1,7 +1,8 @@
 # Nemotron 3.5 Lightning 30B-A3B：静态缺口先验（离线，不上卡）
 
-> 状态：**静态代码审计 + 受限的 config/小模型机械探测**，不是目标 checkpoint 的 C1/C2 结论。
-> 目标权重仍只有 5/14 分片，没有加载过目标 tensor；小模型探测只回答“同架构 Mamba2 路径能否编译”。
+> 状态：**静态代码审计 + config/小模型机械探测 + 真权重 CPU 算子级检查**，不是目标服务的 C1/C3 结论。
+> 2026-11-15 目标权重已 14/14，全部 6513 个张量形状与 config 一致；HF/CPU 参考已跑通。
+> 宿主重启后无 NPU 设备节点，目标 C1/C3 仍未执行。
 > 目的：在权重/实机到位前，把“确定的事实、确定的未知、候选 provider”分开。
 > 任何 `unknown` 都不能写成 `gap=0`，也不能写成“不支持”。
 >
@@ -34,7 +35,7 @@
 | F14 | 用 `normalize_config()` 把 `layers_block_type`/`mtp_layers_block_type` 转成 `hybrid_override_pattern`/`mtp_hybrid_override_pattern` 后，`NemotronHConfig` 能加载，层型和 MTP pattern 与目标一致 | `tools/nemotron/config_to_manifest.py`；测试 `test_normalized_config_loads_in_vllm_without_npu` |
 | F15 | 权重索引有 270 个 `mtp.*` key（`mtp.layers.0` attention / `mtp.layers.1` moe），backbone 最大层号 51；MTP 权重确实存在 | [`m5-nemotron-mtp.json`](m5-nemotron-mtp.json)；索引 612207 B / 6513 keys |
 | F16 | 权重名与声明的 52 层完全对齐：23 Mamba / 23 MoE / 6 attention；每个 MoE 层 0..127 experts 齐全，shared expert 宽度 3712，MTP 为 attention+moe；`mapping_ok=true` | [`m5-nemotron-weight-map.json`](m5-nemotron-weight-map.json)；只读索引，不读 tensor |
-| F17 | 已在盘上的 5 个分片头部全部有效：1968 个 tensor header，文件大小与 header offset 一致，无重复 key、无 index/header 漂移；但只覆盖 5/14 分片，`complete=false` | [`m5-nemotron-shard-headers.json`](m5-nemotron-shard-headers.json)；只读 header，不读 tensor payload |
+| F17 | 2026-11-15 复核：14/14 分片全部存在且非空；全部 6513 个 tensor 的 shape 与 config 逐项一致（0 unknown / 0 mismatch）；早期只覆盖 5/14 的 header 记录见 [`m5-nemotron-shard-headers.json`](m5-nemotron-shard-headers.json) | [`m5-nemotron-real-weights.json`](m5-nemotron-real-weights.json) |
 | F18 | 用真实 checkpoint 生成的 shim config 能被 vLLM 0.23 `NemotronHConfig` 加载：52 层、`MEMEM*...`、MTP `*E`、Mamba 64/64/128/8/4/2、MoE 128/top-6/1856/shared 1/3712 | `.venv_v3/bin/python` 实测；未构造模型、未上卡 |
 | F19 | 已在盘上的 5 个分片里，1950 个 tensor 的 header shape 与 config 推导值一致；0 处不匹配；18 个非 mixer/norm 类 key 未做形状检查 | [`m5-nemotron-shapes.json`](m5-nemotron-shapes.json)；只读 header，不读 tensor payload |
 | F20 | vLLM 0.23.0 的 `_CONFIG_REGISTRY` 没有 `nemotron_h` 项；Transformers 4.57 下 `ModelConfig` 会在模型代码之前报 “does not recognize this architecture”。TileInfer 的 bridge 在 `ModelConfig` 之前注册 vLLM 自带的 `NemotronHConfig` 后，该错误消失 | `tileinfer/vllm/config_compat.py`；`tileinfer/bridge/install.py`；`.venv_v3` 实测 |
@@ -116,8 +117,8 @@ ls .venv_v3/lib/python3.12/site-packages/vllm_ascend/ops/triton/mamba/
 1. 只用 `EngineArgs.create_engine_config()` 验证目标 shim 的 config/page 层；结果见 F21。
 2. 用 2 层、`M*`、hidden 256 的合成同架构模型做 dummy 机械 smoke，结果见 F22；服务未起来，
    自己的 PID 已全部停止。
-3. 目标 checkpoint 仍为 5/14 分片，`preflight_model.py` 仍 `ready_to_load=false`；没有读目标
-   tensor payload，也没有产生目标 C1/C2/C3/C4 证据。
+3. 2026-11-15 目标 checkpoint 已 14/14，`preflight_model.py` 为 `ready_to_load=true`；已读真实
+   tensor 做 CPU 算子级 C2 和 HF/CPU 参考，但宿主无 NPU 设备，仍没有目标 C1/C3/C4 证据。
 
 因此本次把 G2 从“静态缺候选”升级为“同架构合成路径实测失败”，但**不能**写成
 “目标 30B 在 Ascend 上确认不支持”；要得到目标结论，仍需完整权重 + 空闲卡 + 目标 dummy。

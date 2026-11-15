@@ -88,9 +88,9 @@
     }
   ],
   "honesty": [
-    "No claim that the target 30B is servable: weights are 5/14 and no target request has run.",
-    "The synthetic runs prove the Mamba2 and non-gated MoE paths execute on NPU for small shapes; they do not prove target shape numerics, graph capture, MTP or C2 agreement.",
-    "The operator remains eager torch and is declared non-graphable; no request-time compile is added."
+    "No claim that the target 30B is servable: weights are now 14/14, but the host has no NPU device and real C1/C3 have not run.",
+    "The synthetic and target-dummy runs prove the Mamba2 and non-gated MoE paths execute/capture on NPU for those shapes; they do not prove real-weight C2 or steady-state C3.",
+    "The torch Mamba2 replacement is graph-captured in the target dummy; the candidate provider remains non-default until real C2/C3 evidence."
   ],
   "target_geometry_cpu": {
     "test": "tests/test_mamba2_ops.py::test_mamba2_target_geometry_matches_scalar_recurrence",
@@ -109,5 +109,6 @@
     },
     "result": "chunk output and per-sequence final states match the scalar recurrence; tolerance 1e-3 relative, 1e-4 absolute",
     "caveat": "CPU reference check, not target weights"
-  }
+  },
+  "superseded_note": "The 5/14 weight statement in the original note is historical; real-weight evidence is docs/notes/m5-nemotron-real-weights.json."
 }

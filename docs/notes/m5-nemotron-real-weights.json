@@ -73,7 +73,7 @@
   },
   "not_proven": [
     "real-weight C1 service",
-    "full-model C2 against HF/transformers (transformers 4.57.6 has no NemotronH class)",
+    "C2 service-side comparison against the HF/CPU reference (the reference itself is now available)",
     "real-weight C3 graph capture and steady-state fallback=0",
     "MTP acceptance, long context, concurrency, cold start, absolute performance"
   ],
@@ -144,6 +144,12 @@
         "logprob": -3.4895012378692627
       }
     ],
-    "note": "Independent HF/CPU oracle for C2; it is not a vendor baseline and does not prove C1 until compared with the NPU service."
+    "note": "Independent HF/CPU oracle for C2; it is not a vendor baseline and does not prove C1 until compared with the NPU service.",
+    "repeatability": {
+      "second_run": "/tmp/m5-ref-repeat.json",
+      "generated_ids_equal": true,
+      "text_equal": true,
+      "first_top5_equal": true
+    }
   }
 }

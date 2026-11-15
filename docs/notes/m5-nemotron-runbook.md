@@ -13,7 +13,7 @@
 - [ ] `config.json` 已确认：`architectures/model_type/num_hidden_layers/
       layers_block_type/mtp_layers_block_type/num_nextn_predict_layers/max_position_embeddings`；
 - [ ] 已生成 vLLM 0.23 兼容的 config shim（见 §1.1），且 `NemotronHConfig` 能加载；
-- [ ] 权重路径存在，磁盘/内存足够；当前是 **5/14 分片**，`ready_to_load=false`，不要做真权重 C1；
+- [ ] 权重路径存在，磁盘/内存足够；**2026-11-15 已 14/14，`ready_to_load=true`**；但宿主无 NPU 设备，仍未做真权重 C1；
 - [ ] 若只做 dummy：`preflight_model.py` 的 `ready_for_dummy=true`（config/tokenizer 齐全）；
 - [ ] 30B dummy 仍会分配完整参数/state 的 HBM，不是“小模型 smoke”；
 - [ ] MTP 是否存在已确认（没有就不开 MTP，不拿 ngram 冒充）；
@@ -52,7 +52,8 @@ python tools/nemotron/preflight_model.py --model "$MODEL"
 `ready_to_load=false` 时不要做真权重加载；它只查文件是否存在/非空，不会碰 NPU。
 `ready_for_dummy=true` 表示 config/tokenizer 已齐，可以做 §2 的随机权重机械 smoke；
 它仍然**不能**替代 `ready_to_load`，也不能产生 C1/C2/C3/C4 证据。
-2026-11-13 的现状是 5/14 分片，`ready_to_load=false`、`ready_for_dummy=true`。
+2026-11-15 的现状是 14/14 分片、`ready_to_load=true`；宿主重启后无 `/dev/davinci*`，
+真权重服务仍无法启动，见 [`m5-nemotron-blocker.md`](m5-nemotron-blocker.md)。
 
 ### 1.1 config shim（vLLM 0.23 不认 `layers_block_type`）
 
