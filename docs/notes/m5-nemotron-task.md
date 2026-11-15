@@ -159,15 +159,18 @@ MTP 投机、长上下文（8K/16K/32K/128K；config 声明 262144，262K 为条
   不是真权重 C1/C2/C3**。证据 [`m5-nemotron-target-dummy.json`](m5-nemotron-target-dummy.json)；
 - 卡上已有他人的 `VLLM::EngineCore` 或其他服务（约 103 GB HBM），未终止、未抢占。
 
-2026-11-15：目标 14/14 分片全部到位，`preflight_model.py` 返回 `ready_to_load=true`；已做真权重
-CPU/算子级 C2 检查（MoE layer 1 全 128 experts 与参考完全一致；Mamba2 layer 0 真 A/D/dt_bias 在目标
-几何下 max abs 9.16e-4）。同日发现宿主重启后无 `/dev/davinci*`、`npu-smi` 返回 dcmi -8005，真权重
-C1/C3/MTP 仍无法启动，详见 [`m5-nemotron-blocker.md`](m5-nemotron-blocker.md)。
+2026-11-15：目标 14/14 分片全部到位，`preflight_model.py` 返回 `ready_to_load=true`；全部 6513 个
+张量形状 0 mismatch；已做真权重 CPU/算子级 C2 检查（MoE layer 1 全 128 experts 与参考完全一致；
+Mamba2 layer 0 真 A/D/dt_bias 在目标几何下 max abs 9.16e-4）。HF transformers 5.12.1 + CPU torch
+2.13 的 `NemotronHForCausalLM` 已跑通固定样例（真权重、naive Mamba、生成 32 token），证据
+[`m5-nemotron-hf-reference.json`](m5-nemotron-hf-reference.json)。同日发现宿主重启后无
+`/dev/davinci*`、`npu-smi` 返回 dcmi -8005，真权重 C1/C3/MTP 仍无法启动，详见
+[`m5-nemotron-blocker.md`](m5-nemotron-blocker.md)。
 
 仍未做：
 
 - 真权重 C1 / C3 / MTP / 长上下文 / 并发 / 冷启动；
-- 全模型 C2（`transformers 4.57.6` 无 `NemotronH` 类，需可用参考实现）；
+- 全模型 C2 的**服务侧对比**（HF/CPU 参考已落地，见 `m5-nemotron-hf-reference.json`）；
 - 不把合成小模型或静态推断写成目标结论。
 
 ---

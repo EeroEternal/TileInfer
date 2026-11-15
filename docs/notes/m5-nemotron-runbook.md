@@ -204,31 +204,43 @@ curl -sS "http://127.0.0.1:$PORT/v1/chat/completions" \
 
 ## 4. C2：参考实现一致
 
+参考探针已在本机跑通：CPU + HF transformers 5.12.1（`NemotronHForCausalLM`，naive Mamba 路径，
+不加载 torch_npu、不占卡）。默认的 `.venv_v3` 里 transformers 4.57 没有 NemotronH，探针会优先把
+`TILEINFER_HF_SITE`（默认 `/home/dlb/sglang/.venv_npu/lib/python3.12/site-packages`）放到
+`sys.path` 前面，并用本 venv 的 CPU torch。若该路径不存在，先设置可用的 5.x site-packages。
+
 ```bash
-# 参考实现（HF/transformers）固定样例；权重/CPU 时间先估
-python tools/nemotron/reference_probe.py \
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 .venv_native213/bin/python tools/nemotron/reference_probe.py \
   --model "$MODEL" \
   --prompt "Say hello in one sentence." \
   --max-tokens 32 \
   --out /tmp/m5-nemotron-ref.json
 ```
 
-对比：
+C2 必须用**原始 completion**（不是 chat template）请求服务，并要求 logprobs：
 
 ```bash
-python benchmarks/compare_responses.py \
-  /tmp/m5-nemotron-ref.json /tmp/m5-nemotron-c1.json
+curl -sS "http://127.0.0.1:$PORT/v1/completions" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"nemotron","prompt":"Say hello in one sentence.","max_tokens":32,"temperature":0,"logprobs":5}' \
+  -o /tmp/m5-nemotron-c2-service.json
+.venv_native213/bin/python benchmarks/compare_reference.py \
+  /tmp/m5-nemotron-ref.json /tmp/m5-nemotron-c2-service.json --atol 1e-4 \
+  --out /tmp/m5-nemotron-c2-diff.json
 ```
 
-> 参考实现未落地前，本步是 `blocked`；不要拿另一个 vLLM 场景的绝对值当参考。
+`compare_reference.py` 比较生成文本和首个生成 token 的 top-5 logprob；top-k 边界打平时按
+`--atol` 容差判定并在 JSON 里单独列出 strict/tie-aware 结果。C2 未通过前不得把候选
+`tileinfer.mamba2_state` 登记为默认，也不得把 plan 改成 `servable=true`。
+
+> 参考是本机 HF/CPU，不是厂商/vLLM 基线；不要用另一个 vLLM 场景的绝对值当参考。
 
 ---
 
 ## 5. C3：图捕获
 
-> 当前 Mamba2 替换是 eager torch（`graphable=False`），C1 只能用 `--enforce-eager` 跑通；
-> **这不能作为 C3 证据**。C3 需要重新设计可捕获的 Mamba2/MoE 路径，或等厂商 backend 支持；
-> 在拿到 `captured_graphs > 0` 且稳态 `fallbacks = 0` 前，C3 保持未验证。
+> C3 必须开图跑；eager 输出不能作为 C3 证据。目标 dummy 已经能捕获，但真权重尚未重跑；
+> 在真权重下拿到 `captured_graphs > 0` 且稳态 `fallbacks = 0` 前，C3 保持未验证。
 >
 > 合成 `M*E` 的首次图捕获实测（端口 18084，无 `--enforce-eager`）在 PIECEWISE 0/1 阶段失败：
 > `aclnnNonzero` 错误码 107027，位置 `tileinfer/vllm/ops/moe.py:1010`

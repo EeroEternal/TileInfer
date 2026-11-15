@@ -10,6 +10,8 @@
 
 ## 已验证（真权重，CPU/算子级）
 
+- **全部 6513 个张量的形状与 config 逐项核对：0 unknown、0 mismatch**；14 个分片都被索引使用；
+  52 层类型为 23 mamba / 23 moe / 6 attention。这能排除“分片齐但 layout 不对”的常见问题。
 - MoE layer 1 的真实 128 个 expert 权重 `up_proj [128,1856,2688]` / `down_proj [128,2688,1856]`
   已加载；TileInfer 非门控 relu2 `fused_experts` 与逐 expert 直接参考**完全一致**（max abs 0.0）。
   注意 checkpoint 存的是分离的 `up_proj`/`down_proj`，不是 fused `w13`；调用方必须 stack 成
@@ -37,9 +39,11 @@ MTP/长上下文/并发/冷启动验证。** 这是宿主/驱动层问题，不�
 
 1. 宿主恢复 Ascend 驱动/设备节点，`npu-smi info` 能看到卡，且 HBM 空闲。
 2. 取得明确同意后，用指定端口/卡启动真权重 C1：1-token 与 161-token prompt，记录 token、日志、plan id。
-3. C2：同一 prompt 与参考实现逐 token/容差对齐。当前 `transformers 4.57.6` 没有 `NemotronH`
-   类，不能直接 `AutoModel`；需要可用参考（升级/带 remote code 的 checkpoint，或用 vLLM 模型代码在
-   CPU/第二设备上做参考），只有对齐后才能把 `tileinfer.mamba2_state` 注册为默认并改 plan 的 `servable`。
+3. C2：同一 prompt 与参考实现逐 token/容差对齐。**HF/CPU 参考已落地**：transformers 5.12.1 的
+   `NemotronHForCausalLM` + CPU torch 2.13 已用真权重跑出固定样例，证据见
+   [`m5-nemotron-hf-reference.json`](m5-nemotron-hf-reference.json)；`tools/nemotron/reference_probe.py`
+   和 `benchmarks/compare_reference.py` 已就绪。还差与 NPU 服务的实际对比；对齐后才能把
+   `tileinfer.mamba2_state` 注册为默认并改 plan 的 `servable`。
 4. C3：真实权重下确认 graph replay 与稳态 `decode_fallbacks=0`。计数器已修：非 `NONE` replay
    即使厂商传 `uniform_decode=False` 也计入 `decode_calls`/`decode_graph_hits`；严格 fallback 仍是
    `NONE + uniform_decode + graph_allowed`。单测已过，但尚未在 NPU 上重跑。
