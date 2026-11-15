@@ -258,6 +258,10 @@ python benchmarks/compare_responses.py \
 > 离线算子审计见 [`m5-nemotron-op-audit.json`](m5-nemotron-op-audit.json)；Mamba2 还加了目标几何
 > 的 CPU 参考一致性测试（64 头 × 64 head_dim × 128 state × 8 组，非 chunk 对齐的 varlen：
 > 37/53 token），这仍不是真权重 C2。
+>
+> `tileinfer/providers/mamba2.py` 已声明 `tileinfer.mamba2_state` 候选（`covers={"mixer":
+> "mamba2"}`、graphable、证据编号 `m5-nemotron-mamba2-ops`），但**没有**注册进决策表；gap 报告会
+> 列出这个候选并注明“not default until target C1/C2”。这是“已实现、待真权重证据”，不是阻塞项。
 
 保持服务运行，观察日志/指标：
 

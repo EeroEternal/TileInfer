@@ -260,7 +260,15 @@ def test_normalized_config_loads_in_vllm_without_npu(tmp_path: Path) -> None:
     )
     got = subprocess.run([str(VLLM_PY), "-c", code], cwd=ROOT, text=True, capture_output=True)
     assert got.returncode == 0, got.stderr
-    pattern, mtp = got.stdout.splitlines()[-2:]
+    # CANN can append a driver message ("DrvMng...") to stdout; take the two pattern-looking
+    # lines rather than the last two lines.  Both patterns contain only M/*/-/E.
+    lines = [
+        line.strip()
+        for line in got.stdout.splitlines()
+        if line.strip() and set(line.strip()) <= set("M*-E")
+    ]
+    assert len(lines) >= 2, got.stdout
+    pattern, mtp = lines[-2:]
     assert pattern.count("*") == 6 and pattern.count("M") == 23 and pattern.count("E") == 23
     assert mtp == "*E"
 
@@ -558,3 +566,39 @@ def test_raw_layers_block_type_is_normalised_before_vllm_config_init(tmp_path: P
     assert config.hybrid_override_pattern == "MEM*" * 13
     assert config.mtp_hybrid_override_pattern == "*E"
     assert config.layers_block_type[:4] == ["mamba", "moe", "mamba", "attention"]
+
+
+def test_mamba2_candidate_provider_is_declared_but_not_a_default() -> None:
+    """The Mamba2 provider is implemented and declared, but not silently promoted.
+
+    Real-weight C1/C2 is still missing, so the candidate must not appear in the decision
+    table.  This test is the guard against turning target-dummy mechanics into a support
+    claim.
+    """
+    from tileinfer.providers import CANDIDATE_PROVIDERS, MAMBA2_STATE
+
+    MAMBA2_STATE.validate()
+    assert MAMBA2_STATE.capability is Capability.STATE_LINEAR
+    assert MAMBA2_STATE.covers == {"mixer": "mamba2"}
+    assert MAMBA2_STATE.graphable is True
+    assert MAMBA2_STATE.measured_ratio is None
+    assert "m5-nemotron-mamba2-ops" == MAMBA2_STATE.evidence
+    assert MAMBA2_STATE in CANDIDATE_PROVIDERS
+    assert Capability.STATE_LINEAR not in TILEINFER_PROVIDERS
+
+
+def test_state_linear_gap_reports_the_implemented_candidate() -> None:
+    """A gap with an implemented candidate must name it, not read like an unimplemented blocker."""
+    env = Environment(
+        vllm="0.23.0",
+        vllm_ascend="0.23.0",
+        python="3.12",
+        torch="2.10.0",
+        device_type="A5",
+        has_vendor=True,
+    )
+    _, report = decide(NEMOTRON_3_5_DRAFT, env, policy="vendor_first")
+    gap = next(g for g in report.gaps if g.capability == "state.linear")
+    assert gap.required is True
+    assert gap.candidates == ["tileinfer.mamba2_state"]
+    assert "not default until target C1/C2" in gap.reason

@@ -39,6 +39,25 @@ from .vendor import VENDOR_PROVIDERS
 #: capability the vendor rejects, not when we believe we could beat the vendor on speed.
 TILEINFER_PROVIDERS: dict = {}
 
+
+def _candidates(capability: Capability, manifest: ModelManifest) -> List:
+    """Declared candidates that cover this manifest but are not allowed to be defaults.
+
+    A candidate has implementation evidence but not target real-weight C1/C2.  It must appear
+    in the gap report (so the gap is visibly implementable, not a blocker) without entering
+    ``TILEINFER_PROVIDERS`` (which would make the plan claim support).
+    """
+    try:
+        from ..providers import CANDIDATE_PROVIDERS
+    except Exception:  # pragma: no cover - providers are optional during early bring-up
+        return []
+    return [
+        provider
+        for provider in CANDIDATE_PROVIDERS
+        if provider.capability is capability and _covers(provider, manifest)
+    ]
+
+
 POLICIES = ("vendor_first", "tileinfer_first")
 
 
@@ -98,12 +117,16 @@ def _select(
             if not env.has_vendor
             else "vllm-ascend is installed but does not advertise this capability"
         )
+        candidates = _candidates(capability, manifest)
+        if candidates:
+            names = ", ".join(provider.name for provider in candidates)
+            reason += f"; TileInfer candidate(s) implemented but not default until target C1/C2: {names}"
         gaps.append(
             Gap(
                 capability=capability.value,
                 required=True,
                 reason=reason,
-                candidates=[],
+                candidates=[provider.name for provider in candidates],
             )
         )
     return selections, gaps

@@ -212,4 +212,6 @@ MTP 也已用 dummy 跑通执行路径（`NemotronHMTPModel`、drafter 共享 em
 但 0 accepted 是随机权重预期，MTP 图捕获和真权重接受率未测。8K 上下文（6001 token，4 s）
 和 4 路并发（4/4 完成）也只是 eager 机械通路。目标 C1/C2 通过前，`state.linear` 仍保持 gap，
 不把 provider 写成默认支持。离线算子审计记录在 `m5-nemotron-op-audit.json`；Mamba2 目标几何（64 头/
-64 head_dim/128 state/8 组）已与 CPU scalar recurrence 对齐，但仍不是真权重 C2。
+64 head_dim/128 state/8 组）已与 CPU scalar recurrence 对齐，但仍不是真权重 C2。候选 provider
+`tileinfer.mamba2_state` 已声明并出现在 gap 的 candidates 中，故意不注册为默认，因此 plan 仍
+`servable=false`；这不是“没人实现”的阻塞。

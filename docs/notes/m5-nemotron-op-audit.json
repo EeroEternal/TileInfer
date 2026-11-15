@@ -70,5 +70,14 @@
     "target C3 steady-state fallback=0 (graph replay was observed, but the bridge decode counter did not advance)",
     "MTP acceptance with real weights",
     "performance floor"
-  ]
+  ],
+  "candidate_provider": {
+    "name": "tileinfer.mamba2_state",
+    "impl": "tileinfer.vllm.ops.mamba2",
+    "covers": {
+      "mixer": "mamba2"
+    },
+    "registered_as_default": false,
+    "reason": "target real-weight C1/C2 not run; nine shards absent"
+  }
 }

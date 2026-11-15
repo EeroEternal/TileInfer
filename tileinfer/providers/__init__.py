@@ -19,4 +19,10 @@ the vendor rejects.
 
 from __future__ import annotations
 
-__all__: list = []
+from .mamba2 import MAMBA2_STATE
+
+#: Declared candidates, not defaults.  ``resolve.decide.TILEINFER_PROVIDERS`` stays empty until
+#: the candidate has target real-weight C1/C2 evidence; see ``docs/extending.md`` §3.
+CANDIDATE_PROVIDERS = (MAMBA2_STATE,)
+
+__all__ = ["MAMBA2_STATE", "CANDIDATE_PROVIDERS"]
