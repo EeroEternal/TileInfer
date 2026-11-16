@@ -357,6 +357,103 @@ def _softplus_clamp(dt: torch.Tensor, dt_bias: torch.Tensor, enabled: bool) -> t
     return torch.clamp(dt, 0.0, float("inf"))
 
 
+def _selective_state_update_varlen(
+    state: torch.Tensor,
+    x: torch.Tensor,
+    dt: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    D: torch.Tensor,
+    dt_bias: torch.Tensor,
+    z: Optional[torch.Tensor],
+    dt_softplus: bool,
+    state_batch_indices: Optional[torch.Tensor],
+    dst_state_batch_indices: Optional[torch.Tensor],
+    out: Optional[torch.Tensor],
+    num_accepted_tokens: Optional[torch.Tensor],
+    cu_seqlens: torch.Tensor,
+) -> None:
+    """Speculative-decode update: replay every accepted token per sequence.
+
+    vLLM's verification step passes ``x`` as concatenated multi-token sequences and
+    ``num_accepted_tokens`` for the prefix that actually committed.  Ignoring those (the
+    pre-MTP implementation did) leaves the SSM state one or more tokens behind, so the next
+    speculative step disagrees with the target even though the draft was verified.
+    """
+    if state.dim() == 5:
+        state = state.squeeze(1)
+    if state.dim() != 4:
+        raise ValueError(f"state must be [slots, heads, headdim, dstate], got {tuple(state.shape)}")
+    if x.dim() != 3:
+        raise ValueError(f"varlen x must be [tokens, heads, headdim], got {tuple(x.shape)}")
+    slots, nheads, headdim, dstate = state.shape
+    tokens = x.shape[0]
+    ngroups = B.shape[1]
+    if nheads % ngroups:
+        raise ValueError(f"nheads={nheads} is not divisible by ngroups={ngroups}")
+    if out is None:
+        out = torch.empty_like(x)
+    if z is not None and z.dim() != 3:
+        raise ValueError(f"z must be [tokens, heads, headdim], got {tuple(z.shape)}")
+
+    a = A.to(torch.float32)
+    if a.dim() == 1:
+        a = a[:, None, None].expand(nheads, headdim, dstate)
+    elif a.dim() == 2:
+        a = a[:, None, :].expand(nheads, headdim, -1)
+    elif a.dim() != 3:
+        raise ValueError(f"A must be 1-D, 2-D or 3-D, got {tuple(A.shape)}")
+    df = D.to(torch.float32)
+    if df.dim() == 1:
+        df = df[:, None]
+    dt_bias_f = dt_bias.to(torch.float32)
+    if dt_bias_f.dim() == 1:
+        dt_bias_f = dt_bias_f[:, None]
+    b_rep = _repeat_groups(B.to(torch.float32), nheads)
+    c_rep = _repeat_groups(C.to(torch.float32), nheads)
+
+    starts = _as_int_list(cu_seqlens, device=x.device)
+    if len(starts) < 2:
+        return
+    src = (
+        state_batch_indices.reshape(-1).to(torch.int64)
+        if state_batch_indices is not None
+        else torch.arange(len(starts) - 1, device=state.device, dtype=torch.int64)
+    )
+    dst = (
+        dst_state_batch_indices.reshape(-1).to(torch.int64)
+        if dst_state_batch_indices is not None
+        else src
+    )
+    accepted = _as_int_list(num_accepted_tokens, device=x.device) if num_accepted_tokens is not None else []
+
+    for seq in range(len(starts) - 1):
+        start, end = int(starts[seq]), int(starts[seq + 1])
+        if end <= start:
+            continue
+        count = end - start
+        if accepted:
+            count = max(0, min(count, int(accepted[seq])))
+        if count == 0:
+            continue
+        src_slot, dst_slot = int(src[seq]), int(dst[seq])
+        if src_slot < 0 or src_slot >= slots or dst_slot < 0 or dst_slot >= slots:
+            raise IndexError(f"state slot out of range: src={src_slot}, dst={dst_slot}, slots={slots}")
+        current = state[src_slot].to(torch.float32)
+        for pos in range(start, start + count):
+            dtf = _softplus_clamp(dt[pos].to(torch.float32), dt_bias_f[:, 0], dt_softplus)
+            current = (
+                current * torch.exp(dtf[:, None, None] * a)
+                + dtf[:, None, None] * x[pos].to(torch.float32)[:, :, None] * b_rep[pos][:, None, :]
+            )
+            y = (current * c_rep[pos][:, None, :]).sum(dim=-1) + x[pos].to(torch.float32) * df
+            if z is not None:
+                y = y * F.silu(z[pos].to(torch.float32))
+            out[pos].copy_(y.to(out.dtype))
+        state[dst_slot].copy_(current.to(state.dtype))
+
+
 def selective_state_update(
     state: torch.Tensor,
     x: torch.Tensor,
@@ -380,9 +477,30 @@ def selective_state_update(
 
     The common decode case is one token per sequence; ``state_batch_indices`` selects the source
     block and ``dst_state_batch_indices`` the destination (they are equal without speculative
-    decoding).  The function is in-place on ``state`` and ``out`` like vLLM's kernel.
+    decoding).  Speculative decoding passes ``cu_seqlens`` plus ``num_accepted_tokens``; those
+    tokens are replayed in state order so the target state stays exact.  The function is in-place
+    on ``state`` and ``out`` like vLLM's kernel.
     """
-    del null_block_id, num_accepted_tokens, cu_seqlens, is_blackwell  # unsupported extras
+    del null_block_id, is_blackwell
+    if cu_seqlens is not None and x.dim() == 3:
+        _selective_state_update_varlen(
+            state,
+            x,
+            dt,
+            A,
+            B,
+            C,
+            D,
+            dt_bias,
+            z,
+            dt_softplus,
+            state_batch_indices,
+            dst_state_batch_indices,
+            out,
+            num_accepted_tokens,
+            cu_seqlens,
+        )
+        return
     if state.dim() == 3:
         state = state.unsqueeze(1)
     if x.dim() == 2:

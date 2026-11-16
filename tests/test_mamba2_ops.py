@@ -272,3 +272,58 @@ def test_causal_conv1d_prefill_matches_manual_conv_and_updates_state() -> None:
     torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-6)
     torch.testing.assert_close(conv_states, expected_state, rtol=1e-5, atol=1e-6)
     assert out.abs().sum().item() > 0.0
+
+
+def test_mamba2_selective_state_update_replays_speculative_tokens() -> None:
+    """MTP commits multiple accepted tokens; the SSM state must advance through all of them."""
+    torch.manual_seed(41)
+    heads, hdim, dstate, groups = 2, 2, 3, 1
+    slots = 4
+    state = torch.randn(slots, heads, hdim, dstate)
+    state_before = state.clone()
+    lengths = [2, 1]
+    total = sum(lengths)
+    x = torch.randn(total, heads, hdim)
+    dt = torch.randn(total, heads)
+    A = -torch.rand(heads)
+    B = torch.randn(total, groups, dstate)
+    C = torch.randn(total, groups, dstate)
+    D = torch.randn(heads, hdim)
+    dt_bias = torch.randn(heads)
+    src = torch.tensor([0, 2])
+    dst = torch.tensor([1, 3])
+    cu = torch.tensor([0, sum(lengths[:1]), total], dtype=torch.int32)
+    accepted = torch.tensor(lengths, dtype=torch.int32)
+    out = torch.empty_like(x)
+
+    selective_state_update(
+        state,
+        x,
+        dt,
+        A,
+        B,
+        C,
+        D,
+        dt_bias,
+        dt_softplus=True,
+        state_batch_indices=src,
+        dst_state_batch_indices=dst,
+        out=out,
+        num_accepted_tokens=accepted,
+        cu_seqlens=cu,
+    )
+
+    for seq, count in enumerate(lengths):
+        current = state_before[int(src[seq])].clone()
+        start = int(cu[seq])
+        for pos in range(start, start + count):
+            d = torch.nn.functional.softplus(dt[pos] + dt_bias)
+            current = current * torch.exp(d[:, None, None] * A[:, None, None])
+            current = current + d[:, None, None] * x[pos][:, :, None] * B[pos].repeat_interleave(
+                heads // groups, dim=0
+            )[:, None, :]
+            expected = (
+                current * C[pos].repeat_interleave(heads // groups, dim=0)[:, None, :]
+            ).sum(-1) + x[pos] * D
+            torch.testing.assert_close(out[pos], expected, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(state[int(dst[seq])], current, rtol=1e-5, atol=1e-6)
