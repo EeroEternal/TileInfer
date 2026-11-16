@@ -265,7 +265,8 @@ v3 bridge 的安装条件同样是硬性的：plan 必须有 `impl_table` 接入
 > （`max-num-seqs=4` 时 6 张），并在 32-token 请求中观测到 31 次 decode/31 次图命中/0 回退。
 > 默认 `instrumentation.dump_every_decode_steps=500` 时 metrics 只写捕获快照
 > （`decode_calls` 仍可能显示 0），不能据此判 C3 失败；把 plan 的该值设为 1 即可在请求后
-> 读到实时计数。本轮 clean run 已得到 31/31/0。长期/并发回退仍是未覆盖项。
+> 读到实时计数。本轮 clean run 已得到 32-token 31/31/0、8001-prompt 7/7/0。
+> 长期/并发回退仍是未覆盖项。
 >
 > 合成 `M*E` 的首次图捕获实测（端口 18084，无 `--enforce-eager`）在 PIECEWISE 0/1 阶段失败：
 > `aclnnNonzero` 错误码 107027，位置 `tileinfer/providers/moe.py`（原 v2 位置 `legacy/v2/tileinfer/vllm/ops/moe.py:1010`，已迁移到 v3 并归档 v2）

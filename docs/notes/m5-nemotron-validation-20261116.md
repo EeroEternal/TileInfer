@@ -80,7 +80,9 @@ v3 provider `tileinfer/providers/nemotron/mamba2.py` 补齐 prefill conv 后，�
 ```
 
 `decode_calls=31` 全部命中图，`decode_fallbacks=0`；`none_after_capture=1` 是 prefill/非 uniform
-诊断，不是被判定为回退。**结论：短稳态 C3 通过（capture + replay + 0 fallback）。**
+诊断，不是被判定为回退。**8K 长 prefill 复测**：8001 prompt tokens / 8 output，3.01 s；
+`decode_calls=7, decode_graph_hits=7, decode_fallbacks=0, none_after_capture=4`（4 个 prefill chunk
+诊断，不是回退）。**结论：短稳态和 8K 长 prefill 的 C3 都通过（capture + replay + 0 fallback）。**
 默认 `dump_every_decode_steps=500` 时文件只在捕获时落盘（`decode_calls` 仍显示 0），
 不能据此判 C3 失败；本次用 1 的频率取到了真实计数。长期压测和并发下的回退率仍未覆盖。
 
@@ -183,7 +185,7 @@ Reason: The JSON format is incorrect.
 | C2 text/token | 通过（单 prompt） |
 | C2 logprob top-5 | 未通过（最大差 1.636） |
 | C3 捕获 | 通过（2 / 6 graphs） |
-| C3 短稳态零回退 | 通过（31 decode / 31 graph hit / 0 fallback） |
+| C3 稳态零回退 | 通过（32-token：31/31/0；8001-prompt：7/7/0） |
 | 长上下文 8K–261K | 可完成（长度证据） |
 | 并发 2/4 路 | 可完成，4 路约 22 tok/s（短输出） |
 | 冷启动 | 42 s 到 health，首 token 0.33 s（全新 cache） |
