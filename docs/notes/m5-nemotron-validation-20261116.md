@@ -59,6 +59,8 @@ v3 provider `tileinfer/providers/nemotron/mamba2.py` 补齐 prefill conv 后，�
 **结论：C2 的 token/text 级一致；logprob 级不一致，因此不能算完整 C2 通过。**
 另跑 `TILEINFER_MOE_FP32=1` 排除“只是 MoE bf16 舍入”：token ids 仍完全一致，但首 token top-5
 变成 `Paris / ** / Berlin / a / Brussels`，最大差约 1.18，仍不满足严格 logprob 判据；所以问题不在单一 MoE 精度开关。
+再把 `TILEINFER_MOE_SORTED=0 TILEINFER_MOE_BMM=0` 打开（纯 per-expert loop），top-5 与 grouped+fp32
+完全相同，说明也不是 grouped matmul 路径。
 `Say hello in one sentence.` 的 HF 参考首 token 本身是 ` I` / ` The` 的 bf16 并列（logit 都是
 12.25），greedy 任选一个就会分叉；该 prompt 不能作为 C2 判据。
 
