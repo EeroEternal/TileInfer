@@ -252,6 +252,13 @@ v3 bridge 的安装条件同样是硬性的：plan 必须有 `impl_table` 接入
 
 ---
 
+## 4.5 编译缓存（2026-11-16 实测）
+
+`max-num-seqs=4` 在**默认** `VLLM_CACHE_ROOT` 下、跑过 fp32/失败编译后可能报
+`KeyError: 'AscendRMSNorm'`（profile_run 的 AOT 编译）。这不是模型/provider 回退；
+给本次进程设置全新的 `VLLM_CACHE_ROOT=/tmp/m5-vllm-cache-$(date +%s)` 后，同一代码可正常
+捕获 6 张图并完成 4 路请求。**不要删除共享 cache**，也不要 `pkill` 其他服务。
+
 ## 5. C3：图捕获
 
 > C3 必须开图跑；eager 输出不能作为 C3 证据。**2026-11-16 真权重已捕获 2 张图**

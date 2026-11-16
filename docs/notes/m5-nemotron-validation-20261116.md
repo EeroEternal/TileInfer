@@ -113,6 +113,11 @@ MTP 的 varlen 仍走逐 token 循环。
 
 这是“4 路都能完成且有并发收益”的证据，不是 SLA 或厂商基线结论。
 
+**编译缓存注意**：默认 `VLLM_CACHE_ROOT` 在跑过 fp32 服务和一次失败编译后，`max-num-seqs=4`
+启动会在 profile_run 报 `KeyError: 'AscendRMSNorm'`；换一个**全新的 `/tmp` cache** 后同一代码
+正常捕获 6 张图并完成 4 路请求。不要删共享 cache，按进程设置 `VLLM_CACHE_ROOT=/tmp/...` 即可。
+4 路 fresh-cache 复测每个请求 5.86–6.04 s、32/32 tokens 完成。
+
 ### 4.2 冷启动（全新 VLLM_CACHE_ROOT）
 
 在 `/tmp` 新建空 cache 后启动（不删共享 cache）：
