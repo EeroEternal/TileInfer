@@ -1278,7 +1278,7 @@ class TileInferPlatform(Platform):
         attention-only, and for a *uniform* attention model (one spec type) turning the hybrid
         KV manager on would only make vLLM group that single spec type through the hybrid code
         path.  For Qwen3.6 ``hybrid`` is set, so the answer stays True.  A profile that declares
-        ``mixed_attention_specs`` (MuseGlimmer's iRoPE: full-attention + sliding-window layers)
+        ``mixed_attention_specs`` (an iRoPE model: full-attention + sliding-window layers)
         also answers True: vLLM then builds **two** attention groups, and the sliding-window
         allocator keeps only the in-window blocks real (out-of-window table entries point at the
         reserved NULL block, id 0) instead of pinning every layer's full context in the pool.

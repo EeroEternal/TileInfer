@@ -1,17 +1,15 @@
-# MuseGlimmer-30B on TileInfer/Ascend 950PR — status (2026-11-13, code-verified)
+# MuseGlimmer-30B on TileInfer/Ascend 950PR — status (2026-11-16, V3-only)
 
 Target: `/home/models/Muse-Glimmer-30B` (52 dense layers, hidden 6656, 32Q/2KV GQA @ head_dim
 128, iRoPE: 39 sliding-window + 13 full-attention layers, untied lm_head).
 
-**Runtime form: this work lives in the v2 tree (`tileinfer/vllm/`), which is the only runnable
-path on this box.** The v3 bridge (`tileinfer/bridge/`) is merged and functional, but it is
-vendor-first by construction: `install_model_table` is an empty seam ("no model replacement
-requested"), the only manifest is `qwen3_6`, `attn_select` chooses among vllm-ascend's registered
-backends, and `install.py` wraps `vllm_ascend.platform.NPUPlatform`. vllm-ascend is not installed
-(950 wheel needs torch 2.10, this venv is torch 2.13) and has no MuseGlimmer support at all
-(GitHub code search: 0 hits). v3 has no landing spot for a model the vendor does not serve, so
-the Muse work is executed on the v2 runtime; its v3 home (if/when that environment exists) is the
-`model_table` seam plus a manifest — see "v3 mapping" at the bottom.
+**Runtime form: V3 only.** The declaration lives in `tileinfer/manifests/muse_glimmer.py`; the
+upstream-facing implementation lives in `tileinfer/bridge/models/` (`muse_glimmer.py` for the
+architecture + AutoConfig shim, `atem.py` for the chat parser) and is injected by the
+`model_table` seam. Attention, KV management, worker and graph capture are the vendor's
+(vllm-ascend). There is no V2 copy of this model any more: the old
+`tileinfer/vllm/{models/muse_glimmer,profiles/muse_glimmer,reasoning}.py` paths and the
+Muse-only `dense` op family are gone.
 
 **Vendor route update (2026-11-13, device-verified).** vllm-ascend 0.23.0 *can* serve this
 model — the earlier "sliding window unsupported" conclusion was wrong. The failure was
@@ -21,9 +19,10 @@ a strided view for multi-token prefill, and vllm-ascend's sliding-window branch 
 without making the inputs contiguous (the full-attention branch goes through
 ``DeviceOperator``, which does). Upstream fixed the vendor side in ``cfb01b1c8`` (#17925, first
 in v0.30.0); the model-side equivalent (``v = v.contiguous()`` with a comment) is now in the
-port and is harmless on the v2 backend. With it, the read-only-registered model on the vendor
-stack returns HTTP 200, produces clean chat content, recalls the 3,460-token secret exactly, and
-decodes at **37 ms/tok** (vs 75–78 ms/tok on the v2 stack, both eager, single sequence).
+port. With it, the model registered through the V3 `model_table` seam returns HTTP 200 on the
+vendor stack, produces clean chat content, recalls the 3,460-token secret exactly, and decodes at
+**37 ms/tok** (eager, single sequence). The earlier 75–78 ms/tok figure belongs to the retired
+V2 backend below and is kept only as history.
 
 ## Status ledger
 
@@ -39,13 +38,17 @@ decodes at **37 ms/tok** (vs 75–78 ms/tok on the v2 stack, both eager, single 
 | 6 | Concurrency (8 seqs, mixed lengths) | VALIDATED |
 | 7 | Capacity-grid OOM at 0.82 utilisation | FIXED |
 
+Items 1, 1b and 7 document the retired V2 backend that produced the first correct tokens. They
+are kept as root-cause history; the V3 runtime does not execute that code. On V3 the same
+properties come from vllm-ascend (windowed FIA, hybrid KV groups, worker/graph capture).
+
 ## #0 architecture backport (CLOSED)
 
 Root cause: `muse_glimmer` exists only in vLLM main (@ ef5f913, 2026-11-09); vLLM 0.23.0's
 registry has no such architecture, and the venv's transformers 5.5.4 does not know the
 `model_type` (config.json cannot be parsed before the architecture lookup even happens).
 
-- `tileinfer/vllm/models/muse_glimmer.py` — text-only port (no SupportsMultiModal) with a
+- `tileinfer/bridge/models/muse_glimmer.py` — text-only port (no SupportsMultiModal) with a
   `MuseGlimmerHFConfig` shim that promotes **only** text_config (vision_config's
   `window_attention` layer_type is rejected by transformers 5.5.4's strict validator).
   0.23 API fixes: `islice` PP iteration (PPMissingLayer padding), no
@@ -53,15 +56,13 @@ registry has no such architecture, and the venv's transformers 5.5.4 does not kn
   dynamic-dim inference), classic `stacked_params_mapping` in `load_weights` (0.23 has no
   `WeightsMapper.orig_to_new_stacked`), `is_text_generation_model` + `embed_input_ids`
   delegation (VllmModelForTextGeneration protocol). Per-layer sliding windows are passed through
-  (`per_layer_sliding_window`); the backend computes them (#1).
-- `tileinfer/vllm/plugin.py` `_install_models` — registers the model (architecture + AutoConfig).
-- `tileinfer/vllm/profiles/muse_glimmer.py` — model profile (arch match, head_size (128,),
-  group_min 16, block-first fused kv_shape, hybrid=None, mixed_attention_specs=True,
-  op_family="dense").
-- `tileinfer/vllm/ops/families/dense.py` — empty op family (no takeovers; the dense path runs on
-  vLLM's stock layer implementations on NPU).
+  (`per_layer_sliding_window`); the vendor attention backend computes them (#1).
+- `tileinfer/manifests/muse_glimmer.py` — declaration (52 layers, window 2048, iRoPE, output
+  gate, `model_impl`, `reasoning_parser*`).  This is the only place the model's facts live.
+- `tileinfer/bridge/seams.py::install_model_table` — runs `register_config` /
+  `register_models` and registers the parser; no V2 plugin or model profile is involved.
 
-## #1 sliding-window compute (CLOSED)
+## #1 sliding-window compute — V2-era history (CLOSED, not on the V3 path)
 
 Two mechanisms, dispatched by `TileInferAttentionImpl.forward`:
 
@@ -106,10 +107,11 @@ windowed compute masks out. Device-validated: two groups, 3,706-token prompt HTT
 ## #3 vendor (vllm-ascend) route (RESOLVED)
 
 - **Environment**: `/home/userlist/ww/py_venv` (torch 2.10.0 + torch_npu 2.10.0.post4 +
-  triton-ascend 3.2.2 + vllm 0.23.0 + vllm-ascend 0.23.0-950), used **read-only**: the model is
-  registered by a ``vllm.general_plugins`` entry point shipped from a `/tmp` directory on
-  ``PYTHONPATH`` (no install, no venv edits). Verified live: ``[muse-vendor] registered ...`` in
-  both the API server and the EngineCore process.
+  triton-ascend 3.2.2 + vllm 0.23.0 + vllm-ascend 0.23.0-950), used **read-only** during the
+  probe: the model was registered by a ``vllm.general_plugins`` entry point shipped from a `/tmp`
+  directory on ``PYTHONPATH``. That temporary plugin is now retired; the same registration is the
+  V3 bridge's ``model_table`` seam (`tileinfer/bridge/models/`). Verified live: the registration
+  reaches both the API server and the EngineCore process.
 - **Root cause** (from ``/root/ascend/log/debug/plog``):
   ``paged_attention_checker.cpp:1001 ... Reason: In non-PA scenarios, value tensors must be
   contiguous`` → ``NnopbaseExecutorDoTiling`` → errno 561002. Non-PA = prefill with
@@ -130,8 +132,8 @@ windowed compute masks out. Device-validated: two groups, 3,706-token prompt HTT
 
 The checkpoint's chat template ends the generation prompt at a bare `<|start|>assistant`; the
 model emits ` to=self` reasoning `<|eom|>` ` to=user` answer `<|eot|>` (special tokens are
-stripped, so the channel markers survive as plain text). `tileinfer/vllm/reasoning.py` registers
-an `atem` reasoning parser (OOT, from the v2 plugin install; `--reasoning-parser atem`):
+stripped, so the channel markers survive as plain text). `tileinfer/bridge/models/atem.py`
+registers an `atem` reasoning parser (from the V3 `model_table` seam; `--reasoning-parser atem`):
 non-streaming `extract_reasoning` plus a stateless-from-text streaming splitter that holds back
 marker-prefix tails so `" to=user"` never splits across chunks. Degenerate outputs (the model
 answering inside the self channel) are reported entirely as reasoning. Tests:
@@ -151,7 +153,7 @@ across the window boundary (secret at token 0 of a 3,460-token prompt recalled e
 round 109 s incl. plan compiles, warm round 3.5 s; zero tracebacks. Exercises bucket>1 staging
 states, per-bucket plans and group metadata.
 
-## #7 capacity-grid OOM at 0.82 utilisation (FIXED)
+## #7 capacity-grid OOM at 0.82 utilisation — V2-era history (FIXED)
 
 `serving/buckets.capacity_view` re-binds pool storage at the declared capacity via `Tensor.set_`;
 on torch_npu growing the storage **re-allocates the whole pool** (not just the delta), which OOMed
@@ -181,7 +183,7 @@ Final fix (two halves, both in code):
 Device-validated at **0.82** (previously OOMed at first prefill): coherent generation, recall
 exact, TPOT unchanged.
 
-## Performance (real weights, single seq, eager)
+## Performance — retired V2 backend (real weights, single seq, eager)
 
 - decode TPOT: **75–78 ms/tok** (~13 tok/s) after the staged kernel path (was 102–108 ms/tok with
   the masked-reference decode); shared staging does not change it (the gather was never the
@@ -192,25 +194,31 @@ exact, TPOT unchanged.
   roughly 2x the v2 stack. Its attention path is the vendor's optimized FIA; the v2 stack's
   windowed staging + reference prefill is what costs the difference.
 
-## Launch recipe (current, everything on)
+## Launch recipe (V3, vllm-ascend environment)
 
 ```bash
-source /home/userlist/zxs/TileInfer/scripts/env-ascend102.sh
-env PYTHONPATH=/home/userlist/.ernest/TileInfer TILEINFER_OPS=none setsid nohup \
-  /home/userlist/zxs/TileInfer/.venv_native213/bin/python -m vllm.entrypoints.openai.api_server \
+# /home/userlist/ww/py_venv: torch 2.10 + torch_npu + vllm 0.23.0 + vllm-ascend 0.23.0-950
+env PYTHONPATH=/home/userlist/.ernest/TileInfer TILEINFER_MANIFEST=muse_glimmer \
+  /home/userlist/ww/py_venv/bin/python -m vllm.entrypoints.openai.api_server \
   --model /home/models/Muse-Glimmer-30B --max-model-len 8192 --max-num-seqs 1 \
-  --enforce-eager --gpu-memory-utilization 0.82 --block-size 128 \
+  --enforce-eager --gpu-memory-utilization 0.82 \
   --reasoning-parser atem --port 8345
 ```
 
-Note: use explicit `env` (not a heredoc `source /dev/stdin`) — the heredoc variant silently skips
-the vLLM general-plugin load and fails at ModelConfig. The venv's editable dist-info
-`entry_points.txt` was hand-restored to the v2 content (console_scripts / vllm.general_plugins /
-vllm.platform_plugins); RECORD hash no longer matches (pip warns, functionality fine).
+`TILEINFER_MANIFEST` makes the bridge build the plan from the declaration at boot. A frozen
+deployment can instead write a plan and point `TILEINFER_PLAN` at it:
 
-## v3 wiring (DONE 2026-11-13)
+```bash
+tileinfer plan build --model /home/models/Muse-Glimmer-30B --out /tmp/muse.plan.json
+env PYTHONPATH=/home/userlist/.ernest/TileInfer TILEINFER_PLAN=/tmp/muse.plan.json ...
+```
 
-The bridge now hosts vendor-absent models end to end:
+The old V2 recipe (`.venv_native213`, `TILEINFER_OPS=none`, no manifest) is retired: V2 no
+longer contains any Muse code.
+
+## V3 wiring (landed 2026-11-16)
+
+The bridge hosts vendor-absent models end to end, with no V2 involvement:
 
 - Declaration: `manifests/muse_glimmer.py` (52 layers, 39 sliding + 13 NoPE global,
   window 2048, output gate, `model_impl`, `reasoning_parser`).  Schema gained
@@ -221,33 +229,20 @@ The bridge now hosts vendor-absent models end to end:
   `attention.sliding` -> the same Ascend attention backend, sparse mode 4); the plan adds
   the `model_table` access point and carries the model/parser injection fields.
 - Seam: `install_model_table` imports `plan.model_impl` and runs its `register_config` /
-  `register_models` actors, then registers the parser under the plan's name — this is what
-  the temporary /tmp plugin did during the probe, now in the bridge.
+  `register_models` actors, then registers the parser under the plan's name.  The model and
+  parser implementations live in `tileinfer/bridge/models/`, the only layer allowed to import
+  the engine.
+- Removed V2 surface: `tileinfer/vllm/models/muse_glimmer.py`,
+  `tileinfer/vllm/profiles/muse_glimmer.py`, `tileinfer/vllm/reasoning.py`, and the Muse-only
+  `tileinfer/vllm/ops/families/dense.py`; the V2 plugin and profile registry no longer mention
+  the model.
 - Usage: install the bridge in the vllm-ascend environment and set
-  `TILEINFER_MANIFEST=muse_glimmer` (or write a plan with `tileinfer plan build` and point
-  `TILEINFER_PLAN` at it).  Device re-validation is pending (no card available); the probe
-  already showed the vendor stack serves this model at 37 ms/tok with the parser registered.
+  `TILEINFER_MANIFEST=muse_glimmer` (or point `TILEINFER_PLAN` at a built plan).  Device
+  re-validation under the V3 layout is pending (no card available); the probe already showed
+  the vendor stack serves this model at 37 ms/tok with the parser registered.
 
 Open: the C2 benchmark sample (first-token top-5) is not captured, so numeric acceptance is
 not wired yet.
-
-## v3 mapping (what the code had to gain — reference)
-
-The v3 tree has no landing spot for a model the vendor does not serve. Concretely:
-
-1. `contracts/manifest.py` has no sliding-window concept (`AttentionSpec.kind` is "full";
-   `layer_types` only allows `full_attention` / `linear_attention`) — needs a sliding layer type
-   and a window field.
-2. `manifests/` contains only `qwen3_6` — needs `muse_glimmer.py`.
-3. `bridge/seams.py::install_model_table` is empty (`"no model replacement requested"`) — needs the
-   real OOT registration (AutoConfig + ModelRegistry), which is exactly what the v2 plugin's
-   `_install_models` + config shim do today.
-4. `install_attention_selector` selects among vllm-ascend's registered backends; a vendor-absent
-   model needs the seam to fall back to the TileInfer backend (registered in vLLM's
-   `AttentionBackendEnum.CUSTOM`).
-
-None of this can be device-validated on this box until vllm-ascend is installable (torch 2.10
-venv) and adapted to MuseGlimmer; the v2 path above is the currently verified deliverable.
 
 ## Pre-existing .ernest test failures (not from this work, verified via git stash)
 

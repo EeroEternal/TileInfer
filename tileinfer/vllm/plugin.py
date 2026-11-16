@@ -542,10 +542,7 @@ def _install_models() -> Dict[str, Any]:
     except Exception as exc:  # noqa: BLE001 - a general plugin must not raise
         details.append(f"config registration raised {exc!r}")
         logger.warning("TileInfer config registration: %s", details[-1])
-    actors = (
-        ("tileinfer.vllm.models.dsv41", "register_models"),
-        ("tileinfer.vllm.models.muse_glimmer", "register_models"),
-    )
+    actors = (("tileinfer.vllm.models.dsv41", "register_models"),)
     for module_name, entry in actors:
         try:
             module = __import__(module_name, fromlist=[entry])
@@ -557,18 +554,6 @@ def _install_models() -> Dict[str, Any]:
         if result.get("registered"):
             info["registered"].append(result["arch"])
         details.append(str(result.get("detail", "")))
-    # The ATEM reasoning parser (MuseGlimmer's channel protocol) registers under the name
-    # ``atem`` so ``--reasoning-parser atem`` can select it; failure-tolerant like the rest.
-    try:
-        from vllm.reasoning import ReasoningParserManager
-
-        from tileinfer.vllm.reasoning import AtemReasoningParser
-
-        ReasoningParserManager.register_module("atem", module=AtemReasoningParser)
-        details.append("reasoning parser 'atem' registered")
-    except Exception as exc:  # noqa: BLE001 - a general plugin must not raise
-        details.append(f"reasoning parser registration raised {exc!r}")
-        logger.warning("TileInfer reasoning parser registration: %s", details[-1])
     info["detail"] = "; ".join(d for d in details if d) or "nothing to register"
     return info
 

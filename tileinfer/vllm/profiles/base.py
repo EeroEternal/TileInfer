@@ -285,7 +285,7 @@ class ModelProfile:
         Everything this profile refuses, with the reason each consumer prints.
     ``mixed_attention_specs``
         True when the model's attention layers mix spec types that vLLM's unified-spec mode
-        would flatten (MuseGlimmer's iRoPE: full-attention + sliding-window layers).  The
+        would flatten (an iRoPE model: full-attention + sliding-window layers).  The
         platform answers ``support_hybrid_kv_cache() == True`` for such a profile so vLLM builds
         one group per spec and the sliding-window allocator can drop out-of-window blocks —
         the memory optimisation the unified path (``unify_hybrid_kv_cache_specs``) gives up.

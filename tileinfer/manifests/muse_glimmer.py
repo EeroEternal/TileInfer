@@ -62,8 +62,8 @@ MUSE_GLIMMER = ModelManifest(
         Capability.SAMPLING_TOPK.value,
     ),
     benchmark={},  # C2 sample pending; deployment does not depend on it
-    model_impl="tileinfer.vllm.models.muse_glimmer",
+    model_impl="tileinfer.bridge.models.muse_glimmer",
     reasoning_parser="atem",
-    reasoning_parser_impl="tileinfer.vllm.reasoning:AtemReasoningParser",
+    reasoning_parser_impl="tileinfer.bridge.models.atem:AtemReasoningParser",
     source="docs/notes/muse-glimmer-static.md",
 )

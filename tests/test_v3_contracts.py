@@ -275,7 +275,8 @@ def test_muse_declaration_matches_the_checkpoint_facts() -> None:
     assert m.attention.sliding_window == 2048
     assert m.attention.num_heads == 32 and m.attention.num_kv_heads == 2
     assert Capability.ATTENTION_SLIDING.value in m.required_capabilities
-    assert m.model_impl == "tileinfer.vllm.models.muse_glimmer"
+    assert m.model_impl == "tileinfer.bridge.models.muse_glimmer"
+    assert m.reasoning_parser_impl == "tileinfer.bridge.models.atem:AtemReasoningParser"
     assert m.reasoning_parser == "atem"
     # a brand-new model may be declared before its C2 sample exists
     assert m.benchmark == {}
@@ -342,20 +343,21 @@ def test_model_table_seam_registers_the_model_and_parser(monkeypatch) -> None:
         register_module=lambda name, module=None: registered.update({name: module})
     )
 
-    sys.modules["fake_model_impl"] = fake_model
-    sys.modules["fake_parser_mod"] = fake_parser_mod
+    monkeypatch.setitem(sys.modules, "fake_model_impl", fake_model)
+    monkeypatch.setitem(sys.modules, "fake_parser_mod", fake_parser_mod)
 
     plan = Plan.from_dict(decide(MUSE_GLIMMER, _vendor_env())[0].as_dict())
     plan.model_impl = "fake_model_impl"
     plan.reasoning_parser = "atem"
     plan.reasoning_parser_impl = "fake_parser_mod:FakeParser"
 
-    # The seam imports vllm.reasoning lazily; inject a stub so no engine is needed.
-    import vllm  # noqa: F401  (the v3 package imports vllm only inside the seam)
-
-    monkeypatch.setattr(
-        "vllm.reasoning.ReasoningParserManager", fake_manager, raising=False
-    )
+    # The seam imports vllm.reasoning lazily; stub the engine so this stays a CPU test.
+    fake_vllm = types.ModuleType("vllm")
+    fake_reasoning = types.ModuleType("vllm.reasoning")
+    fake_reasoning.ReasoningParserManager = fake_manager
+    fake_vllm.reasoning = fake_reasoning
+    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+    monkeypatch.setitem(sys.modules, "vllm.reasoning", fake_reasoning)
     result = seams.install_model_table(plan)
     assert result.ok, result.detail
     assert calls == ["config", "models"]

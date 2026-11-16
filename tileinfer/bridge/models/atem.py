@@ -1,4 +1,4 @@
-"""The ATEM reasoning parser — MuseGlimmer's channel protocol, for ``--reasoning-parser atem``.
+"""``tileinfer.bridge.models.atem`` — MuseGlimmer's ATEM channel parser (``--reasoning-parser atem``).
 
 The checkpoint's chat template (``chat_template.jinja``, ATEM protocol) ends the generation
 prompt with a bare ``<|start|>assistant``; the *model* then chooses its recipient and emits
