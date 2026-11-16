@@ -84,6 +84,7 @@ def _select(
     manifest: ModelManifest,
     env: Environment,
     policy: str,
+    allow_candidates: bool = False,
 ) -> Tuple[List[Selection], List[Gap]]:
     selections: List[Selection] = []
     gaps: List[Gap] = []
@@ -92,6 +93,43 @@ def _select(
         vendor = VENDOR_PROVIDERS.get(capability)
         ours = TILEINFER_PROVIDERS.get(capability)
         order = ("vendor", "tileinfer") if policy == "vendor_first" else ("tileinfer", "vendor")
+
+        if allow_candidates:
+            # A candidate with a model-type cover replaces the vendor even when the vendor
+            # advertises the capability: the vendor's generic MoE does not cover Nemotron's
+            # non-gated relu2 expert MLP.  This is bring-up only and still writes a required gap.
+            overrides = [
+                provider
+                for provider in _candidates(capability, manifest)
+                if provider.covers.get("model_type") == manifest.model_type
+            ]
+            if overrides:
+                candidate = overrides[0]
+                selections.append(
+                    Selection(
+                        capability=capability.value,
+                        provider=candidate.name,
+                        impl=candidate.impl,
+                        reason=(
+                            f"explicit candidate bring-up; {candidate.name} covers "
+                            f"model_type={manifest.model_type}, the vendor does not"
+                        ),
+                        source="tileinfer",
+                        graphable=candidate.graphable,
+                    )
+                )
+                gaps.append(
+                    Gap(
+                        capability=capability.value,
+                        required=True,
+                        reason=(
+                            "candidate overrides the vendor for this model type; "
+                            f"target real-weight C1/C2 pending for {candidate.name}"
+                        ),
+                        candidates=[provider.name for provider in overrides],
+                    )
+                )
+                continue
 
         chosen: Optional[Selection] = None
         for source in order:
@@ -119,6 +157,35 @@ def _select(
         if chosen is not None:
             selections.append(chosen)
             continue
+        if allow_candidates:
+            candidates = _candidates(capability, manifest)
+            if candidates:
+                candidate = candidates[0]
+                selections.append(
+                    Selection(
+                        capability=capability.value,
+                        provider=candidate.name,
+                        impl=candidate.impl,
+                        reason=(
+                            "explicit candidate bring-up; the plan is still servable=false "
+                            "until real-weight C1/C2"
+                        ),
+                        source="tileinfer",
+                        graphable=candidate.graphable,
+                    )
+                )
+                gaps.append(
+                    Gap(
+                        capability=capability.value,
+                        required=True,
+                        reason=(
+                            "candidate selected only for an explicit bring-up run; "
+                            f"target real-weight C1/C2 pending for {candidate.name}"
+                        ),
+                        candidates=[provider.name for provider in candidates],
+                    )
+                )
+                continue
         reason = (
             "vllm-ascend is not installed, so no vendor provider exists"
             if not env.has_vendor
@@ -143,11 +210,17 @@ def decide(
     manifest: ModelManifest,
     env: Environment,
     policy: str = "vendor_first",
+    allow_candidates: bool = False,
 ) -> Tuple[Plan, GapReport]:
-    """Compute the plan and the gap report from one declaration."""
+    """Compute the plan and the gap report from one declaration.
+
+    ``allow_candidates`` is for an explicit bring-up run.  It selects declared candidates
+    into the plan (so the v3 ``impl_table`` can install them) but keeps the gap required and
+    ``Plan.servable`` false; the bridge still refuses unless its own bring-up override is set.
+    """
     if policy not in POLICIES:
         raise ValueError(f"unknown policy {policy!r}; known: {POLICIES}")
-    selections, gaps = _select(manifest, env, policy)
+    selections, gaps = _select(manifest, env, policy, allow_candidates=allow_candidates)
     servable = not any(g.required for g in gaps)
 
     # The access points that are actually installed.  ``impl_table`` and ``model_table`` are
@@ -201,6 +274,7 @@ def decide(
             f"vendor={env.vllm_ascend or 'missing'}",
             f"device={env.device_type or 'unknown'}",
             "the layer selects implementations; it does not own platform/worker/KV/graph",
+            f"allow_candidates={bool(allow_candidates)}",
         ],
     )
     return plan, report

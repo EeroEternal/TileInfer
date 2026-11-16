@@ -44,7 +44,9 @@ For operator providers:
 - the plan must contain the `impl_table` access point;
 - the provider name must have an explicit binder in `tileinfer/bridge/impl_table.py`;
 - `Plan.servable=false` refuses the install, unless an explicitly labelled bring-up run sets
-  `TILEINFER_ALLOW_UNSERVABLE=1`.
+  `TILEINFER_ALLOW_UNSERVABLE=1`.  Such a run builds its plan with `--allow-candidates`; that
+  selects the declared candidates (including a model-type candidate that overrides a generic
+  vendor capability) but still writes `servable=false`.
 
 There is no global `install_ops()` call in the v3 bridge and no "install everything then let the
 model choose" fallback. A missing access point, an unknown provider, or a failed binder is

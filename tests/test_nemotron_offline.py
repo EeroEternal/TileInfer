@@ -615,3 +615,30 @@ def test_state_linear_gap_reports_the_implemented_candidate() -> None:
     assert gap.required is True
     assert gap.candidates == ["tileinfer.mamba2_state"]
     assert "not default until target C1/C2" in gap.reason
+
+
+def test_candidate_bringup_selects_the_v3_provider_without_promoting_it() -> None:
+    """The explicit bring-up path exists, but it is still not a support claim."""
+    env = Environment(
+        vllm="0.23.0",
+        vllm_ascend="0.23.0",
+        python="3.12",
+        torch="2.10.0",
+        device_type="A5",
+        has_vendor=True,
+    )
+    plan, report = decide(
+        NEMOTRON_3_5_DRAFT, env, policy="vendor_first", allow_candidates=True
+    )
+    selected = plan.selection(Capability.STATE_LINEAR.value)
+    assert selected is not None
+    assert selected.provider == "tileinfer.mamba2_state"
+    assert selected.source == "tileinfer"
+    assert plan.servable is False
+    assert report.servable is False
+    assert "impl_table" in plan.access_points
+    moe = plan.selection(Capability.MOE_ROUTED.value)
+    assert moe is not None
+    assert moe.provider == "tileinfer.nemotron_moe"
+    assert any(g.capability == "state.linear" and g.required for g in report.gaps)
+    assert any(g.capability == "moe.routed" and g.required for g in report.gaps)

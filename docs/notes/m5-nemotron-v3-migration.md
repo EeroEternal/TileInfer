@@ -28,6 +28,12 @@ hardware evidence.
 5. The two Nemotron providers remain **candidates** (`tileinfer.mamba2_state`,
    `tileinfer.nemotron_moe`); they are not defaults and the target plan stays `servable=false`
    until real-weight C1/C2/C3 exists.
+6. An explicit bring-up plan (`decide(..., allow_candidates=True)` or
+   `tools/nemotron/build_plan.py --allow-candidates`) selects both candidates and records a
+   required gap for each.  `tileinfer.nemotron_moe` overrides the generic vendor MoE capability
+   because its `covers.model_type` is `nemotron_h`; the vendor table has no non-gated `relu2`
+   expert MLP.  The plan is still `servable=false` and the bridge still needs
+   `TILEINFER_ALLOW_UNSERVABLE=1`.
 
 ## Offline verification (no NPU)
 

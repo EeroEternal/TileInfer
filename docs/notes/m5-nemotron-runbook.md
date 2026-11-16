@@ -96,12 +96,15 @@ Transformers 4.57 下 `ModelConfig` 会在模型代码之前直接失败。TileI
 过 config gate。用离线工具生成临时 plan：
 
 ```bash
-.venv_v3/bin/python tools/nemotron/build_plan.py --out "$PLAN"
+.venv_v3/bin/python tools/nemotron/build_plan.py --allow-candidates --out "$PLAN"
 ```
 
 输出会明确 `servable=false`、`gaps=["state.linear"]`；这是 bring-up 用的 plan，不是支持声明。
-启动时设 `TILEINFER_PLAN="$PLAN"`，否则 bridge 会按默认 Qwen 声明生成 plan，config gate
-会报 `TileInfer plan/model mismatch`。
+`--allow-candidates` 只是把已声明的 v3 候选（Mamba2 + 非门控 MoE）选进 plan，plan 仍然
+`servable=false`；启动时还要
+显式设 `TILEINFER_ALLOW_UNSERVABLE=1`，bridge 才会安装候选，否则会拒绝并保留厂商路径。同时设
+`TILEINFER_PLAN="$PLAN"`，否则 bridge 会按默认 Qwen 声明生成 plan，config gate 会报
+`TileInfer plan/model mismatch`。
 
 ---
 
