@@ -106,6 +106,7 @@ from .backend import SUPPORTED_KV_CACHE_DTYPES, TileInferAttentionBackend
 from .kv_cache import write_kv_cache
 from .metadata import TileInferMetadata
 from .prefill import PrefillPath, PrefillUnsupported
+from .window import reset_shared_stagers, shared_stager
 
 __all__ = [
     "TileInferAttentionImpl",
@@ -154,6 +155,11 @@ IMPL_COUNTER_INITIAL = {
     "input_reshape_copy": 0,
     "output_copyback": 0,
     "output_allocated": 0,
+    # windowed layers (deliberate dispatch, not a fallback): the paged kernels are full-causal
+    # only, so a sliding-window layer computes on the reference path (see the constructor note)
+    "decode_window_staged": 0,
+    "decode_window_reference": 0,
+    "prefill_window_reference": 0,
     # per-step ragged triple sharing (one refresh per step instead of one per attention layer)
     "step_share_refresh": 0,
     "step_share_reuse": 0,
@@ -181,6 +187,8 @@ _REFERENCE_ATTN: Optional[BatchAttention] = None
 _REFERENCE_ERROR: Optional[BaseException] = None
 #: Prefill fallback reasons already logged (one warning per reason, not per step).
 _PREFILL_WARNED: set = set()
+#: Sliding-window sizes already logged (one warning per window, not per layer/step).
+_WINDOW_WARNED: set = set()
 
 
 def snapshot() -> Dict[str, object]:
@@ -205,7 +213,9 @@ def reset_runtime_state() -> None:
         _REFERENCE_ATTN = None
         _REFERENCE_ERROR = None
         _PREFILL_WARNED.clear()
+        _WINDOW_WARNED.clear()
         _SHARED_STEPS.clear()
+        reset_shared_stagers()
 
 
 def _step_share_enabled() -> bool:
@@ -282,6 +292,15 @@ def _prefill_enabled() -> bool:
     """Whether prefill may use the paged-prefill kernel (``TILEINFER_PREFILL=0`` forces the
     reference backend, which is the same-process control for the C4 A/B)."""
     raw = os.environ.get("TILEINFER_PREFILL", "").strip().lower()
+    return raw not in ("0", "off", "false", "no")
+
+
+def _window_decode_enabled() -> bool:
+    """Whether windowed decode stages the window for the kernel path (``TILEINFER_WINDOW_DECODE=0``
+    forces the masked reference decode — the same-process A/B control, like ``TILEINFER_PREFILL``).
+    On by default: the staging is exact, and the fallbacks inside the kernel path remain correct
+    because the scratch *is* the window."""
+    raw = os.environ.get("TILEINFER_WINDOW_DECODE", "").strip().lower()
     return raw not in ("0", "off", "false", "no")
 
 
@@ -423,10 +442,31 @@ class TileInferAttentionImpl(AttentionImpl):
             raise NotImplementedError(
                 "alibi slopes are not supported by the TileInfer attention backend"
             )
+        # Sliding-window (iRoPE) layers: the window is honoured on the reference path, whose
+        # mask uses absolute positions (``window_left``: query at ``q_pos`` sees
+        # ``[q_pos - window_left, q_pos]``; a window of ``w`` tokens is ``window_left = w - 1``).
+        # The paged kernel paths are full-causal only, so a windowed layer never reaches them
+        # (``forward`` branches before dispatch); the graph-capture support is downgraded to
+        # match (``TileInferMetadataBuilder.get_cudagraph_support``).  What is NOT done here is
+        # vLLM's hybrid-manager memory optimisation (dropping out-of-window blocks): the
+        # unified-spec pool keeps every block, and the window exists only in the compute.
+        window: Optional[int] = None
         if sliding_window is not None:
-            raise NotImplementedError(
-                "sliding-window attention is not supported by the TileInfer attention backend"
-            )
+            window = int(sliding_window)
+            if window < 1:
+                raise ValueError(
+                    f"sliding_window must be a positive number of tokens, got {sliding_window}"
+                )
+            if window not in _WINDOW_WARNED:
+                _WINDOW_WARNED.add(window)
+                logger.warning(
+                    "TileInfer attention: sliding-window layers (window=%d) decode via exact "
+                    "scratch staging onto the paged kernel path (prefill stays on the masked "
+                    "reference path; capture is not verified for the staged path, so windowed "
+                    "specs downgrade to --enforce-eager)",
+                    window,
+                )
+        self.window_size: Optional[int] = window
         if logits_soft_cap is not None:
             raise NotImplementedError(
                 "logits soft capping is not supported by the TileInfer attention backend"
@@ -455,7 +495,8 @@ class TileInferAttentionImpl(AttentionImpl):
         self.kv_cache_dtype = kv_cache_dtype
         self.attn_type = attn_type
         # Read by `vllm.v1.attention.backends.utils.get_per_layer_parameters` (:126-130); must be
-        # `None` rather than an int, because that function indexes it as a tuple.
+        # `None` rather than an int, because that function indexes it as a tuple.  The window
+        # itself lives in ``self.window_size`` (see the constructor's sliding-window note).
         self.sliding_window = None
         self.logits_soft_cap = None
         self.alibi_slopes = None
@@ -483,6 +524,16 @@ class TileInferAttentionImpl(AttentionImpl):
                     "step will use the reference backend"
                 )
                 self._prefill_enabled = False
+        # Windowed decode: the shared scratch stager + this layer's own per-bucket state dict,
+        # so the scratch pools never share a bucket key (or a plan key) with the real-pool
+        # states.  The stager is shared across same-geometry layers (they all stage the same
+        # window from the same pool - one gather per step instead of one per layer); the states
+        # stay per-layer because the query/output buffers are per-layer.  Built here (pure
+        # geometry, no device), never lazily — same dynamo reasoning as ``_prefill``.
+        self._window_states: Dict[int, _BucketState] = {}
+        self._stager = None
+        if self.window_size is not None:
+            self._stager = shared_stager(self.num_kv_heads, self.head_size, self.window_size)
 
     # ------------------------------------------------------------------ vLLM contract
 
@@ -588,6 +639,20 @@ class TileInferAttentionImpl(AttentionImpl):
             IMPL_COUNTERS.bump("prefill_steps")
             return self._prefill_forward(q3, k_half, v_half, block_size, meta, output, num_tokens)
 
+        if self.window_size is not None:
+            # A windowed layer on a decode step: the paged decode kernel is full-causal only,
+            # so the window is presented to it exactly — the last ``window`` tokens are staged
+            # into a per-layer scratch pool and the kernel runs on that (see
+            # ``attn.window``).  TILEINFER_WINDOW_DECODE=0 switches back to the masked
+            # reference decode (the C4 A/B control).
+            if _window_decode_enabled():
+                IMPL_COUNTERS.bump("decode_window_staged")
+                return self._windowed_kernel_forward(
+                    q3, k_half, v_half, block_size, meta, output, num_tokens
+                )
+            IMPL_COUNTERS.bump("decode_window_reference")
+            return self._reference_forward(q3, k_half, v_half, block_size, meta, output, num_tokens)
+
         IMPL_COUNTERS.bump("decode_steps")
         return self._kernel_forward(q3, k_half, v_half, block_size, meta, output, num_tokens)
 
@@ -615,7 +680,7 @@ class TileInferAttentionImpl(AttentionImpl):
         and returns wrong numbers is a bug, and silently degrading would hide it (C3).
         """
         path = self._prefill_path()
-        if path is not None:
+        if path is not None and self.window_size is None:
             try:
                 result = path.run(q3, k_half, v_half, block_size, meta, output, num_tokens)
             except PrefillUnsupported as exc:
@@ -632,7 +697,12 @@ class TileInferAttentionImpl(AttentionImpl):
                 IMPL_COUNTERS.bump("prefill_kernel")
                 self._log_prefill_share()
                 return result
-        IMPL_COUNTERS.bump("prefill_reference")
+        if self.window_size is not None:
+            # Windowed prefill cannot use the paged kernel at all; counting it separately keeps
+            # the kernel-share log about kernel-eligible steps (M1's ratio).
+            IMPL_COUNTERS.bump("prefill_window_reference")
+        else:
+            IMPL_COUNTERS.bump("prefill_reference")
         self._log_prefill_share()
         return self._reference_forward(q3, k_half, v_half, block_size, meta, output, num_tokens)
 
@@ -649,11 +719,12 @@ class TileInferAttentionImpl(AttentionImpl):
         total = kernel + reference
         logger.warning(
             "TileInfer prefill: %d steps, kernel=%d reference=%d unsupported=%d "
-            "(kernel share %.3f)",
+            "window_reference=%d (kernel share %.3f of kernel-eligible steps)",
             steps,
             kernel,
             reference,
             IMPL_COUNTERS.get("prefill_unsupported"),
+            IMPL_COUNTERS.get("prefill_window_reference"),
             (kernel / total) if total else 0.0,
         )
 
@@ -670,7 +741,7 @@ class TileInferAttentionImpl(AttentionImpl):
 
     # ------------------------------------------------------------------ decode path
 
-    def _kernel_forward(
+    def _windowed_kernel_forward(
         self,
         q3: torch.Tensor,
         k_half: torch.Tensor,
@@ -680,7 +751,45 @@ class TileInferAttentionImpl(AttentionImpl):
         output: Optional[torch.Tensor],
         num_tokens: int,
     ) -> torch.Tensor:
-        """The fast path: plan lookup -> refresh_step -> BatchAttention.run -> output."""
+        """Windowed decode on the kernel path, via the exact scratch staging.
+
+        The stage replaces the pool and the batch geometry: the kernel (and every fallback it
+        can take, including the reference backend) then sees a request whose whole context *is*
+        the window, so causal attention over it is the windowed answer.  ``block_size`` is the
+        scratch page (128) from here on, not the engine page.
+        """
+        scratch_k, scratch_v, meta2 = self._stager.stage(k_half, v_half, block_size, meta)
+        return self._kernel_forward(
+            q3,
+            scratch_k,
+            scratch_v,
+            int(KERNEL_PAGE_SIZE),
+            meta2,
+            output,
+            num_tokens,
+            states=self._window_states,
+            windowed=True,
+        )
+
+    def _kernel_forward(
+        self,
+        q3: torch.Tensor,
+        k_half: torch.Tensor,
+        v_half: torch.Tensor,
+        block_size: int,
+        meta: TileInferMetadata,
+        output: Optional[torch.Tensor],
+        num_tokens: int,
+        *,
+        states: Optional[Dict[int, _BucketState]] = None,
+        windowed: bool = False,
+    ) -> torch.Tensor:
+        """The fast path: plan lookup -> refresh_step -> BatchAttention.run -> output.
+
+        ``states``/``windowed`` serve the windowed scratch staging: a separate per-bucket dict
+        (the scratch pools must not collide with the real pool's states) and a plan-key salt
+        (a scratch pool could otherwise share a key with a real pool of the same geometry).
+        """
         attn = self._decode_attn(q3.dtype)
         if attn is None:
             IMPL_COUNTERS.bump("kernel_path_unavailable")
@@ -693,11 +802,11 @@ class TileInferAttentionImpl(AttentionImpl):
         k_pool = pool_sub_view(k_half, sub)
         v_pool = pool_sub_view(v_half, sub)
 
-        state = self._state_for(meta, k_pool, v_pool, block_size, q3)
+        state = self._state_for(meta, k_pool, v_pool, block_size, q3, states=states)
 
         # (c1) Plan lookup.  A miss starts a *background* build and degrades this step: blocking
         # here would stall the engine for a ~70 s compile, possibly inside a captured graph.
-        key = self._plan_key(state)
+        key = self._plan_key(state, windowed=windowed)
         plan = PLAN_CACHE.get(key)
         if plan is None:
             if PLAN_CACHE.is_failed(key):
@@ -841,6 +950,11 @@ class TileInferAttentionImpl(AttentionImpl):
         if num_reqs < 1:
             IMPL_COUNTERS.bump("bad_query_len")
             raise ValueError("a batch with no requests cannot be attended")
+        # The window the reference mask applies, spelled in its vocabulary: a layer whose
+        # window is ``w`` tokens (counting the query itself) masks
+        # ``k_pos < q_pos - window_left`` with ``window_left = w - 1``.  ``-1`` disables
+        # windowing; the mask's absolute positions make chunked-prefill extends correct.
+        window_left = -1 if self.window_size is None else self.window_size - 1
 
         qo_lens = meta.query_start_loc_cpu[1 : num_reqs + 1] - meta.query_start_loc_cpu[:num_reqs]
         if int(qo_lens.numel()) != num_reqs or int(qo_lens.min().item()) <= 0:
@@ -876,6 +990,7 @@ class TileInferAttentionImpl(AttentionImpl):
                 sm_scale=self.scale,
                 kv_layout="NHD",
                 causal=True,
+                window_left=window_left,
                 finalize=True,
                 k_cache=k_half,
                 v_cache=v_half,
@@ -923,6 +1038,7 @@ class TileInferAttentionImpl(AttentionImpl):
                 sm_scale=self.scale,
                 kv_layout="NHD",
                 causal=True,
+                window_left=window_left,
                 finalize=True,
                 k_cache=k_half,
                 v_cache=v_half,
@@ -949,13 +1065,18 @@ class TileInferAttentionImpl(AttentionImpl):
         v_pool: torch.Tensor,
         block_size: int,
         q3: torch.Tensor,
+        states: Optional[Dict[int, _BucketState]] = None,
     ) -> _BucketState:
         """Per-bucket scratch, allocated on first sight of the bucket.
 
         Allocation is legal on the engine's warm-up step and illegal inside a captured graph, so
         this is exactly the boundary the W8 pre-warm must cover: one eager step per reachable
         bucket.  ``state_builds`` is the counter W8 asserts is zero during capture.
+
+        ``states`` is the dict the state is cached in — the windowed scratch staging passes its
+        own (see ``_kernel_forward``); ``None`` means the real pool's ``self._states``.
         """
+        states = self._states if states is None else states
         bucket = int(meta.bucket)
         sub = sub_pages(block_size)
         table_width = int(meta.block_table_tensor.shape[1])
@@ -963,7 +1084,7 @@ class TileInferAttentionImpl(AttentionImpl):
             IMPL_COUNTERS.bump("shape_mismatch")
             raise ValueError("block_table_tensor must have at least one page column")
         width = table_width * sub  # kernel pages covered by the engine table
-        state = self._states.get(bucket)
+        state = states.get(bucket)
         if state is not None:
             if (
                 state.width != width
@@ -1028,7 +1149,7 @@ class TileInferAttentionImpl(AttentionImpl):
                 (bucket, self.num_heads, self.head_size), dtype=q3.dtype, device=device
             ),
         )
-        self._states[bucket] = state
+        states[bucket] = state
         IMPL_COUNTERS.bump("state_builds")
         logger.info(
             "TileInfer attention: prepared bucket %d (width=%d kernel pages, block_size=%d, "
@@ -1052,44 +1173,124 @@ class TileInferAttentionImpl(AttentionImpl):
         Only buckets that already have a :class:`_BucketState` can be pre-warmed — the plan needs
         the pool geometry, which is learned from the first eager forward of that bucket.  That is
         the same warm-up step the engine runs before capture; there is no way to pre-warm a pool
-        that does not exist yet.
+        that does not exist yet.  The windowed scratch states pre-warm the same way, off their
+        own dict.
         """
         wanted = tuple(int(b) for b in (buckets if buckets is not None else sorted(self._states)))
         built = 0
         for bucket in wanted:
-            state = self._states.get(bucket)
-            if state is None:
-                logger.warning(
-                    "TileInfer attention: prewarm asked for bucket %d before any step built its "
-                    "buffers; run one eager step for that bucket first",
-                    bucket,
+            for state, windowed in (
+                (self._states.get(bucket), False),
+                (self._window_states.get(bucket), True),
+            ):
+                if state is None:
+                    if windowed:
+                        continue  # windowed scratch is built lazily like the real one
+                    logger.warning(
+                        "TileInfer attention: prewarm asked for bucket %d before any step built "
+                        "its buffers; run one eager step for that bucket first",
+                        bucket,
+                    )
+                    continue
+                key = self._plan_key(state, windowed=windowed)
+                if PLAN_CACHE.get(key) is not None or PLAN_CACHE.is_failed(key):
+                    continue
+                try:
+                    PLAN_CACHE.build(
+                        key, lambda key=key, state=state: self._build_plan(key, state)
+                    )
+                except Exception:  # noqa: BLE001 - one bad bucket must not kill the pre-warm
+                    logger.exception(
+                        "TileInfer attention: pre-warm failed for bucket %d (%s)",
+                        bucket,
+                        "windowed" if windowed else "full",
+                    )
+                    continue
+                built += 1
+        return built
+
+    # ------------------------------------------------------------------ helpers
+
+    def prepare_windowed_buckets(
+        self, buckets: Sequence[int], dtype: torch.dtype, device: torch.device
+    ) -> int:
+        """Pre-warm the windowed scratch states and their plans (the worker's pre-warm calls
+        this for windowed layers instead of the real-pool path).
+
+        The scratch pool, the synthetic table and the bucket state are built here — the same
+        objects the first staged step would build lazily — so the first real windowed decode
+        finds a ready plan instead of degrading for one step.  Returns how many plans were
+        built; a bucket that fails to compile is remembered by the plan cache and degrades
+        exactly like the real path's ``plan_failed``.
+        """
+        if self._stager is None:
+            return 0
+        from tileinfer.serving.buckets import pool_sub_view as _psv
+
+        built = 0
+        q3_shape = (0, self.num_heads, self.head_size)
+        for bucket in buckets:
+            bucket = int(bucket)
+            scratch = self._stager._state_for(bucket, dtype, device)
+            meta = TileInferMetadata(
+                query_start_loc=torch.arange(bucket + 1, dtype=torch.int32, device=device),
+                query_start_loc_cpu=torch.arange(bucket + 1, dtype=torch.int32),
+                seq_lens=torch.ones(bucket, dtype=torch.int32, device=device),
+                block_table_tensor=scratch.table,
+                slot_mapping=torch.arange(bucket, dtype=torch.int64, device=device),
+                num_reqs=bucket,
+                num_actual_tokens=bucket,
+                max_query_len=1,
+                max_seq_len=1,
+                bucket=bucket,
+                block_size=int(KERNEL_PAGE_SIZE),
+            )
+            q3 = torch.empty(q3_shape, dtype=dtype, device=device)
+            try:
+                state = self._state_for(
+                    meta,
+                    _psv(scratch.scratch_k, 1),
+                    _psv(scratch.scratch_v, 1),
+                    int(KERNEL_PAGE_SIZE),
+                    q3,
+                    states=self._window_states,
+                )
+            except Exception:  # noqa: BLE001 - one bucket must not stop the others
+                logger.exception(
+                    "TileInfer attention: cannot prepare windowed bucket %d", bucket
                 )
                 continue
-            key = self._plan_key(state)
+            key = self._plan_key(state, windowed=True)
             if PLAN_CACHE.get(key) is not None or PLAN_CACHE.is_failed(key):
                 continue
             try:
                 PLAN_CACHE.build(key, lambda key=key, state=state: self._build_plan(key, state))
             except Exception:  # noqa: BLE001 - one bad bucket must not kill the pre-warm
-                logger.exception("TileInfer attention: pre-warm failed for bucket %d", bucket)
+                logger.exception(
+                    "TileInfer attention: windowed pre-warm failed for bucket %d", bucket
+                )
                 continue
             built += 1
         return built
 
-    # ------------------------------------------------------------------ helpers
+    def _plan_key(self, state: _BucketState, *, windowed: bool = False) -> Tuple[object, ...]:
+        """The plan-cache key for one bucket (see ``serving.planner.plan_key``).
 
-    def _plan_key(self, state: _BucketState) -> Tuple[object, ...]:
-        """The plan-cache key for one bucket (see ``serving.planner.plan_key``)."""
+        ``windowed`` salts the key: a scratch pool could otherwise share a key with a real pool
+        of the same (bucket, width, block_size) geometry, and the two plans compile against
+        different caches (``_build_plan`` finalizes on ``state.k_pool``).
+        """
+        base = (
+            self._backend_name,
+            "windowed-decode" if windowed else "decode",
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_size,
+            str(state.dtype),
+            str(state.device),
+        )
         return plan_key(
-            (
-                self._backend_name,
-                "decode",
-                self.num_heads,
-                self.num_kv_heads,
-                self.head_size,
-                str(state.dtype),
-                str(state.device),
-            ),
+            base,
             self._split_kv_pages,
             state.bucket,
             state.width,

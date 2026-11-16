@@ -213,6 +213,14 @@ class TileInferAttentionBackend(AttentionBackend):
         (:attr:`tileinfer.vllm.profiles.ModelProfile.kv_shape`), not a backend constant: another
         model family may fuse K/V differently or put the block elsewhere, and the runner discovers
         both from this call.
+
+        **The page count is not rounded here**, even though the kernel ABI declares a larger
+        capacity: the runner sizes the raw buffer from the scheduler's ``num_blocks`` and then
+        applies this shape as a *view* (``gpu_model_runner.py:7105-7131``), so a rounded shape
+        would not fit the allocation.  The declared capacity's gap is instead closed on the view
+        side — ``capacity_view`` declines to extend the storage (the kernel never dereferences
+        pages outside ``kv_indices`` spans, so the extension is pure metadata whose torch_npu
+        realisation OOMed a hybrid two-group deployment at 0.82 utilisation).
         """
         return active_profile().kv_shape(
             int(num_blocks), int(block_size), int(num_kv_heads), int(head_size)

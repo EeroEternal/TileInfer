@@ -63,6 +63,8 @@ __all__ = [
     "unregister_profile",
     "qwen3_6",
     "dsv41",
+    "muse_glimmer",
 ]
 
 from . import dsv41  # noqa: E402,F401  (registers the DeepSeek-V4.1 profile)
+from . import muse_glimmer  # noqa: E402,F401  (registers the MuseGlimmer profile)
