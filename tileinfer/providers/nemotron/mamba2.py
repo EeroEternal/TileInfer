@@ -350,6 +350,29 @@ def causal_conv1d_fn(
     return out.to(original_dtype)
 
 
+def _conv_lines(
+    batch: int,
+    indices: Optional[torch.Tensor],
+    pointer: Optional[torch.Tensor],
+    device: torch.device,
+) -> torch.Tensor:
+    """Select ``batch`` cache lines without a host round-trip (graph-capture safe)."""
+    if indices is None:
+        return torch.arange(batch, device=device, dtype=torch.int64)
+    if indices.dim() == 1:
+        lines = indices[:batch].to(torch.int64)
+    else:
+        pos = (
+            pointer.reshape(-1)[:batch].to(torch.int64)
+            if pointer is not None
+            else torch.zeros(batch, device=indices.device, dtype=torch.int64)
+        )
+        lines = indices.gather(1, pos[:, None]).squeeze(1).to(torch.int64)
+    if lines.numel() != batch:
+        raise ValueError(f"expected {batch} cache lines, got {lines.numel()}")
+    return lines
+
+
 def causal_conv1d_update(
     x: torch.Tensor,
     conv_state: torch.Tensor,
@@ -374,6 +397,67 @@ def causal_conv1d_update(
     them must be convolved so the sliding window ends at the verified prefix.
     """
     del validate_data
+    # Graph capture needs a host-sync-free path.  Ordinary decode is one token per sequence;
+    # update that vectorised, and keep the per-token loop only for speculative/varlen batches.
+    single = False
+    if num_accepted_tokens is None:
+        if x.dim() == 2 and query_start_loc is None:
+            single = True
+            batch = x.shape[0]
+            starts = None
+        elif x.dim() == 2:
+            batch = query_start_loc.numel() - 1
+            single = x.shape[0] == batch
+            starts = query_start_loc[:-1].to(torch.int64) if single else None
+        elif x.dim() == 3 and x.shape[2] == 1:
+            single = True
+            batch = x.shape[0]
+            starts = None
+    if single:
+        dim = x.shape[1]
+        _, width = weight.shape
+        taps = width - 1
+        _, cache_dim, state_len = conv_state.shape
+        if cache_dim != dim or state_len < taps:
+            raise ValueError("conv_state shape is incompatible with x/weight")
+        read_lines = _conv_lines(
+            conv_state_indices.size(0) if conv_state_indices is not None else batch,
+            conv_state_indices,
+            initial_state_idx,
+            conv_state.device,
+        )
+        write_lines = _conv_lines(
+            conv_state_indices.size(0) if conv_state_indices is not None else batch,
+            conv_state_indices,
+            block_idx_last_scheduled_token,
+            conv_state.device,
+        )
+        head = conv_state[read_lines, :, state_len - taps :].to(torch.float32)
+        tokens = x if starts is None else x.index_select(0, starts)
+        if x.dim() == 3:
+            tokens = tokens[:, :, 0]
+        full = torch.cat((head, tokens.to(torch.float32).unsqueeze(-1)), dim=2)
+        y = F.conv1d(
+            full,
+            weight.to(torch.float32).unsqueeze(1),
+            None if bias is None else bias.to(torch.float32),
+            groups=dim,
+        )
+        y = _apply_activation(y, activation)
+        out = torch.empty_like(x, dtype=conv_state.dtype)
+        if starts is None:
+            if x.dim() == 3:
+                out[:, :, 0] = y[:, :, 0].to(out.dtype)
+            else:
+                out[:] = y[:, :, 0].to(out.dtype)
+        else:
+            out[starts] = y[:, :, 0].to(out.dtype)
+        if taps:
+            conv_state[write_lines, :, state_len - taps :] = full[:, :, -taps:].to(
+                conv_state.dtype
+            )
+        return out.to(x.dtype)
+
     if x.dim() == 3:
         if query_start_loc is not None:
             raise ValueError("3-D x and query_start_loc are mutually exclusive")
