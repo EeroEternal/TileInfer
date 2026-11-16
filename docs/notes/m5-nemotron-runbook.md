@@ -256,8 +256,9 @@ v3 bridge 的安装条件同样是硬性的：plan 必须有 `impl_table` 接入
 
 > C3 必须开图跑；eager 输出不能作为 C3 证据。**2026-11-16 真权重已捕获 2 张图**
 > （`max-num-seqs=4` 时 6 张），并在 32-token 请求中观测到 31 次 decode/31 次图命中/0 回退。
-> 非 debug 运行时 metrics 文件默认只写捕获快照（`decode_calls` 仍可能显示 0），
-> 不能据此判 C3 失败；需要 `SIGUSR1` 或 `TILEINFER_GRAPH_DEBUG=1` 取实时计数。
+> 非 debug 运行时 metrics 文件默认只写捕获快照（`decode_calls` 仍可能显示 0，
+> 本轮 clean run 的 `SIGUSR1` 未刷新文件），不能据此判 C3 失败；实时值来自
+> `TILEINFER_GRAPH_DEBUG=1` 的 dispatch 观测。长期/并发回退仍是未覆盖项。
 >
 > 合成 `M*E` 的首次图捕获实测（端口 18084，无 `--enforce-eager`）在 PIECEWISE 0/1 阶段失败：
 > `aclnnNonzero` 错误码 107027，位置 `tileinfer/providers/moe.py`（原 v2 位置 `legacy/v2/tileinfer/vllm/ops/moe.py:1010`，已迁移到 v3 并归档 v2）
