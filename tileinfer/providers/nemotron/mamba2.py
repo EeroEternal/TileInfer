@@ -4,10 +4,12 @@ Why this file exists
 --------------------
 vLLM 0.23's Mamba2 prefill path calls ``mamba_chunk_scan_combined_varlen`` and its decode path
 calls ``selective_state_update``; both are Triton kernels (``ssd_chunk_scan.py`` /
-``mamba_ssm.py``).  On Ascend the first one fails in Triton code generation at
-``ssd_chunk_scan.py:238`` (``Currently ptr type from different source not supported``), before any
-model token can run.  This module implements the same two ABI entry points with torch tensor
-operations, so the Mamba2 mixer has a real path on the vendor platform.
+``mamba_ssm.py``).  The Mamba2 mixer's prefill also calls ``causal_conv1d_fn`` before the SSD
+scan.  On Ascend the SSD kernel fails in Triton code generation at
+``ssd_chunk_scan.py:238`` (``Currently ptr type from different source not supported``), and the
+vendor prefill convolution kernel returns all zeros at the target geometry.  This module
+implements the three ABI entry points with torch tensor operations, so the Mamba2 mixer has a
+real path on the vendor platform.
 
 Scope and honesty
 -----------------
@@ -17,8 +19,8 @@ Scope and honesty
 * It is an operator replacement, not a model registration and not a claim that the target 30B has
   been through C1/C2.  The provider evidence lives in the Mamba2 bring-up notes.
 * No vLLM import at module level: the CPU tests and ``tileinfer doctor`` can import it.
-* This is the canonical v3 implementation; ``tileinfer.vllm.ops.mamba2`` is a frozen
-  compatibility shim and must not receive new development.
+* This is the canonical v3 implementation.  The old v2 module is archived at
+  ``legacy/v2/tileinfer/vllm/ops/mamba2.py``; it is no longer part of the installed package.
 * No compile, no device sync in the tensor math.  The varlen/chunk loops read host-side metadata
   once per call; a later kernel can replace the inner matmuls without changing this ABI.
 """
@@ -30,7 +32,11 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 import torch
 import torch.nn.functional as F
 
-__all__ = ["mamba_chunk_scan_combined_varlen", "selective_state_update"]
+__all__ = [
+    "causal_conv1d_fn",
+    "mamba_chunk_scan_combined_varlen",
+    "selective_state_update",
+]
 
 
 def _as_int_list(value: Optional[Iterable], *, device: torch.device) -> List[int]:
@@ -101,7 +107,9 @@ def _chunk_output(
     g = torch.einsum("thn,shn->hts", cf, bf)
     diff = da_cs[:, None, :] - da_cs[None, :, :]  # [T, T, H]
     causal = torch.tril(torch.ones(t, t, device=device, dtype=torch.bool))
-    decay = torch.exp(diff) * causal[..., None]
+    # Mask before exp: the strict upper triangle can have a positive exponent that overflows
+    # to inf, and ``inf * False`` is NaN, not zero.
+    decay = torch.exp(diff.masked_fill(~causal[..., None], float("-inf")))
     m = g * decay.permute(2, 0, 1)
     y_diag = torch.einsum("hts,shp->thp", m, xdt)
 
@@ -245,6 +253,100 @@ def mamba_chunk_scan_combined_varlen(
             (0, nheads, headdim, dstate), device=device, dtype=state_dtype or torch.float32
         )
     return state.to(state_dtype or torch.float32)
+
+
+def _apply_activation(x: torch.Tensor, activation: object) -> torch.Tensor:
+    if activation is True:
+        activation = "silu"
+    if activation in (None, False):
+        return x
+    if activation in ("silu", "swish"):
+        return x * torch.sigmoid(x)
+    raise ValueError(f"unsupported causal-conv activation {activation!r}")
+
+
+def causal_conv1d_fn(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    conv_states: Optional[torch.Tensor],
+    query_start_loc: torch.Tensor,
+    cache_indices: Optional[torch.Tensor] = None,
+    has_initial_state: Optional[torch.Tensor] = None,
+    activation: object = "silu",
+    pad_slot_id: int = -1,
+    null_block_id: int = 0,
+    block_idx_first_scheduled_token: Optional[torch.Tensor] = None,
+    block_idx_last_scheduled_token: Optional[torch.Tensor] = None,
+    initial_state_idx: Optional[torch.Tensor] = None,
+    num_computed_tokens: Optional[torch.Tensor] = None,
+    block_size_to_align: int = 0,
+    metadata: object = None,
+    validate_data: bool = False,
+) -> torch.Tensor:
+    """Torch implementation of vLLM's prefill ``causal_conv1d_fn`` contract.
+
+    ``x`` is ``[dim, tokens]``.  For each sequence the incoming ``width - 1`` convolution
+    taps are read from ``conv_states[cache_indices[i]]`` when ``has_initial_state[i]`` is true,
+    and the last ``width - 1`` taps are written back to that cache line.  This mirrors the
+    vendor kernel's state ownership; APC block bookkeeping is accepted but not used by this
+    correctness path.
+
+    The vendor Ascend prefill kernel at the target geometry returns all zeros, which turns the
+    following SSD scan into a constant/non-finite state.  Keeping the convolution here makes the
+    Mamba2 provider's prefill path complete rather than partially vendor-backed.
+    """
+    del (null_block_id, block_idx_first_scheduled_token, block_idx_last_scheduled_token,
+         initial_state_idx, num_computed_tokens, block_size_to_align, metadata, validate_data)
+    if x.dim() != 2:
+        raise ValueError(f"causal_conv1d_fn expects x [dim, tokens], got {tuple(x.shape)}")
+    dim, total = x.shape
+    width = int(weight.shape[1])
+    if tuple(weight.shape) != (dim, width):
+        raise ValueError(f"weight shape {tuple(weight.shape)} != {(dim, width)}")
+    starts = _as_int_list(query_start_loc, device=x.device)
+    if len(starts) < 2:
+        starts = [0, total]
+    cache = _as_int_list(cache_indices, device=x.device) if cache_indices is not None else []
+    initial = (
+        _as_int_list(has_initial_state, device=x.device)
+        if has_initial_state is not None
+        else []
+    )
+
+    original_dtype = x.dtype
+    work_dtype = conv_states.dtype if conv_states is not None else x.dtype
+    xw = x.to(work_dtype)
+    out = torch.zeros((dim, total), device=x.device, dtype=work_dtype)
+    taps = width - 1
+
+    for seq in range(len(starts) - 1):
+        start, end = int(starts[seq]), int(starts[seq + 1])
+        if end <= start:
+            continue
+        cache_line = int(cache[seq]) if cache else seq
+        if cache_line == int(pad_slot_id) or cache_line < 0:
+            continue
+        if conv_states is not None and cache_line >= conv_states.shape[0]:
+            raise IndexError(f"conv cache line {cache_line} outside {conv_states.shape[0]}")
+        use_initial = bool(initial[seq]) if initial else conv_states is not None
+        if conv_states is not None and use_initial:
+            head = conv_states[cache_line, :, :taps].to(work_dtype)
+        else:
+            head = torch.zeros((dim, taps), device=x.device, dtype=work_dtype)
+        full = torch.cat((head, xw[:, start:end]), dim=1)
+        # conv1d is cross-correlation: out[:, t] = sum_k weight[:, k] * full[:, t + k].
+        y = F.conv1d(
+            full.unsqueeze(0),
+            weight.to(work_dtype).unsqueeze(1),
+            None if bias is None else bias.to(work_dtype),
+            groups=dim,
+        ).squeeze(0)
+        out[:, start:end] = _apply_activation(y, activation)
+        if conv_states is not None and taps > 0:
+            conv_states[cache_line, :, :taps] = full[:, -taps:].to(conv_states.dtype)
+
+    return out.to(original_dtype)
 
 
 def _softplus_clamp(dt: torch.Tensor, dt_bias: torch.Tensor, enabled: bool) -> torch.Tensor:

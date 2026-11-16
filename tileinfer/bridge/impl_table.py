@@ -48,6 +48,10 @@ class ImplReport:
 # The vLLM 0.23 names.  The aliases are needed because the mixers import the names by value.
 _MAMBA_PREFIX = "vllm.model_executor.layers.mamba"
 _MAMBA2_TARGETS: Dict[str, Sequence[str]] = {
+    "causal_conv1d_fn": (
+        f"{_MAMBA_PREFIX}.ops.causal_conv1d.causal_conv1d_fn",
+        f"{_MAMBA_PREFIX}.mamba_mixer2.causal_conv1d_fn",
+    ),
     "mamba_chunk_scan_combined_varlen": (
         f"{_MAMBA_PREFIX}.ops.ssd_combined.mamba_chunk_scan_combined_varlen",
         f"{_MAMBA_PREFIX}.mamba_mixer2.mamba_chunk_scan_combined_varlen",

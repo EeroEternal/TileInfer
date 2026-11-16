@@ -8,8 +8,13 @@ slot update) against a scalar per-token recurrence.  They do not need vLLM or a 
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
-from tileinfer.providers.nemotron.mamba2 import mamba_chunk_scan_combined_varlen, selective_state_update
+from tileinfer.providers.nemotron.mamba2 import (
+    causal_conv1d_fn,
+    mamba_chunk_scan_combined_varlen,
+    selective_state_update,
+)
 
 
 def _scalar_chunk(x, dt, A, B, C, D, dt_bias, state, group_ratio):
@@ -228,3 +233,42 @@ def test_mamba2_target_geometry_matches_scalar_recurrence() -> None:
     torch.testing.assert_close(out, reference, rtol=1e-3, atol=1e-4)
     for got, want in zip(final, ref_states):
         torch.testing.assert_close(got, want, rtol=1e-3, atol=1e-4)
+
+
+def test_causal_conv1d_prefill_matches_manual_conv_and_updates_state() -> None:
+    """The Ascend prefill convolution returns zeros; this pins the torch contract."""
+    torch.manual_seed(31)
+    dim, width, total = 5, 4, 7
+    taps = width - 1
+    x = torch.randn(dim, total)
+    weight = torch.randn(dim, width)
+    bias = torch.randn(dim)
+    conv_states = torch.randn(2, dim, taps)
+    state_before = conv_states.clone()
+    starts = torch.tensor([0, 3, total], dtype=torch.int32)
+    cache = torch.tensor([0, 1], dtype=torch.int32)
+    has_initial = torch.tensor([True, False])
+
+    out = causal_conv1d_fn(
+        x,
+        weight,
+        bias,
+        conv_states,
+        starts,
+        cache_indices=cache,
+        has_initial_state=has_initial,
+        activation="silu",
+    )
+
+    expected = torch.empty_like(x)
+    expected_state = state_before.clone()
+    for seq, (start, end) in enumerate(((0, 3), (3, total))):
+        line = int(cache[seq])
+        head = state_before[line] if bool(has_initial[seq]) else torch.zeros(dim, taps)
+        full = torch.cat((head, x[:, start:end]), dim=1)
+        y = F.conv1d(full.unsqueeze(0), weight.unsqueeze(1), bias, groups=dim).squeeze(0)
+        expected[:, start:end] = y * torch.sigmoid(y)
+        expected_state[line] = full[:, -taps:]
+    torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(conv_states, expected_state, rtol=1e-5, atol=1e-6)
+    assert out.abs().sum().item() > 0.0

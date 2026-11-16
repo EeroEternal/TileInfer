@@ -49,10 +49,10 @@ def test_mamba2_binder_writes_only_the_selected_targets(monkeypatch) -> None:
     # The binder imports vLLM modules; give it a fake module tree and pin that only the
     # selected provider's names are written.
     targets = {
+        "vllm.model_executor.layers.mamba.ops.causal_conv1d": "old_conv",
         "vllm.model_executor.layers.mamba.ops.ssd_combined": "old_chunk",
         "vllm.model_executor.layers.mamba.mamba_mixer2": "old_chunk",
         "vllm.model_executor.layers.mamba.ops.ssu_dispatch": "old_ssu",
-        "vllm.model_executor.layers.mamba.mamba_mixer2": "old_ssu",
     }
     # mamba_mixer2 is one module for both names; create the hierarchy explicitly.
     modules: dict[str, types.ModuleType] = {}
@@ -62,6 +62,7 @@ def test_mamba2_binder_writes_only_the_selected_targets(monkeypatch) -> None:
         "vllm.model_executor.layers",
         "vllm.model_executor.layers.mamba",
         "vllm.model_executor.layers.mamba.ops",
+        "vllm.model_executor.layers.mamba.ops.causal_conv1d",
         "vllm.model_executor.layers.mamba.ops.ssd_combined",
         "vllm.model_executor.layers.mamba.ops.ssu_dispatch",
         "vllm.model_executor.layers.mamba.mamba_mixer2",
@@ -70,6 +71,12 @@ def test_mamba2_binder_writes_only_the_selected_targets(monkeypatch) -> None:
         module.__path__ = []
         modules[name] = module
     modules[
+        "vllm.model_executor.layers.mamba.ops.causal_conv1d"
+    ].causal_conv1d_fn = targets["vllm.model_executor.layers.mamba.ops.causal_conv1d"]
+    modules["vllm.model_executor.layers.mamba.mamba_mixer2"].causal_conv1d_fn = targets[
+        "vllm.model_executor.layers.mamba.ops.causal_conv1d"
+    ]
+    modules[
         "vllm.model_executor.layers.mamba.ops.ssd_combined"
     ].mamba_chunk_scan_combined_varlen = targets[
         "vllm.model_executor.layers.mamba.ops.ssd_combined"
@@ -77,22 +84,27 @@ def test_mamba2_binder_writes_only_the_selected_targets(monkeypatch) -> None:
     modules[
         "vllm.model_executor.layers.mamba.mamba_mixer2"
     ].mamba_chunk_scan_combined_varlen = targets[
-        "vllm.model_executor.layers.mamba.mamba_mixer2"
+        "vllm.model_executor.layers.mamba.ops.ssd_combined"
     ]
     modules["vllm.model_executor.layers.mamba.ops.ssu_dispatch"].selective_state_update = targets[
         "vllm.model_executor.layers.mamba.ops.ssu_dispatch"
     ]
     modules["vllm.model_executor.layers.mamba.mamba_mixer2"].selective_state_update = targets[
-        "vllm.model_executor.layers.mamba.mamba_mixer2"
+        "vllm.model_executor.layers.mamba.ops.ssu_dispatch"
     ]
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
 
     report = impl_table.install(_plan("tileinfer.mamba2_state"))
     assert report.ok is True, report.failed
-    assert len(report.installed) == 5  # 2 primary + 2 aliases + provider marker
+    assert len(report.installed) == 7  # 3 primary + 3 aliases + provider marker
     from tileinfer.providers.nemotron import mamba2
 
+    assert (
+        modules[
+            "vllm.model_executor.layers.mamba.ops.causal_conv1d"
+        ].causal_conv1d_fn is mamba2.causal_conv1d_fn
+    )
     assert (
         modules[
             "vllm.model_executor.layers.mamba.ops.ssd_combined"
