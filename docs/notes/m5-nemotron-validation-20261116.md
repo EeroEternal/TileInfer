@@ -154,7 +154,8 @@ MTP 的 varlen 仍走逐 token 循环。
      ` Paris.</think>Paris is the capital of France.`；
   2. 临时跳过 `causal_conv1d_update` 绑定、走厂商 conv 更新：输出仍是同一串；
   3. `--no-async-scheduling`：`Asynchronous scheduling is disabled`，输出仍相同
-     （drafts=7 / accepted=4）。
+     （drafts=7 / accepted=4）；
+  4. `method=nemotron_h_mtp`（显式名）也被规范化为 `method=mtp`，输出仍相同。
   因此**不是我们补的 state / conv update 单独导致的**；差异在 MTP 的 draft/验证链。
 
 已补的 `selective_state_update` / `causal_conv1d_update` 多 token 重放没有修复该差异，
