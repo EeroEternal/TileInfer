@@ -1,5 +1,9 @@
 """L4 - implementation providers.
 
+Qwen3.6 needs no provider: every capability it declares is served by vllm-ascend.  LFM3 is
+the first model with a real gap - its short convolution state is not GDN - so
+``state/short_conv.py`` exists and is declared as the route-O model's own state provider.
+
 A provider is written only when the vendor cannot use a capability at all, cannot run it
 correctly, or cannot run it at the shape we need (``docs/extending.md`` §3.0).  Serving a
 capability the vendor already serves is not a gap, and re-implementing it is the cost v2

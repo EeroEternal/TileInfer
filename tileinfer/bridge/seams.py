@@ -202,6 +202,25 @@ def install_impl_table(plan: Any) -> SeamResult:
     """
     if plan is None:
         return SeamResult("impl_table", False, "no plan")
+    non_vendor = [
+        s
+        for s in plan.selections
+        if s.source != "vendor" and s.capability != "model.arch"
+    ]
+    if not non_vendor:
+        return SeamResult("impl_table", True, "no non-vendor selections (vendor table kept)")
+    consumed = [
+        s
+        for s in non_vendor
+        if s.provider == "tileinfer.short_conv"
+        and s.capability == "state.linear"
+    ]
+    if len(consumed) == len(non_vendor):
+        return SeamResult(
+            "impl_table",
+            True,
+            "short-conv provider is consumed inside the route-O model",
+        )
     try:
         from .impl_table import install as install_providers
 
@@ -389,5 +408,9 @@ def install_all(plan: Any) -> Dict[str, Any]:
         results.append(install_model_table(plan))
     report["seams"] = [r.as_dict() for r in results]
     critical = {"config_gate", "graph_hook", "attn_select", "impl_table"}
+    if "model_table" in access:
+        # A requested model registration is load-bearing: a route-O model that cannot be
+        # registered must fail the install, not fall back to a vendor architecture.
+        critical.add("model_table")
     report["ok"] = all(r.ok for r in results if r.name in critical)
     return report

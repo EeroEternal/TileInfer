@@ -6,6 +6,8 @@ architecture already exists upstream and the declaration leaves ``model_impl`` e
 
 * :mod:`.muse_glimmer` — the text decoder vLLM 0.23 does not ship
   (``MuseGlimmerForConditionalGeneration``) plus the ``AutoConfig`` shim.
+* :mod:`.lfm3` — route-O registration actors for LFM3: transformers/rope compatibility
+  plus the ``Lfm3ForCausalLM`` class-path registration.
 * :mod:`.atem` — the checkpoint's private channel reasoning parser
   (``--reasoning-parser atem``).
 

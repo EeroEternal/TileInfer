@@ -31,12 +31,10 @@ from ..contracts.plan import (
 )
 from .probe import Environment
 from .vendor import VENDOR_PROVIDERS
+from ..providers.catalog import ROUTE_O_PROVIDERS
 
-#: Capabilities our own providers can serve.  Empty today, and empty is correct: this table
-#: is for gaps only - a capability the vendor cannot run, or cannot run correctly at the shape
-#: a model needs.  Qwen3.6 requires nothing the vendor lacks, so claiming our v2 kernels here
-#: would invent work and make the gap report lie.  Entries appear when a model needs a
-#: capability the vendor rejects, not when we believe we could beat the vendor on speed.
+#: Global default providers.  Empty today, and empty is correct: candidates and route-O
+#: providers are model-scoped and must not become defaults for unrelated declarations.
 TILEINFER_PROVIDERS: dict = {}
 
 
@@ -88,10 +86,23 @@ def _select(
 ) -> Tuple[List[Selection], List[Gap]]:
     selections: List[Selection] = []
     gaps: List[Gap] = []
+    state_kind = getattr(manifest.state, "kind", None) if manifest.state else None
     for cap_name in manifest.required_capabilities:
         capability = Capability(cap_name)
         vendor = VENDOR_PROVIDERS.get(capability)
         ours = TILEINFER_PROVIDERS.get(capability)
+        if capability is Capability.STATE_LINEAR:
+            if state_kind == "short_conv":
+                # The vendor state entry is GDN.  A declaration that states a different
+                # recurrent flavour (short convolution) uses its own model-scoped provider.
+                vendor = None
+                ours = ROUTE_O_PROVIDERS.get(capability)
+            else:
+                # A GDN declaration must not use the short-conv route provider.  Other
+                # state providers (for example a declared Mamba2 candidate) are kept and
+                # left to ``_covers`` to decide.
+                if ours is not None and ours.name == "tileinfer.short_conv":
+                    ours = None
         order = ("vendor", "tileinfer") if policy == "vendor_first" else ("tileinfer", "vendor")
 
         if allow_candidates:
@@ -223,9 +234,9 @@ def decide(
     selections, gaps = _select(manifest, env, policy, allow_candidates=allow_candidates)
     servable = not any(g.required for g in gaps)
 
-    # The access points that are actually installed.  ``impl_table`` and ``model_table`` are
-    # only listed when the decision selects something that needs them; an unused mechanism
-    # in the budget would be noise, not capability.
+    # Route O: the declaration names the module that owns the missing upstream model.
+    # It is a plan field, not a capability row: the capability rows still answer "who owns
+    # each operator/layer".  The model_table seam registers it before vLLM reads the config.
     access = ["plugin_entry", "attn_select", "method_wrap", "graph_hook"]
     if manifest.model_impl:
         # The vendor has no architecture for this model: the layer must register it, which is
@@ -233,6 +244,10 @@ def decide(
         access.append("model_table")
     if any(selection.source != "vendor" for selection in selections):
         access.append("impl_table")
+
+    # The access points that are actually installed.  ``impl_table`` and ``model_table`` are
+    # only listed when the decision selects something that needs them; an unused mechanism
+    # in the budget would be noise, not capability.
     for name in access:
         assert name in ACCESS_POINTS
 

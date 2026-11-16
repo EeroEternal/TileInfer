@@ -41,6 +41,8 @@ class AttentionSpec:
     #: layer sequence contains ``sliding_attention`` layers; ``None`` means every attention
     #: layer sees the whole history.
     sliding_window: Optional[int] = None
+    #: Per-layer-type RoPE parameters (LFM3 has two rotary dims: full and sliding layers).
+    rope_by_layer: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     #: Layer indices with no rotary embedding (iRoPE: the global layers of MuseGlimmer are
     #: NoPE).  Empty for ordinary models.
     rope_disabled_layers: Tuple[int, ...] = ()
@@ -52,9 +54,12 @@ class AttentionSpec:
             raise ValueError("num_heads must be a multiple of num_kv_heads (GQA grouping)")
         if self.sliding_window is not None and self.sliding_window < 1:
             raise ValueError("sliding_window must be a positive token count")
+        for layer_type, params in self.rope_by_layer.items():
+            if not isinstance(params, Mapping) or "rope_theta" not in params:
+                raise ValueError(f"rope_by_layer[{layer_type!r}] needs a rope_theta")
 
     def as_dict(self) -> Dict[str, Any]:
-        return {
+        data = {
             "kind": self.kind,
             "num_heads": self.num_heads,
             "num_kv_heads": self.num_kv_heads,
@@ -65,6 +70,13 @@ class AttentionSpec:
             "sliding_window": self.sliding_window,
             "rope_disabled_layers": list(self.rope_disabled_layers),
         }
+        if self.sliding_window is not None:
+            data["sliding_window"] = self.sliding_window
+        if self.rope_by_layer:
+            data["rope_by_layer"] = {
+                key: dict(value) for key, value in self.rope_by_layer.items()
+            }
+        return data
 
 
 @dataclass(frozen=True)
@@ -94,6 +106,30 @@ class LinearSpec:
             "head_v_dim": self.head_v_dim,
             "conv_kernel_dim": self.conv_kernel_dim,
             "state_dtype": self.state_dtype,
+        }
+
+
+@dataclass(frozen=True)
+class StateSpec:
+    """Recurrent state carried by a non-attention layer (for example a short convolution)."""
+
+    kind: str = "short_conv"
+    dim: int = 2048
+    kernel: int = 7
+    bias: bool = False
+
+    def validate(self) -> None:
+        if self.kind not in {"short_conv"}:
+            raise ValueError(f"unknown state kind {self.kind!r}")
+        if self.dim <= 0 or self.kernel <= 0:
+            raise ValueError("state dim and kernel must be positive")
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "dim": self.dim,
+            "kernel": self.kernel,
+            "bias": self.bias,
         }
 
 
@@ -183,6 +219,7 @@ class ModelManifest:
     layer_types: Tuple[str, ...]
     attention: AttentionSpec
     linear: Optional[LinearSpec] = None
+    state: Optional[StateSpec] = None
     mamba: Optional[MambaSpec] = None
     moe: Optional[MoESpec] = None
     quantization: str = "none"
@@ -215,6 +252,7 @@ class ModelManifest:
                 "full_attention",
                 "sliding_attention",
                 "linear_attention",
+                "conv",
                 "mamba",
                 "mlp",
                 "moe",
@@ -224,13 +262,19 @@ class ModelManifest:
             raise ValueError(f"unknown layer types {unknown}")
         if self.linear is not None and "linear_attention" not in self.layer_types:
             raise ValueError("linear spec declared but no linear_attention layer")
+        if self.state is not None and "conv" not in self.layer_types:
+            raise ValueError("state spec declared but no conv layer")
+        if "conv" in self.layer_types and self.state is None:
+            raise ValueError("conv layer declared but no state spec")
         if self.mamba is not None and "mamba" not in self.layer_types:
             raise ValueError("mamba spec declared but no mamba layer")
         if "mamba" in self.layer_types and self.mamba is None:
             raise ValueError("mamba layer declared but no mamba spec")
-        if (self.mamba is not None or self.linear is not None) and (
-            Capability.STATE_LINEAR.value not in self.required_capabilities
-        ):
+        if (
+            self.mamba is not None
+            or self.linear is not None
+            or self.state is not None
+        ) and Capability.STATE_LINEAR.value not in self.required_capabilities:
             raise ValueError("recurrent mixer declared but state.linear is not required")
         if self.moe is not None and "moe" not in self.required_capabilities and (
             Capability.MOE_ROUTED.value not in self.required_capabilities
@@ -248,6 +292,8 @@ class ModelManifest:
             )
         if self.linear is not None:
             self.linear.validate()
+        if self.state is not None:
+            self.state.validate()
         if self.mamba is not None:
             self.mamba.validate()
         if self.moe is not None:
@@ -281,6 +327,8 @@ class ModelManifest:
             kinds.append(self.linear.kind)
         if self.mamba is not None:
             kinds.append(self.mamba.kind)
+        if self.state is not None:
+            kinds.append(self.state.kind)
         return tuple(kinds)
 
     @property
@@ -314,6 +362,8 @@ class ModelManifest:
             "reasoning_parser_impl": self.reasoning_parser_impl,
             "source": self.source,
         }
+        if self.state is not None:
+            data["state"] = self.state.as_dict()
         if self.mamba is not None:
             data["mamba"] = self.mamba.as_dict()
         return data
