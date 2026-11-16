@@ -195,4 +195,6 @@ v2 的做法是自己实现平台层（不装 vllm-ascend），因此它必须�
 v3 把这个前提反过来：**平台槽位归上游，我们只占通用槽位。**
 
 v2 的接入经验仍然有效（哪些地方必须 hook、哪些地方 hook 了也没用），
-但代码形态不作数——`tileinfer/vllm/` 是 v2 形态，重构计划见架构文档的里程碑。
+但代码形态不作数——`tileinfer/vllm/` 已归档到 `legacy/v2/`，v3 的接入形态是
+`tileinfer/bridge/`（见 [`architecture.md`](architecture.md) 的 L5 与
+[`development-rules.md`](development-rules.md) §3）。

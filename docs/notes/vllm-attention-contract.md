@@ -1,5 +1,8 @@
 # vLLM 0.23 attention contract, transcribed from the local source
 
+> **归档提示（2026-11-16）**：文中 `tileinfer/vllm/...` 路径已整体移动到
+> `legacy/v2/tileinfer/vllm/...`；v2 不再安装、不可 import。下文按历史记录阅读。
+
 Source of truth: `reference/vllm-0.23/` (one file per upstream path, `__` as the separator), fetched
 from `vllm-project/vllm@v0.23.0`; see `docs/notes/vllm-api-0.23.md` for provenance. **Every line
 number below is a line in one of those local files.** Anything marked `[inferred] ` was *not*

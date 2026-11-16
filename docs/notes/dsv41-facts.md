@@ -1,5 +1,9 @@
 # DeepSeek-V4.1-Flash 架构事实核准（S0）
 
+> **归档提示（2026-11-16）**：文中 `tileinfer/vllm/...` 路径已整体移动到
+> `legacy/v2/tileinfer/vllm/...`；`tools/dsv41/` 仍在主树（v3 的 DSV41 parity 测试要 import
+> 它），只有两个 import v2 的脚本在 `legacy/v2/tools/dsv41/`。DSV41 事实本身仍有效。
+
 > 状态：S0 完成（2026-11-03）。本文是 S1–S5 的唯一事实基准：**所有形状、公式、量化语义都来自
 > 官方只读实现 `/home/models/DeepSeek-V4.1-Flash/inference/`（`model.py` / `engram.py` /
 > `kernel.py` / `vision.py` / `image_processor.py` / `convert.py` / `config.json`）与
@@ -1360,7 +1364,7 @@ get_config: Dsv41HFConfig | deepseek_v41 keys: 60
 3. **平台/算子**：`tileinfer.vllm.platform:register` + 11 个算子绑定（`chunk_gated_delta_rule`、`fused_experts`、
    `moe_align_block_size` 等），1 个显式未接管（`chunk_local_cumsum`，理由记录在 status 里）。
 
-复现：`tools/dsv41/s1_vllm_registry.py`。
+复现：`legacy/v2/tools/dsv41/s1_vllm_registry.py`。
 
 ### 26.2 尚未打通
 

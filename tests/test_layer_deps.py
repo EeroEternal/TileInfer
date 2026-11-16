@@ -25,8 +25,8 @@ import pytest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / "tileinfer"
 
-#: Engine-free paths (relative to ``tileinfer/``).  ``vllm/`` is deliberately absent: it is the
-#: one layer allowed to import vLLM.
+#: Engine-free paths (relative to ``tileinfer/``).  The v2 tree is no longer under ``tileinfer/``;
+#: it is archived at ``legacy/v2/tileinfer/vllm`` and is not importable.
 ENGINE_FREE_PATHS: Tuple[str, ...] = (
     "serving",
     "attention",

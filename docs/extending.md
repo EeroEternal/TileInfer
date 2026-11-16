@@ -94,21 +94,21 @@ vendor 选择下都返回厂商原路径，不做任何替换。`impl_table` 不
 `tileinfer.nemotron_moe`。它们可以在显式构造的 bring-up 计划里被选中并测试安装，但不会
 自动进入默认计划；真权重 C1/C2 通过前，Nemotron 的计划仍是 `servable=false`。
 
-### 3.5 v2 冻结规则（硬约束）
+### 3.5 v2 归档规则（硬约束）
 
-**`tileinfer/vllm/` 是 v2 legacy，已冻结；不能再在 v2 基础上做任何开发。**
+**`tileinfer/vllm/` 已于 2026-11-16 归档到 `legacy/v2/tileinfer/vllm/`；它不在安装包内，
+也不可 import。** v3 不再保留 v2 兼容 shim。
 
-- 不新增/修改 v2 实现；只允许保留**兼容 shim**，或直接删除。
-- 兼容 shim 的方向只能是 **v2 → v3**：旧模块 re-export `tileinfer.providers` /
-  `tileinfer.bridge` 的新实现；v3 模块不得 import `tileinfer.vllm`。
+- 不在 `legacy/v2/` 新增/修改实现；那里只是历史参照。
+- v3 模块不得 import `tileinfer.vllm`；`import tileinfer.vllm` 现在应当失败。
 - 新算子/适配器放 `tileinfer/providers/`（L4），只 import torch/契约；需要 import vLLM
   或 vllm-ascend 的安装代码放 `tileinfer/bridge/`（L5）。
-- 新模型必须有 `ModelProfile`；不能靠"默认 profile + 改一个 family"跑起来。模型相关
-  事实写 profile，算子到 vLLM 名字的绑定写 bridge 的显式表。
+- 新模型必须有 `ModelManifest`（不是 v2 的 `ModelProfile`）；不能靠"默认声明 + 改一个
+  family"跑起来。模型相关事实写 manifest，算子到 vLLM 名字的绑定写 bridge 的显式表。
 - 计划是唯一安装依据：`Plan.servable=false` 时默认拒绝安装非厂商 provider；只有显式
   `TILEINFER_ALLOW_UNSERVABLE=1` 的 bring-up 运行可以覆盖，且必须打日志、不能进产品路径。
-- 新增 v3 路径必须带一条"没有 v2 import"的测试；review 看到新的 `tileinfer/vllm/`
-  业务改动应直接拒绝。
+- 新增 v3 路径必须带一条"没有 v2 import"的测试；review 看到 `legacy/v2/` 业务改动或
+  重新引入 `tileinfer.vllm` 应直接拒绝。
 
 **每条提供者必须自带五条声明**：
 

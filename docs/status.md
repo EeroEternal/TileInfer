@@ -44,14 +44,14 @@ v2 自带平台层的形态，v3 不再走那条路。本页 §1 的 v3 数字�
 | 观测 | ✅ | capture/fallback 计数落 JSON（`SIGUSR1`/500 步/atexit）；API server 的零计数不再覆盖 EngineCore；算子级审计（`TILEINFER_AUDIT`）2026-11-12 跑通：23 类/903 实例，热路径全 vendor，3 个非 vendor 行均有解释，见 `notes/m1-op-audit.md` |
 | CLI / doctor | ✅ | `plan build/show/verify`、`tileinfer doctor`；doctor 在最终 metrics 上全 PASS |
 
-### 1.1 v2 资产（冻结，v3 继续用）
+### 1.1 v2 资产（已归档到 `legacy/v2/`，v3 只保留结论）
 
 | 能力 | 状态 | 凭什么相信 |
 |---|---|---|
-| 平台层（平台插件、注意力枚举接管）**v2 形态，v3 不用** | ⛔ | 冻结；v3 由 vllm-ascend 拥有平台槽 |
-| worker 四个 hook（设备初始化 / 可用显存 / 配置初始化 / 编译预热） | ✅ 冻结 | 有契约测试锁住形状；v3 不安装 |
-| attention 后端四件套（后端 / 元数据 / 实现 / KV 写入） | ✅ | 设备上出 token，与参考实现对得上；作为 M2+ provider 候选 |
-| 混合 KV cache（30 线性 + 10 full，单池两种页） | ✅ | 能力探测为真；v2 设备实测不报池一致性错误 |
+| 平台层（平台插件、注意力枚举接管）**v2 形态，v3 不用** | ⛔ | 已归档到 `legacy/v2/`；v3 由 vllm-ascend 拥有平台槽 |
+| worker 四个 hook（设备初始化 / 可用显存 / 配置初始化 / 编译预热） | ✅ 归档 | 有契约测试锁住形状；v3 不安装 |
+| attention 后端四件套（后端 / 元数据 / 实现 / KV 写入） | ✅ 归档 | 设备上出过 token，与参考实现对得上；实现留在 `legacy/v2/`，v3 只在厂商缺口时重写 |
+| 混合 KV cache（30 线性 + 10 full，单池两种页） | ✅ 归档 | 能力探测为真；v2 设备实测不报池一致性错误 |
 | 线性注意力（GDN）算子族：卷积 / chunk / kkt / wu / solve_tril / delta_h / gating / recurrent / post_conv | ✅ | 单测 + 设备对数；离线比值见 `notes/perf-candidates.md` |
 | MoE 算子族（排序路由 / bmm / 严格缓存） | ✅ | 三个候选已进默认，各有离线比值与 bench 脚本 |
 | 分相计时（主机/设备双时钟） | ✅ | 报告可复现 |
@@ -67,7 +67,8 @@ v2 自带平台层的形态，v3 不再走那条路。本页 §1 的 v3 数字�
 
 | 项 | 现状 | 影响 |
 |---|---|---|
-| **补缺口还是空的** | `providers/` 无 provider——**按规则它就该是空的**：Qwen3.6 的 8 项能力厂商全覆盖，没有缺口可补。gap=0 是"没有缺口"，不是"补完了" | **M5 目标已定：`nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16`**；真实 config 已取到（52 层 = 23 Mamba + 23 MoE + 6 attention，262144，MTP 权重已确认 270 key），声明落到 draft，benchmark top5 仍待参考实现；今晚只做离线，不占卡；任务书见 [`notes/m5-nemotron-task.md`](notes/m5-nemotron-task.md) |
+| **补缺口还是空的** | Qwen3.6 的 8 项能力厂商全覆盖，gap=0 是"没有缺口"，不是"补完了"；**M5 Nemotron 已有两个候选 provider**（`tileinfer.mamba2_state`、`tileinfer.nemotron_moe`），默认仍不选，plan `servable=false` | M5 已做真权重单卡 bring-up，证据见 [`notes/m5-nemotron-validation-20261116.md`](notes/m5-nemotron-validation-20261116.md)；C2 logprob/C3 稳态/MTP 仍未闭合 |
+| **M5 Nemotron 真权重** | 单卡 TP=1 可服务；短文本 token/text 与 HF 一致（单 prompt）；8K–261K 长度可完成；图捕获 2/6 张，32-token 31/31、8001-prompt 7/7 命中/0 回退；2/4 路并发和冷启动通过；TP=2/4/8 已通过（TP8 未做图/MTP）；MTP 无损性失败 | 不能写成“已支持”；详见 [`notes/m5-nemotron-validation-20261116.md`](notes/m5-nemotron-validation-20261116.md) |
 | **图捕获** | v3 已接上（厂商捕获 + 我们计数）；4K 8 张、32K 6 张、MTP 6 张（PIECEWISE，FULL=0），均 0 回退；MTP+32K 6 图/0 回退；`impl_table`/`model_table` 两个机制仍是空实现 | 非 vendor 实现还没有落点；128K 组合未验 |
 | **投机解码 / MTP** | S2/S3 按 B 质量等价过：套件 8/8、needle 8K/16K/32K 9/9、同请求两次 `same`、4K 93.9% / 1.35×；图 6 张、0 回退。严格逐位不成立（256 token 中 85.9% 相同、第 58 token 分叉），明确非逐位。S4 32K 部分：9/9、TTFT 1.037×、6 图/0 回退，acceptance 81–88%、128K 未测。证据见 [`notes/m1-spec-quality.md`](notes/m1-spec-quality.md) | S2/S3 过；S4 仅 32K 部分；非逐位 |
 | **TPOT / 首字** | v3 M1：单流 0.907–1.016× / 0.999–1.001×；4K 1.000× / 0.999×；长上下文 8K/16K/32K：TTFT 1.008–1.011×、TPOT 0.999–1.002× | 门已过（本机、本参数） |

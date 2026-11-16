@@ -1,5 +1,9 @@
 # DeepSeek-V4.1-Flash on Ascend950PR — 性能/验收终态报告
 
+> **归档提示（2026-11-16）**：v2 已整体移动到 `legacy/v2/tileinfer/vllm/`，
+> `scripts/serve_*` 已移动到 `legacy/v2/scripts/`；`tools/dsv41/` 仍在主树（v3 parity 测试
+> 使用）。文中 v2 路径与命令只作历史证据阅读。
+
 > 2026-11-06。所有数字均来自本机实跑；逐项证据在 `dsv41-perf-plan.md` / `dsv41-status.md`。
 > 环境：vLLM 0.23.0、torch_npu 2.10.0.post4、CANN 25.7.RC1、单卡 Ascend950PR 128 GiB、
 > 专家+engram 全主机卸载、mmap 权重默认开启。

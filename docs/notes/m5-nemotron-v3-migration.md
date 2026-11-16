@@ -1,20 +1,21 @@
 # Nemotron v2 → v3 migration (2026-11-16)
 
 The Nemotron work was originally implemented on the v2 operator path
-(`tileinfer/vllm/ops/*`). v2 is now frozen. This note records what moved and what still needs
-hardware evidence.
+(`tileinfer/vllm/ops/*`). v2 is now archived under `legacy/v2/`; it is no longer importable.
+This note records what moved and what still needs hardware evidence.
 
 ## Canonical locations
 
-| Concern | v3 location | Frozen v2 location |
+| Concern | v3 location | Archived v2 source |
 |---|---|---|
-| Mamba2 chunk scan + selective state update | `tileinfer/providers/nemotron/mamba2.py` | `tileinfer/vllm/ops/mamba2.py` (shim) |
-| generic + non-gated `relu2` MoE compute | `tileinfer/providers/moe.py` | `tileinfer/vllm/ops/moe.py` (shim) |
-| OOT `UnquantizedFusedMoEMethod` | `tileinfer/providers/fused_moe_oot.py` | `tileinfer/vllm/ops/fused_moe_oot.py` (shim) |
-| non-gated FusedMoE guard / Ascend experts / shared alias | `tileinfer/bridge/nemotron_moe.py` | `tileinfer/vllm/ops/moe_guard.py` (shim) |
-| `nemotron_h` config alias | `tileinfer/bridge/nemotron_config.py` | `tileinfer/vllm/config_compat.py` (shim) |
+| Mamba2 chunk scan + selective state update | `tileinfer/providers/nemotron/mamba2.py` | `legacy/v2/tileinfer/vllm/ops/mamba2.py` |
+| causal-conv prefill + speculative state/conv update | `tileinfer/providers/nemotron/mamba2.py` (`causal_conv1d_fn`, `causal_conv1d_update`) | vendor op replaced (prefill returned zeros; speculative multi-token was not replayed) |
+| generic + non-gated `relu2` MoE compute | `tileinfer/providers/moe.py` | `legacy/v2/tileinfer/vllm/ops/moe.py` |
+| OOT `UnquantizedFusedMoEMethod` | `tileinfer/providers/fused_moe_oot.py` | `legacy/v2/tileinfer/vllm/ops/fused_moe_oot.py` |
+| non-gated FusedMoE guard / Ascend experts / shared alias | `tileinfer/bridge/nemotron_moe.py` | `legacy/v2/tileinfer/vllm/ops/moe_guard.py` |
+| `nemotron_h` config alias | `tileinfer/bridge/nemotron_config.py` | `legacy/v2/tileinfer/vllm/config_compat.py` |
 | provider declarations | `tileinfer/providers/nemotron/__init__.py` | — |
-| plan-driven installation | `tileinfer/bridge/impl_table.py` | `tileinfer/vllm/ops/install.py` (not called by v3) |
+| plan-driven installation | `tileinfer/bridge/impl_table.py` | `legacy/v2/tileinfer/vllm/ops/install.py` (not called by v3) |
 
 ## Behavior changes
 
@@ -46,3 +47,11 @@ hardware evidence.
 
 These are offline checks only. C1 (real service), C2 (HF reference consistency), and C3
 (graph capture) still require the NPU and explicit consent; no support claim is made here.
+
+## Hardware evidence (2026-11-16)
+
+`docs/notes/m5-nemotron-validation-20261116.md` records the first real-weight run on one
+Ascend950PR: C1 short completions, C2 token/text equality for a non-tied prompt (logprob
+top-5 still differs), C3 capture (steady decode counters not observed), long context through
+261K prompt tokens, and an MTP losslessness failure.  MTP must stay off until that gate is
+understood; the plan remains `servable=false`.

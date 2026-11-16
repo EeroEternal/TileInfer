@@ -56,7 +56,7 @@
 | Python | `.venv_native213`（本题）、`.venv_baseline`（A/B 基线） |
 | 环境入口 | `source scripts/env-ascend102.sh`（**唯一**环境定义，别自己拼） |
 | 模型 | Qwen3.6-35B-A3B：40 层 = 10 层全注意力（head_dim 256）+ 30 层 GDN 线性注意力，256 专家 MoE |
-| 代码形态 | **v2**：`tileinfer/vllm/` 是一整块自带平台层的后端，约 21 k 行 |
+| 代码形态 | **v2 已归档**到 `legacy/v2/tileinfer/vllm/`（约 21 k 行，自带平台层）；v3 只做 vllm-ascend 之上的选择与计数，安装路径是 `tileinfer/bridge/` |
 | 已知断点 | 图捕获未接、投机解码未开始、TPOT 2.53× / 首字 11.8× |
 
 **已经建成、不要重做的**：注意力 / GDN / MoE / 采样四族内核、`plan/run` 注意力契约、

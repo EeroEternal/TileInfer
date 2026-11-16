@@ -165,7 +165,8 @@ def fused_halves(
     dimension that is, is the backend's declaration:
 
     * ``block_dim == 0`` - ``[blocks, 2, block_size, heads, dim]``.  This is what
-      :meth:`tileinfer.vllm.attn.backend.TileInferAttentionBackend.get_kv_cache_shape` returns, so
+      the v2 ``TileInferAttentionBackend.get_kv_cache_shape`` (archived under
+      ``legacy/v2/tileinfer/vllm/attn/backend.py``) returns, so
       that ``get_kv_cache_block_dim`` discovers the *block* in dim 0 and vLLM's hybrid layout
       rewrite (``gpu_model_runner.py:7167-7199``) is skipped: ``block_dim == 0`` makes it
       ``continue`` (``:7190-7191``).  The physical order is declared by

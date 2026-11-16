@@ -7,8 +7,9 @@ loaded and unit-tested on a CPU box with no vLLM and no NPU:
   Hyper-Connections, DSpark MTP, ViT).  Facts: ``docs/notes/dsv41-facts.md``.
 
 Hard rule (mirrors ``docs/plan-vllm-native-backend.md`` §2): nothing under ``tileinfer/models``
-imports ``vllm``, ``torch_npu`` or ``vllm_ascend``.  The vLLM adapter lives in
-``tileinfer/vllm/models/<arch>.py`` and imports *this* package, never the other way round.
+imports ``vllm``, ``torch_npu`` or ``vllm_ascend``.  The v3 engine adapter lives in
+``tileinfer/bridge/models/<arch>.py`` and imports *this* package, never the other way round.
+The v2 adapter is archived at ``legacy/v2/tileinfer/vllm/models/<arch>.py``.
 """
 
 __all__ = ["dsv41"]

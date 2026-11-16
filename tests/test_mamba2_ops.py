@@ -8,8 +8,14 @@ slot update) against a scalar per-token recurrence.  They do not need vLLM or a 
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
-from tileinfer.providers.nemotron.mamba2 import mamba_chunk_scan_combined_varlen, selective_state_update
+from tileinfer.providers.nemotron.mamba2 import (
+    causal_conv1d_fn,
+    causal_conv1d_update,
+    mamba_chunk_scan_combined_varlen,
+    selective_state_update,
+)
 
 
 def _scalar_chunk(x, dt, A, B, C, D, dt_bias, state, group_ratio):
@@ -228,3 +234,137 @@ def test_mamba2_target_geometry_matches_scalar_recurrence() -> None:
     torch.testing.assert_close(out, reference, rtol=1e-3, atol=1e-4)
     for got, want in zip(final, ref_states):
         torch.testing.assert_close(got, want, rtol=1e-3, atol=1e-4)
+
+
+def test_causal_conv1d_prefill_matches_manual_conv_and_updates_state() -> None:
+    """The Ascend prefill convolution returns zeros; this pins the torch contract."""
+    torch.manual_seed(31)
+    dim, width, total = 5, 4, 7
+    taps = width - 1
+    x = torch.randn(dim, total)
+    weight = torch.randn(dim, width)
+    bias = torch.randn(dim)
+    conv_states = torch.randn(2, dim, taps)
+    state_before = conv_states.clone()
+    starts = torch.tensor([0, 3, total], dtype=torch.int32)
+    cache = torch.tensor([0, 1], dtype=torch.int32)
+    has_initial = torch.tensor([True, False])
+
+    out = causal_conv1d_fn(
+        x,
+        weight,
+        bias,
+        conv_states,
+        starts,
+        cache_indices=cache,
+        has_initial_state=has_initial,
+        activation="silu",
+    )
+
+    expected = torch.empty_like(x)
+    expected_state = state_before.clone()
+    for seq, (start, end) in enumerate(((0, 3), (3, total))):
+        line = int(cache[seq])
+        head = state_before[line] if bool(has_initial[seq]) else torch.zeros(dim, taps)
+        full = torch.cat((head, x[:, start:end]), dim=1)
+        y = F.conv1d(full.unsqueeze(0), weight.unsqueeze(1), bias, groups=dim).squeeze(0)
+        expected[:, start:end] = y * torch.sigmoid(y)
+        expected_state[line] = full[:, -taps:]
+    torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(conv_states, expected_state, rtol=1e-5, atol=1e-6)
+    assert out.abs().sum().item() > 0.0
+
+
+def test_mamba2_selective_state_update_replays_speculative_tokens() -> None:
+    """MTP commits multiple accepted tokens; the SSM state must advance through all of them."""
+    torch.manual_seed(41)
+    heads, hdim, dstate, groups = 2, 2, 3, 1
+    slots = 4
+    state = torch.randn(slots, heads, hdim, dstate)
+    state_before = state.clone()
+    lengths = [2, 1]
+    total = sum(lengths)
+    x = torch.randn(total, heads, hdim)
+    dt = torch.randn(total, heads)
+    A = -torch.rand(heads)
+    B = torch.randn(total, groups, dstate)
+    C = torch.randn(total, groups, dstate)
+    D = torch.randn(heads, hdim)
+    dt_bias = torch.randn(heads)
+    src = torch.tensor([0, 2])
+    dst = torch.tensor([1, 3])
+    cu = torch.tensor([0, sum(lengths[:1]), total], dtype=torch.int32)
+    accepted = torch.tensor(lengths, dtype=torch.int32)
+    out = torch.empty_like(x)
+
+    selective_state_update(
+        state,
+        x,
+        dt,
+        A,
+        B,
+        C,
+        D,
+        dt_bias,
+        dt_softplus=True,
+        state_batch_indices=src,
+        dst_state_batch_indices=dst,
+        out=out,
+        num_accepted_tokens=accepted,
+        cu_seqlens=cu,
+    )
+
+    for seq, count in enumerate(lengths):
+        current = state_before[int(src[seq])].clone()
+        start = int(cu[seq])
+        for pos in range(start, start + count):
+            d = torch.nn.functional.softplus(dt[pos] + dt_bias)
+            current = current * torch.exp(d[:, None, None] * A[:, None, None])
+            current = current + d[:, None, None] * x[pos][:, :, None] * B[pos].repeat_interleave(
+                heads // groups, dim=0
+            )[:, None, :]
+            expected = (
+                current * C[pos].repeat_interleave(heads // groups, dim=0)[:, None, :]
+            ).sum(-1) + x[pos] * D
+            torch.testing.assert_close(out[pos], expected, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(state[int(dst[seq])], current, rtol=1e-5, atol=1e-6)
+
+
+def test_causal_conv1d_update_replays_speculative_tokens() -> None:
+    """MTP's decode conv window must advance through every accepted token."""
+    torch.manual_seed(43)
+    dim, width, batch = 4, 3, 2
+    taps = width - 1
+    conv_state = torch.randn(3, dim, taps)
+    before = conv_state.clone()
+    weight = torch.randn(dim, width)
+    bias = torch.randn(dim)
+    lengths = [2, 1]
+    total = sum(lengths)
+    x = torch.randn(total, dim)
+    indices = torch.tensor([1, 2])
+    qsl = torch.tensor([0, lengths[0], total], dtype=torch.int32)
+    accepted = torch.tensor(lengths, dtype=torch.int32)
+
+    out = causal_conv1d_update(
+        x,
+        conv_state,
+        weight,
+        bias,
+        activation=None,
+        conv_state_indices=indices,
+        num_accepted_tokens=accepted,
+        query_start_loc=qsl,
+        max_query_len=max(lengths),
+    )
+
+    for seq, count in enumerate(lengths):
+        line = int(indices[seq])
+        start = int(qsl[seq])
+        head = before[line]
+        full = torch.cat((head, x[start : start + count].T), dim=1)
+        expected = F.conv1d(
+            full.unsqueeze(0), weight.unsqueeze(1), bias, groups=dim
+        ).squeeze(0).T
+        torch.testing.assert_close(out[start : start + count], expected, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(conv_state[line], full[:, -taps:], rtol=1e-5, atol=1e-6)

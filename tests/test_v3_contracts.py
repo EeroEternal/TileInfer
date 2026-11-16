@@ -383,3 +383,18 @@ def test_model_table_seam_registers_the_model_and_parser(monkeypatch) -> None:
     # A vendor-served plan (no fields) is a no-op.
     empty = seams.install_model_table(Plan.from_dict(decide(QWEN3_6, _vendor_env())[0].as_dict()))
     assert empty.ok and "no model replacement" in empty.detail
+
+
+def test_v2_package_is_not_importable() -> None:
+    """The v2 tree is archived under ``legacy/v2``; the installed package must not expose it."""
+    import importlib.util
+
+    assert importlib.util.find_spec("tileinfer.vllm") is None
+
+
+def test_v2_tree_lives_only_under_legacy() -> None:
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    assert not (root / "tileinfer" / "vllm").exists()
+    assert (root / "legacy" / "v2" / "tileinfer" / "vllm").is_dir()

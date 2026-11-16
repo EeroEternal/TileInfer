@@ -5,6 +5,12 @@
 >
 > 共享环境：只停止自己启动的 PID；不要 `pkill`/`killall`；不要动他人的进程、端口、缓存。
 
+> **2026-11-16 实机结果**：单卡 TP=1、真权重、`servable=false` bring-up 已跑通；
+> C2 仅 token/text 通过（logprob top-5 未通过）；C3 短稳态 31/31 命中、0 回退（metrics 文件默认只写捕获快照），
+> MTP 无损性失败；TP=2/4/8 后来用全新 cache 重试均通过，早先 TP=8 的 HCCL rootinfo 报错是共享环境瞬时状态。
+> 证据与命令见 [`m5-nemotron-validation-20261116.md`](m5-nemotron-validation-20261116.md)。
+> **不要默认开 MTP，也不要对外说“已支持”。**
+
 ---
 
 ## 0. 部署前检查表（全部满足才申请）
@@ -246,13 +252,24 @@ v3 bridge 的安装条件同样是硬性的：plan 必须有 `impl_table` 接入
 
 ---
 
+## 4.5 编译缓存（2026-11-16 实测）
+
+`max-num-seqs=4` 在**默认** `VLLM_CACHE_ROOT` 下、跑过 fp32/失败编译后可能报
+`KeyError: 'AscendRMSNorm'`（profile_run 的 AOT 编译）。这不是模型/provider 回退；
+给本次进程设置全新的 `VLLM_CACHE_ROOT=/tmp/m5-vllm-cache-$(date +%s)` 后，同一代码可正常
+捕获 6 张图并完成 4 路请求。**不要删除共享 cache**，也不要 `pkill` 其他服务。
+
 ## 5. C3：图捕获
 
-> C3 必须开图跑；eager 输出不能作为 C3 证据。目标 dummy 已经能捕获，但真权重尚未重跑；
-> 在真权重下拿到 `captured_graphs > 0` 且稳态 `fallbacks = 0` 前，C3 保持未验证。
+> C3 必须开图跑；eager 输出不能作为 C3 证据。**2026-11-16 真权重已捕获 2 张图**
+> （`max-num-seqs=4` 时 6 张），并在 32-token 请求中观测到 31 次 decode/31 次图命中/0 回退。
+> 默认 `instrumentation.dump_every_decode_steps=500` 时 metrics 只写捕获快照
+> （`decode_calls` 仍可能显示 0），不能据此判 C3 失败；把 plan 的该值设为 1 即可在请求后
+> 读到实时计数。本轮 clean run 已得到 32-token 31/31/0、8001-prompt 7/7/0。
+> 长期/并发回退仍是未覆盖项。
 >
 > 合成 `M*E` 的首次图捕获实测（端口 18084，无 `--enforce-eager`）在 PIECEWISE 0/1 阶段失败：
-> `aclnnNonzero` 错误码 107027，位置 `tileinfer/providers/moe.py`（原 v2 位置 `tileinfer/vllm/ops/moe.py:1010`，已迁移）
+> `aclnnNonzero` 错误码 107027，位置 `tileinfer/providers/moe.py`（原 v2 位置 `legacy/v2/tileinfer/vllm/ops/moe.py:1010`，已迁移到 v3 并归档 v2）
 > （`(local < 0).nonzero(...)`）。这说明**非门控 MoE 的数据依赖路径先于 Mamba2 断图**。
 >
 > 随后把非门控 MoE 改成 `npu_grouped_matmul`（按 local expert 排序，不再 `unique/nonzero/tolist`），
@@ -324,6 +341,14 @@ vllm serve "$SHIM" \
 - 图捕获/回退留证；
 - 若 `num_nextn_predict_layers=0` 或权重无 MTP：**停止**，记录“无 MTP”，不用 ngram 代替。
 
+**2026-11-16 真权重结果：MTP 质量门失败。** 隔离过：跳过 `selective_state_update`、跳过
+`causal_conv1d_update`、`--no-async-scheduling` 三种情况输出都不变，所以不是这两个补丁单独导致；
+问题在 MTP draft/验证链。服务能起（`NemotronHMTPModel`、drafter 加载，
+drafts=14 / accepted=8），但同 prompt、greedy 下输出与非 MTP 不同：
+MTP ` Paris.</think>Paris is the capital of France.`，非 MTP
+` Paris.  \nThe capital of Germany is Berlin.  \nThe capital of`。
+speculative decoding 应无损；在查清验证链之前 MTP 输出不能作为正确性证据，默认关闭。
+
 ---
 
 ## 7. D5：长上下文
@@ -337,6 +362,9 @@ vllm serve "$SHIM" \
 | 32K | 32768 | ~32K | |
 | 128K | 131072 | ~128K | 单流 |
 | 262K | 262144 | ~261K | config 支持 262144；HBM/图/质量通过才留 |
+
+**2026-11-16 真权重实测**：8K/16K/32K/128K/261K 均完成（32K 用 32000 prompt 给生成留空间；
+128K 32.22 s，261K 68.84 s，单流 eager）。这是长度/可运行性证据，不是内容理解正确性证据。
 
 每档记录：`usage.prompt_tokens`、TTFT、TPOT、HBM 峰值、chunked prefill、回退、完整输出。
 

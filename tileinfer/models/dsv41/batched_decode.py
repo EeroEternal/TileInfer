@@ -2,7 +2,8 @@
 
 Why this module exists
 ----------------------
-`_forward_multi` (``tileinfer/vllm/models/dsv41.py``) used to call ``transformer_forward`` once per
+`_forward_multi` (archived v2 ``legacy/v2/tileinfer/vllm/models/dsv41.py``) used to call
+``transformer_forward`` once per
 request, so a 4-request decode step cost ~4x a single step (measured 3009 ms/step).  This module runs
 the 40 layers once with ``bsz = R``: every dense op (norm / linear / hc) naturally batches, the
 attention window + compressed stream are gathered per request from the existing ``ModelState``

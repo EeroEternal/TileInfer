@@ -1,9 +1,11 @@
 # TileInfer 昇腾 950 硬件点亮清单（bring-up checklist）
 
-> **范围说明（2026-11-12）**：本文是**操作清单**，不是架构文档。
-> 文中出现的「原生后端」「平台层」「`tileinfer/vllm/*`」等表述属于 **v2 形态**
-> （自带平台层、不装 vllm-ascend）；项目定位已改为 **v3（vllm-ascend 之上的兼容适配层）**，
-> 见 [`architecture.md`](architecture.md)。各步骤的判据与失败归因仍然有效。
+> **范围说明（2026-11-12，2026-11-16 更新）**：本文是**v2 操作清单**，不是 v3 架构文档。
+> 文中出现的「原生后端」「平台层」「`tileinfer/vllm/*`」等表述属于 **v2 形态**；v2 已整体
+> 归档到 [`legacy/v2/tileinfer/vllm/`](../legacy/v2/tileinfer/vllm/)，不在安装包内，所以本文的
+> `python -m tileinfer.vllm...` 命令现在会失败。项目定位是 **v3（vllm-ascend 之上的兼容
+> 适配层）**，见 [`architecture.md`](architecture.md)；步骤的判据与失败归因仍可参考，但命令
+> 要换成 v3 的 `tileinfer plan build/show` 与 `tileinfer doctor`。
 
 
 > 适用对象：第一次在这台 Ascend 950 机器上把 **TileInfer 作为 vLLM 0.23 原生后端**跑起来的人。

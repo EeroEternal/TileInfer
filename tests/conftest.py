@@ -102,6 +102,19 @@ def seed() -> int:
     return 0
 
 
+@pytest.fixture(autouse=True)
+def _restore_torch_default_dtype():
+    """Keep one test's ``torch.set_default_dtype(bfloat16)`` from leaking into the next.
+
+    Several DSV41 tests switch the global default dtype because they build bf16 models; without
+    this, every later test that calls ``torch.randn`` without an explicit dtype silently changes
+    precision and fails on a numerical tolerance.  The fixture restores the process default after
+    each test, whether it passed or not.
+    """
+    yield
+    torch.set_default_dtype(torch.float32)
+
+
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line("markers", "npu: test requires an Ascend NPU")
     config.addinivalue_line("markers", "tilelang: test requires the TileLang Ascend toolchain")
