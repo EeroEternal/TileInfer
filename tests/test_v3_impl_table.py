@@ -77,6 +77,12 @@ def test_mamba2_binder_writes_only_the_selected_targets(monkeypatch) -> None:
         "vllm.model_executor.layers.mamba.ops.causal_conv1d"
     ]
     modules[
+        "vllm.model_executor.layers.mamba.ops.causal_conv1d"
+    ].causal_conv1d_update = targets["vllm.model_executor.layers.mamba.ops.causal_conv1d"]
+    modules["vllm.model_executor.layers.mamba.mamba_mixer2"].causal_conv1d_update = targets[
+        "vllm.model_executor.layers.mamba.ops.causal_conv1d"
+    ]
+    modules[
         "vllm.model_executor.layers.mamba.ops.ssd_combined"
     ].mamba_chunk_scan_combined_varlen = targets[
         "vllm.model_executor.layers.mamba.ops.ssd_combined"
@@ -97,13 +103,18 @@ def test_mamba2_binder_writes_only_the_selected_targets(monkeypatch) -> None:
 
     report = impl_table.install(_plan("tileinfer.mamba2_state"))
     assert report.ok is True, report.failed
-    assert len(report.installed) == 7  # 3 primary + 3 aliases + provider marker
+    assert len(report.installed) == 9  # 4 primary + 4 aliases + provider marker
     from tileinfer.providers.nemotron import mamba2
 
     assert (
         modules[
             "vllm.model_executor.layers.mamba.ops.causal_conv1d"
         ].causal_conv1d_fn is mamba2.causal_conv1d_fn
+    )
+    assert (
+        modules[
+            "vllm.model_executor.layers.mamba.ops.causal_conv1d"
+        ].causal_conv1d_update is mamba2.causal_conv1d_update
     )
     assert (
         modules[

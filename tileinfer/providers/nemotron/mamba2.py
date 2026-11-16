@@ -34,6 +34,7 @@ import torch.nn.functional as F
 
 __all__ = [
     "causal_conv1d_fn",
+    "causal_conv1d_update",
     "mamba_chunk_scan_combined_varlen",
     "selective_state_update",
 ]
@@ -347,6 +348,124 @@ def causal_conv1d_fn(
             conv_states[cache_line, :, :taps] = full[:, -taps:].to(conv_states.dtype)
 
     return out.to(original_dtype)
+
+
+def causal_conv1d_update(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    activation: object = "silu",
+    conv_state_indices: Optional[torch.Tensor] = None,
+    num_accepted_tokens: Optional[torch.Tensor] = None,
+    query_start_loc: Optional[torch.Tensor] = None,
+    max_query_len: int = -1,
+    null_block_id: int = 0,
+    block_idx_last_scheduled_token: Optional[torch.Tensor] = None,
+    initial_state_idx: Optional[torch.Tensor] = None,
+    validate_data: bool = False,
+) -> torch.Tensor:
+    """Torch ``causal_conv1d_update`` including speculative multi-token replay.
+
+    Shapes are the vLLM contract: ``x`` is ``[tokens, dim]`` with ``query_start_loc``,
+    ``[batch, dim]`` for one token per sequence, or ``[batch, dim, seqlen]``.  The cache line is
+    selected by ``conv_state_indices`` (optionally through the APC block pointers).  For MTP,
+    ``num_accepted_tokens[i]`` limits how many of sequence ``i``'s tokens are committed; all of
+    them must be convolved so the sliding window ends at the verified prefix.
+    """
+    del validate_data
+    if x.dim() == 3:
+        if query_start_loc is not None:
+            raise ValueError("3-D x and query_start_loc are mutually exclusive")
+        batch, dim, seqlen = x.shape
+        source = x
+        qsl = None
+    elif x.dim() == 2:
+        dim = x.shape[1]
+        if query_start_loc is not None:
+            starts = _as_int_list(query_start_loc, device=x.device)
+            batch = len(starts) - 1
+            source = x
+            qsl = starts
+        else:
+            batch, seqlen = x.shape
+            source = x.unsqueeze(-1)
+            qsl = None
+    else:
+        raise ValueError(f"x must be 2-D or 3-D, got {tuple(x.shape)}")
+
+    num_cache_lines, cache_dim, state_len = conv_state.shape
+    if cache_dim != dim:
+        raise ValueError(f"conv_state dim={cache_dim} != x dim={dim}")
+    _, width = weight.shape
+    taps = width - 1
+    if state_len < taps:
+        raise ValueError(f"conv_state state_len={state_len} < width-1={taps}")
+    out = torch.empty_like(x, dtype=conv_state.dtype)
+    accepted = _as_int_list(num_accepted_tokens, device=x.device) if num_accepted_tokens is not None else []
+    cache_indices = conv_state_indices
+    write_pointer = (
+        block_idx_last_scheduled_token.reshape(-1).to(torch.int64)
+        if block_idx_last_scheduled_token is not None
+        else None
+    )
+    read_pointer = (
+        initial_state_idx.reshape(-1).to(torch.int64)
+        if initial_state_idx is not None
+        else write_pointer
+    )
+
+    def _cache_line(seq: int, pointer: Optional[torch.Tensor]) -> int:
+        if cache_indices is None:
+            return seq
+        if cache_indices.dim() == 1:
+            return int(cache_indices[seq])
+        pos = int(pointer[seq]) if pointer is not None and seq < len(pointer) else 0
+        return int(cache_indices[seq, pos])
+
+    for seq in range(batch):
+        if qsl is not None:
+            start, end = int(qsl[seq]), int(qsl[seq + 1])
+            count = end - start
+            if accepted:
+                count = max(0, min(count, int(accepted[seq])))
+            if count == 0:
+                continue
+            tokens = source[start : start + count].transpose(0, 1)
+        else:
+            tokens = source[seq]
+            if tokens.dim() == 1:
+                tokens = tokens[:, None]
+            count = tokens.shape[1]
+            if accepted:
+                count = max(0, min(count, int(accepted[seq])))
+                tokens = tokens[:, :count]
+            if count == 0:
+                continue
+
+        read_line = _cache_line(seq, read_pointer)
+        write_line = _cache_line(seq, write_pointer)
+        if read_line == int(null_block_id) or write_line == int(null_block_id):
+            continue
+        if not (0 <= read_line < num_cache_lines and 0 <= write_line < num_cache_lines):
+            raise IndexError(f"conv cache line out of range: read={read_line}, write={write_line}")
+
+        head = conv_state[read_line, :, state_len - taps :].to(torch.float32)
+        full = torch.cat((head, tokens.to(torch.float32)), dim=1)
+        y = F.conv1d(
+            full.unsqueeze(0),
+            weight.to(torch.float32).unsqueeze(1),
+            None if bias is None else bias.to(torch.float32),
+            groups=dim,
+        ).squeeze(0)
+        y = _apply_activation(y, activation)
+        if qsl is not None:
+            out[start : start + count] = y.transpose(0, 1).to(out.dtype)
+        else:
+            out[seq, :, :count] = y.to(out.dtype)
+        if taps:
+            conv_state[write_line, :, state_len - taps :] = full[:, -taps:].to(conv_state.dtype)
+    return out.to(x.dtype)
 
 
 def _softplus_clamp(dt: torch.Tensor, dt_bias: torch.Tensor, enabled: bool) -> torch.Tensor:

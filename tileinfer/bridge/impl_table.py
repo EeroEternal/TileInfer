@@ -52,6 +52,10 @@ _MAMBA2_TARGETS: Dict[str, Sequence[str]] = {
         f"{_MAMBA_PREFIX}.ops.causal_conv1d.causal_conv1d_fn",
         f"{_MAMBA_PREFIX}.mamba_mixer2.causal_conv1d_fn",
     ),
+    "causal_conv1d_update": (
+        f"{_MAMBA_PREFIX}.ops.causal_conv1d.causal_conv1d_update",
+        f"{_MAMBA_PREFIX}.mamba_mixer2.causal_conv1d_update",
+    ),
     "mamba_chunk_scan_combined_varlen": (
         f"{_MAMBA_PREFIX}.ops.ssd_combined.mamba_chunk_scan_combined_varlen",
         f"{_MAMBA_PREFIX}.mamba_mixer2.mamba_chunk_scan_combined_varlen",

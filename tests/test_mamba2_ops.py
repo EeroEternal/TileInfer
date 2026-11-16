@@ -12,6 +12,7 @@ import torch.nn.functional as F
 
 from tileinfer.providers.nemotron.mamba2 import (
     causal_conv1d_fn,
+    causal_conv1d_update,
     mamba_chunk_scan_combined_varlen,
     selective_state_update,
 )
@@ -327,3 +328,43 @@ def test_mamba2_selective_state_update_replays_speculative_tokens() -> None:
             ).sum(-1) + x[pos] * D
             torch.testing.assert_close(out[pos], expected, rtol=1e-5, atol=1e-6)
         torch.testing.assert_close(state[int(dst[seq])], current, rtol=1e-5, atol=1e-6)
+
+
+def test_causal_conv1d_update_replays_speculative_tokens() -> None:
+    """MTP's decode conv window must advance through every accepted token."""
+    torch.manual_seed(43)
+    dim, width, batch = 4, 3, 2
+    taps = width - 1
+    conv_state = torch.randn(3, dim, taps)
+    before = conv_state.clone()
+    weight = torch.randn(dim, width)
+    bias = torch.randn(dim)
+    lengths = [2, 1]
+    total = sum(lengths)
+    x = torch.randn(total, dim)
+    indices = torch.tensor([1, 2])
+    qsl = torch.tensor([0, lengths[0], total], dtype=torch.int32)
+    accepted = torch.tensor(lengths, dtype=torch.int32)
+
+    out = causal_conv1d_update(
+        x,
+        conv_state,
+        weight,
+        bias,
+        activation=None,
+        conv_state_indices=indices,
+        num_accepted_tokens=accepted,
+        query_start_loc=qsl,
+        max_query_len=max(lengths),
+    )
+
+    for seq, count in enumerate(lengths):
+        line = int(indices[seq])
+        start = int(qsl[seq])
+        head = before[line]
+        full = torch.cat((head, x[start : start + count].T), dim=1)
+        expected = F.conv1d(
+            full.unsqueeze(0), weight.unsqueeze(1), bias, groups=dim
+        ).squeeze(0).T
+        torch.testing.assert_close(out[start : start + count], expected, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(conv_state[line], full[:, -taps:], rtol=1e-5, atol=1e-6)
