@@ -1,0 +1,155 @@
+{
+  "evidence_id": "m5-nemotron-real-weights-2026-11-15",
+  "date": "2026-11-15",
+  "timezone": "Asia/Shanghai",
+  "scope": "real checkpoint completeness and CPU/op-level C2 checks; no NPU service",
+  "model": "/home/models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
+  "preflight": {
+    "shards_declared": 14,
+    "shards_missing": [],
+    "shards_empty": [],
+    "ready_to_load": true,
+    "index_keys": 6513,
+    "source": "/tmp/m5-preflight-real.json"
+  },
+  "real_weight_checks": [
+    {
+      "check": "MoE non-gated relu2 layer 1, all 128 experts",
+      "weights": {
+        "up_proj": [
+          128,
+          1856,
+          2688
+        ],
+        "down_proj": [
+          128,
+          2688,
+          1856
+        ]
+      },
+      "input": {
+        "tokens": 1,
+        "top_k": 2,
+        "dtype": "float32 x, bf16 weights"
+      },
+      "tileinfer_result": "fused_experts matched direct per-expert relu2 reference exactly (max_abs=0.0)",
+      "note": "checkpoint stores separate up_proj/down_proj, not a fused w13; the caller must stack them into [E,I,H] / [E,H,I]"
+    },
+    {
+      "check": "Mamba2 layer 0 real A_log/D/dt_bias, random x/dt/B/C",
+      "shape": {
+        "heads": 64,
+        "head_dim": 64,
+        "state": 128,
+        "groups": 8,
+        "chunk": 64,
+        "varlen": [
+          37,
+          53
+        ]
+      },
+      "params": {
+        "A_range": [
+          -1752.4148,
+          -0.0005361
+        ],
+        "dt_bias_range": [
+          -9.6875,
+          21.25
+        ]
+      },
+      "result": "chunk output max abs 9.16e-4 (relative 4.0e-7); final states max abs 1.14e-4 vs scalar recurrence",
+      "note": "initial_states was found to be mutated when it was already fp32; fixed by cloning the input, with a regression assertion"
+    }
+  ],
+  "npu_blocker": {
+    "observed_at": "2026-11-15T15:48:54+08:00",
+    "host_uptime": "1 day 18:23 (boot about 2026-11-13T21:27+08:00)",
+    "devices": "no /dev/davinci* nodes",
+    "npu_smi": "dcmi module initialize failed. ret is -8005",
+    "pci": "no Huawei accelerator PCI device; only an NVMe controller at 62:00.0",
+    "consequence": "cannot start a real-weight NPU C1 service or graph capture",
+    "no_processes": true
+  },
+  "not_proven": [
+    "real-weight C1 service",
+    "C2 service-side comparison against the HF/CPU reference (the reference itself is now available)",
+    "real-weight C3 graph capture and steady-state fallback=0",
+    "MTP acceptance, long context, concurrency, cold start, absolute performance"
+  ],
+  "cleanup": {
+    "service_started": false,
+    "npu_processes": false
+  },
+  "shape_audit": {
+    "keys_checked": 6513,
+    "shards_used": 14,
+    "unknown_keys": 0,
+    "shape_mismatches": 0,
+    "layer_counts": {
+      "mamba": 23,
+      "moe": 23,
+      "attention": 6
+    },
+    "notes": [
+      "Every tensor shape matches config.json and layers_block_type/mtp_layers_block_type.",
+      "Mamba input projection is 10304 x 2688: 2*4096 (x,z) + 2048 (B,C) + 64 (dt).",
+      "Conv1d is 6144 x 1 x 4 (x+B+C depthwise).",
+      "Attention q/k/v are separate checkpoint keys; q is 4096 x 2688, k/v 256 x 2688, o 2688 x 4096.",
+      "MoE experts are non-gated up_proj 1856 x 2688 and down_proj 2688 x 1856; shared expert 3712 x 2688 / 2688 x 3712."
+    ]
+  },
+  "hf_cpu_reference": {
+    "script": "tools/nemotron/reference_probe.py",
+    "json": "docs/notes/m5-nemotron-hf-reference.json",
+    "reference_id": "hf-cpu-nemotron-h-20261115T084001Z",
+    "device": "cpu",
+    "torch_version": "2.13.0+cpu",
+    "transformers_version": "5.12.1",
+    "transformers_site": "/home/dlb/sglang/.venv_npu/lib/python3.12/site-packages",
+    "fast_path": "naive (selective_state_update / causal_conv1d unavailable)",
+    "prompt": "Say hello in one sentence.",
+    "prompt_tokens": 6,
+    "generated_tokens": 32,
+    "generated_text_prefix": " I am a language model. I can help with a wide range of tasks, from answering questions to creative writing. I'm designe",
+    "first_token_top5": [
+      {
+        "token_id": 1362,
+        "token": " I",
+        "logit": 12.25,
+        "logprob": -2.9895012378692627
+      },
+      {
+        "token_id": 1531,
+        "token": " The",
+        "logit": 12.25,
+        "logprob": -2.9895012378692627
+      },
+      {
+        "token_id": 1256,
+        "token": "  ",
+        "logit": 11.875,
+        "logprob": -3.3645012378692627
+      },
+      {
+        "token_id": 1032,
+        "token": " ",
+        "logit": 11.8125,
+        "logprob": -3.4270012378692627
+      },
+      {
+        "token_id": 1319,
+        "token": " (",
+        "logit": 11.75,
+        "logprob": -3.4895012378692627
+      }
+    ],
+    "note": "Independent HF/CPU oracle for C2; it is not a vendor baseline and does not prove C1 until compared with the NPU service.",
+    "repeatability": {
+      "second_run": "/tmp/m5-ref-repeat.json",
+      "generated_ids_equal": true,
+      "text_equal": true,
+      "first_top5_equal": true
+    }
+  }
+}

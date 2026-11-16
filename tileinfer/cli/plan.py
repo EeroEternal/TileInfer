@@ -36,7 +36,9 @@ def build(args: argparse.Namespace) -> int:
     key = args.manifest_id or manifest_key_from_config(config)
     manifest = find_manifest(key)
     env = probe()
-    plan, report = decide(manifest, env, policy=args.policy)
+    plan, report = decide(
+        manifest, env, policy=args.policy, allow_candidates=bool(args.allow_candidates)
+    )
 
     plan.write(args.out)
     gaps_path = args.gaps or (os.path.splitext(args.out)[0] + ".gaps.json")
@@ -90,6 +92,11 @@ def main(argv: Optional[list] = None) -> int:
     p_build.add_argument("--gaps", default=None, help="gap report JSON (default: <out>.gaps.json)")
     p_build.add_argument("--manifest-id", default=None, help="override the declaration lookup key")
     p_build.add_argument("--policy", default="vendor_first", choices=POLICIES)
+    p_build.add_argument(
+        "--allow-candidates",
+        action="store_true",
+        help="select declared candidates for a labelled bring-up plan (still servable=false)",
+    )
     p_build.set_defaults(func=build)
 
     p_show = sub.add_parser("show", help="print a plan")

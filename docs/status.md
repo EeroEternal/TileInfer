@@ -4,7 +4,7 @@
 > 目标形态见 [`architecture.md`](architecture.md)，验收口径见 [`acceptance.md`](acceptance.md)，
 > 数字见 [`performance.md`](performance.md)。
 >
-> 最后核对：**2026-11-12 20:20**，代码 `567a669`（长上下文 L4/L5；v3 主体 `6f41866`），
+> 最后核对：**2026-11-12 21:03**，代码 `aa97b16`（M5 Nemotron 离线任务；v3 主体 `6f41866`），
 > 单卡 Ascend950PR，CANN 9.3.0。
 
 ---
@@ -39,7 +39,7 @@ v2 自带平台层的形态，v3 不再走那条路。本页 §1 的 v3 数字�
 | 声明层（`manifests/qwen3_6.py`） | ✅ | 40 层/30 GDN+10 full、16Q/2KV、256 experts top-8、8 项 required capability，纯数据可校验 |
 | 契约层（`contracts/`） | ✅ | 8 个 `Protocol` + plan/manifest/gap schema；未知 key、重复选择、超预算都拒绝 |
 | 决策层（`resolve/`） | ✅ | 纯函数；vendor 在→8/8 选 vendor、gap=0；vendor 不在→8 条 required gap、servable=False（这是"会不会服务不了"的判定，不是"要去补 8 个实现"的待办） |
-| 接入层（`bridge/`） | ✅ | 6 个具体钩子（plugin entry、dispatch、capture、attn select、config gate、init keys），4/6 类机制，预算 8 |
+| 接入层（`bridge/`） | ✅ | 6 个具体钩子（plugin entry、dispatch、capture、attn select、config gate、init keys），计划用 4/6 类机制；已定义 6、设计上限 8 |
 | 分层禁令 | ✅ | AST 守卫：只有 `tileinfer/bridge/` 可 import `vllm_ascend`；另有测试防止 carve-out 变空 |
 | 观测 | ✅ | capture/fallback 计数落 JSON（`SIGUSR1`/500 步/atexit）；API server 的零计数不再覆盖 EngineCore；算子级审计（`TILEINFER_AUDIT`）2026-11-12 跑通：23 类/903 实例，热路径全 vendor，3 个非 vendor 行均有解释，见 `notes/m1-op-audit.md` |
 | CLI / doctor | ✅ | `plan build/show/verify`、`tileinfer doctor`；doctor 在最终 metrics 上全 PASS |
@@ -67,7 +67,7 @@ v2 自带平台层的形态，v3 不再走那条路。本页 §1 的 v3 数字�
 
 | 项 | 现状 | 影响 |
 |---|---|---|
-| **补缺口还是空的** | `providers/` 无 provider——**按规则它就该是空的**：Qwen3.6 的 8 项能力厂商全覆盖，没有缺口可补。gap=0 是"没有缺口"，不是"补完了" | 要验证补缺口，得先选一个**厂商部署不了的模型**；**M5 目标未定**，调研笔记里的"首选"只是候选，不是决定，也不能当对比基线 |
+| **补缺口还是空的** | `providers/` 无 provider——**按规则它就该是空的**：Qwen3.6 的 8 项能力厂商全覆盖，没有缺口可补。gap=0 是"没有缺口"，不是"补完了" | **M5 目标已定：`nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16`**；真实 config 已取到（52 层 = 23 Mamba + 23 MoE + 6 attention，262144，MTP 权重已确认 270 key），声明落到 draft，benchmark top5 仍待参考实现；今晚只做离线，不占卡；任务书见 [`notes/m5-nemotron-task.md`](notes/m5-nemotron-task.md) |
 | **图捕获** | v3 已接上（厂商捕获 + 我们计数）；4K 8 张、32K 6 张、MTP 6 张（PIECEWISE，FULL=0），均 0 回退；MTP+32K 6 图/0 回退；`impl_table`/`model_table` 两个机制仍是空实现 | 非 vendor 实现还没有落点；128K 组合未验 |
 | **投机解码 / MTP** | S2/S3 按 B 质量等价过：套件 8/8、needle 8K/16K/32K 9/9、同请求两次 `same`、4K 93.9% / 1.35×；图 6 张、0 回退。严格逐位不成立（256 token 中 85.9% 相同、第 58 token 分叉），明确非逐位。S4 32K 部分：9/9、TTFT 1.037×、6 图/0 回退，acceptance 81–88%、128K 未测。证据见 [`notes/m1-spec-quality.md`](notes/m1-spec-quality.md) | S2/S3 过；S4 仅 32K 部分；非逐位 |
 | **TPOT / 首字** | v3 M1：单流 0.907–1.016× / 0.999–1.001×；4K 1.000× / 0.999×；长上下文 8K/16K/32K：TTFT 1.008–1.011×、TPOT 0.999–1.002× | 门已过（本机、本参数） |
@@ -87,7 +87,7 @@ v2 自带平台层的形态，v3 不再走那条路。本页 §1 的 v3 数字�
 |---|---|---|---|
 | **v1 寄生** | 是 | 短上下文与基线打平（0.91–1.09），补丁点散落十几处 | 代码冻结在 `legacy/`，作为 v3 接入点的素材 |
 | **v2 原生** | 否 | 能跑能对，但 TPOT 2.53×、TTFT 11.8×，图捕获未接 | 形态作废；内核、契约、计时、剖析工具保留 |
-| **v3 兼容层** | 是 | 控制模型 4K/128K 单流 C1–C4 过；262K L5 不过；6 个钩子/预算 8 | 目标形态，见 [`architecture.md`](architecture.md)、[`notes/m1-v3-bridge.md`](notes/m1-v3-bridge.md) |
+| **v3 兼容层** | 是 | 控制模型 4K/128K 单流 C1–C4 过；262K L5 不过；6 个钩子/已定义 6 类机制（上限 8） | 目标形态，见 [`architecture.md`](architecture.md)、[`notes/m1-v3-bridge.md`](notes/m1-v3-bridge.md) |
 
 ### 3.2 已作废的结论（保留在案，防止重犯）
 

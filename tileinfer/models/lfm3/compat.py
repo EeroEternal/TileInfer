@@ -22,36 +22,42 @@ def apply() -> None:
             for layer in layers
         ]
 
-    original_convert = rope_utils.RotaryEmbeddingConfigMixin.convert_rope_params_to_dict
+    mixin = getattr(rope_utils, "RotaryEmbeddingConfigMixin", None)
+    if mixin is not None:
+        original_convert = mixin.convert_rope_params_to_dict
 
-    def convert(self, **kwargs):
-        rope_params = getattr(self, "rope_parameters", None)
-        layer_types = getattr(self, "layer_types", None)
-        if isinstance(rope_params, dict) and layer_types and "conv" in layer_types:
-            if "conv" not in rope_params:
-                for key in ("sliding_attention", "full_attention"):
-                    if isinstance(rope_params.get(key), dict):
-                        rope_params["conv"] = dict(rope_params[key])
-                        break
-        result = original_convert(self, **kwargs)
-        rope_params = getattr(self, "rope_parameters", None)
-        if isinstance(rope_params, dict):
-            for key in [k for k, v in rope_params.items() if v is not None and not isinstance(v, dict)]:
-                rope_params.pop(key, None)
-        return result
+        def convert(self, **kwargs):
+            rope_params = getattr(self, "rope_parameters", None)
+            layer_types = getattr(self, "layer_types", None)
+            if isinstance(rope_params, dict) and layer_types and "conv" in layer_types:
+                if "conv" not in rope_params:
+                    for key in ("sliding_attention", "full_attention"):
+                        if isinstance(rope_params.get(key), dict):
+                            rope_params["conv"] = dict(rope_params[key])
+                            break
+            result = original_convert(self, **kwargs)
+            rope_params = getattr(self, "rope_parameters", None)
+            if isinstance(rope_params, dict):
+                for key in [
+                    k for k, v in rope_params.items() if v is not None and not isinstance(v, dict)
+                ]:
+                    rope_params.pop(key, None)
+            return result
 
-    rope_utils.RotaryEmbeddingConfigMixin.convert_rope_params_to_dict = convert
+        mixin.convert_rope_params_to_dict = convert
 
-    original_validate = rope_utils.RotaryEmbeddingConfigMixin.validate_rope
+        original_validate = mixin.validate_rope
 
-    def validate(self):
-        rope_params = getattr(self, "rope_parameters", None)
-        if isinstance(rope_params, dict):
-            for key in [k for k, v in rope_params.items() if v is not None and not isinstance(v, dict)]:
-                rope_params.pop(key, None)
-        return original_validate(self)
+        def validate(self):
+            rope_params = getattr(self, "rope_parameters", None)
+            if isinstance(rope_params, dict):
+                for key in [
+                    k for k, v in rope_params.items() if v is not None and not isinstance(v, dict)
+                ]:
+                    rope_params.pop(key, None)
+            return original_validate(self)
 
-    rope_utils.RotaryEmbeddingConfigMixin.validate_rope = validate
+        mixin.validate_rope = validate
     configuration_utils._tileinfer_lfm3_compat = True
 
 

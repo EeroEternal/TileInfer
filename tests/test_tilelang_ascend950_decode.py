@@ -187,15 +187,19 @@ def test_paged_decode_matches_reference(batch, kv_heads, group, kv_lens, label, 
 def test_declared_pool_cap_semantics(monkeypatch):
     from tileinfer.kernels.attention.paged_decode_ascend950 import declared_pool_cap
 
+    # The grid is eighth-of-a-pow2 (see tests/test_declared_pool_cap_grid.py): aligned pools
+    # get cap == pages, drifted pools share a grid point, the extension is bounded at pool/8.
     assert declared_pool_cap(1) == 1
     assert declared_pool_cap(2) == 2
-    assert declared_pool_cap(3) == 4
-    assert declared_pool_cap(30) == 32
+    assert declared_pool_cap(3) == 3
+    assert declared_pool_cap(30) == 30
     # the two snapshot-derived pool sizes actually observed on the reference box: same bucket
-    assert declared_pool_cap(9425) == declared_pool_cap(9899) == 16384
+    assert declared_pool_cap(9425) == declared_pool_cap(9899) == 10240
     for pool in (1, 2, 3, 17, 100, 8192, 8193, 9425, 9899):
         cap = declared_pool_cap(pool)
-        assert cap >= pool and cap & (cap - 1) == 0, pool
+        from tileinfer.serving.buckets import next_pow2
+
+        assert pool <= cap <= next_pow2(pool), pool
     # an explicit pin wins; going below the real pool is a hard error
     monkeypatch.setenv("TILEINFER_POOL_CAP", "64")
     assert declared_pool_cap(50) == 64

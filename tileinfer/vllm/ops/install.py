@@ -718,6 +718,25 @@ def install_ops() -> OpsReport:
                             )
                         report.unbound.append(binding.op)
 
+            # FusedMoE's own platform guard rejects is_act_and_mul=False on Ascend before our
+            # OOT quant method can run.  Enable the bypass only after the OOT MoE record is bound;
+            # otherwise we would be admitting a path that still has no expert implementation.
+            if "unquantized_fused_moe" in report.bound:
+                try:
+                    from tileinfer.vllm.ops.moe_guard import install_non_gated_guard
+
+                    install_non_gated_guard()
+                    from tileinfer.vllm.ops.moe_guard import install_ascend_non_gated_experts
+
+                    install_ascend_non_gated_experts()
+                    from tileinfer.vllm.ops.moe_guard import install_nemotron_shared_alias
+
+                    install_nemotron_shared_alias()
+                except Exception as exc:  # noqa: BLE001 - a missing bypass keeps the honest refusal
+                    logger.warning(
+                        "TileInfer ops: non-gated FusedMoE guard was not bypassed (%r)", exc
+                    )
+
             for op in report.unbound:
                 logger.warning("TileInfer op unbound: %s - %s", op, report.details.get(op, ""))
             for op in report.disabled:

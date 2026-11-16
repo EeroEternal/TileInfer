@@ -12,6 +12,7 @@ from typing import Dict
 
 from ..contracts.manifest import ModelManifest
 from .lfm3_1_7 import LFM3_1_7
+from .muse_glimmer import MUSE_GLIMMER
 from .qwen3_6 import QWEN3_6
 
 MANIFESTS: Dict[str, ModelManifest] = {
@@ -21,6 +22,9 @@ MANIFESTS: Dict[str, ModelManifest] = {
     LFM3_1_7.manifest_id: LFM3_1_7,
     LFM3_1_7.arch: LFM3_1_7,
     LFM3_1_7.name: LFM3_1_7,
+    MUSE_GLIMMER.manifest_id: MUSE_GLIMMER,
+    MUSE_GLIMMER.arch: MUSE_GLIMMER,
+    MUSE_GLIMMER.name: MUSE_GLIMMER,
 }
 
 

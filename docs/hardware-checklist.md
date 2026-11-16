@@ -501,7 +501,7 @@ python -m pytest tests/test_moe_ops.py -q -k "256" -p no:cacheprovider
 # 9.2 设备 vs CPU：同一组 router logits，top-k 的 id 必须逐元素相等
 cat > /tmp/moe_route_probe.py <<'PY'
 import torch, torch_npu
-from tileinfer.vllm.ops.moe import topk_softmax
+from tileinfer.providers.moe import topk_softmax
 
 torch.manual_seed(0)
 num_tokens, num_experts, top_k = 64, 256, 8      # 一个 decode batch 的几何

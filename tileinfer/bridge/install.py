@@ -6,8 +6,12 @@ start before any of our code can explain itself (``docs/integration.md`` §2).
 
 Order of operations, and why it is fixed:
 
-1. **Read the plan.**  No plan, no injection.  The vendor path then runs exactly as it would
-   without us installed, which is a supported outcome, not an error.
+1. **Read the plan.**  ``TILEINFER_PLAN`` names a plan file.  If it is set but the file is
+   missing, nothing is injected and the vendor path runs exactly as it would without us
+   installed - a supported outcome, not an error.  If the variable is *unset*, a vendor-first
+   plan is computed here from the default declaration (``TILEINFER_MANIFEST``, default
+   ``qwen3_6``): a convenience for "installed but forgot the deploy step", and the reason the
+   config gate exists - that fallback cannot know which checkpoint ``vllm serve`` was given.
 2. **Version gate.**  The plan records the vLLM / vllm-ascend / Python versions it was
    computed against.  A mismatch means "do not inject": the usual symptom of injecting across
    versions is wrong numbers, not a traceback.
@@ -131,6 +135,14 @@ def install() -> bool:
         if _INSTALLED:
             return True
         try:
+            # Runs before ModelConfig regardless of which model the plan names.  The alias
+            # is a no-op when vLLM already registers it; a failure is reported, never raised.
+            from tileinfer.bridge.nemotron_config import register_nemotron_h_alias
+
+            _STATUS["configs"] = register_nemotron_h_alias()
+        except Exception as exc:  # noqa: BLE001 - optional compatibility aid
+            _STATUS["configs"] = {"name": "nemotron_h", "registered": False, "detail": repr(exc)}
+        try:
             live = _versions()
             _STATUS["versions"] = live
             plan, source = _load_plan()
@@ -159,6 +171,10 @@ def install() -> bool:
             report = seams.install_all(plan)
             _STATUS["seams"] = report["seams"]
 
+            # Operator installation is part of the ``impl_table`` seam and is driven by the
+            # plan.  There is deliberately no global v2 operator-install call here: the v2
+            # operator table is frozen and the v3 providers are installed only when selected.
+
             # Diagnostic, off unless asked for: which implementation each op instance got.
             audit_path = _audit_path()
             if audit_path:
@@ -166,9 +182,8 @@ def install() -> bool:
                     _STATUS["audit"] = seams.install_op_audit(audit_path)
                 except Exception as exc:  # never let a diagnostic break the install
                     _STATUS["audit"] = {"ok": False, "detail": f"{type(exc).__name__}: {exc}"}
-            # Critical seams (config gate, graph hook, attention selector) must all be in
-            # place; a partial install is reported as failure so `doctor` and the caller see
-            # it, even though the hooks that did install remain harmless.
+            # Critical seams (config gate, graph hook, attention selector, and a requested
+            # provider table) must all be in place; a partial install is reported as failure.
             _STATUS["installed"] = bool(report["ok"])
             _INSTALLED = bool(report["ok"])
 

@@ -18,7 +18,7 @@ def test_lfm3_manifest_and_route_o_plan() -> None:
     assert manifest.layer_types.count("conv") == 13
     assert manifest.layer_types.count("full_attention") == 6
     assert manifest.layer_types.count("sliding_attention") == 5
-    assert manifest.model_impl == "tileinfer.models.lfm3.model:Lfm3ForCausalLM"
+    assert manifest.model_impl == "tileinfer.bridge.models.lfm3"
 
     plan, report = decide(
         manifest,
@@ -26,8 +26,10 @@ def test_lfm3_manifest_and_route_o_plan() -> None:
     )
     by_capability = {selection.capability: selection for selection in plan.selections}
     assert by_capability["state.linear"].provider == "tileinfer.short_conv"
-    assert by_capability["model.arch"].source == "tileinfer"
+    assert "model.arch" not in by_capability
+    assert plan.model_impl == manifest.model_impl
     assert "model_table" in plan.access_points
+    assert "impl_table" in plan.access_points
     assert report.servable
 
 

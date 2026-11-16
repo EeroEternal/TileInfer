@@ -1,0 +1,32 @@
+{
+  "schema": 1,
+  "model": "/tmp/m5-nemotron-tiny",
+  "synthetic": true,
+  "architecture": "NemotronHForCausalLM",
+  "pattern": "M*",
+  "layers": 2,
+  "hidden_size": 256,
+  "mamba": {
+    "num_heads": 4,
+    "head_dim": 16,
+    "state_size": 32,
+    "n_groups": 2,
+    "conv_kernel": 4
+  },
+  "load_format": "dummy",
+  "loaded_weights_gb": 0.1253,
+  "vllm": "0.23.0",
+  "vllm_ascend": "0.23.0",
+  "transformers": "4.57.6",
+  "startup_reached": "vLLM constructed the Mamba2 layer, loaded dummy weights, and entered Mamba2 SSD Triton kernel warmup",
+  "health_endpoint": false,
+  "failure": {
+    "where": ".venv_v3/lib/python3.12/site-packages/vllm/model_executor/layers/mamba/ops/ssd_chunk_scan.py:238",
+    "triton_error": "CompilationError: at 93:12 ... AttributeError('NoneType' object has no attribute 'type')",
+    "ascend_backend_error": "Currently ptr type from different source not supported",
+    "first_seen_after": "Warming up Mamba2 SSD Triton kernels"
+  },
+  "device_used": true,
+  "service_left_running": false,
+  "note": "Synthetic same-architecture model, not the target checkpoint. It proves the current vllm-ascend path cannot compile the Mamba2 SSD chunk-scan kernel for this shape; it is not a target-C1 result, not C2, and not performance evidence. No target weights were loaded."
+}

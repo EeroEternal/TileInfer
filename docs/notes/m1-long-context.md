@@ -61,7 +61,7 @@ TTFT 随长度近似线性：8K→32K 斜率约 **0.080 ms/token**。32K prompt 
 
 | 字段 | 值 |
 |---|---|
-| `plan_id` | `7d00064d487af3f6` |
+| `plan_id` | `7d00064d487af3f6`（合并 upstream v3 `model_impl` 机制后重建为 `079341ffd3f17b0d`；本表保留合并前的运行记录） |
 | `capture_calls` | 1 |
 | `captured_graphs` | **6**（PIECEWISE 3 + FULL 3） |
 | `cudagraph_mode` | `FULL_AND_PIECEWISE` |

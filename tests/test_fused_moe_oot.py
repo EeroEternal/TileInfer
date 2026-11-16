@@ -37,8 +37,8 @@ from typing import Any, Dict, Optional
 import pytest
 import torch
 
-from tileinfer.vllm.ops import fused_moe_oot
-from tileinfer.vllm.ops import moe as moe_ops
+from tileinfer.providers import fused_moe_oot
+from tileinfer.providers import moe as moe_ops
 from tileinfer.vllm.ops.families import gdn_moe
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -397,7 +397,6 @@ def test_the_monolithic_slot_refuses_instead_of_computing_something_else() -> No
         ({"in_dtype": torch.float8_e4m3fn}, "in_dtype"),
         ({"has_bias": True}, "has_bias"),
         ({"is_lora_enabled": True}, "is_lora_enabled"),
-        ({"is_act_and_mul": False}, "is_act_and_mul"),
         ({"moe_parallel_config": _ParallelConfig(ep_size=2)}, "ep_size"),
         ({"moe_parallel_config": _ParallelConfig(dp_size=2)}, "dp_size"),
         ({"moe_parallel_config": _ParallelConfig(pcp_size=2)}, "pcp_size"),

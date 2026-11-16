@@ -77,15 +77,16 @@ LFM3 不是普通 dense Transformer，而是 **卷积 + 注意力混合** 结构
 
 | 层/文件 | 改动 | 为什么 | 效果 |
 |---|---|---|---|
-| `tileinfer/manifests/lfm3_1_7.py` + registry | 新增模型声明：24 层类型、16/4 头、head_dim 128、窗口 256、双 RoPE、短卷积 kernel 7、benchmark、perf、`model_impl` | 项目要求“声明先于实现”，所有决策从声明出发 | `tileinfer plan build` 可产出计划；缺口报告可计算；与 Qwen3.6 互不影响 |
-| `tileinfer/contracts/manifest.py` | 新增 `StateSpec`；`AttentionSpec` 增加 `sliding_window`、`rope_by_layer`；`ModelManifest` 增加 `state`、`model_impl`；允许 `conv`/`sliding_attention` | 原 schema 只能表达 full/linear + GDN | 能合法表达 LFM3 的卷积状态、滑窗、双 RoPE 和路线 O；`as_dict` 对默认值省略，Qwen plan id 保持 `7d00064d487af3f6` 不变 |
-| `tileinfer/resolve/decide.py` | 按 `state.kind` 区分 GDN/short_conv；新增 `model.arch` 计划行和 `model_table` 接入点 | 厂商 `state.linear` 是 GDN，直接选会“假装覆盖”；模型替换需要可审计计划行 | LFM3 计划出现 `tileinfer.short_conv` + `tileinfer.models.lfm3.model`；Qwen 仍 8 条全厂商 |
-| `tileinfer/providers/catalog.py` | 新增 short-conv provider 声明（覆盖、可图、并行、证据、删除条件） | 这是真实缺口，不是速度问题 | 计划可以选到 `tileinfer.short_conv`；`graphable=True` |
+| `tileinfer/manifests/lfm3_1_7.py` + registry | 新增模型声明：24 层类型、16/4 头、head_dim 128、窗口 256、双 RoPE、短卷积 kernel 7、benchmark、perf、模块式 `model_impl` | 项目要求“声明先于实现”，所有决策从声明出发 | `tileinfer plan build` 可产出计划；缺口报告可计算；与 Qwen3.6 互不影响 |
+| `tileinfer/contracts/manifest.py` | 新增 `StateSpec`；`AttentionSpec` 增加 `sliding_window`、`rope_by_layer`；`ModelManifest` 增加 `state`、模块式 `model_impl`；允许 `conv`/`sliding_attention` | 原 schema 只能表达 full/linear + GDN | 能合法表达 LFM3 的卷积状态、滑窗、双 RoPE 和路线 O；合并 upstream 后 Qwen plan id 为 `079341ffd3f17b0d` |
+| `tileinfer/resolve/decide.py` | 按 `state.kind` 区分 GDN/short_conv；`model_impl` 保留在 `Plan` 上并请求 `model_table`，不再生成 `model.arch` 计划行 | 厂商 `state.linear` 是 GDN，直接选会“假装覆盖”；模型注册由 `model_table` 统一负责 | LFM3 计划出现 `tileinfer.short_conv`，`plan.model_impl=tileinfer.bridge.models.lfm3`；Qwen 仍 8 条全厂商 |
+| `tileinfer/providers/catalog.py` | 新增 route-O 作用域的 short-conv provider 声明（覆盖、可图、并行、证据、删除条件） | 这是真实缺口，不是速度问题，也不能变成全局默认 | 计划可以选到 `tileinfer.short_conv`；`graphable=True` |
 | `tileinfer/providers/state/short_conv.py` | 纯 torch 的因果 depthwise 卷积与滚动状态；prefill/step/batch 三种入口 | 厂商没有短卷积状态实现 | 数学可独立在 CPU 测试；模型层只负责状态缓存/元数据 |
-| `tileinfer/bridge/seams.py` | `install_model_table()` 真正注册 `Lfm3ForCausalLM`；注册前应用配置/rope 兼容补丁；`impl_table` 识别“provider 被路线 O 模型内部消费”；`model_table` 作为关键 seam | vLLM 在创建 `ModelConfig` 时就会做架构回退，不先注册会去 import HF remote code 并失败 | 插件路径 `skipped=none`，6 个 seam 全 ok；模型类在配置解析前就位 |
+| `tileinfer/bridge/seams.py` | `install_model_table()` 按 upstream 约定导入 `model_impl` 模块并调用 `register_config()` / `register_models()`；`impl_table` 识别“provider 被路线 O 模型内部消费”；`model_table` 在计划请求时作为关键 seam | vLLM 在创建 `ModelConfig` 时就会做架构回退，不先注册会去 import HF remote code 并失败 | 插件路径 `skipped=none`，所需 seam 全 ok；模型类在配置解析前就位 |
+| `tileinfer/bridge/models/lfm3.py` | `register_config()` 应用 transformers/rope 兼容补丁并关闭 vllm-ascend 全局 cos/sin 缓冲；`register_models()` 按类路径注册 `Lfm3ForCausalLM` | 与 upstream 的 `model_impl` 机制保持一致；LFM3 特例不再硬编码在 bridge 里 | 两种模型（MuseGlimmer / LFM3）走同一套注册路径 |
 | `tileinfer/models/lfm3/model.py` | 完整 vLLM 模型实现：短卷积层（接 vLLM short-conv 状态元数据）、滑窗/全注意力、QK RMSNorm、per-head gate、零尾 RoPE、sandwich norm、SwiGLU、qkv/w13 权重合并、状态页对齐填充 | vLLM 无 LFM3 实现，HF remote code 与 vLLM 布局不兼容 | 权重正常加载（3.38 GB），C1/C3/C4 跑通 |
 | `tileinfer/models/lfm3/compat.py` | transformers 5.16/5.17 兼容 shim：阻止 `conv` 重映射、补齐/清理嵌套 rope 参数 | 新版 transformers 的配置规范化与 LFM3 自定义 `conv`/per-layer rope 冲突 | `ModelConfig` 能解析 LFM3；不导入 HF `modeling_lfm3.py`，绕开布局冲突 |
-| bridge 中的 `_patch_lfm3_ascend_rope()` | 关闭 vllm-ascend 的全局 cos/sin 缓冲更新 | 厂商只维护一份按模型级 partial factor 定尺寸的缓冲；LFM3 同时有 64/128 两种旋转维度，必然错位 | 不再触发 `update_cos_sin` 形状断言；模型使用自己的逐层 RoPE |
+| `tileinfer/bridge/models/lfm3.py` 中的 `_patch_ascend_rope()` | 关闭 vllm-ascend 的全局 cos/sin 缓冲更新 | 厂商只维护一份按模型级 partial factor 定尺寸的缓冲；LFM3 同时有 64/128 两种旋转维度，必然错位 | 不再触发 `update_cos_sin` 形状断言；模型使用自己的逐层 RoPE |
 | 短卷积状态填充 | 状态形状从 `(6,2048)` 填充到 `(32,2048)`，前向只取前 6 槽 | 满足 Ascend 的 SSM/attention 页大小对齐断言 | 通过 `Cannot align ssm_page_size and attn_page_size` 检查，不改变卷积数学 |
 | 短卷积 decode 优化 | 用 7 次向量乘加替代 grouped `F.conv1d`；状态 gather/scatter 改到连续原始布局 | Ascend 上 2048 组 depthwise conv 每层约 8 ms，13 层约 110 ms | TPOT 从 ~138 ms → 5–7 ms |
 | `tests/test_lfm3_manifest.py` | 声明/计划/GDN 不误选/短卷积数学/批量 prefill 测试 | 固化关键假设 | CPU 守护测试全绿 |
@@ -93,7 +94,7 @@ LFM3 不是普通 dense Transformer，而是 **卷积 + 注意力混合** 结构
 
 ### 3.2 关键实现细节
 
-1. **路线 O 注册**：模型声明里的 `model_impl="tileinfer.models.lfm3.model:Lfm3ForCausalLM"` 在计划中变成一条 `model.arch` 行；bridge 在 `ModelConfig` 创建前调用 `ModelRegistry.register_model()`，避免 vLLM 走 transformers 回退。
+1. **路线 O 注册**：模型声明里的 `model_impl="tileinfer.bridge.models.lfm3"` 保留在计划字段中；bridge 在 `ModelConfig` 创建前导入该模块，先跑 `register_config()`（transformers/rope 兼容 + Ascend rope 补丁），再跑 `register_models()`（`ModelRegistry.register_model()`），避免 vLLM 走 transformers 回退。
 2. **短卷积状态**：vLLM 的 `ShortConv` 自定义算子只提供 CUDA/Triton 路径，Ascend 上的 `forward_native` 是空实现；因此模型层继承 `MambaBase`，自己用 vLLM 的 short-conv 元数据（`state_indices_tensor_*`、`query_start_loc_*`、`has_initial_states_p`）驱动纯 torch 卷积。
 3. **双 RoPE**：没有使用 vLLM `get_rope(partial_rotary_factor=0.5)`，因为它的配对方式与 HF 不同；在模型内实现了 HF 等价的 `Lfm3RotaryEmbedding`（零尾 inv_freq + 完整 128 维 `rotate_half`）。
 4. **RMSNorm**：使用 float32 方差、与 HF 一致的实现，减少数值差异。
@@ -104,15 +105,13 @@ LFM3 不是普通 dense Transformer，而是 **卷积 + 注意力混合** 结构
 
 ### 4.1 C1：能跑
 
-真实插件入口（没有手工调用 `install()`）：
+真实插件入口（没有手工调用 `install()`）。合并 upstream `model_impl` 机制后已用新计划在 LFM3 真权重上重跑：
 
 ```text
-[tileinfer] TileInfer v3 bridge: plan=0279ee548e634470 model=LFM3-1.7B
-selections=7 ... seams=config_gate,graph_hook,attn_select,impl_table,
-model_table,method_wrap | skipped=none
-engine ready 17.2
-OUT 0 ' Paris.\n\nThe capital of Japan is Tokyo'
-OUT 1 ' Tokyo. The capital of Japan is Tokyo'
+[tileinfer] TileInfer v3 bridge: plan=497db0c9c88f09b3 model=LFM3-1.7B
+selections=7 ... access_points=6 |
+seams=config_gate,graph_hook,attn_select,impl_table,model_table | skipped=none
+OUT 0 ' Paris.\n\nThe capital of Japan is Tokyo.\n\nThe capital of Australia is Canberra'
 ```
 
 `tileinfer doctor`：python / vllm / vllm_ascend / device_type / plan / layer_guard / bridge / graph_metrics 全 PASS。
@@ -123,13 +122,13 @@ OUT 1 ' Tokyo. The capital of Japan is Tokyo'
 
 | 排名 | HF logprob | vLLM logprob |
 |---|---|---|
-| ` Paris` | -0.1842 | -0.1810 |
-| ` the` | -2.6842 | -2.6810 |
-| `:\n\n` | -4.3717 | -4.4310（vLLM 第 4） |
-| `Paris` | -4.4967 | -4.4310（vLLM 第 3） |
-| `:` | -5.4342 | -5.4310 |
+| ` Paris` | -0.1842 | -0.1854 |
+| ` the` | -2.6842 | -2.6854 |
+| `:\n\n` | -4.3717 | -4.3729 |
+| `Paris` | -4.4967 | -4.4354 |
+| `:` | -5.4342 | -5.3729 |
 
-top-5 集合一致，每个 logprob 在声明容差 `0.1` 内；第 3/4 名互换。贪心生成前 2 个 token 一致，之后分叉（`What is ...` vs `The capital of ...`），原因是 Ascend FIA 与 HF SDPA 的累积顺序不同。
+top-5 集合一致，每个 logprob 在声明容差 `0.1` 内；新计划下第 3/4 名不再互换。贪心生成前 2 个 token 一致，之后分叉（`What is ...` vs `The capital of ...`），原因是 Ascend FIA 与 HF SDPA 的累积顺序不同。
 
 逐层对比（HF decoder layer hook vs vLLM hook）显示差异是渐进的，没有某层突变：
 
@@ -144,16 +143,18 @@ layer 22 full  max=0.05029 mean=0.005642
 
 ### 4.3 C3：能上图
 
-短卷积改成张量操作后，图模式实测：
+短卷积改成张量操作后，图模式实测（新计划 C1 运行）：
 
 ```text
 capture_calls=1  captured_graphs=8  (PIECEWISE 4 + FULL 4)
-decode_calls=567  hits=567  fallbacks=0  errors=0
+decode_calls=16  hits=16  fallbacks=0  errors=0
 ```
 
-batch=2、~1K token、`max_num_batched_tokens=512`（chunked prefill）也正常，说明 `has_initial_states_p` 的续接状态路径可用。
+更早的长跑记录为 `decode_calls=567 / hits=567 / fallbacks=0`。batch=2、~1K token、`max_num_batched_tokens=512`（chunked prefill）也正常，说明 `has_initial_states_p` 的续接状态路径可用。
 
 ### 4.4 C4：跑得快
+
+C1/C2/C3 的重跑只改了模型注册机制，没有改模型数学；下表沿用同一实现的测量，未在新计划下重做 p50/p90 门禁。新计划冒烟（1024 prompt + 64 output，conc=1）单请求 0.534 s，约 120 tok/s，与下表一致。
 
 64 output tokens，512 引擎，1/4/16 并发：
 

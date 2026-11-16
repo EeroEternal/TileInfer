@@ -39,8 +39,13 @@ vllm-ascend 已经适配的模型走它；它没适配的模型，我们把缺�
 
 ## 现在是什么状态
 
-- **定位已改为 v3（兼容适配层）**；**代码仍是 v2 形态**（自带平台层、不装 vllm-ascend）。
-  重构尚未开始。当前进度与每条断点见 [`docs/status.md`](docs/status.md)。
+- **v3 接入层已建成（M1）**：`tileinfer/bridge/`（6 个接入点 + 版本门 + 指标）、`contracts/`、
+  `resolve/`、`manifests/`、`cli/` 均已实现；`pyproject.toml` 只注册
+  `vllm.general_plugins → tileinfer.bridge.install:install`，不注册平台插件。当前进度与每条断点见
+  [`docs/status.md`](docs/status.md)。
+- **v2 运行时（`tileinfer/vllm/`）保留为冻结基线**，删除清单未执行。v3 的分层不 import 它；它也不再
+  是打包入口（v2 的插件入口只出现在该目录的文档字符串里）。注意：v3 运行需要 vllm-ascend，在未安装
+  vllm-ascend 的机器上，v2 是唯一可运行的形态。
 - 已有资产：注意力 / GDN / MoE / 采样四族内核、`plan/run` 注意力契约、分相计时的剖析工具、
   v1 时代在役过的 vllm-ascend 插件（冻结在 `legacy/`）。
 - 性能数字一律以 [`docs/performance.md`](docs/performance.md) 为准，**不要从 README 或旧文档引用**。
@@ -80,7 +85,7 @@ vllm-ascend 已经适配的模型走它；它没适配的模型，我们把缺�
 | 路径（当前） | 是什么 |
 |---|---|
 | `tileinfer/kernels/` | TileLang 算子（attention / GDN / MoE / sampling） |
-| `tileinfer/vllm/` | **v2 形态**的后端本体（平台层、worker hook、attention 后端、图捕获）——v3 会拆进分层 |
+| `tileinfer/vllm/` | **v2 形态**的后端本体（平台层、worker hook、attention 后端、图捕获）——冻结基线，v3 分层不 import 它，删除清单见 `docs/status.md` |
 | `tileinfer/models/` | 上游没有的模型实现（DeepSeek-V4.1 是样例） |
 | `tileinfer/serving/` | serving 侧工具（分相计时、bucket、planner） |
 | `legacy/` | 冻结的 vllm-ascend 时代代码：不打包、不测试、不再增长，是 v3 接入层的素材库 |

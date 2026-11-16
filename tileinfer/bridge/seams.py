@@ -26,7 +26,8 @@ The six mechanisms and where each lives:
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
+import importlib
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import metrics
 
@@ -193,11 +194,11 @@ def install_config_gate(plan: Any) -> SeamResult:
 
 
 def install_impl_table(plan: Any) -> SeamResult:
-    """Apply the plan's non-vendor operator selections through vLLM's CustomOp table.
+    """Install the plan's non-vendor providers through the v3 ``impl_table`` seam.
 
-    A vendor selection is a no-op: the vendor already installed its own implementations and
-    re-registering the same class would be the "same-name assertion" trap from
-    ``docs/integration.md`` §6.  An empty table is the expected steady state on Qwen3.6.
+    The plan is authoritative: no plan, no ``impl_table`` access point, or no non-vendor
+    selection means no operator write.  The v2 ``install_ops`` table is deliberately not
+    imported; its implementations now live under ``tileinfer.providers``.
     """
     if plan is None:
         return SeamResult("impl_table", False, "no plan")
@@ -221,74 +222,63 @@ def install_impl_table(plan: Any) -> SeamResult:
             "short-conv provider is consumed inside the route-O model",
         )
     try:
-        from vllm.model_executor.custom_op import CustomOp  # noqa: F401
-    except Exception as exc:
-        return SeamResult("impl_table", False, f"CustomOp unavailable: {exc}")
-    # Providers are added here once they expose a vendor-compatible class form.  Refusing to
-    # guess is deliberate: a wrong entry here is a silent numerical bug.
-    return SeamResult(
-        "impl_table",
-        False,
-        f"{len(non_vendor)} non-vendor selections have no registered class form yet",
-    )
+        from .impl_table import install as install_providers
 
-
-def _patch_lfm3_ascend_rope() -> None:
-    """Disable vllm-ascend's single global cos/sin buffer for LFM3's two rotary dims.
-
-    The Ascend GQA rope path keeps one process-wide buffer sized from a model-wide
-    ``partial_rotary_factor``.  LFM3 has 64 rotary dims on full-attention layers and 128 on
-    sliding layers, so the global update cannot be correct; the model uses a native
-    per-layer implementation instead.
-    """
-    try:
-        import vllm_ascend.ops.rotary_embedding as ascend_rope
-
-        ascend_rope.update_cos_sin = lambda positions: None
-        ascend_rope.set_cos_and_sin = lambda *args, **kwargs: None
-    except Exception:
-        return
-    try:
-        import vllm_ascend.worker.model_runner_v1 as model_runner
-
-        if hasattr(model_runner, "update_cos_sin"):
-            model_runner.update_cos_sin = lambda positions: None
-    except Exception:
-        pass
+        report = install_providers(plan)
+    except Exception as exc:  # noqa: BLE001 - a failed provider must not aborts the bridge
+        return SeamResult(
+            "impl_table", False, f"provider table failed: {type(exc).__name__}: {exc}"
+        )
+    detail = report.summary()
+    if report.failed:
+        detail += " | " + "; ".join(f"{k}: {v}" for k, v in report.failed.items())
+    return SeamResult("impl_table", report.ok, detail)
 
 
 def install_model_table(plan: Any) -> SeamResult:
-    """Register the route-O model class named by the plan, before vLLM reads its config."""
-    if plan is None:
-        return SeamResult("model_table", False, "no plan")
-    selection = next(
-        (s for s in plan.selections if s.capability == "model.arch"), None
-    )
-    if selection is None:
-        return SeamResult("model_table", True, "no model replacement requested")
-    try:
-        from vllm.model_executor.models.registry import ModelRegistry
-    except Exception as exc:
-        return SeamResult("model_table", False, f"vLLM registry unavailable: {exc}")
-    if getattr(ModelRegistry, "_tileinfer_model_arch", None) == plan.model.arch:
-        return SeamResult(
-            "model_table", True, f"{plan.model.arch} already registered"
-        )
-    try:
-        if plan.model.arch == "Lfm3ForCausalLM":
-            from ..models.lfm3.compat import apply as apply_lfm3_compat
+    """Register the model (and its chat parser) when the declaration names one.
 
-            apply_lfm3_compat()
-            _patch_lfm3_ascend_rope()
-        ModelRegistry.register_model(plan.model.arch, selection.impl)
-    except Exception as exc:
-        return SeamResult(
-            "model_table", False, f"register {selection.impl} failed: {exc}"
-        )
-    ModelRegistry._tileinfer_model_arch = plan.model.arch
-    return SeamResult(
-        "model_table", True, f"{plan.model.arch} -> {selection.impl}"
-    )
+    A vendor-served model leaves both fields empty and this seam is a no-op.  A model the
+    vendor lacks (MuseGlimmer is the first) ships its implementation in this repository:
+    ``plan.model_impl`` names a module with the ``register_config`` / ``register_models``
+    actors, and ``plan.reasoning_parser`` / ``reasoning_parser_impl`` name the chat-format
+    parser to register under vLLM's parser manager.  Imports and registrations are reported,
+    never raised: a broken optional model must not stop a vendor-served boot.
+    """
+    spec = str(getattr(plan, "model_impl", "") or "").strip()
+    parser = str(getattr(plan, "reasoning_parser", "") or "").strip()
+    parser_impl = str(getattr(plan, "reasoning_parser_impl", "") or "").strip()
+    if not spec and not parser:
+        return SeamResult("model_table", True, "no model replacement requested")
+
+    details: List[str] = []
+    if spec:
+        try:
+            module = importlib.import_module(spec)
+        except Exception as exc:  # noqa: BLE001 - report, never raise from a seam
+            return SeamResult("model_table", False, f"cannot import {spec!r}: {exc!r}")
+        for actor in ("register_config", "register_models"):
+            fn = getattr(module, actor, None)
+            if fn is None:
+                continue
+            try:
+                result = fn()
+            except Exception as exc:  # noqa: BLE001
+                return SeamResult("model_table", False, f"{spec}.{actor} raised {exc!r}")
+            details.append(f"{actor}: {result}")
+    if parser and parser_impl:
+        try:
+            from vllm.reasoning import ReasoningParserManager
+
+            module_name, _, class_name = parser_impl.partition(":")
+            parser_cls = getattr(importlib.import_module(module_name), class_name)
+            # 0.23's register_module takes the class as a KEYWORD; positionally it lands in
+            # ``force`` and raises.
+            ReasoningParserManager.register_module(parser, module=parser_cls)
+            details.append(f"parser {parser!r} registered")
+        except Exception as exc:  # noqa: BLE001
+            return SeamResult("model_table", False, f"parser registration failed: {exc!r}")
+    return SeamResult("model_table", True, "; ".join(details) or "nothing to register")
 
 
 def install_method_wrappers(plan: Any) -> SeamResult:
@@ -388,21 +378,39 @@ def install_op_audit(path: str) -> Dict[str, Any]:
 def install_all(plan: Any) -> Dict[str, Any]:
     """Install the seams named by the plan.  Returns a report; never raises."""
     report: Dict[str, Any] = {"seams": [], "ok": True}
-    results = [
-        install_config_gate(plan),
-        install_graph_hook(),
-        install_attention_selector(plan),
-        install_impl_table(plan),
-        install_model_table(plan),
-        install_method_wrappers(plan),
+    access = set(getattr(plan, "access_points", ()) or ())
+    results = []
+    # Every mechanism is independent and is installed only when the plan names it.  The
+    # plugin entry itself is the caller; ``method_wrap`` carries the config gate.
+    if "method_wrap" in access:
+        results.append(install_config_gate(plan))
+    if "graph_hook" in access:
+        results.append(install_graph_hook())
+    if "attn_select" in access:
+        results.append(install_attention_selector(plan))
+    non_vendor = [
+        s
+        for s in getattr(plan, "selections", ())
+        if getattr(s, "source", "vendor") != "vendor"
     ]
+    if non_vendor and "impl_table" not in access:
+        results.append(
+            SeamResult(
+                "impl_table",
+                False,
+                "non-vendor selections but no impl_table access point; "
+                "refusing silent vendor fallback",
+            )
+        )
+    elif "impl_table" in access:
+        results.append(install_impl_table(plan))
+    if "model_table" in access:
+        results.append(install_model_table(plan))
     report["seams"] = [r.as_dict() for r in results]
-    critical = {"config_gate", "graph_hook", "attn_select"}
-    if plan is not None and any(
-        getattr(s, "capability", "") == "model.arch" for s in plan.selections
-    ):
+    critical = {"config_gate", "graph_hook", "attn_select", "impl_table"}
+    if "model_table" in access:
+        # A requested model registration is load-bearing: a route-O model that cannot be
+        # registered must fail the install, not fall back to a vendor architecture.
         critical.add("model_table")
-    report["ok"] = all(
-        r.ok for r in results if r.name in critical
-    )
+    report["ok"] = all(r.ok for r in results if r.name in critical)
     return report

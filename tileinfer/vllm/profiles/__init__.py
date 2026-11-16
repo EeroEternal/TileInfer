@@ -1,6 +1,8 @@
 """Model profiles: the pluggable home for every model-dependent fact in the vLLM layer.
 
-Importing this package registers the profiles it ships (today only :mod:`qwen3_6`).  Consumers -
+Importing this package registers the profiles it ships (today :mod:`qwen3_6` and :mod:`dsv41`).
+Models the vendor cannot serve are not V2 profiles any more: they are V3 declarations plus
+the bridge's ``model_table`` seam.  Consumers -
 ``tileinfer.vllm.platform``, ``attn/backend.py``, ``worker.py``, ``ops/install.py`` and the
 launchers - call :func:`active_profile` / :func:`profile_for` instead of holding their own copy of
 a head width, a page size, a KV layout, an op table or a reject list.

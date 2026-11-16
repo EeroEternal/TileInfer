@@ -41,7 +41,8 @@ providers / aot / observ / cli` 加进 engine-free 列表。
 4. **接入**：`tileinfer/bridge/install.py` + `seams.py`。入口只做四件事：读 plan → 版本门 →
    装钩子 → 记录实际生效的 seam；任何异常不外抛。
 
-Plan 是内容寻址的，本次为 `7d00064d487af3f6`：
+Plan 是内容寻址的，本次为 `7d00064d487af3f6`（合并 upstream v3 `model_impl` 机制后，
+同一 Qwen 声明重建的 plan id 为 `079341ffd3f17b0d`；下面的日志保留合并前的记录）：
 
 ```bash
 .venv_v3/bin/python -m tileinfer.cli.plan build \
@@ -50,7 +51,7 @@ Plan 是内容寻址的，本次为 `7d00064d487af3f6`：
 # model=Qwen3.6-35B-A3B servable=True gaps=0 (required=0)
 ```
 
-## 3. 接入点：6 个具体钩子，4/6 类机制，预算 8
+## 3. 接入点：6 个具体钩子，计划用 4 类机制（已定义 6，设计上限 8）
 
 | # | 机制 | 具体位置 | 做什么 | 改数值？ |
 |---|---|---|---|---|
@@ -61,8 +62,9 @@ Plan 是内容寻址的，本次为 `7d00064d487af3f6`：
 | 5 | attn_select | `NPUPlatform.get_attn_backend_cls` | 按 plan 返回实现；vendor 选择原样返回 | 否 |
 | 6 | method_wrap | `NPUPlatform.check_and_update_config` | 校验 plan.arch == 实际 checkpoint.arch，不匹配 fail-closed | 否 |
 
-预算 8，用 6；`impl_table` / `model_table` 两个机制留了空实现（非 vendor 选择时才写表），
-不占当前钩子数。所有钩子都带 `_tileinfer_*` 幂等标记。
+已定义 6 类机制、计划用 4 类（入口 / 注意力选择 / 方法包装 / 图捕获）；`impl_table` /
+`model_table` 两个机制留了空实现（非 vendor 选择时才写表），不占当前钩子数。
+设计上限是 8，但加机制要改封闭列表，不是运行期可填的配置。所有钩子都带 `_tileinfer_*` 幂等标记。
 
 负向门已单独验证：
 

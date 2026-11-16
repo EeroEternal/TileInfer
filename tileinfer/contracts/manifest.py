@@ -3,7 +3,7 @@
 A declaration is the input to the decision layer and must be computable without loading
 weights or touching a device.  It therefore describes structure and requirements only:
 
-* the layer sequence (full attention vs linear attention),
+* the layer sequence (full attention, linear attention, Mamba, MLP, or MoE),
 * the per-flavour parameters (heads, head dims, convolution width, ...),
 * the KV grouping and page constraints,
 * the quantization scheme,
@@ -37,16 +37,23 @@ class AttentionSpec:
     output_gate: bool = False
     rope: str = "mrope"
     partial_rotary_factor: float = 1.0
+    #: Sliding-window width (tokens visible to a query, including itself).  Set when the
+    #: layer sequence contains ``sliding_attention`` layers; ``None`` means every attention
+    #: layer sees the whole history.
     sliding_window: Optional[int] = None
+    #: Per-layer-type RoPE parameters (LFM3 has two rotary dims: full and sliding layers).
     rope_by_layer: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+    #: Layer indices with no rotary embedding (iRoPE: the global layers of MuseGlimmer are
+    #: NoPE).  Empty for ordinary models.
+    rope_disabled_layers: Tuple[int, ...] = ()
 
     def validate(self) -> None:
         if self.num_heads <= 0 or self.num_kv_heads <= 0 or self.head_dim <= 0:
             raise ValueError("attention head counts and head_dim must be positive")
         if self.num_heads % self.num_kv_heads:
             raise ValueError("num_heads must be a multiple of num_kv_heads (GQA grouping)")
-        if self.sliding_window is not None and self.sliding_window <= 0:
-            raise ValueError("sliding_window must be positive when set")
+        if self.sliding_window is not None and self.sliding_window < 1:
+            raise ValueError("sliding_window must be a positive token count")
         for layer_type, params in self.rope_by_layer.items():
             if not isinstance(params, Mapping) or "rope_theta" not in params:
                 raise ValueError(f"rope_by_layer[{layer_type!r}] needs a rope_theta")
@@ -60,6 +67,8 @@ class AttentionSpec:
             "output_gate": self.output_gate,
             "rope": self.rope,
             "partial_rotary_factor": self.partial_rotary_factor,
+            "sliding_window": self.sliding_window,
+            "rope_disabled_layers": list(self.rope_disabled_layers),
         }
         if self.sliding_window is not None:
             data["sliding_window"] = self.sliding_window
@@ -125,6 +134,48 @@ class StateSpec:
 
 
 @dataclass(frozen=True)
+class MambaSpec:
+    """Mamba2 mixer parameters (not GDN; keep the two separate)."""
+
+    kind: str = "mamba2"
+    num_heads: int = 128
+    head_dim: int = 64
+    state_size: int = 128
+    n_groups: int = 8
+    conv_kernel: int = 4
+    expand: int = 2
+    state_dtype: str = "float32"
+
+    def validate(self) -> None:
+        if self.kind != "mamba2":
+            raise ValueError(f"unsupported mamba kind {self.kind!r}")
+        fields = (
+            self.num_heads,
+            self.head_dim,
+            self.state_size,
+            self.n_groups,
+            self.conv_kernel,
+            self.expand,
+        )
+        if min(fields) <= 0:
+            raise ValueError("mamba head/state/group/conv/expand values must be positive")
+        if self.num_heads % self.n_groups:
+            raise ValueError("mamba num_heads must be a multiple of n_groups")
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "num_heads": self.num_heads,
+            "head_dim": self.head_dim,
+            "state_size": self.state_size,
+            "n_groups": self.n_groups,
+            "conv_kernel": self.conv_kernel,
+            "expand": self.expand,
+            "state_dtype": self.state_dtype,
+        }
+
+
+@dataclass(frozen=True)
 class MoESpec:
     """Routed-expert parameters."""
 
@@ -132,18 +183,28 @@ class MoESpec:
     top_k: int = 8
     intermediate_size: int = 512
     shared_experts: int = 0
+    shared_intermediate_size: int = 0
 
     def validate(self) -> None:
         if self.num_experts <= 0 or not (0 < self.top_k <= self.num_experts):
-            raise ValueError("MoE needs num_experts > 0 and 0 < top_k <= num_experts")
+            raise ValueError("MoE needs num_experts > 0 and 0 < top_k <= self.num_experts")
+        if self.shared_experts < 0 or self.shared_intermediate_size < 0:
+            raise ValueError("MoE shared expert counts/sizes must be non-negative")
+        if self.shared_experts and self.shared_intermediate_size <= 0:
+            raise ValueError("MoE with shared experts needs shared_intermediate_size > 0")
 
     def as_dict(self) -> Dict[str, Any]:
-        return {
+        data = {
             "num_experts": self.num_experts,
             "top_k": self.top_k,
             "intermediate_size": self.intermediate_size,
             "shared_experts": self.shared_experts,
         }
+        # Qwen's shared_experts=0 keeps the old byte-identical shape; Nemotron records the
+        # 3712-wide shared MLP that the checkpoint actually contains.
+        if self.shared_intermediate_size:
+            data["shared_intermediate_size"] = self.shared_intermediate_size
+        return data
 
 
 @dataclass(frozen=True)
@@ -159,13 +220,21 @@ class ModelManifest:
     attention: AttentionSpec
     linear: Optional[LinearSpec] = None
     state: Optional[StateSpec] = None
+    mamba: Optional[MambaSpec] = None
     moe: Optional[MoESpec] = None
     quantization: str = "none"
     kv: Dict[str, Any] = field(default_factory=dict)
     required_capabilities: Tuple[str, ...] = ()
     benchmark: Dict[str, Any] = field(default_factory=dict)
+    #: Dotted module path of the model implementation this repository supplies when the
+    #: vendor has no architecture for it (``register_config`` / ``register_models`` actors).
+    #: Empty means "the vendor already serves the model".
+    model_impl: str = ""
+    #: CLI name and ``module:Class`` path of the reasoning/chat-format parser, when the
+    #: checkpoint speaks a private channel protocol (``--reasoning-parser <name>``).
+    reasoning_parser: str = ""
+    reasoning_parser_impl: str = ""
     source: str = "docs/notes/op-coverage-qwen36.md"
-    model_impl: Optional[str] = None
     schema_version: int = MANIFEST_SCHEMA_VERSION
 
     def validate(self) -> None:
@@ -179,7 +248,15 @@ class ModelManifest:
             )
         unknown = sorted(
             set(self.layer_types)
-            - {"full_attention", "linear_attention", "sliding_attention", "conv"}
+            - {
+                "full_attention",
+                "sliding_attention",
+                "linear_attention",
+                "conv",
+                "mamba",
+                "mlp",
+                "moe",
+            }
         )
         if unknown:
             raise ValueError(f"unknown layer types {unknown}")
@@ -187,19 +264,40 @@ class ModelManifest:
             raise ValueError("linear spec declared but no linear_attention layer")
         if self.state is not None and "conv" not in self.layer_types:
             raise ValueError("state spec declared but no conv layer")
+        if "conv" in self.layer_types and self.state is None:
+            raise ValueError("conv layer declared but no state spec")
+        if self.mamba is not None and "mamba" not in self.layer_types:
+            raise ValueError("mamba spec declared but no mamba layer")
+        if "mamba" in self.layer_types and self.mamba is None:
+            raise ValueError("mamba layer declared but no mamba spec")
+        if (
+            self.mamba is not None
+            or self.linear is not None
+            or self.state is not None
+        ) and Capability.STATE_LINEAR.value not in self.required_capabilities:
+            raise ValueError("recurrent mixer declared but state.linear is not required")
         if self.moe is not None and "moe" not in self.required_capabilities and (
             Capability.MOE_ROUTED.value not in self.required_capabilities
         ):
             raise ValueError("MoE spec declared but moe.routed is not required")
         self.attention.validate()
+        has_sliding = "sliding_attention" in self.layer_types
+        if has_sliding and self.attention.sliding_window is None:
+            raise ValueError("sliding_attention layers declared but attention.sliding_window is unset")
+        if not has_sliding and self.attention.sliding_window is not None:
+            raise ValueError("attention.sliding_window set but no sliding_attention layer")
+        if has_sliding and Capability.ATTENTION_SLIDING.value not in self.required_capabilities:
+            raise ValueError(
+                "sliding_attention layers require the attention.sliding capability"
+            )
         if self.linear is not None:
             self.linear.validate()
         if self.state is not None:
             self.state.validate()
+        if self.mamba is not None:
+            self.mamba.validate()
         if self.moe is not None:
             self.moe.validate()
-        if self.model_impl is not None and ":" not in self.model_impl:
-            raise ValueError("model_impl must be 'module:Class'")
         caps = set(self.required_capabilities)
         valid = {c.value for c in CAPABILITIES}
         unknown_caps = sorted(caps - valid)
@@ -209,9 +307,29 @@ class ModelManifest:
             raise ValueError("a manifest must declare at least one required capability")
         if self.quantization not in {"none", "fp8", "fp4", "w4a8"}:
             raise ValueError(f"unknown quantization scheme {self.quantization!r}")
-        for key in ("prompt", "max_tokens", "top5"):
-            if key not in self.benchmark:
-                raise ValueError(f"benchmark sample is missing {key!r}")
+        # A declaration may ship before its C2 sample is captured; it then cannot be used for
+        # numeric acceptance, but it can still drive deployment (this is how a brand-new model
+        # is onboarded).  A partially filled sample is an error, never a silent pass.
+        if self.benchmark:
+            for key in ("prompt", "max_tokens", "top5"):
+                if key not in self.benchmark:
+                    raise ValueError(f"benchmark sample is missing {key!r}")
+
+    @property
+    def mixer_kinds(self) -> Tuple[str, ...]:
+        """Recurrent mixer kinds a ``state.linear`` provider must cover.
+
+        A GDN provider and a Mamba2 provider both speak ``state.linear``; the manifest's
+        mixer kind is what keeps them from being mistaken for one another.
+        """
+        kinds = []
+        if self.linear is not None:
+            kinds.append(self.linear.kind)
+        if self.mamba is not None:
+            kinds.append(self.mamba.kind)
+        if self.state is not None:
+            kinds.append(self.state.kind)
+        return tuple(kinds)
 
     @property
     def fingerprint(self) -> str:
@@ -221,6 +339,9 @@ class ModelManifest:
         return hashlib.sha256(payload).hexdigest()[:16]
 
     def as_dict(self) -> Dict[str, Any]:
+        # Keep the pre-Mamba shape byte-identical when a model has no Mamba layers:
+        # plan ids are content-addressed and must not churn for Qwen3.6 just because the
+        # schema learned a new optional field.
         data = {
             "schema_version": self.schema_version,
             "name": self.name,
@@ -236,12 +357,15 @@ class ModelManifest:
             "kv": dict(self.kv),
             "required_capabilities": list(self.required_capabilities),
             "benchmark": dict(self.benchmark),
+            "model_impl": self.model_impl,
+            "reasoning_parser": self.reasoning_parser,
+            "reasoning_parser_impl": self.reasoning_parser_impl,
             "source": self.source,
         }
         if self.state is not None:
             data["state"] = self.state.as_dict()
-        if self.model_impl is not None:
-            data["model_impl"] = self.model_impl
+        if self.mamba is not None:
+            data["mamba"] = self.mamba.as_dict()
         return data
 
     def write(self, path: str) -> None:

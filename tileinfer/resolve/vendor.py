@@ -26,6 +26,20 @@ VENDOR_PROVIDERS: Dict[Capability, ProviderSpec] = {
         evidence="baseline",
         delete_when="never - this is the baseline",
     ),
+    Capability.ATTENTION_SLIDING: ProviderSpec(
+        capability=Capability.ATTENTION_SLIDING,
+        name="vllm_ascend.attention.swa",
+        impl="vllm_ascend.attention.attention_v1.AscendAttentionBackend",
+        source="vendor",
+        graphable=True,
+        measured_ratio=1.0,
+        evidence=(
+            "baseline: the same Ascend attention backend serves the windowed layers "
+            "(sparse_mode=4); stacks older than the cfb01b1c8 contiguity fix need the "
+            "model-side value.contiguous() guard"
+        ),
+        delete_when="never - this is the baseline",
+    ),
     Capability.ATTENTION_LINEAR: ProviderSpec(
         capability=Capability.ATTENTION_LINEAR,
         name="vllm_ascend.gdn",
@@ -82,6 +96,7 @@ VENDOR_PROVIDERS: Dict[Capability, ProviderSpec] = {
         impl="vllm_ascend.ops.gdn",
         source="vendor",
         graphable=True,
+        covers={"mixer": "gdn"},
         measured_ratio=1.0,
         evidence="baseline",
         delete_when="never - this is the baseline",

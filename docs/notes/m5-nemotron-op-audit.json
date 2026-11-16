@@ -1,0 +1,84 @@
+{
+  "evidence_id": "m5-nemotron-op-audit-2026-11-15",
+  "date": "2026-11-15",
+  "timezone": "Asia/Shanghai",
+  "scope": "capability/operator audit for the target declaration; static plus CPU/fake and target-dummy mechanical evidence, not real-weight C1/C2",
+  "model": "/home/models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
+  "capabilities": [
+    {
+      "capability": "attention.full",
+      "path": "vllm_ascend.attention.attention_v1.AscendAttentionBackend",
+      "source": "vendor",
+      "evidence": "target dummy eager and graph services served 1/161/6001-token prompts; graph capture FULL/PIECEWISE passed",
+      "unknown": "real-weight numerics, long-context graph capture"
+    },
+    {
+      "capability": "moe.routed",
+      "path": "vllm_ascend.ops.fused_moe + TileInfer non-gated relu2 path",
+      "source": "vendor + tileinfer",
+      "evidence": "CPU non-gated relu2 test; NPU grouped-matmul path matches a per-token reference (fp32 max abs 5.96e-8, bf16 max rel 8.9e-3); target dummy graph capture",
+      "unknown": "real-weight expert numerics, multi-rank"
+    },
+    {
+      "capability": "norm.rms",
+      "path": "vllm_ascend.ops.layernorm",
+      "source": "vendor",
+      "evidence": "target dummy services loaded and served",
+      "unknown": "real-weight numerics"
+    },
+    {
+      "capability": "rotary",
+      "path": "vllm_ascend.ops.rotary_embedding",
+      "source": "vendor",
+      "evidence": "target dummy services loaded and served",
+      "unknown": "real-weight numerics"
+    },
+    {
+      "capability": "sampling.topk",
+      "path": "vllm_ascend.sample",
+      "source": "vendor",
+      "evidence": "target dummy completion requests returned token IDs/text",
+      "unknown": "real-weight logits and determinism"
+    },
+    {
+      "capability": "state.linear",
+      "path": "tileinfer.vllm.ops.mamba2",
+      "source": "tileinfer",
+      "evidence": [
+        "CPU scalar-recurrence tests: chunk scan, varlen boundaries, decode state update",
+        "target geometry 64 heads x 64 head_dim x 128 state x 8 groups test matches scalar recurrence within 1e-3/1e-4",
+        "target dummy graph capture with Mamba2 decode vectorised (no host index copy)"
+      ],
+      "unknown": "real-weight C1/C2; Mamba2 provider not registered as default; no absolute performance floor yet"
+    },
+    {
+      "capability": "quant.verify",
+      "path": "vllm_ascend.quantization",
+      "source": "vendor",
+      "evidence": "checkpoint quantization is none; dummy service loaded",
+      "unknown": "none for this checkpoint"
+    }
+  ],
+  "tests": {
+    "cpu": ".venv_native213/bin/python -m pytest tests/test_mamba2_ops.py tests/test_moe_ops.py tests/test_fused_moe_oot.py tests/test_nemotron_offline.py -q",
+    "npu": ".venv_v3/bin/python -m pytest tests/test_mamba2_ops.py tests/test_moe_ops.py tests/test_nemotron_offline.py -q",
+    "npu_grouped_test": "tests/test_moe_ops.py::test_grouped_non_gated_npu_path_matches_reference"
+  },
+  "not_claimed": [
+    "target C1 with real weights",
+    "target C2 HF reference consistency",
+    "target C3 steady-state fallback=0 (graph replay was observed, but the bridge decode counter did not advance)",
+    "MTP acceptance with real weights",
+    "performance floor"
+  ],
+  "candidate_provider": {
+    "name": "tileinfer.mamba2_state",
+    "impl": "tileinfer.vllm.ops.mamba2",
+    "covers": {
+      "mixer": "mamba2"
+    },
+    "registered_as_default": false,
+    "reason": "target real-weight C1/C2 not run; nine shards absent"
+  },
+  "v3_migration_note": "Historical audit paths point at the frozen v2 modules; the canonical implementations are tileinfer.providers.nemotron.mamba2 / tileinfer.providers.moe."
+}

@@ -63,6 +63,7 @@ LFM3_1_7 = ModelManifest(
     },
     required_capabilities=(
         Capability.ATTENTION_FULL.value,
+        Capability.ATTENTION_SLIDING.value,
         Capability.STATE_LINEAR.value,
         Capability.NORM_RMS.value,
         Capability.ROTARY.value,
@@ -104,5 +105,5 @@ LFM3_1_7 = ModelManifest(
         },
     },
     source="docs/notes/lfm3-adaptation.md",
-    model_impl="tileinfer.models.lfm3.model:Lfm3ForCausalLM",
+    model_impl="tileinfer.bridge.models.lfm3",
 )

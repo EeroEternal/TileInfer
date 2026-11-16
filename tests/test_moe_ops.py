@@ -37,7 +37,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from tileinfer.vllm.ops import moe as moe_ops
+from tileinfer.providers import moe as moe_ops
 
 FP32_TOL = dict(rtol=1e-5, atol=1e-5)
 BF16_TOL = dict(rtol=2e-2, atol=2e-2)
@@ -571,6 +571,27 @@ def test_fused_experts_matches_per_token_loop():
     torch.testing.assert_close(out, ref, **FP32_TOL)
 
 
+def test_fused_experts_non_gated_relu2_matches_per_token_loop():
+    """Nemotron's expert MLP has no gate half: w1 is [E, inter, hidden] and activation is relu2."""
+    torch.manual_seed(0)
+    g = torch.Generator().manual_seed(31)
+    hidden, inter, num_experts = 16, 12, 5
+    w1 = torch.randn((num_experts, inter, hidden), generator=g) * 0.05
+    w2 = torch.randn((num_experts, hidden, inter), generator=g) * 0.05
+    x = torch.randn((6, hidden), generator=g)
+    ids = torch.randint(0, num_experts, (6, 2), generator=g)
+    weights = _weights_and_ids(ids, 32)
+
+    out = moe_ops.fused_experts(x, w1, w2, weights, ids, activation="relu2_no_mul")
+    ref = torch.zeros_like(x)
+    for t in range(x.shape[0]):
+        for k in range(ids.shape[1]):
+            e = int(ids[t, k])
+            h = torch.relu(x[t] @ w1[e].T).square()
+            ref[t] += weights[t, k] * (h @ w2[e].T)
+    torch.testing.assert_close(out, ref, **FP32_TOL)
+
+
 def test_fused_experts_256_experts_top8():
     g = torch.Generator().manual_seed(23)
     hidden, inter, num_experts, top_k = 16, 8, 256, 8
@@ -758,6 +779,9 @@ def test_fused_experts_empty_batch():
 
 
 def test_fused_experts_validation():
+    # Validation is cached per (device, expert count); earlier tests in this module may have
+    # populated the cache. The invalid-id assertions below must see a fresh check.
+    moe_ops._VALIDATED_ID_BOUNDS.clear()
     w1, w2 = _random_moe(48, 4, 8, 4)
     x = torch.randn(3, 8)
     ids = torch.zeros((3, 2), dtype=torch.int64)
@@ -794,3 +818,38 @@ def test_silu_and_mul_matches_torch_formula():
                                **BF16_TOL)
     with pytest.raises(ValueError, match="even last dimension"):
         moe_ops.silu_and_mul(torch.randn(2, 5))
+
+
+def test_grouped_non_gated_npu_path_matches_reference() -> None:
+    """The Ascend grouped-matmul path must produce the same non-gated relu2 result as the loop.
+
+    This is the path C3 capture uses; it is skipped on CPU, so the CPU tests above still run
+    without torch_npu.  The reference is an independent per-token loop over the same tensors.
+    """
+    torch_npu = pytest.importorskip("torch_npu")
+    if not (hasattr(torch, "npu") and torch.npu.is_available()):
+        pytest.skip("NPU not available")
+    del torch_npu
+
+    torch.manual_seed(17)
+    n_tokens, hidden, inter, n_experts, top_k = 7, 8, 12, 4, 2
+    for dtype in (torch.float32, torch.bfloat16):
+        x = torch.randn(n_tokens, hidden, dtype=dtype, device="npu")
+        w1 = torch.randn(n_experts, inter, hidden, dtype=dtype, device="npu") * 0.2
+        w2 = torch.randn(n_experts, hidden, inter, dtype=dtype, device="npu") * 0.2
+        ids = torch.randint(0, n_experts, (n_tokens, top_k), device="npu")
+        weights = torch.rand(n_tokens, top_k, dtype=dtype, device="npu")
+
+        out = moe_ops.fused_experts(x, w1, w2, weights, ids, activation="relu2_no_mul")
+
+        xc, w1c, w2c = x.float().cpu(), w1.float().cpu(), w2.float().cpu()
+        idc, wc = ids.cpu(), weights.float().cpu()
+        ref = torch.zeros(n_tokens, hidden)
+        for t in range(n_tokens):
+            for k in range(top_k):
+                e = int(idc[t, k])
+                h = torch.relu(xc[t] @ w1c[e].T).square()
+                ref[t] += wc[t, k] * (h @ w2c[e].T)
+
+        tol = dict(rtol=3e-2, atol=3e-2) if dtype is torch.bfloat16 else dict(rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(out.float().cpu(), ref, **tol)

@@ -19,47 +19,51 @@ Status: **C1 pass; C2 within declared tolerance; C3 pass; C4 pass (conc=1 refere
 | Layer | Change |
 |---|---|
 | L1 declaration | `tileinfer/manifests/lfm3_1_7.py` + registry: 24 layers (13 conv / 5 sliding / 6 full), 16 Q / 4 KV at head_dim 128, short-conv kernel 7, sliding window 256, per-layer RoPE, benchmark sample |
-| L3 contracts | `AttentionSpec` gained `sliding_window` and `rope_by_layer`; new `StateSpec`; `ModelManifest` gained `state` and `model_impl`; layer types allow `conv`/`sliding_attention` |
-| L2 decision | `decide()` adds a `model.arch` row for `model_impl`; `state.linear` stays vendor GDN for Qwen3.6 and selects `tileinfer.short_conv` only when the declaration says `kind="short_conv"` |
-| L4 provider | `providers/state/short_conv.py` (pure torch causal depthwise conv + rolling state); `providers/catalog.py` declares it with evidence and delete condition |
-| L5 bridge | `install_model_table()` registers the route-O class and applies the LFM3 config/rope compatibility patches; `install_impl_table()` recognises the short-conv provider as consumed by the model; `model_table` is critical when a model row exists |
+| L3 contracts | `AttentionSpec` gained `sliding_window` and `rope_by_layer`; new `StateSpec`; `ModelManifest` gained `state` and a module-style `model_impl`; layer types allow `conv`/`sliding_attention` |
+| L2 decision | `decide()` keeps `model_impl` on the `Plan` and adds the `model_table` access point; `state.linear` stays vendor GDN for Qwen3.6 and selects `tileinfer.short_conv` only when the declaration says `kind="short_conv"` |
+| L4 provider | `providers/state/short_conv.py` (pure torch causal depthwise conv + rolling state); `providers/catalog.py` declares it as a route-O-scoped provider with evidence and delete condition |
+| L5 bridge | `install_model_table()` imports `tileinfer.bridge.models.lfm3` and calls its `register_config()` / `register_models()` actors; `install_impl_table()` recognises the short-conv provider as consumed by the model; `model_table` is critical when the plan requests it |
 | Model | `tileinfer/models/lfm3/model.py`: gated short conv with vLLM short-conv state metadata, sliding/full GQA with per-head output gate and QK RMSNorm, zero-tail partial RoPE, sandwich norms, SwiGLU, stacked qkv/w13 weight loading, short-conv state shape padded to the Ascend attention page size |
-| Compat | `tileinfer/models/lfm3/compat.py`: transformers 5.16/5.17 shims for `conv` layer-type remapping and the nested rope dict; the vllm-ascend global rope buffer is disabled from the bridge |
+| Registration | `tileinfer/bridge/models/lfm3.py`: `register_config()` applies the transformers/rope shims and disables the vllm-ascend global rope buffer; `register_models()` registers `Lfm3ForCausalLM` by class path |
 
 ## Reproduction
 
-The run needs transformers 5.17 (the baseline 4.57 cannot parse the LFM3 config). Install
-TileInfer into an isolated target so the real `vllm.general_plugins` entry point loads:
+The run needs transformers 5.17 (the baseline 4.57 cannot parse the LFM3 config) and the
+Ascend Triton package, which `vllm-ascend` imports instead of upstream Triton:
 
 ```bash
-cd /home/userlist/ww/TileInfer_xjx1
-/home/userlist/ww/py_venv/bin/pip install --no-deps --no-build-isolation \
-    --target /tmp/tileinfer_pkg .
-/home/userlist/ww/py_venv/bin/python -m tileinfer.cli.plan build \
-    --model /home/models/LFM3-1.7B --out /tmp/lfm3-plan.json
+cd /home/xjx/TileInfer
+source scripts/env-ascend102.sh
+source .venv_lfm3/bin/activate
+export PYTHONPATH=/home/zxs/triton-ascend-3.2.2:$PYTHONPATH
+python -m tileinfer.cli.plan build \
+    --model /home/models/LFM3-1.7B --out /tmp/lfm3-plan-real.json
 ```
 
-The plan is `0279ee548e634470` (7 selections, 5 access points, `state.linear` from
-`tileinfer.short_conv`, `model.arch` from `tileinfer.models.lfm3.model`). The plugin run:
+The plan rebuilt after the v3 `model_impl` merge is `497db0c9c88f09b3` (7 selections,
+6 access points, `state.linear` from `tileinfer.short_conv`,
+`model_impl=tileinfer.bridge.models.lfm3`).  It has no `model.arch` row: the model is
+registered through the module's `register_config()` / `register_models()` actors.
+
+C1/C2/C3 were rerun with this plan on the real checkpoint:
 
 ```bash
-PYTHONPATH=/tmp/tileinfer_pkg \
-TILEINFER_PLAN=/tmp/lfm3-plan.json \
+TILEINFER_PLAN=/tmp/lfm3-plan-real.json \
 VLLM_ENABLE_V1_MULTIPROCESSING=0 \
-/home/userlist/ww/py_venv/bin/python -c "from vllm import LLM; ..."
+python -c "from vllm import LLM; ..."
 ```
 
 Observed log (no manual `install()` call):
 
 ```text
-[tileinfer] TileInfer v3 bridge: plan=0279ee548e634470 model=LFM3-1.7B selections=7 ...
-seams=config_gate,graph_hook,attn_select,impl_table,model_table,method_wrap | skipped=none
-engine ready 17.2
-OUT: ' Paris.\n\nThe capital of Japan is Tokyo'
+[tileinfer] TileInfer v3 bridge: plan=497db0c9c88f09b3 model=LFM3-1.7B selections=7
+(...) access_points=6 fallback=forbid | seams=config_gate,graph_hook,attn_select,
+impl_table,model_table | skipped=none | metrics=/tmp/tileinfer-v3-metrics.json
+OUT: ' Paris.\n\nThe capital of Japan is Tokyo.\n\nThe capital of Australia is Canberra'
 ```
 
 `tileinfer doctor` with the same plan: python / vllm / vllm_ascend / device_type / plan /
-layer_guard / bridge / graph_metrics all PASS (captured=4, fallbacks=0).
+layer_guard / bridge / graph_metrics all PASS.
 
 ## C2: reference comparison
 
@@ -67,11 +71,11 @@ Reference is HF transformers 5.17 on the same NPU (no vendor baseline exists):
 
 ```text
 HF top5:  [(' Paris', -0.1842), (' the', -2.6842), (':\n\n', -4.3717), ('Paris', -4.4967), (':', -5.4342)]
-vLLM top5: [(' Paris', -0.1810), (' the', -2.6810), ('Paris', -4.4310), (':\n\n', -4.4310), (':', -5.4310)]
+vLLM top5: [(' Paris', -0.1854), (' the', -2.6854), (':\n\n', -4.3729), ('Paris', -4.4354), (':', -5.3729)]
 ```
 
 The top-5 set matches and every logprob is inside the 0.1 tolerance declared in the
-manifest; ranks 3/4 swap. Greedy generation matches the first two tokens then diverges
+manifest. Greedy generation matches the first two tokens then diverges
 (`What is ...` vs `The capital of ...`) because those later logits are closer than the
 remaining FIA-vs-SDPA numerical difference. This is **not** a bit-exact C2.
 
@@ -97,9 +101,12 @@ The short-conv path was vectorised over `state_indices_*`/`query_start_loc_*` (n
 per-request Python loop and no device sync), so graph capture now succeeds:
 
 ```text
-capture_calls=1 captured_graphs=4 (PIECEWISE 2 + FULL 2)
-decode_calls=7 hits=7 fallbacks=0 errors=0
+capture_calls=1 captured_graphs=8 (PIECEWISE 4 + FULL 4)
+decode_calls=16 hits=16 fallbacks=0 errors=0
 ```
+
+(The earlier class-path run captured 4 graphs; the rebuilt plan under the module-style
+`model_impl` captures 8.)
 
 Batch-2 generation is coherent in both eager and graph modes. A ~1K-token prompt with
 `max_num_batched_tokens=512` (chunked prefill) and two requests also runs under graphs with
@@ -113,6 +120,12 @@ OK
 ```
 
 ## C4: performance
+
+The C1/C2/C3 rerun changed only the model-registration mechanism, not the model math, so
+the C4 numbers below are retained from the same implementation and were **not re-measured**
+under plan `497db0c9c88f09b3`.  A post-merge smoke run (1024-token prompt, 64 output tokens,
+conc=1) finished in 0.534 s end to end (~120 tok/s), consistent with the table; it is not a
+p50/p90 gate measurement.
 
 After replacing the grouped `conv1d` decode and the non-contiguous state gather/scatter with
 seven fused multiply-adds over a contiguous state slice, TPOT dropped from ~138 ms to

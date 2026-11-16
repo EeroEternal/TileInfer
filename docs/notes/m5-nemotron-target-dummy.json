@@ -1,0 +1,72 @@
+{
+  "evidence_id": "m5-nemotron-target-dummy-2026-11-13",
+  "date": "2026-11-13",
+  "timezone": "Asia/Shanghai",
+  "scope": "target-shape mechanical smoke with dummy weights; NOT numerical C1, NOT C2, NOT C3",
+  "model": "/home/models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
+  "checkpoint": {
+    "shards_on_disk": 5,
+    "shards_declared": 14,
+    "ready_to_load": false,
+    "real_target_tensor_read": false
+  },
+  "service": {
+    "host": "127.0.0.1",
+    "port": 18081,
+    "load_format": "dummy",
+    "max_model_len": 2048,
+    "max_num_seqs": 1,
+    "enforce_eager": true,
+    "gpu_memory_utilization": 0.75,
+    "health": 200,
+    "weights_loaded_gb": 58.8333,
+    "kv_cache_gib": 33.5,
+    "plan_id": "abd6348895c2d65d",
+    "access_points": 4,
+    "selections": 6,
+    "fallback_policy": "forbid"
+  },
+  "requests": [
+    {
+      "id": "cmpl-b3d297350912e262",
+      "prompt_tokens": 1,
+      "completion_tokens": 8,
+      "finish_reason": "length",
+      "kind": "single-token prefill + decode"
+    },
+    {
+      "id": "cmpl-88a043485639fdba",
+      "prompt_tokens": 161,
+      "completion_tokens": 8,
+      "finish_reason": "length",
+      "kind": "multi-token prefill + decode; exercises chunked Mamba2 and 23 MoE layers"
+    }
+  ],
+  "observed": [
+    "config normalized from raw layers_block_type; NemotronHForCausalLM constructed",
+    "Mamba2 warmup ran through tileinfer.vllm.ops.mamba2 instead of the failing vendor Triton ssd_chunk_scan",
+    "non-gated relu2 FusedMoE and shared-expert path executed with the target 52-layer geometry",
+    "no NotImplementedError, no ACL shape error, no fallback counter",
+    "weights are dummy: output text has no semantic meaning"
+  ],
+  "not_proven": [
+    "C1 correctness with real checkpoint weights",
+    "C2 agreement with an independent reference",
+    "C3 graph capture: service used --enforce-eager, so captured_graphs is 0",
+    "MTP, long context, concurrency, cold start, op audit",
+    "target-shape numerical bounds for Mamba2 or non-gated MoE"
+  ],
+  "stop": {
+    "method": "SIGTERM to the exact service PID, then to EngineCore/parent shell",
+    "port_18081_free": true,
+    "hbm_returned": "no process on NPU 0 after stop"
+  },
+  "logs": "/tmp/m5-target-dummy6.log",
+  "responses": "/tmp/m5-target-c1-dummy6.json, /tmp/m5-target-c1-dummy7.json",
+  "graph_followup": {
+    "evidence": "m5-nemotron-target-graph.json",
+    "result": "without --enforce-eager the same target dummy captured PIECEWISE 1 + FULL 1, used 2.68 GiB graph memory, and logged Replaying aclgraph",
+    "caveat": "dummy weights; decode-call counter did not advance, so this is not full C3"
+  },
+  "v3_migration_note": "Historical dummy run used the v2 op installer; the implementation now lives under tileinfer.providers and is installed by tileinfer.bridge.impl_table from the plan. The dummy result is still not C1/C2/C3 evidence."
+}

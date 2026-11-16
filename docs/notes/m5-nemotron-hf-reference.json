@@ -1,0 +1,88 @@
+{
+  "reference_id": "hf-cpu-nemotron-h-20261115T084001Z",
+  "generated_at": "2026-11-15T08:40:01.730125+00:00",
+  "model": "/home/models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
+  "prompt": "Say hello in one sentence.",
+  "max_tokens": 32,
+  "dtype": "bfloat16",
+  "device": "cpu",
+  "torch_version": "2.13.0+cpu",
+  "transformers_version": "5.12.1",
+  "transformers_site": "/home/dlb/sglang/.venv_npu/lib/python3.12/site-packages",
+  "prompt_token_ids": [
+    67935,
+    52528,
+    1294,
+    1925,
+    19286,
+    1046
+  ],
+  "generated_token_ids": [
+    1362,
+    1855,
+    1261,
+    7278,
+    3244,
+    1046,
+    1362,
+    1710,
+    3508,
+    1454,
+    1261,
+    9924,
+    4521,
+    1307,
+    15048,
+    1044,
+    1562,
+    51193,
+    8352,
+    1317,
+    27214,
+    9664,
+    1046,
+    1362,
+    4525,
+    9543,
+    1317,
+    5048,
+    5315,
+    1321,
+    5234,
+    18501
+  ],
+  "text": " I am a language model. I can help with a wide range of tasks, from answering questions to creative writing. I'm designed to understand context and provide accurate",
+  "first_token_top5": [
+    {
+      "token_id": 1362,
+      "token": " I",
+      "logit": 12.25,
+      "logprob": -2.9895012378692627
+    },
+    {
+      "token_id": 1531,
+      "token": " The",
+      "logit": 12.25,
+      "logprob": -2.9895012378692627
+    },
+    {
+      "token_id": 1256,
+      "token": "  ",
+      "logit": 11.875,
+      "logprob": -3.3645012378692627
+    },
+    {
+      "token_id": 1032,
+      "token": " ",
+      "logit": 11.8125,
+      "logprob": -3.4270012378692627
+    },
+    {
+      "token_id": 1319,
+      "token": " (",
+      "logit": 11.75,
+      "logprob": -3.4895012378692627
+    }
+  ],
+  "note": "CPU reference; no NPU and no vllm-ascend baseline"
+}

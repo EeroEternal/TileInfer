@@ -169,7 +169,7 @@ Qwen3.6 是**控制模型**，用来校准 TileInfer 在厂商已支持路径上
 2. 每个 gap 对应一个 provider，声明五项：coverage / graphable / parallel / 证据 / `delete_when`。
 3. 跑完 §1 全表；无厂商基线时按 [`acceptance.md`](acceptance.md) §2.1 的绝对口径。
 4. 记录"从声明到在役"的人日与缺口条数（边际成本，见 acceptance §4）。
-5. 接入点总数仍 ≤ 8；超了写例外说明并重新设计。
+5. 接入点总数仍 ≤ 8（已定义 6，计划只选子集）；加第 7 个要改封闭列表并写例外说明。
 6. 矩阵不是可选项：**新模型也必须验证 MTP / 图模式 / 长上下文 / 并发 / 冷启动**，
    不能只验"能跑"。
 
@@ -201,7 +201,7 @@ Qwen3.6 按以下顺序推进：
 2. ✅ 投机质量门：S2（4K）Q1/Q2/Q3 过；S3 图 6 图/0 回退过；S4 32K 部分，128K 未测。
 3. 组合：S3 已跑；S4 32K 已跑；S4 128K/262K 未测，控制模型不做。
 4. 控制模型免测：P2/P3、K1/K2、O2（见 §1.9）；M5 新模型仍全验。
-5. 下一步：等用户指定 M5 模型，先做静态 gap report，不下载、不占卡。
+5. 下一步：M5 目标已定 `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16`；先做离线静态 gap report，不下载、不占卡；任务书见 [`notes/m5-nemotron-task.md`](notes/m5-nemotron-task.md)。
 
 ---
 

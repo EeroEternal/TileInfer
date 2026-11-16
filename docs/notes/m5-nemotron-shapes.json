@@ -1,0 +1,12 @@
+{
+  "model_dir": "/home/models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
+  "layers_declared": 52,
+  "mtp_layers_declared": 2,
+  "tensors_checked": 1950,
+  "tensors_skipped": 18,
+  "shape_ok": true,
+  "errors": [],
+  "weights_read": false,
+  "hardware_used": false,
+  "note": "safetensors headers only; missing shards are not covered"
+}

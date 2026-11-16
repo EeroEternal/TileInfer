@@ -210,6 +210,25 @@ class TileInferMetadataBuilder(AttentionMetadataBuilder):
     #: cheap (integers + references), so we take the boring path instead of an unverified one.
     supports_update_block_table = False
 
+    @classmethod
+    def get_cudagraph_support(
+        cls,
+        vllm_config,
+        kv_cache_spec,
+    ) -> AttentionCGSupport:
+        """Windowed specs are eager-only; everything else keeps the class-level answer.
+
+        A sliding-window layer takes the staged scratch path on decode (``attn.window``) and the
+        masked reference on prefill — neither is verified inside a captured region (the prefill
+        path walks the page table on the host), so the support is downgraded here, where vLLM
+        can still honour it.  The spec carries the window even in the unified-spec mode (vLLM
+        converts ``SlidingWindowSpec`` to ``FullAttentionSpec`` and keeps ``sliding_window``),
+        so this sees every windowed configuration.
+        """
+        if getattr(kv_cache_spec, "sliding_window", None):
+            return AttentionCGSupport.NEVER
+        return cls._cudagraph_support
+
     def __init__(
         self,
         kv_cache_spec,

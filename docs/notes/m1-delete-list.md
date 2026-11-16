@@ -54,6 +54,20 @@ grep -rn "tileinfer\.vllm\|from \.\.vllm\|from \.vllm" \
 
 2026-11-12 的结果：**no live references**。
 
+**2026-11-16 复核：这条结论已过期。** M5 的 Nemotron 工作把 v2 重新接回了 live 路径：
+
+- `tileinfer/bridge/install.py:140` — `from tileinfer.vllm.config_compat import register_nemotron_h_alias`
+- `tileinfer/bridge/install.py:180` — `from tileinfer.vllm.ops.install import install_ops`
+
+第二处不只是 import。`install_ops()` 默认启用 `gdn,moe` 两族；没有显式设置 profile 时，
+`_profile_family_names()` 会 import `tileinfer.vllm.profiles` 并落到默认的 Qwen3.6 profile
+（`op_family="gdn_moe"`），然后执行 `patches.install_all()` —— 即 v2 的补丁注册表。
+也就是说，v3 的安装路径目前会**默认执行** v2 的算子接管和补丁，不只是"代码留在那里"。
+
+在 `bridge/install.py` 的两处引用被移走、且加一条 AST 守卫之前，本节不能再说"零引用"。
+两处引用的性质不同：配置别名（`register_nemotron_h_alias`）可以搬进 bridge；`install_ops`
+则应该由 `providers/` + `impl_table` 承担，或者显式 opt-in，不能在 v3 默认执行。
+
 ## 4. 入口点账本
 
 `pyproject.toml` 现在只注册：

@@ -1,0 +1,72 @@
+{
+  "model_dir": "/home/models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
+  "index_present": true,
+  "shards_declared": 14,
+  "shards_present": 5,
+  "shards_missing": [
+    "model-00002-of-00014.safetensors",
+    "model-00003-of-00014.safetensors",
+    "model-00004-of-00014.safetensors",
+    "model-00007-of-00014.safetensors",
+    "model-00008-of-00014.safetensors",
+    "model-00009-of-00014.safetensors",
+    "model-00010-of-00014.safetensors",
+    "model-00011-of-00014.safetensors",
+    "model-00012-of-00014.safetensors"
+  ],
+  "tensor_headers": 1968,
+  "dtypes": {
+    "F32": 6,
+    "BF16": 1962
+  },
+  "shards": [
+    {
+      "shard": "model-00001-of-00014.safetensors",
+      "ok": true,
+      "header_bytes": 55584,
+      "tensors": 435,
+      "data_bytes": 4991154432,
+      "file_bytes": 4991210024
+    },
+    {
+      "shard": "model-00005-of-00014.safetensors",
+      "ok": true,
+      "header_bytes": 64864,
+      "tensors": 504,
+      "data_bytes": 4980488960,
+      "file_bytes": 4980553832
+    },
+    {
+      "shard": "model-00006-of-00014.safetensors",
+      "ok": true,
+      "header_bytes": 64808,
+      "tensors": 502,
+      "data_bytes": 4989358720,
+      "file_bytes": 4989423536
+    },
+    {
+      "shard": "model-00013-of-00014.safetensors",
+      "ok": true,
+      "header_bytes": 33128,
+      "tensors": 257,
+      "data_bytes": 3249690368,
+      "file_bytes": 3249723504
+    },
+    {
+      "shard": "model-00014-of-00014.safetensors",
+      "ok": true,
+      "header_bytes": 33072,
+      "tensors": 270,
+      "data_bytes": 2670652160,
+      "file_bytes": 2670685240
+    }
+  ],
+  "headers_ok": true,
+  "complete": false,
+  "errors": [
+    "9 declared shard(s) not on disk"
+  ],
+  "weights_read": false,
+  "hardware_used": false,
+  "note": "only safetensors headers were read; tensor payload was not opened"
+}

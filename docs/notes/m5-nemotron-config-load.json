@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "model": "/tmp/m5-nemotron-shim-1794559898",
+  "source_model": "/home/models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
+  "plan": "/tmp/m5-nemotron-plan.json",
+  "plan_id": "abd6348895c2d65d",
+  "vllm": "0.23.0",
+  "vllm_ascend": "0.23.0",
+  "transformers": "4.57.6",
+  "python": "3.12.14",
+  "architecture": "NemotronHForCausalLM",
+  "config_ok": true,
+  "cache_block_size": 4096,
+  "mamba_page_size_padded": 4231168,
+  "mamba_padding_pct": 0.87,
+  "plan_servable": false,
+  "gaps": ["state.linear"],
+  "device_used": false,
+  "weights_loaded": false,
+  "note": "EngineArgs.create_engine_config() only; this validates config/page alignment, not the model or kernels. The plan comes from the unregistered draft and is not a support claim."
+}

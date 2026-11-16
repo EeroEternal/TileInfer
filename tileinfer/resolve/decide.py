@@ -31,15 +31,58 @@ from ..contracts.plan import (
 )
 from .probe import Environment
 from .vendor import VENDOR_PROVIDERS
-from ..providers.catalog import TILEINFER_PROVIDERS
+from ..providers.catalog import ROUTE_O_PROVIDERS
+
+#: Global default providers.  Empty today, and empty is correct: candidates and route-O
+#: providers are model-scoped and must not become defaults for unrelated declarations.
+TILEINFER_PROVIDERS: dict = {}
+
+
+def _candidates(capability: Capability, manifest: ModelManifest) -> List:
+    """Declared candidates that cover this manifest but are not allowed to be defaults.
+
+    A candidate has implementation evidence but not target real-weight C1/C2.  It must appear
+    in the gap report (so the gap is visibly implementable, not a blocker) without entering
+    ``TILEINFER_PROVIDERS`` (which would make the plan claim support).
+    """
+    try:
+        from ..providers import CANDIDATE_PROVIDERS
+    except Exception:  # pragma: no cover - providers are optional during early bring-up
+        return []
+    return [
+        provider
+        for provider in CANDIDATE_PROVIDERS
+        if provider.capability is capability and _covers(provider, manifest)
+    ]
+
 
 POLICIES = ("vendor_first", "tileinfer_first")
+
+
+def _covers(provider, manifest: ModelManifest) -> bool:
+    """Honour the provider's symbolic `covers` constraints.
+
+    `state.linear` is shared by GDN and Mamba2.  Without this check a vendor GDN
+    provider is selected for a Mamba2 declaration just because both spell the same
+    capability.  Unknown cover keys are ignored here; they are evidence metadata, not
+    routing keys.
+    """
+    if provider is None:
+        return True
+    wanted_mixer = provider.covers.get("mixer")
+    if wanted_mixer is not None and wanted_mixer not in manifest.mixer_kinds:
+        return False
+    wanted_model = provider.covers.get("model_type")
+    if wanted_model is not None and wanted_model != manifest.model_type:
+        return False
+    return True
 
 
 def _select(
     manifest: ModelManifest,
     env: Environment,
     policy: str,
+    allow_candidates: bool = False,
 ) -> Tuple[List[Selection], List[Gap]]:
     selections: List[Selection] = []
     gaps: List[Gap] = []
@@ -51,17 +94,57 @@ def _select(
         if capability is Capability.STATE_LINEAR:
             if state_kind == "short_conv":
                 # The vendor state entry is GDN.  A declaration that states a different
-                # recurrent flavour (short convolution) cannot use it.
+                # recurrent flavour (short convolution) uses its own model-scoped provider.
                 vendor = None
+                ours = ROUTE_O_PROVIDERS.get(capability)
             else:
-                # Qwen3.6's GDN state is vendor-served; the short-conv provider must not
-                # answer a GDN declaration.
-                ours = None
+                # A GDN declaration must not use the short-conv route provider.  Other
+                # state providers (for example a declared Mamba2 candidate) are kept and
+                # left to ``_covers`` to decide.
+                if ours is not None and ours.name == "tileinfer.short_conv":
+                    ours = None
         order = ("vendor", "tileinfer") if policy == "vendor_first" else ("tileinfer", "vendor")
+
+        if allow_candidates:
+            # A candidate with a model-type cover replaces the vendor even when the vendor
+            # advertises the capability: the vendor's generic MoE does not cover Nemotron's
+            # non-gated relu2 expert MLP.  This is bring-up only and still writes a required gap.
+            overrides = [
+                provider
+                for provider in _candidates(capability, manifest)
+                if provider.covers.get("model_type") == manifest.model_type
+            ]
+            if overrides:
+                candidate = overrides[0]
+                selections.append(
+                    Selection(
+                        capability=capability.value,
+                        provider=candidate.name,
+                        impl=candidate.impl,
+                        reason=(
+                            f"explicit candidate bring-up; {candidate.name} covers "
+                            f"model_type={manifest.model_type}, the vendor does not"
+                        ),
+                        source="tileinfer",
+                        graphable=candidate.graphable,
+                    )
+                )
+                gaps.append(
+                    Gap(
+                        capability=capability.value,
+                        required=True,
+                        reason=(
+                            "candidate overrides the vendor for this model type; "
+                            f"target real-weight C1/C2 pending for {candidate.name}"
+                        ),
+                        candidates=[provider.name for provider in overrides],
+                    )
+                )
+                continue
 
         chosen: Optional[Selection] = None
         for source in order:
-            if source == "vendor" and env.has_vendor and vendor is not None:
+            if source == "vendor" and env.has_vendor and vendor is not None and _covers(vendor, manifest):
                 chosen = Selection(
                     capability=capability.value,
                     provider=vendor.name,
@@ -71,7 +154,7 @@ def _select(
                     graphable=vendor.graphable,
                 )
                 break
-            if source == "tileinfer" and ours is not None:
+            if source == "tileinfer" and ours is not None and _covers(ours, manifest):
                 chosen = Selection(
                     capability=capability.value,
                     provider=ours.name,
@@ -85,17 +168,50 @@ def _select(
         if chosen is not None:
             selections.append(chosen)
             continue
+        if allow_candidates:
+            candidates = _candidates(capability, manifest)
+            if candidates:
+                candidate = candidates[0]
+                selections.append(
+                    Selection(
+                        capability=capability.value,
+                        provider=candidate.name,
+                        impl=candidate.impl,
+                        reason=(
+                            "explicit candidate bring-up; the plan is still servable=false "
+                            "until real-weight C1/C2"
+                        ),
+                        source="tileinfer",
+                        graphable=candidate.graphable,
+                    )
+                )
+                gaps.append(
+                    Gap(
+                        capability=capability.value,
+                        required=True,
+                        reason=(
+                            "candidate selected only for an explicit bring-up run; "
+                            f"target real-weight C1/C2 pending for {candidate.name}"
+                        ),
+                        candidates=[provider.name for provider in candidates],
+                    )
+                )
+                continue
         reason = (
             "vllm-ascend is not installed, so no vendor provider exists"
             if not env.has_vendor
             else "vllm-ascend is installed but does not advertise this capability"
         )
+        candidates = _candidates(capability, manifest)
+        if candidates:
+            names = ", ".join(provider.name for provider in candidates)
+            reason += f"; TileInfer candidate(s) implemented but not default until target C1/C2: {names}"
         gaps.append(
             Gap(
                 capability=capability.value,
                 required=True,
                 reason=reason,
-                candidates=[],
+                candidates=[provider.name for provider in candidates],
             )
         )
     return selections, gaps
@@ -105,29 +221,29 @@ def decide(
     manifest: ModelManifest,
     env: Environment,
     policy: str = "vendor_first",
+    allow_candidates: bool = False,
 ) -> Tuple[Plan, GapReport]:
-    """Compute the plan and the gap report from one declaration."""
+    """Compute the plan and the gap report from one declaration.
+
+    ``allow_candidates`` is for an explicit bring-up run.  It selects declared candidates
+    into the plan (so the v3 ``impl_table`` can install them) but keeps the gap required and
+    ``Plan.servable`` false; the bridge still refuses unless its own bring-up override is set.
+    """
     if policy not in POLICIES:
         raise ValueError(f"unknown policy {policy!r}; known: {POLICIES}")
-    selections, gaps = _select(manifest, env, policy)
+    selections, gaps = _select(manifest, env, policy, allow_candidates=allow_candidates)
     servable = not any(g.required for g in gaps)
 
-    # Route O: the declaration names the class that replaces the missing upstream model.
-    # This is a plan row, not a capability: it answers "who owns the model structure" while
-    # the capability rows still answer "who owns each operator/layer".
+    # Route O: the declaration names the module that owns the missing upstream model.
+    # It is a plan field, not a capability row: the capability rows still answer "who owns
+    # each operator/layer".  The model_table seam registers it before vLLM reads the config.
     access = ["plugin_entry", "attn_select", "method_wrap", "graph_hook"]
     if manifest.model_impl:
-        selections.append(
-            Selection(
-                capability="model.arch",
-                provider=manifest.model_impl.split(":", 1)[0],
-                impl=manifest.model_impl,
-                reason="route O: the declaration names the model implementation",
-                source="tileinfer",
-                graphable=False,
-            )
-        )
+        # The vendor has no architecture for this model: the layer must register it, which is
+        # the model_table access point.  Parser registration rides along with it.
         access.append("model_table")
+    if any(selection.source != "vendor" for selection in selections):
+        access.append("impl_table")
 
     # The access points that are actually installed.  ``impl_table`` and ``model_table`` are
     # only listed when the decision selects something that needs them; an unused mechanism
@@ -156,6 +272,10 @@ def decide(
             "dump_every_decode_steps": 500,
         },
         fallback_policy="forbid",
+        model_impl=manifest.model_impl,
+        reasoning_parser=manifest.reasoning_parser,
+        reasoning_parser_impl=manifest.reasoning_parser_impl,
+        servable=servable,
     )
     plan.validate()
 
@@ -169,6 +289,7 @@ def decide(
             f"vendor={env.vllm_ascend or 'missing'}",
             f"device={env.device_type or 'unknown'}",
             "the layer selects implementations; it does not own platform/worker/KV/graph",
+            f"allow_candidates={bool(allow_candidates)}",
         ],
     )
     return plan, report

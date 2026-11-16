@@ -20,8 +20,11 @@ from typing import Any, Dict, List, Mapping, Optional
 
 SCHEMA_VERSION = 1
 
-#: The only mechanisms allowed to be recorded as access points.  The budget is 8; the
-#: project uses 6.  Keeping the closed list here means a plan cannot invent a seventh.
+#: The only mechanisms a plan may name.  This closed list is the real cap: a seventh name is
+#: rejected on read, so a config file cannot invent a mechanism.  Six are defined today;
+#: ``MAX_ACCESS_POINTS`` (8) is the *design* ceiling - reaching 7 or 8 means editing this
+#: dict, adding the install/verify/uninstall probes for the new mechanism, and writing a
+#: reviewed exception.  Deployment only ever selects a subset of what is listed here.
 ACCESS_POINTS: Dict[str, str] = {
     "plugin_entry": "vllm.general_plugins entry point that calls the bridge installer",
     "impl_table": "implementation replacement table (operator/layer dispatch)",
@@ -135,6 +138,16 @@ class Plan:
     access_points: List[str] = field(default_factory=list)
     instrumentation: Dict[str, Any] = field(default_factory=dict)
     fallback_policy: str = "forbid"
+    #: Model implementation and chat-format parser this plan asks the layer to inject
+    #: (copied from the declaration).  Empty strings mean "the vendor serves the model and
+    #: the output is plain text".
+    model_impl: str = ""
+    reasoning_parser: str = ""
+    reasoning_parser_impl: str = ""
+    #: The decision's gap report verdict.  Stored in the plan so the bridge cannot install a
+    #: provider for a model the decision already called unservable; older plan files that predate
+    #: this field load as ``True`` for compatibility.
+    servable: bool = True
     plan_id: str = ""
     created_at: str = ""
     schema_version: int = SCHEMA_VERSION
@@ -154,6 +167,10 @@ class Plan:
             "selections": [s.as_dict() for s in self.selections],
             "access_points": sorted(self.access_points),
             "fallback_policy": self.fallback_policy,
+            "model_impl": self.model_impl,
+            "reasoning_parser": self.reasoning_parser,
+            "reasoning_parser_impl": self.reasoning_parser_impl,
+            "servable": self.servable,
         }
         blob = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(blob).hexdigest()[:16]
@@ -179,6 +196,11 @@ class Plan:
             )
         if len(set(self.access_points)) != len(self.access_points):
             raise ValueError("plan lists an access point twice")
+        if (
+            any(s.source != "vendor" for s in self.selections)
+            and "impl_table" not in self.access_points
+        ):
+            raise ValueError("non-vendor selections require the impl_table access point")
         seen = set()
         for selection in self.selections:
             if selection.capability in seen:
@@ -200,6 +222,10 @@ class Plan:
             "access_points": list(self.access_points),
             "instrumentation": dict(self.instrumentation),
             "fallback_policy": self.fallback_policy,
+            "model_impl": self.model_impl,
+            "reasoning_parser": self.reasoning_parser,
+            "reasoning_parser_impl": self.reasoning_parser_impl,
+            "servable": bool(self.servable),
         }
 
     @classmethod
@@ -214,6 +240,10 @@ class Plan:
             "access_points",
             "instrumentation",
             "fallback_policy",
+            "model_impl",
+            "reasoning_parser",
+            "reasoning_parser_impl",
+            "servable",
         }
         unknown = sorted(set(data) - known)
         if unknown:
@@ -225,6 +255,10 @@ class Plan:
             access_points=list(data.get("access_points", [])),
             instrumentation=dict(data.get("instrumentation", {})),
             fallback_policy=str(data.get("fallback_policy", "forbid")),
+            model_impl=str(data.get("model_impl", "")),
+            reasoning_parser=str(data.get("reasoning_parser", "")),
+            reasoning_parser_impl=str(data.get("reasoning_parser_impl", "")),
+            servable=bool(data.get("servable", True)),
             plan_id=str(data.get("plan_id", "")),
             created_at=str(data.get("created_at", "")),
             schema_version=int(data.get("schema_version", SCHEMA_VERSION)),
