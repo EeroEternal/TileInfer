@@ -67,8 +67,8 @@ v3 provider `tileinfer/providers/nemotron/mamba2.py` 补齐 prefill conv 后，�
 不带 `--enforce-eager` 启动，NPU 2，`capture` 成功；`max-num-seqs=1` 捕获 2 张，
 `max-num-seqs=4` 捕获 6 张（PIECEWISE 3 + FULL 3）。
 
-一次带 `TILEINFER_GRAPH_DEBUG=1` 的只读观测（打印 dispatch，不改变选择）在 32-token 请求后
-给出真实 decode 计数：
+把 plan 的 `instrumentation.dump_every_decode_steps` 设为 1（只改落盘频率，不改实现选择），
+32-token 请求后 metrics 直接给出真实 decode 计数：
 
 ```json
 {"capture_calls":1,"captured_graphs":2,"capture_keys":{"PIECEWISE":1,"FULL":1},
@@ -79,9 +79,8 @@ v3 provider `tileinfer/providers/nemotron/mamba2.py` 补齐 prefill conv 后，�
 
 `decode_calls=31` 全部命中图，`decode_fallbacks=0`；`none_after_capture=1` 是 prefill/非 uniform
 诊断，不是被判定为回退。**结论：短稳态 C3 通过（capture + replay + 0 fallback）。**
-注意：非 debug 运行的 metrics 文件只在捕获时落盘（`decode_calls` 仍显示 0），
-要读真实计数需在请求中/进程退出时 dump，或加 `TILEINFER_GRAPH_DEBUG`。长期压测和并发下的
-回退率仍未覆盖。
+默认 `dump_every_decode_steps=500` 时文件只在捕获时落盘（`decode_calls` 仍显示 0），
+不能据此判 C3 失败；本次用 1 的频率取到了真实计数。长期压测和并发下的回退率仍未覆盖。
 
 另外，加入 speculative `causal_conv1d_update` 的 host 循环后图捕获曾失败
 （`Synchronizing a stream failed ... stream is captured`）；改为单 token 向量化快路径后捕获取回，
