@@ -340,7 +340,9 @@ vllm serve "$SHIM" \
 - 图捕获/回退留证；
 - 若 `num_nextn_predict_layers=0` 或权重无 MTP：**停止**，记录“无 MTP”，不用 ngram 代替。
 
-**2026-11-16 真权重结果：MTP 质量门失败。** 服务能起（`NemotronHMTPModel`、drafter 加载，
+**2026-11-16 真权重结果：MTP 质量门失败。** 隔离过：跳过 `selective_state_update`、跳过
+`causal_conv1d_update`、`--no-async-scheduling` 三种情况输出都不变，所以不是这两个补丁单独导致；
+问题在 MTP draft/验证链。服务能起（`NemotronHMTPModel`、drafter 加载，
 drafts=14 / accepted=8），但同 prompt、greedy 下输出与非 MTP 不同：
 MTP ` Paris.</think>Paris is the capital of France.`，非 MTP
 ` Paris.  \nThe capital of Germany is Berlin.  \nThe capital of`。

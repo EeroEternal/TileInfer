@@ -147,6 +147,13 @@ MTP 的 varlen 仍走逐 token 循环。
   非 MTP 输出 ` Paris.  \nThe capital of Germany is Berlin.  \nThe capital of`；
 - 两次 MTP 结果确定，但不是非 MTP 的 greedy 结果。speculative decoding 应当无损；
   当前 MTP 路径不满足这一条。
+- 隔离实验（都保持 fresh `VLLM_CACHE_ROOT`，只改一个变量）：
+  1. 临时跳过 `selective_state_update` 绑定、走厂商 state 更新：输出仍是
+     ` Paris.</think>Paris is the capital of France.`；
+  2. 临时跳过 `causal_conv1d_update` 绑定、走厂商 conv 更新：输出仍是同一串；
+  3. `--no-async-scheduling`：`Asynchronous scheduling is disabled`，输出仍相同
+     （drafts=7 / accepted=4）。
+  因此**不是我们补的 state / conv update 单独导致的**；差异在 MTP 的 draft/验证链。
 
 已补的 `selective_state_update` / `causal_conv1d_update` 多 token 重放没有修复该差异，
 因此**不是我们的 state/conv 补丁单独能解释的**；在查清 MTP 验证链之前，MTP 质量门判失败，
