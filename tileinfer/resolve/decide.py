@@ -69,8 +69,15 @@ def _covers(provider, manifest: ModelManifest) -> bool:
     capability.  Unknown cover keys are ignored here; they are evidence metadata, not
     routing keys.
     """
-    wanted = provider.covers.get("mixer") if provider is not None else None
-    return wanted is None or wanted in manifest.mixer_kinds
+    if provider is None:
+        return True
+    wanted_mixer = provider.covers.get("mixer")
+    if wanted_mixer is not None and wanted_mixer not in manifest.mixer_kinds:
+        return False
+    wanted_model = provider.covers.get("model_type")
+    if wanted_model is not None and wanted_model != manifest.model_type:
+        return False
+    return True
 
 
 def _select(
@@ -151,6 +158,8 @@ def decide(
         # The vendor has no architecture for this model: the layer must register it, which is
         # the model_table access point.  Parser registration rides along with it.
         access.append("model_table")
+    if any(selection.source != "vendor" for selection in selections):
+        access.append("impl_table")
     for name in access:
         assert name in ACCESS_POINTS
 
@@ -178,6 +187,7 @@ def decide(
         model_impl=manifest.model_impl,
         reasoning_parser=manifest.reasoning_parser,
         reasoning_parser_impl=manifest.reasoning_parser_impl,
+        servable=servable,
     )
     plan.validate()
 

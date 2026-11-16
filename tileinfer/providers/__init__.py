@@ -1,28 +1,24 @@
 """L4 - implementation providers.
 
-Empty, and empty is the correct state here: every capability Qwen3.6 declares is served by
-vllm-ascend, so there is no gap to fill.  A provider is written only when the vendor cannot
-use a capability at all - cannot run it, cannot run it correctly, or cannot run it at a shape
-we need (``docs/extending.md`` §3.0).  Serving a capability the vendor already serves is not
-a gap, and re-implementing it is the cost v2 already paid for 2.53x TPOT.
+A provider is written only when the vendor cannot use a capability at all, cannot run it
+correctly, or cannot run it at the shape we need (``docs/extending.md`` §3.0).  Serving a
+capability the vendor already serves is not a gap, and re-implementing it is the cost v2
+already paid.
 
-A provider lands here only with the five declarations from ``docs/extending.md`` §3
-(coverage, graphability, parallelism, evidence, delete condition).  ``measured_ratio`` is
-optional - it exists only when the arm this provider replaces still runs - but ``evidence``
-is not: without it the entry is a candidate, not a default.
+Providers here are implementations plus their five declarations (coverage, graphability,
+parallelism, evidence, delete condition).  They import torch and the capability contracts,
+never vLLM or vllm-ascend; installation belongs to ``tileinfer.bridge``.
 
-The v2 operator families under ``tileinfer/vllm/ops`` are *reference material* for answering
-"is the vendor really unable to do this on this shape?", not providers: they are written
-against the v2 KV layout, and one becomes a provider only when a concrete model needs a shape
-the vendor rejects.
+The v2 operator tree under ``tileinfer/vllm/ops`` is frozen.  Its modules are compatibility
+shims that re-export these providers where needed; v3 code must not import from that tree.
 """
 
 from __future__ import annotations
 
-from .mamba2 import MAMBA2_STATE
+from .nemotron import CANDIDATES, MAMBA2_STATE, NEMOTRON_MOE
 
 #: Declared candidates, not defaults.  ``resolve.decide.TILEINFER_PROVIDERS`` stays empty until
-#: the candidate has target real-weight C1/C2 evidence; see ``docs/extending.md`` §3.
-CANDIDATE_PROVIDERS = (MAMBA2_STATE,)
+#: a candidate has target real-weight C1/C2 evidence; see ``docs/extending.md`` §3.
+CANDIDATE_PROVIDERS = CANDIDATES
 
-__all__ = ["MAMBA2_STATE", "CANDIDATE_PROVIDERS"]
+__all__ = ["MAMBA2_STATE", "NEMOTRON_MOE", "CANDIDATE_PROVIDERS"]

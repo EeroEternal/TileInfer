@@ -110,5 +110,12 @@
     "result": "chunk output and per-sequence final states match the scalar recurrence; tolerance 1e-3 relative, 1e-4 absolute",
     "caveat": "CPU reference check, not target weights"
   },
-  "superseded_note": "The 5/14 weight statement in the original note is historical; real-weight evidence is docs/notes/m5-nemotron-real-weights.json."
+  "superseded_note": "The 5/14 weight statement in the original note is historical; real-weight evidence is docs/notes/m5-nemotron-real-weights.json.",
+  "migrated_to_v3": {
+    "mamba2": "tileinfer.providers.nemotron.mamba2",
+    "non_gated_moe": "tileinfer.providers.moe",
+    "moe_guard": "tileinfer.bridge.nemotron_moe",
+    "installer": "tileinfer.bridge.impl_table (plan-driven)",
+    "note": "The historical evidence below was produced before the v3 migration; paths named there are v2-era locations."
+  }
 }

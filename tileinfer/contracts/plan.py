@@ -141,6 +141,10 @@ class Plan:
     model_impl: str = ""
     reasoning_parser: str = ""
     reasoning_parser_impl: str = ""
+    #: The decision's gap report verdict.  Stored in the plan so the bridge cannot install a
+    #: provider for a model the decision already called unservable; older plan files that predate
+    #: this field load as ``True`` for compatibility.
+    servable: bool = True
     plan_id: str = ""
     created_at: str = ""
     schema_version: int = SCHEMA_VERSION
@@ -163,6 +167,7 @@ class Plan:
             "model_impl": self.model_impl,
             "reasoning_parser": self.reasoning_parser,
             "reasoning_parser_impl": self.reasoning_parser_impl,
+            "servable": self.servable,
         }
         blob = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(blob).hexdigest()[:16]
@@ -188,6 +193,11 @@ class Plan:
             )
         if len(set(self.access_points)) != len(self.access_points):
             raise ValueError("plan lists an access point twice")
+        if (
+            any(s.source != "vendor" for s in self.selections)
+            and "impl_table" not in self.access_points
+        ):
+            raise ValueError("non-vendor selections require the impl_table access point")
         seen = set()
         for selection in self.selections:
             if selection.capability in seen:
@@ -212,6 +222,7 @@ class Plan:
             "model_impl": self.model_impl,
             "reasoning_parser": self.reasoning_parser,
             "reasoning_parser_impl": self.reasoning_parser_impl,
+            "servable": bool(self.servable),
         }
 
     @classmethod
@@ -229,6 +240,7 @@ class Plan:
             "model_impl",
             "reasoning_parser",
             "reasoning_parser_impl",
+            "servable",
         }
         unknown = sorted(set(data) - known)
         if unknown:
@@ -243,6 +255,7 @@ class Plan:
             model_impl=str(data.get("model_impl", "")),
             reasoning_parser=str(data.get("reasoning_parser", "")),
             reasoning_parser_impl=str(data.get("reasoning_parser_impl", "")),
+            servable=bool(data.get("servable", True)),
             plan_id=str(data.get("plan_id", "")),
             created_at=str(data.get("created_at", "")),
             schema_version=int(data.get("schema_version", SCHEMA_VERSION)),

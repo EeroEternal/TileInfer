@@ -194,28 +194,26 @@ def install_config_gate(plan: Any) -> SeamResult:
 
 
 def install_impl_table(plan: Any) -> SeamResult:
-    """Apply the plan's non-vendor operator selections through vLLM's CustomOp table.
+    """Install the plan's non-vendor providers through the v3 ``impl_table`` seam.
 
-    A vendor selection is a no-op: the vendor already installed its own implementations and
-    re-registering the same class would be the "same-name assertion" trap from
-    ``docs/integration.md`` §6.  An empty table is the expected steady state on Qwen3.6.
+    The plan is authoritative: no plan, no ``impl_table`` access point, or no non-vendor
+    selection means no operator write.  The v2 ``install_ops`` table is deliberately not
+    imported; its implementations now live under ``tileinfer.providers``.
     """
     if plan is None:
         return SeamResult("impl_table", False, "no plan")
-    non_vendor = [s for s in plan.selections if s.source != "vendor"]
-    if not non_vendor:
-        return SeamResult("impl_table", True, "no non-vendor selections (vendor table kept)")
     try:
-        from vllm.model_executor.custom_op import CustomOp  # noqa: F401
-    except Exception as exc:
-        return SeamResult("impl_table", False, f"CustomOp unavailable: {exc}")
-    # Providers are added here once they expose a vendor-compatible class form.  Refusing to
-    # guess is deliberate: a wrong entry here is a silent numerical bug.
-    return SeamResult(
-        "impl_table",
-        False,
-        f"{len(non_vendor)} non-vendor selections have no registered class form yet",
-    )
+        from .impl_table import install as install_providers
+
+        report = install_providers(plan)
+    except Exception as exc:  # noqa: BLE001 - a failed provider must not aborts the bridge
+        return SeamResult(
+            "impl_table", False, f"provider table failed: {type(exc).__name__}: {exc}"
+        )
+    detail = report.summary()
+    if report.failed:
+        detail += " | " + "; ".join(f"{k}: {v}" for k, v in report.failed.items())
+    return SeamResult("impl_table", report.ok, detail)
 
 
 def install_model_table(plan: Any) -> SeamResult:
@@ -361,16 +359,35 @@ def install_op_audit(path: str) -> Dict[str, Any]:
 def install_all(plan: Any) -> Dict[str, Any]:
     """Install the seams named by the plan.  Returns a report; never raises."""
     report: Dict[str, Any] = {"seams": [], "ok": True}
-    results = [
-        install_config_gate(plan),
-        install_graph_hook(),
-        install_attention_selector(plan),
-        install_impl_table(plan),
-        install_model_table(plan),
-        install_method_wrappers(plan),
+    access = set(getattr(plan, "access_points", ()) or ())
+    results = []
+    # Every mechanism is independent and is installed only when the plan names it.  The
+    # plugin entry itself is the caller; ``method_wrap`` carries the config gate.
+    if "method_wrap" in access:
+        results.append(install_config_gate(plan))
+    if "graph_hook" in access:
+        results.append(install_graph_hook())
+    if "attn_select" in access:
+        results.append(install_attention_selector(plan))
+    non_vendor = [
+        s
+        for s in getattr(plan, "selections", ())
+        if getattr(s, "source", "vendor") != "vendor"
     ]
+    if non_vendor and "impl_table" not in access:
+        results.append(
+            SeamResult(
+                "impl_table",
+                False,
+                "non-vendor selections but no impl_table access point; "
+                "refusing silent vendor fallback",
+            )
+        )
+    elif "impl_table" in access:
+        results.append(install_impl_table(plan))
+    if "model_table" in access:
+        results.append(install_model_table(plan))
     report["seams"] = [r.as_dict() for r in results]
-    report["ok"] = all(
-        r.ok for r in results if r.name in {"config_gate", "graph_hook", "attn_select"}
-    )
+    critical = {"config_gate", "graph_hook", "attn_select", "impl_table"}
+    report["ok"] = all(r.ok for r in results if r.name in critical)
     return report

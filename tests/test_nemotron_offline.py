@@ -460,6 +460,8 @@ def test_a_mamba2_provider_with_the_right_covers_can_fill_state_linear(monkeypat
     assert selected is not None
     assert selected.source == "tileinfer"
     assert report.servable is True
+    assert plan.servable is True
+    assert "impl_table" in plan.access_points
 
 
 def test_no_vendor_decision_reports_all_gaps_without_hardware(tmp_path: Path) -> None:
@@ -522,7 +524,7 @@ def test_nemotron_static_audit_is_read_only_and_reports_unknowns(tmp_path: Path)
 
 
 def test_nemotron_h_config_alias_is_resolvable_by_autoconfig(tmp_path: Path) -> None:
-    from tileinfer.vllm.config_compat import register_nemotron_h_alias
+    from tileinfer.bridge.nemotron_config import register_nemotron_h_alias
 
     info = register_nemotron_h_alias()
     if not info["registered"]:
@@ -555,7 +557,7 @@ def test_raw_layers_block_type_is_normalised_before_vllm_config_init(tmp_path: P
     ``AttributeError: property 'layers_block_type' ... has no setter``; the adapter must convert it
     before the vendor class sees it.
     """
-    from tileinfer.vllm.config_compat import register_nemotron_h_alias
+    from tileinfer.bridge.nemotron_config import register_nemotron_h_alias
 
     info = register_nemotron_h_alias()
     if not info["registered"]:
@@ -606,7 +608,9 @@ def test_state_linear_gap_reports_the_implemented_candidate() -> None:
         device_type="A5",
         has_vendor=True,
     )
-    _, report = decide(NEMOTRON_3_5_DRAFT, env, policy="vendor_first")
+    plan, report = decide(NEMOTRON_3_5_DRAFT, env, policy="vendor_first")
+    assert plan.servable is False
+    assert "impl_table" not in plan.access_points
     gap = next(g for g in report.gaps if g.capability == "state.linear")
     assert gap.required is True
     assert gap.candidates == ["tileinfer.mamba2_state"]

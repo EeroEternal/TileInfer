@@ -37,7 +37,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from tileinfer.vllm.ops import moe as moe_ops
+from tileinfer.providers import moe as moe_ops
 
 FP32_TOL = dict(rtol=1e-5, atol=1e-5)
 BF16_TOL = dict(rtol=2e-2, atol=2e-2)

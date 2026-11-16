@@ -67,5 +67,6 @@
     "evidence": "m5-nemotron-target-graph.json",
     "result": "without --enforce-eager the same target dummy captured PIECEWISE 1 + FULL 1, used 2.68 GiB graph memory, and logged Replaying aclgraph",
     "caveat": "dummy weights; decode-call counter did not advance, so this is not full C3"
-  }
+  },
+  "v3_migration_note": "Historical dummy run used the v2 op installer; the implementation now lives under tileinfer.providers and is installed by tileinfer.bridge.impl_table from the plan. The dummy result is still not C1/C2/C3 evidence."
 }

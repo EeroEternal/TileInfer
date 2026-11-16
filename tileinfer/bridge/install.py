@@ -137,7 +137,7 @@ def install() -> bool:
         try:
             # Runs before ModelConfig regardless of which model the plan names.  The alias
             # is a no-op when vLLM already registers it; a failure is reported, never raised.
-            from tileinfer.vllm.config_compat import register_nemotron_h_alias
+            from tileinfer.bridge.nemotron_config import register_nemotron_h_alias
 
             _STATUS["configs"] = register_nemotron_h_alias()
         except Exception as exc:  # noqa: BLE001 - optional compatibility aid
@@ -171,34 +171,9 @@ def install() -> bool:
             report = seams.install_all(plan)
             _STATUS["seams"] = report["seams"]
 
-            # Operator table.  The bridge entry point is what the API server loads; without this
-            # call the Mamba2 records in the op table would exist but never be bound (the old
-            # vllm plugin entry point installed them, the bridge did not).  A failure is recorded
-            # and does not stop the vendor seams: the target simply stays on the vendor kernel and
-            # its own error remains the evidence.
-            try:
-                from tileinfer.vllm.ops.install import install_ops
-
-                ops = install_ops()
-                failed = list(ops.patches.failed) if ops.patches else []
-                _STATUS["ops"] = {
-                    "ok": not failed,
-                    "bound": list(ops.bound),
-                    "unbound": list(ops.unbound),
-                    "disabled": list(ops.disabled),
-                    "failed": failed,
-                    "summary": ops.summary(),
-                }
-                if failed:
-                    logger.warning(
-                        "TileInfer v3 bridge: operator table has failed patches: %s",
-                        ",".join(failed),
-                    )
-                else:
-                    logger.info("TileInfer v3 bridge: %s", ops.summary())
-            except Exception as exc:  # never let an op-table problem break config load
-                _STATUS["ops"] = {"ok": False, "detail": f"{type(exc).__name__}: {exc}"}
-                logger.exception("TileInfer v3 bridge: operator table install failed")
+            # Operator installation is part of the ``impl_table`` seam and is driven by the
+            # plan.  There is deliberately no global v2 operator-install call here: the v2
+            # operator table is frozen and the v3 providers are installed only when selected.
 
             # Diagnostic, off unless asked for: which implementation each op instance got.
             audit_path = _audit_path()
@@ -207,9 +182,8 @@ def install() -> bool:
                     _STATUS["audit"] = seams.install_op_audit(audit_path)
                 except Exception as exc:  # never let a diagnostic break the install
                     _STATUS["audit"] = {"ok": False, "detail": f"{type(exc).__name__}: {exc}"}
-            # Critical seams (config gate, graph hook, attention selector) must all be in
-            # place; a partial install is reported as failure so `doctor` and the caller see
-            # it, even though the hooks that did install remain harmless.
+            # Critical seams (config gate, graph hook, attention selector, and a requested
+            # provider table) must all be in place; a partial install is reported as failure.
             _STATUS["installed"] = bool(report["ok"])
             _INSTALLED = bool(report["ok"])
 

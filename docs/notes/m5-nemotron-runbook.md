@@ -87,7 +87,7 @@ PY
 
 vLLM 0.23.0 自带 `NemotronHConfig`，但它的 `_CONFIG_REGISTRY` 没有 `nemotron_h` 项；
 Transformers 4.57 下 `ModelConfig` 会在模型代码之前直接失败。TileInfer 的 bridge 在
-`ModelConfig` 之前注册 vLLM 自带的类（`tileinfer/vllm/config_compat.py`），不修改上游源码。
+`ModelConfig` 之前注册 vLLM 自带的类（`tileinfer/bridge/nemotron_config.py`），不修改上游源码。
 如果 bridge 被 `TILEINFER_V3=0` 关闭，这个别名不会注册；因此目标服务不要关 bridge。
 
 ### 1.3 目标 plan（不注册 draft）
@@ -149,7 +149,7 @@ echo $! > /tmp/m5-nemotron.pid
   `CompilationError` / `AttributeError('NoneType' object has no attribute 'type')`，Ascend 后端
   报 `Currently ptr type from different source not supported`；服务未监听 `/health`。证据
   [`m5-nemotron-tiny-mamba2.json`](m5-nemotron-tiny-mamba2.json)。
-- **替换后**：`tileinfer/vllm/ops/mamba2.py` 实现 `mamba_chunk_scan_combined_varlen` 和
+- **替换后**：`tileinfer/providers/nemotron/mamba2.py` 实现 `mamba_chunk_scan_combined_varlen` 和
   `selective_state_update`；op table 在 `ssd_combined`、`mamba_mixer2`、`ssu_dispatch` 三处
   绑定。2 层 `M*` 合成模型启动成功，`/health` 200，chat completion 返回 8 token
   （`chatcmpl-90bbd5d4088b9a52`）。
@@ -234,6 +234,11 @@ curl -sS "http://127.0.0.1:$PORT/v1/completions" \
 `--atol` 容差判定并在 JSON 里单独列出 strict/tie-aware 结果。C2 未通过前不得把候选
 `tileinfer.mamba2_state` 登记为默认，也不得把 plan 改成 `servable=true`。
 
+v3 bridge 的安装条件同样是硬性的：plan 必须有 `impl_table` 接入点、非厂商 selection，且
+`servable=true`；当前目标的 plan 是 `servable=false`，bridge 会拒绝安装 Mamba2 候选并保留
+厂商路径，而不是"先装上再说"。只有显式 `TILEINFER_ALLOW_UNSERVABLE=1` 的 bring-up 运行
+可以覆盖，且日志会标注。
+
 > 参考是本机 HF/CPU，不是厂商/vLLM 基线；不要用另一个 vLLM 场景的绝对值当参考。
 
 ---
@@ -244,7 +249,7 @@ curl -sS "http://127.0.0.1:$PORT/v1/completions" \
 > 在真权重下拿到 `captured_graphs > 0` 且稳态 `fallbacks = 0` 前，C3 保持未验证。
 >
 > 合成 `M*E` 的首次图捕获实测（端口 18084，无 `--enforce-eager`）在 PIECEWISE 0/1 阶段失败：
-> `aclnnNonzero` 错误码 107027，位置 `tileinfer/vllm/ops/moe.py:1010`
+> `aclnnNonzero` 错误码 107027，位置 `tileinfer/providers/moe.py`（原 v2 位置 `tileinfer/vllm/ops/moe.py:1010`，已迁移）
 > （`(local < 0).nonzero(...)`）。这说明**非门控 MoE 的数据依赖路径先于 Mamba2 断图**。
 >
 > 随后把非门控 MoE 改成 `npu_grouped_matmul`（按 local expert 排序，不再 `unique/nonzero/tolist`），
@@ -272,7 +277,7 @@ curl -sS "http://127.0.0.1:$PORT/v1/completions" \
 > 的 CPU 参考一致性测试（64 头 × 64 head_dim × 128 state × 8 组，非 chunk 对齐的 varlen：
 > 37/53 token），这仍不是真权重 C2。
 >
-> `tileinfer/providers/mamba2.py` 已声明 `tileinfer.mamba2_state` 候选（`covers={"mixer":
+> `tileinfer/providers/nemotron/__init__.py` 已声明 `tileinfer.mamba2_state` 候选（`covers={"mixer":
 > "mamba2"}`、graphable、证据编号 `m5-nemotron-mamba2-ops`），但**没有**注册进决策表；gap 报告会
 > 列出这个候选并注明“not default until target C1/C2”。这是“已实现、待真权重证据”，不是阻塞项。
 

@@ -53,8 +53,8 @@ def main() -> int:
         if "mamba_mixer2" in _read(path) or "ssd_combined" in _read(path)
     ]
     project = Path(__file__).resolve().parents[2]
-    ti_mamba = project / "tileinfer/vllm/ops/mamba2.py"
-    ti_moe = project / "tileinfer/vllm/ops/moe_guard.py"
+    ti_mamba = project / "tileinfer/providers/nemotron/mamba2.py"
+    ti_moe = project / "tileinfer/bridge/nemotron_moe.py"
 
     checks = [
         {
@@ -141,7 +141,7 @@ def main() -> int:
             "id": "tileinfer_non_gated_moe",
             "ok": ti_moe.is_file()
             and "install_ascend_non_gated_experts" in _read(ti_moe)
-            and "relu2_no_mul" in _read(project / "tileinfer/vllm/ops/moe.py"),
+            and "relu2_no_mul" in _read(project / "tileinfer/providers/moe.py"),
             "evidence": str(ti_moe) if ti_moe.is_file() else "",
             "meaning": (
                 "TileInfer routes non-gated relu2 experts through fused_experts on Ascend; "

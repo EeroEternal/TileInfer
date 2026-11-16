@@ -37,8 +37,8 @@ from typing import Any, Dict, Optional
 import pytest
 import torch
 
-from tileinfer.vllm.ops import fused_moe_oot
-from tileinfer.vllm.ops import moe as moe_ops
+from tileinfer.providers import fused_moe_oot
+from tileinfer.providers import moe as moe_ops
 from tileinfer.vllm.ops.families import gdn_moe
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]

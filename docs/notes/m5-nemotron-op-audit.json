@@ -79,5 +79,6 @@
     },
     "registered_as_default": false,
     "reason": "target real-weight C1/C2 not run; nine shards absent"
-  }
+  },
+  "v3_migration_note": "Historical audit paths point at the frozen v2 modules; the canonical implementations are tileinfer.providers.nemotron.mamba2 / tileinfer.providers.moe."
 }

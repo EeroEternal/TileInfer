@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import torch
 
-from tileinfer.vllm.ops.mamba2 import mamba_chunk_scan_combined_varlen, selective_state_update
+from tileinfer.providers.nemotron.mamba2 import mamba_chunk_scan_combined_varlen, selective_state_update
 
 
 def _scalar_chunk(x, dt, A, B, C, D, dt_bias, state, group_ratio):
