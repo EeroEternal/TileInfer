@@ -147,6 +147,10 @@ def decide(
     # only listed when the decision selects something that needs them; an unused mechanism
     # in the budget would be noise, not capability.
     access = ["plugin_entry", "attn_select", "method_wrap", "graph_hook"]
+    if manifest.model_impl:
+        # The vendor has no architecture for this model: the layer must register it, which is
+        # the model_table access point.  Parser registration rides along with it.
+        access.append("model_table")
     for name in access:
         assert name in ACCESS_POINTS
 
@@ -171,6 +175,9 @@ def decide(
             "dump_every_decode_steps": 500,
         },
         fallback_policy="forbid",
+        model_impl=manifest.model_impl,
+        reasoning_parser=manifest.reasoning_parser,
+        reasoning_parser_impl=manifest.reasoning_parser_impl,
     )
     plan.validate()
 

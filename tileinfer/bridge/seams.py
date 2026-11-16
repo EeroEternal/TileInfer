@@ -26,7 +26,8 @@ The six mechanisms and where each lives:
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
+import importlib
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import metrics
 
@@ -218,8 +219,49 @@ def install_impl_table(plan: Any) -> SeamResult:
 
 
 def install_model_table(plan: Any) -> SeamResult:
-    """Reserve the model-table seam; Qwen3.6 is a vendor-served model, so it is empty."""
-    return SeamResult("model_table", True, "no model replacement requested")
+    """Register the model (and its chat parser) when the declaration names one.
+
+    A vendor-served model leaves both fields empty and this seam is a no-op.  A model the
+    vendor lacks (MuseGlimmer is the first) ships its implementation in this repository:
+    ``plan.model_impl`` names a module with the ``register_config`` / ``register_models``
+    actors, and ``plan.reasoning_parser`` / ``reasoning_parser_impl`` name the chat-format
+    parser to register under vLLM's parser manager.  Imports and registrations are reported,
+    never raised: a broken optional model must not stop a vendor-served boot.
+    """
+    spec = str(getattr(plan, "model_impl", "") or "").strip()
+    parser = str(getattr(plan, "reasoning_parser", "") or "").strip()
+    parser_impl = str(getattr(plan, "reasoning_parser_impl", "") or "").strip()
+    if not spec and not parser:
+        return SeamResult("model_table", True, "no model replacement requested")
+
+    details: List[str] = []
+    if spec:
+        try:
+            module = importlib.import_module(spec)
+        except Exception as exc:  # noqa: BLE001 - report, never raise from a seam
+            return SeamResult("model_table", False, f"cannot import {spec!r}: {exc!r}")
+        for actor in ("register_config", "register_models"):
+            fn = getattr(module, actor, None)
+            if fn is None:
+                continue
+            try:
+                result = fn()
+            except Exception as exc:  # noqa: BLE001
+                return SeamResult("model_table", False, f"{spec}.{actor} raised {exc!r}")
+            details.append(f"{actor}: {result}")
+    if parser and parser_impl:
+        try:
+            from vllm.reasoning import ReasoningParserManager
+
+            module_name, _, class_name = parser_impl.partition(":")
+            parser_cls = getattr(importlib.import_module(module_name), class_name)
+            # 0.23's register_module takes the class as a KEYWORD; positionally it lands in
+            # ``force`` and raises.
+            ReasoningParserManager.register_module(parser, module=parser_cls)
+            details.append(f"parser {parser!r} registered")
+        except Exception as exc:  # noqa: BLE001
+            return SeamResult("model_table", False, f"parser registration failed: {exc!r}")
+    return SeamResult("model_table", True, "; ".join(details) or "nothing to register")
 
 
 def install_method_wrappers(plan: Any) -> SeamResult:

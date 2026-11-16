@@ -37,12 +37,21 @@ class AttentionSpec:
     output_gate: bool = False
     rope: str = "mrope"
     partial_rotary_factor: float = 1.0
+    #: Sliding-window width (tokens visible to a query, including itself).  Set when the
+    #: layer sequence contains ``sliding_attention`` layers; ``None`` means every attention
+    #: layer sees the whole history.
+    sliding_window: Optional[int] = None
+    #: Layer indices with no rotary embedding (iRoPE: the global layers of MuseGlimmer are
+    #: NoPE).  Empty for ordinary models.
+    rope_disabled_layers: Tuple[int, ...] = ()
 
     def validate(self) -> None:
         if self.num_heads <= 0 or self.num_kv_heads <= 0 or self.head_dim <= 0:
             raise ValueError("attention head counts and head_dim must be positive")
         if self.num_heads % self.num_kv_heads:
             raise ValueError("num_heads must be a multiple of num_kv_heads (GQA grouping)")
+        if self.sliding_window is not None and self.sliding_window < 1:
+            raise ValueError("sliding_window must be a positive token count")
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -53,6 +62,8 @@ class AttentionSpec:
             "output_gate": self.output_gate,
             "rope": self.rope,
             "partial_rotary_factor": self.partial_rotary_factor,
+            "sliding_window": self.sliding_window,
+            "rope_disabled_layers": list(self.rope_disabled_layers),
         }
 
 
@@ -178,6 +189,14 @@ class ModelManifest:
     kv: Dict[str, Any] = field(default_factory=dict)
     required_capabilities: Tuple[str, ...] = ()
     benchmark: Dict[str, Any] = field(default_factory=dict)
+    #: Dotted module path of the model implementation this repository supplies when the
+    #: vendor has no architecture for it (``register_config`` / ``register_models`` actors).
+    #: Empty means "the vendor already serves the model".
+    model_impl: str = ""
+    #: CLI name and ``module:Class`` path of the reasoning/chat-format parser, when the
+    #: checkpoint speaks a private channel protocol (``--reasoning-parser <name>``).
+    reasoning_parser: str = ""
+    reasoning_parser_impl: str = ""
     source: str = "docs/notes/op-coverage-qwen36.md"
     schema_version: int = MANIFEST_SCHEMA_VERSION
 
@@ -191,7 +210,15 @@ class ModelManifest:
                 f"layer_types has {len(self.layer_types)} entries for {self.num_layers} layers"
             )
         unknown = sorted(
-            set(self.layer_types) - {"full_attention", "linear_attention", "mamba", "mlp", "moe"}
+            set(self.layer_types)
+            - {
+                "full_attention",
+                "sliding_attention",
+                "linear_attention",
+                "mamba",
+                "mlp",
+                "moe",
+            }
         )
         if unknown:
             raise ValueError(f"unknown layer types {unknown}")
@@ -210,6 +237,15 @@ class ModelManifest:
         ):
             raise ValueError("MoE spec declared but moe.routed is not required")
         self.attention.validate()
+        has_sliding = "sliding_attention" in self.layer_types
+        if has_sliding and self.attention.sliding_window is None:
+            raise ValueError("sliding_attention layers declared but attention.sliding_window is unset")
+        if not has_sliding and self.attention.sliding_window is not None:
+            raise ValueError("attention.sliding_window set but no sliding_attention layer")
+        if has_sliding and Capability.ATTENTION_SLIDING.value not in self.required_capabilities:
+            raise ValueError(
+                "sliding_attention layers require the attention.sliding capability"
+            )
         if self.linear is not None:
             self.linear.validate()
         if self.mamba is not None:
@@ -225,9 +261,13 @@ class ModelManifest:
             raise ValueError("a manifest must declare at least one required capability")
         if self.quantization not in {"none", "fp8", "fp4", "w4a8"}:
             raise ValueError(f"unknown quantization scheme {self.quantization!r}")
-        for key in ("prompt", "max_tokens", "top5"):
-            if key not in self.benchmark:
-                raise ValueError(f"benchmark sample is missing {key!r}")
+        # A declaration may ship before its C2 sample is captured; it then cannot be used for
+        # numeric acceptance, but it can still drive deployment (this is how a brand-new model
+        # is onboarded).  A partially filled sample is an error, never a silent pass.
+        if self.benchmark:
+            for key in ("prompt", "max_tokens", "top5"):
+                if key not in self.benchmark:
+                    raise ValueError(f"benchmark sample is missing {key!r}")
 
     @property
     def mixer_kinds(self) -> Tuple[str, ...]:
@@ -269,6 +309,9 @@ class ModelManifest:
             "kv": dict(self.kv),
             "required_capabilities": list(self.required_capabilities),
             "benchmark": dict(self.benchmark),
+            "model_impl": self.model_impl,
+            "reasoning_parser": self.reasoning_parser,
+            "reasoning_parser_impl": self.reasoning_parser_impl,
             "source": self.source,
         }
         if self.mamba is not None:

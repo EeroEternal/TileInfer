@@ -26,6 +26,7 @@ class Capability(str, Enum):
     """The closed set of capabilities a model declaration may require."""
 
     ATTENTION_FULL = "attention.full"
+    ATTENTION_SLIDING = "attention.sliding"
     ATTENTION_LINEAR = "attention.linear"
     MOE_ROUTED = "moe.routed"
     NORM_RMS = "norm.rms"
@@ -38,6 +39,7 @@ class Capability(str, Enum):
 #: Stable iteration order; used by the plan writer so two runs produce identical files.
 CAPABILITIES: Tuple[Capability, ...] = (
     Capability.ATTENTION_FULL,
+    Capability.ATTENTION_SLIDING,
     Capability.ATTENTION_LINEAR,
     Capability.MOE_ROUTED,
     Capability.NORM_RMS,

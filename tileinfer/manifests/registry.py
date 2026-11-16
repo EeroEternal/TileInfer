@@ -11,12 +11,16 @@ from __future__ import annotations
 from typing import Dict
 
 from ..contracts.manifest import ModelManifest
+from .muse_glimmer import MUSE_GLIMMER
 from .qwen3_6 import QWEN3_6
 
 MANIFESTS: Dict[str, ModelManifest] = {
     QWEN3_6.manifest_id: QWEN3_6,
     QWEN3_6.arch: QWEN3_6,
     QWEN3_6.name: QWEN3_6,
+    MUSE_GLIMMER.manifest_id: MUSE_GLIMMER,
+    MUSE_GLIMMER.arch: MUSE_GLIMMER,
+    MUSE_GLIMMER.name: MUSE_GLIMMER,
 }
 
 

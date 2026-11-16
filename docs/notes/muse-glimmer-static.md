@@ -208,7 +208,30 @@ the vLLM general-plugin load and fails at ModelConfig. The venv's editable dist-
 `entry_points.txt` was hand-restored to the v2 content (console_scripts / vllm.general_plugins /
 vllm.platform_plugins); RECORD hash no longer matches (pip warns, functionality fine).
 
-## v3 mapping (what the code must gain before this runs under the bridge)
+## v3 wiring (DONE 2026-11-13)
+
+The bridge now hosts vendor-absent models end to end:
+
+- Declaration: `manifests/muse_glimmer.py` (52 layers, 39 sliding + 13 NoPE global,
+  window 2048, output gate, `model_impl`, `reasoning_parser`).  Schema gained
+  `attention.sliding`, `sliding_window`, `rope_disabled_layers`, `model_impl`,
+  `reasoning_parser(_impl)`; the C2 benchmark sample became optional (a brand-new model is
+  declared before its sample exists).
+- Decision: with a vendor environment, every capability selects the vendor (including
+  `attention.sliding` -> the same Ascend attention backend, sparse mode 4); the plan adds
+  the `model_table` access point and carries the model/parser injection fields.
+- Seam: `install_model_table` imports `plan.model_impl` and runs its `register_config` /
+  `register_models` actors, then registers the parser under the plan's name — this is what
+  the temporary /tmp plugin did during the probe, now in the bridge.
+- Usage: install the bridge in the vllm-ascend environment and set
+  `TILEINFER_MANIFEST=muse_glimmer` (or write a plan with `tileinfer plan build` and point
+  `TILEINFER_PLAN` at it).  Device re-validation is pending (no card available); the probe
+  already showed the vendor stack serves this model at 37 ms/tok with the parser registered.
+
+Open: the C2 benchmark sample (first-token top-5) is not captured, so numeric acceptance is
+not wired yet.
+
+## v3 mapping (what the code had to gain — reference)
 
 The v3 tree has no landing spot for a model the vendor does not serve. Concretely:
 
