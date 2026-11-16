@@ -1,5 +1,6 @@
 > **SUPERSEDED（2026-11-12）**：本文描述的是 **v2「原生后端」** 定位（不依赖 vllm-ascend、
-> 自带平台层），该定位已被 v3 取代。**不要按本文建目录或改代码。**
+> 自带平台层），该定位已被 v3 取代。**不要按本文建目录或改代码。** v2 代码已归档到
+> `legacy/v2/tileinfer/vllm/`，文中的 `tileinfer/vllm/...` 路径只作历史记录阅读。
 >
 > 现行文档：[`../../architecture.md`](../../architecture.md) ·
 > [`../../integration.md`](../../integration.md) · [`../../status.md`](../../status.md)

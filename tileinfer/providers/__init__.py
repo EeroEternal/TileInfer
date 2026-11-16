@@ -9,8 +9,9 @@ Providers here are implementations plus their five declarations (coverage, graph
 parallelism, evidence, delete condition).  They import torch and the capability contracts,
 never vLLM or vllm-ascend; installation belongs to ``tileinfer.bridge``.
 
-The v2 operator tree under ``tileinfer/vllm/ops`` is frozen.  Its modules are compatibility
-shims that re-export these providers where needed; v3 code must not import from that tree.
+The v2 operator tree was moved to ``legacy/v2/tileinfer/vllm/ops`` on 2026-11-16.  It is not
+importable and has no compatibility shims in the installed package; v3 code must not reference
+``tileinfer.vllm`` at all.
 """
 
 from __future__ import annotations

@@ -2,6 +2,11 @@
 
 > 目标：**只搬不改**。行为一位不变，逻辑一行不动，删除动作全部留到 M1。
 > 这份文档是"新会话可以直接照着做"的程度：每一步有输入、输出、验收门。
+>
+> **2026-11-16 更新：本文是历史计划。** `tileinfer/vllm/` 已整体归档到
+> [`legacy/v2/tileinfer/vllm/`](../legacy/v2/tileinfer/vllm/)；文中所有 `tileinfer/vllm/...`
+> 路径现在都读作 `legacy/v2/tileinfer/vllm/...`。v2 不再可 import、不参与打包/测试。归档记录见
+> [`notes/m1-delete-list.md`](notes/m1-delete-list.md)。
 
 ---
 
@@ -61,18 +66,18 @@
 | **S3 搬 L1 + L2** | `models/dsv41/`、`manifests/`（现 profiles 的两个具体声明）、`resolve/`（profiles.base、candidates、switch、config、flags、buckets、planner） | 声明与决策分开 | G-A / G-B / G-C |
 | **S4 搬 L4** | `providers/`：fla、moe、gdn、extern、fused_moe_oot、families、attention 后端（reference / tilelang） | 实现与声明同目录 | G-A / G-B / G-C |
 | **S5 搬 L5** | `bridge/`：plugin → 入口函数；compat/patches → 接入点；attn/* → 后端适配；doctor → cli | 接入层收敛到一处 | G-A / G-B / G-C |
-| **S6 收尾** | `tileinfer/vllm/` 只留冻结区（platform / worker / platform_dsv41）+ shim；写 M1 删除清单 | 冻结区有注释、无引用 | 全部门 + `grep` 证明冻结区零引用 |
+| **S6 收尾** | `tileinfer/vllm/` 整体归档到 `legacy/v2/`（instead of 只留冻结区）；v2 测试/脚本/benchmark/DSV41 工具一并移出 | ✅ 已完成：`tileinfer.vllm` 不可 import，`pytest tests` 不收集 v2 | 全部门 + `grep` 证明 v3 live 路径零引用 |
 
 顺序理由：**先搬"零依赖"的（S2），最后搬"碰上游"的（S5）**。这样每一步都能独立回滚，
 且越靠后越清楚哪些代码真的需要留在接入层。
 
 > 2026-11-12 的实际推进：S0 基线见 [`notes/m0-baseline.md`](notes/m0-baseline.md)；
 > v3 分层骨架 + 决策 + bridge + 端到端验收见 [`notes/m1-v3-bridge.md`](notes/m1-v3-bridge.md)。
-> v2 冻结区与删除清单见 [`notes/m1-delete-list.md`](notes/m1-delete-list.md)。
+> v2 归档记录见 [`notes/m1-delete-list.md`](notes/m1-delete-list.md)。
 >
 > **S4 已修订**：原计划把 fla / moe / gdn / fused_moe 等整族搬进 `providers/`。按 v3 的
 > "只补缺口"规则（[`extending.md`](extending.md) §3.0），这些是厂商**已经覆盖**的能力，
-> 搬进去等于重做一遍，因此不再搬：它们留在冻结区，按删除清单逐批清理；`providers/`
+> 搬进去等于重做一遍，因此不再搬：它们已整体归档到 `legacy/v2/`；`providers/`
 > 只收厂商确实不能用的实现。所以 S4 的产出从"实现与声明同目录"改成**一张确认清单**：
 > 哪条形状厂商真的用不了。当前结论是"没有"，本层为空。
 
@@ -133,7 +138,7 @@ M0 对这些文件只做两件事：在文件头加 `deprecated` 说明；用 `g
 ## 5. M0 完成的定义
 
 - 新目录存在且**各自只 import 该 import 的东西**（分层禁令在 CI 里能跑）。
-- `tileinfer/vllm/` 只剩冻结区 + shim，且**没有任何新目录引用它**。
+- `tileinfer/vllm/` 已整体归档到 `legacy/v2/`，且**没有任何新目录引用它**。
 - 逐文件测试结果与 S0 基线一致；`ti_trace smoke` 数字在噪声内。
 - `docs/notes/m0-baseline.md` 与 M1 删除清单已写。
 

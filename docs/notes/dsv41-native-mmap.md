@@ -1,5 +1,8 @@
 # 原生 vllm-ascend V4.1-Flash：可回收 mmap 权重 + 逐专家 NZ 方案
 
+> **归档提示（2026-11-16）**：v2 运行时已归档到 `legacy/v2/`；本文的 `tools/dsv41/...`
+> 仍在主树，可继续作为 DSV41 工具阅读。
+
 ## 1. 为什么需要
 
 原生 vLLM 0.30 的 `PrefetchOffloader` 在 `_CpuParamOffloader` 里把每个被

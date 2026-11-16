@@ -1,5 +1,8 @@
 # vLLM 0.23.0 API reference (verified from source, not memory)
 
+> **归档提示（2026-11-16）**：文中 `tileinfer/vllm/...` 路径已整体移动到
+> `legacy/v2/tileinfer/vllm/...`；v2 不再安装、不可 import。vLLM API 事实本身仍有效。
+
 Source: `raw.githubusercontent.com/vllm-project/vllm/v0.23.0/...`, stored in `reference/vllm-0.23/`
 (gitignored, one file per path with `__` as separator). Re-fetch:
 

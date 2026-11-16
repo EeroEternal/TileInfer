@@ -11,7 +11,8 @@
 - **v1** = vllm-ascend 托管时期（2026-10）。那时 TileInfer 是 vllm-ascend 里的一个
   attention backend，走官方图模式。**v1 的数字不是当前后端的数字**，但它是"不低于现网"
   这句话的分母，必须留着。
-- **v2** = 当前的原生 vLLM 后端（`tileinfer/vllm/`）。仍在追赶。
+- **v2** = 已归档的原生 vLLM 后端（源码在 `legacy/v2/tileinfer/vllm/`）。它的数字只作历史
+  A/B 基线，v2 不在安装包内、不可 import；仍在追赶的是 v3。
 - **v3** = 兼容适配层形态（2026-11-12 起）：平台/worker/KV/图捕获归 vllm-ascend，TileInfer
   只做选择与计数。v3 的 M1 数字见 §0.1，**不要和 v1/v2 的表混算**。
 - 数字后面的 **[已核实]** 表示有落盘日志与命令可复现；**[待复核]** 表示只在某次窗口测过，

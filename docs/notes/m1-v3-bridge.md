@@ -15,7 +15,7 @@
 | L0 CLI | `tileinfer/cli/` | `plan build/show/verify`、`doctor` | 否（doctor 通过 probe 读 build info） |
 | L1 声明 | `tileinfer/manifests/` | 模型需要什么：层序列、头数、KV、量化、能力表、oracle | 否 |
 | L2 决策 | `tileinfer/resolve/` | 探测环境 → 纯函数决策 → plan + gap report | 否 |
-| L3 契约 | `tileinfer/contracts/` | 8 类能力协议、plan/manifest/gap 的 schema 与校验 | 否 |
+| L3 契约 | `tileinfer/contracts/` | 9 类能力协议、plan/manifest/gap 的 schema 与校验 | 否 |
 | L4 提供者 | `tileinfer/providers/` | 我们自己的实现（M1 为空） | 否 |
 | L5 桥 | `tileinfer/bridge/` | **唯一**允许 import 上游的层；安装 6 个钩子、计数 | 是 |
 | L6 内核 | `tileinfer/kernels/` | v2 资产，M1 不动 | 否 |

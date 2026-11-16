@@ -86,7 +86,8 @@ class TileLangAscend950Backend(AttentionBackend):
     @classmethod
     def supports_mode(cls, mode: AttentionMode) -> bool:
         """Both modes are served: DECODE through :meth:`finalize_plan`/:meth:`run` (one compiled
-        plan per batch bucket), PREFILL through ``tileinfer.vllm.attn.prefill.PrefillPath``.
+        plan per batch bucket), PREFILL through the v2 ``PrefillPath`` archived under
+        ``legacy/v2/tileinfer/vllm/attn/prefill.py`` (not imported by v3).
 
         PREFILL is *not* plan-backed on purpose.  A prefill step's tile count is
         ``sum_b ceil(qo_len_b * group / block_q)``, which changes with every prompt length; a plan

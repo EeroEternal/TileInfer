@@ -9,7 +9,8 @@ architecture + AutoConfig shim, `atem.py` for the chat parser) and is injected b
 `model_table` seam. Attention, KV management, worker and graph capture are the vendor's
 (vllm-ascend). There is no V2 copy of this model any more: the old
 `tileinfer/vllm/{models/muse_glimmer,profiles/muse_glimmer,reasoning}.py` paths and the
-Muse-only `dense` op family are gone.
+Muse-only `dense` op family were deleted before the whole v2 tree was archived under
+`legacy/v2/`.
 
 **Vendor route update (2026-11-13, device-verified).** vllm-ascend 0.23.0 *can* serve this
 model — the earlier "sliding window unsupported" conclusion was wrong. The failure was
@@ -66,7 +67,8 @@ registry has no such architecture, and the venv's transformers 5.5.4 does not kn
 
 Two mechanisms, dispatched by `TileInferAttentionImpl.forward`:
 
-- **Decode — staged kernel path** (`tileinfer/vllm/attn/window.py`). The paged decode kernel is
+- **Decode — staged kernel path** (archived v2 `legacy/v2/tileinfer/vllm/attn/window.py`; the
+  v3 path does not install it). The paged decode kernel is
   full-causal only; `WindowedDecodeStager` gathers the last `window` tokens of each request into a
   compact per-layer scratch pool (fixed shapes, device-side indices, no host sync) and runs the
   *unchanged* kernel on it with a synthetic `arange` block table and clamped `seq_lens` — causal
@@ -235,7 +237,7 @@ The bridge hosts vendor-absent models end to end, with no V2 involvement:
 - Removed V2 surface: `tileinfer/vllm/models/muse_glimmer.py`,
   `tileinfer/vllm/profiles/muse_glimmer.py`, `tileinfer/vllm/reasoning.py`, and the Muse-only
   `tileinfer/vllm/ops/families/dense.py`; the V2 plugin and profile registry no longer mention
-  the model.
+  the model. The remaining v2 tree is archived under `legacy/v2/` and is not importable.
 - Usage: install the bridge in the vllm-ascend environment and set
   `TILEINFER_MANIFEST=muse_glimmer` (or point `TILEINFER_PLAN` at a built plan).  Device
   re-validation under the V3 layout is pending (no card available); the probe already showed

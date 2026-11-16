@@ -1,5 +1,8 @@
 # Operator coverage for the Qwen3.6 forward path (vLLM 0.23.0, out-of-tree platform)
 
+> **归档提示（2026-11-16）**：文中 `tileinfer/vllm/...` 路径已整体移动到
+> `legacy/v2/tileinfer/vllm/...`；v2 不再安装、不可 import。下文按 v2 历史台账阅读。
+
 **Question this answers.** For every operator the Qwen3.6 model actually calls, is it
 
 * **bound** - we replace it (`tileinfer/vllm/ops/families/gdn_moe.py::required_names()` or the patch
