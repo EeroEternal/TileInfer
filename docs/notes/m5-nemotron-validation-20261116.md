@@ -165,18 +165,26 @@ MTP 的 varlen 仍走逐 token 循环。
 因此**不是我们的 state/conv 补丁单独能解释的**；在查清 MTP 验证链之前，MTP 质量门判失败，
 不能用 MTP 输出作为模型正确性证据，也不要默认开启。
 
-## 6. TP=8 与共享环境
+## 6. TP=2/4/8 与共享环境
 
-TP=8 启动在 HCCL 初始化被环境挡住：
+早先 TP=8 曾在 HCCL 初始化报：
 
 ```text
 Failed to parse the ranktable file /etc/hccl_rootinfo.json.
 Reason: The JSON format is incorrect.
 ```
 
-`/etc/hccl_rootinfo.json` 在宿主上是**空目录**，不是 JSON 文件。没有改系统路径、没有删目录；
-本轮只做 TP=1。卡 0/1 有他人的 `VLLM::EngineCore` / `VLLMWorker_TP`，全程只使用空闲的 NPU 2，
-只停止自己 PID 启动的进程。
+当时 `/etc/hccl_rootinfo.json` 是**空目录**，所以没有改系统路径、没有删目录，先退回 TP=1。
+后来 8 张卡全部空闲、使用全新的 `VLLM_CACHE_ROOT` 重试，**TP=2、TP=4、TP=8 都启动成功**：
+
+- TP=8：`ASCEND_RT_VISIBLE_DEVICES=0..7`，max-model-len 2048，eager；
+  每卡权重 7.39 GiB，KV 55.13 GiB；同 prompt 16 tokens 输出与 TP=1 完全一致
+  ` Paris.  \nThe capital of Germany is Berlin.  \nThe capital of`；
+- TP=2 同样输出完全一致；TP=4 也 health 通过。
+- 只启动自己的 PID；停止后 8 张卡都回到 `No running processes`。
+
+结论：TP=8 **不再是环境阻塞**；之前是共享环境/rootinfo 的瞬时状态，重试已通过。
+TP=8 下尚未做 C3 图和 MTP。
 
 ## 7. 当前结论
 
@@ -192,9 +200,9 @@ Reason: The JSON format is incorrect.
 | 冷启动 | 42 s 到 health，首 token 0.33 s（全新 cache） |
 | 算子审计 | 390 实例；1 个有解释的 suspicious；无静默回退证据 |
 | MTP 无损性 | 失败 |
-| TP=8 | 环境阻塞（HCCL rootinfo 是空目录） |
+| TP=2/4/8 | 通过（TP8 输出与 TP1 一致；未做 TP8 图/MTP） |
 
 因此：**不能对外说“vllm-ascend 已支持 Nemotron 3.5 Lightning”。** 可以说的是：
 在单张 Ascend950PR 上，通过 v3 provider 补齐 Mamba2 conv/SSD/state 与非门控 relu2 MoE 后，
-真权重短文本、C3 短稳态、2/4 路并发、冷启动和 261K 长度可以跑通；C2 logprob、MTP 仍未闭合，
-TP=8 被环境挡住。
+真权重短文本、C3 短稳态、2/4 路并发、冷启动、TP=2/4/8 和 261K 长度可以跑通；
+C2 logprob 和 MTP 仍未闭合。

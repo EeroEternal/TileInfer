@@ -68,7 +68,7 @@ v2 自带平台层的形态，v3 不再走那条路。本页 §1 的 v3 数字�
 | 项 | 现状 | 影响 |
 |---|---|---|
 | **补缺口还是空的** | Qwen3.6 的 8 项能力厂商全覆盖，gap=0 是"没有缺口"，不是"补完了"；**M5 Nemotron 已有两个候选 provider**（`tileinfer.mamba2_state`、`tileinfer.nemotron_moe`），默认仍不选，plan `servable=false` | M5 已做真权重单卡 bring-up，证据见 [`notes/m5-nemotron-validation-20261116.md`](notes/m5-nemotron-validation-20261116.md)；C2 logprob/C3 稳态/MTP 仍未闭合 |
-| **M5 Nemotron 真权重** | 单卡 TP=1 可服务；短文本 token/text 与 HF 一致（单 prompt）；8K–261K 长度可完成；图捕获 2/6 张，32-token 31/31、8001-prompt 7/7 命中/0 回退；2/4 路并发和冷启动通过；MTP 无损性失败；TP=8 被 HCCL rootinfo 空目录阻塞 | 不能写成“已支持”；详见 [`notes/m5-nemotron-validation-20261116.md`](notes/m5-nemotron-validation-20261116.md) |
+| **M5 Nemotron 真权重** | 单卡 TP=1 可服务；短文本 token/text 与 HF 一致（单 prompt）；8K–261K 长度可完成；图捕获 2/6 张，32-token 31/31、8001-prompt 7/7 命中/0 回退；2/4 路并发和冷启动通过；TP=2/4/8 已通过（TP8 未做图/MTP）；MTP 无损性失败 | 不能写成“已支持”；详见 [`notes/m5-nemotron-validation-20261116.md`](notes/m5-nemotron-validation-20261116.md) |
 | **图捕获** | v3 已接上（厂商捕获 + 我们计数）；4K 8 张、32K 6 张、MTP 6 张（PIECEWISE，FULL=0），均 0 回退；MTP+32K 6 图/0 回退；`impl_table`/`model_table` 两个机制仍是空实现 | 非 vendor 实现还没有落点；128K 组合未验 |
 | **投机解码 / MTP** | S2/S3 按 B 质量等价过：套件 8/8、needle 8K/16K/32K 9/9、同请求两次 `same`、4K 93.9% / 1.35×；图 6 张、0 回退。严格逐位不成立（256 token 中 85.9% 相同、第 58 token 分叉），明确非逐位。S4 32K 部分：9/9、TTFT 1.037×、6 图/0 回退，acceptance 81–88%、128K 未测。证据见 [`notes/m1-spec-quality.md`](notes/m1-spec-quality.md) | S2/S3 过；S4 仅 32K 部分；非逐位 |
 | **TPOT / 首字** | v3 M1：单流 0.907–1.016× / 0.999–1.001×；4K 1.000× / 0.999×；长上下文 8K/16K/32K：TTFT 1.008–1.011×、TPOT 0.999–1.002× | 门已过（本机、本参数） |

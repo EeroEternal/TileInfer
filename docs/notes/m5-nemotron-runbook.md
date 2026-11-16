@@ -7,7 +7,7 @@
 
 > **2026-11-16 实机结果**：单卡 TP=1、真权重、`servable=false` bring-up 已跑通；
 > C2 仅 token/text 通过（logprob top-5 未通过）；C3 短稳态 31/31 命中、0 回退（metrics 文件默认只写捕获快照），
-> MTP 无损性失败，TP=8 被 `/etc/hccl_rootinfo.json`（空目录）阻塞。
+> MTP 无损性失败；TP=2/4/8 后来用全新 cache 重试均通过，早先 TP=8 的 HCCL rootinfo 报错是共享环境瞬时状态。
 > 证据与命令见 [`m5-nemotron-validation-20261116.md`](m5-nemotron-validation-20261116.md)。
 > **不要默认开 MTP，也不要对外说“已支持”。**
 
