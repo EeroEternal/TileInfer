@@ -6,7 +6,7 @@
 > 共享环境：只停止自己启动的 PID；不要 `pkill`/`killall`；不要动他人的进程、端口、缓存。
 
 > **2026-11-16 实机结果**：单卡 TP=1、真权重、`servable=false` bring-up 已跑通；
-> C2 仅 token/text 通过（logprob top-5 未通过），C3 只证明捕获（稳态 decode 计数未观测到），
+> C2 仅 token/text 通过（logprob top-5 未通过）；C3 短稳态 31/31 命中、0 回退（metrics 文件默认只写捕获快照），
 > MTP 无损性失败，TP=8 被 `/etc/hccl_rootinfo.json`（空目录）阻塞。
 > 证据与命令见 [`m5-nemotron-validation-20261116.md`](m5-nemotron-validation-20261116.md)。
 > **不要默认开 MTP，也不要对外说“已支持”。**
@@ -255,8 +255,9 @@ v3 bridge 的安装条件同样是硬性的：plan 必须有 `impl_table` 接入
 ## 5. C3：图捕获
 
 > C3 必须开图跑；eager 输出不能作为 C3 证据。**2026-11-16 真权重已捕获 2 张图**
-> （PIECEWISE 1 + FULL 1，日志 `Replaying aclgraph`），但 `decode_calls=0`：
-> 只能证明捕获，不能证明稳态 `fallbacks=0`；不要把“捕获成功”写成完整 C3 通过。
+> （`max-num-seqs=4` 时 6 张），并在 32-token 请求中观测到 31 次 decode/31 次图命中/0 回退。
+> 非 debug 运行时 metrics 文件默认只写捕获快照（`decode_calls` 仍可能显示 0），
+> 不能据此判 C3 失败；需要 `SIGUSR1` 或 `TILEINFER_GRAPH_DEBUG=1` 取实时计数。
 >
 > 合成 `M*E` 的首次图捕获实测（端口 18084，无 `--enforce-eager`）在 PIECEWISE 0/1 阶段失败：
 > `aclnnNonzero` 错误码 107027，位置 `tileinfer/providers/moe.py`（原 v2 位置 `legacy/v2/tileinfer/vllm/ops/moe.py:1010`，已迁移到 v3 并归档 v2）

@@ -62,17 +62,25 @@ v3 provider `tileinfer/providers/nemotron/mamba2.py` 补齐 prefill conv 后，�
 
 ## 3. C3：图捕获 / 回退
 
-不带 `--enforce-eager` 启动，NPU 2，`capture` 成功：
+不带 `--enforce-eager` 启动，NPU 2，`capture` 成功；`max-num-seqs=1` 捕获 2 张，
+`max-num-seqs=4` 捕获 6 张（PIECEWISE 3 + FULL 3）。
+
+一次带 `TILEINFER_GRAPH_DEBUG=1` 的只读观测（打印 dispatch，不改变选择）在 32-token 请求后
+给出真实 decode 计数：
 
 ```json
 {"capture_calls":1,"captured_graphs":2,"capture_keys":{"PIECEWISE":1,"FULL":1},
  "cudagraph_mode":"FULL_AND_PIECEWISE","capture_done":true,
- "decode_calls":0,"decode_graph_hits":0,"decode_fallbacks":0,
- "none_after_capture":0,"attention_backend":"AscendAttentionBackend","errors":0}
+ "decode_calls":31,"decode_graph_hits":31,"decode_fallbacks":0,
+ "none_after_capture":1,"attention_backend":"AscendAttentionBackend","errors":0}
 ```
 
-日志有 `Replaying aclgraph`，但 `decode_calls=0`：dispatcher 计数没有记录到真实请求的 decode，
-因此**只能证明捕获成功，不能证明稳态回退为 0**。这是观测缺口，不要把它写成完整 C3 通过。
+`decode_calls=31` 全部命中图，`decode_fallbacks=0`；`none_after_capture=1` 是 prefill/非 uniform
+诊断，不是被判定为回退。**结论：短稳态 C3 通过（capture + replay + 0 fallback）。**
+注意：非 debug 运行的 metrics 文件只在捕获时落盘（`decode_calls` 仍显示 0），
+要读真实计数需在请求中/进程退出时 dump，或加 `TILEINFER_GRAPH_DEBUG`。长期压测和并发下的
+回退率仍未覆盖。
+
 另外，加入 speculative `causal_conv1d_update` 的 host 循环后图捕获曾失败
 （`Synchronizing a stream failed ... stream is captured`）；改为单 token 向量化快路径后捕获取回，
 MTP 的 varlen 仍走逐 token 循环。
@@ -92,6 +100,36 @@ MTP 的 varlen 仍走逐 token 循环。
 32K 用 32000 prompt 而不是 32768，是为了给生成 token 留出 `max_model_len` 空间；
 各档 `usage.prompt_tokens` 与生成 prompt 完全一致。长上下文是**长度/可运行性**证据，
 不是“256K 内容理解正确”的证据（seed 是 README 重复文本）。
+
+### 4.1 并发（max-num-seqs=4，短输出）
+
+单流/2 路/4 路都用 greedy、32 output tokens；每档 2 轮：
+
+| 客户端 | 吞吐（tok/s，两轮） | TTFT（s） | 完成 token |
+|---:|---|---|---|
+| 2 | 11.20 / 11.45 | 0.23–0.36 | 32/32 |
+| 4 | 21.60 / 22.57 | 0.26–0.48 | 32/32 |
+
+这是“4 路都能完成且有并发收益”的证据，不是 SLA 或厂商基线结论。
+
+### 4.2 冷启动（全新 VLLM_CACHE_ROOT）
+
+在 `/tmp` 新建空 cache 后启动（不删共享 cache）：
+
+- 启动到 `/health=200`：**42 s**；
+- 首个请求首 token：**0.33 s**；
+- 16 output tokens 完成：2.896 s；
+- 日志显示权重加载 58.8333 GB，捕获 1 张 PIECEWISE + 1 张 FULL。
+
+### 4.3 算子审计
+
+`TILEINFER_AUDIT` + `SIGUSR1` EngineCore：
+
+- 4 路并发后：`classes=17, instances=390, vendor=229, torch=92, calls=513, suspicious=1`；
+- 冷启动首请求后：`calls=214`，其余相同；
+- 唯一 suspicious 是 `AscendUnquantizedFusedMoEMethod`（非门控 MoE 的 torch 替换路径，
+  审计器看不到 `apply` 的 forward 计数，属于解释项，不是静默回退）；
+- `ReLUSquaredActivation` 在并发轮有 437 次调用，`Mixer2RMSNormGated` 23 次。
 
 ## 5. MTP：失败，不要开启
 
@@ -128,12 +166,16 @@ Reason: The JSON format is incorrect.
 | C1 真权重可服务 | 通过（bring-up，`servable=false`） |
 | C2 text/token | 通过（单 prompt） |
 | C2 logprob top-5 | 未通过（最大差 1.636） |
-| C3 捕获 | 通过（2 graphs） |
-| C3 稳态零回退 | 未证明（decode 计数为 0） |
+| C3 捕获 | 通过（2 / 6 graphs） |
+| C3 短稳态零回退 | 通过（31 decode / 31 graph hit / 0 fallback） |
 | 长上下文 8K–261K | 可完成（长度证据） |
+| 并发 2/4 路 | 可完成，4 路约 22 tok/s（短输出） |
+| 冷启动 | 42 s 到 health，首 token 0.33 s（全新 cache） |
+| 算子审计 | 390 实例；1 个有解释的 suspicious；无静默回退证据 |
 | MTP 无损性 | 失败 |
 | TP=8 | 环境阻塞（HCCL rootinfo 是空目录） |
 
 因此：**不能对外说“vllm-ascend 已支持 Nemotron 3.5 Lightning”。** 可以说的是：
 在单张 Ascend950PR 上，通过 v3 provider 补齐 Mamba2 conv/SSD/state 与非门控 relu2 MoE 后，
-真权重短文本和 261K 长度可以跑通；C2 logprob、C3 稳态计数、MTP 仍未闭合。
+真权重短文本、C3 短稳态、2/4 路并发、冷启动和 261K 长度可以跑通；C2 logprob、MTP 仍未闭合，
+TP=8 被环境挡住。
