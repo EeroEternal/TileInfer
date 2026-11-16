@@ -17,7 +17,7 @@ import pytest
 from tileinfer.contracts.capabilities import CAPABILITIES, Capability, ProviderSpec
 from tileinfer.contracts.gaps import Gap, GapReport
 from tileinfer.contracts.manifest import ModelManifest
-from tileinfer.contracts.plan import ACCESS_POINTS, Plan, Selection
+from tileinfer.contracts.plan import ACCESS_POINTS, MAX_ACCESS_POINTS, Plan, Selection
 from tileinfer.manifests import MANIFESTS, QWEN3_6, find_manifest
 from tileinfer.resolve.decide import decide
 from tileinfer.resolve.probe import Environment
@@ -205,6 +205,23 @@ def test_plan_rejects_over_budget_and_duplicate_selections() -> None:
     dup["selections"] = dup["selections"] + [dup["selections"][0]]
     with pytest.raises(ValueError, match="twice"):
         Plan.from_dict(dup)
+
+
+def test_access_point_budget_is_a_ceiling_not_a_menu() -> None:
+    """6 mechanisms are defined; 8 is the design ceiling.  A plan only ever selects a subset."""
+    assert len(ACCESS_POINTS) == 6
+    assert len(ACCESS_POINTS) <= MAX_ACCESS_POINTS
+
+    plan, _ = decide(QWEN3_6, _vendor_env())
+    assert set(plan.access_points) <= set(ACCESS_POINTS)
+    assert len(plan.access_points) < len(ACCESS_POINTS)  # deploy selects, never extends
+
+    # A seventh name is rejected even though its count (7) is under the 8 ceiling: the closed
+    # list is what stops a plan from inventing a mechanism, not MAX_ACCESS_POINTS.
+    bad = plan.as_dict()
+    bad["access_points"] = list(ACCESS_POINTS) + ["compiler_pass"]
+    with pytest.raises(ValueError, match="unknown access points"):
+        Plan.from_dict(bad)
 
 
 def test_gap_report_round_trips(tmp_path: pathlib.Path) -> None:

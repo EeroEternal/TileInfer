@@ -20,8 +20,11 @@ from typing import Any, Dict, List, Mapping, Optional
 
 SCHEMA_VERSION = 1
 
-#: The only mechanisms allowed to be recorded as access points.  The budget is 8; the
-#: project uses 6.  Keeping the closed list here means a plan cannot invent a seventh.
+#: The only mechanisms a plan may name.  This closed list is the real cap: a seventh name is
+#: rejected on read, so a config file cannot invent a mechanism.  Six are defined today;
+#: ``MAX_ACCESS_POINTS`` (8) is the *design* ceiling - reaching 7 or 8 means editing this
+#: dict, adding the install/verify/uninstall probes for the new mechanism, and writing a
+#: reviewed exception.  Deployment only ever selects a subset of what is listed here.
 ACCESS_POINTS: Dict[str, str] = {
     "plugin_entry": "vllm.general_plugins entry point that calls the bridge installer",
     "impl_table": "implementation replacement table (operator/layer dispatch)",

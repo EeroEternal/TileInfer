@@ -78,11 +78,43 @@
 "厂商原生"不是本层的来源——它是决策层可以直接选的条目（`resolve/vendor.py`），
 进计划表，不进 `providers/`。
 
+**能力不是算子。** 8 个 capability 是**契约粒度**，一个能力可以覆盖一组算子：`attention.linear`
+覆盖 GDN 的 chunk / recurrent 两条路径，底层涉及 conv / gating / kkt / wu / solve_tril /
+delta_h 一组算子（状态读写归 `state.linear`）。能力→算子的绑定分两段：`ProviderSpec.impl`
+给出实现位置（类路径或模块），`covers` 给出覆盖范围；真正写进引擎的落点由接入点决定——
+注意力后端走 `attn_select`，算子/层走 `impl_table`，整模型走 `model_table`。
+
+**当前已接通的接入点**：`attn_select` 会查计划里的 `attention.full`；`impl_table` 由
+`tileinfer/bridge/impl_table.py` 按计划里的**非厂商 selection**逐条安装 provider。两者在
+vendor 选择下都返回厂商原路径，不做任何替换。`impl_table` 不维护全局算子表，也不允许
+"看到非厂商选择就先装一遍"；没有 `impl_table` 接入点、没有对应 selection、或 provider 名
+未知，都必须失败而不是猜。`model_table` 仍是空实现（没有整模型替换需求）。
+
+当前 L4 只有 Nemotron 的两个**候选**：`tileinfer.mamba2_state` 和
+`tileinfer.nemotron_moe`。它们可以在显式构造的 bring-up 计划里被选中并测试安装，但不会
+自动进入默认计划；真权重 C1/C2 通过前，Nemotron 的计划仍是 `servable=false`。
+
+### 3.5 v2 冻结规则（硬约束）
+
+**`tileinfer/vllm/` 是 v2 legacy，已冻结；不能再在 v2 基础上做任何开发。**
+
+- 不新增/修改 v2 实现；只允许保留**兼容 shim**，或直接删除。
+- 兼容 shim 的方向只能是 **v2 → v3**：旧模块 re-export `tileinfer.providers` /
+  `tileinfer.bridge` 的新实现；v3 模块不得 import `tileinfer.vllm`。
+- 新算子/适配器放 `tileinfer/providers/`（L4），只 import torch/契约；需要 import vLLM
+  或 vllm-ascend 的安装代码放 `tileinfer/bridge/`（L5）。
+- 新模型必须有 `ModelProfile`；不能靠"默认 profile + 改一个 family"跑起来。模型相关
+  事实写 profile，算子到 vLLM 名字的绑定写 bridge 的显式表。
+- 计划是唯一安装依据：`Plan.servable=false` 时默认拒绝安装非厂商 provider；只有显式
+  `TILEINFER_ALLOW_UNSERVABLE=1` 的 bring-up 运行可以覆盖，且必须打日志、不能进产品路径。
+- 新增 v3 路径必须带一条"没有 v2 import"的测试；review 看到新的 `tileinfer/vllm/`
+  业务改动应直接拒绝。
+
 **每条提供者必须自带五条声明**：
 
 | 声明 | 用途 | 没有基线时怎么填 |
 |---|---|---|
-| 覆盖范围（形状符号、精度、头部维度等） | 决策层据此匹配；**用符号表达，不用具体数值** | 同左 |
+| 覆盖范围（形状符号、精度、头部维度等） | 决策层**目前只用 `mixer` 键**做匹配（GDN vs Mamba2）；`head_dim`/`dtype` 等键是证据元数据，不参与路由 | 同左 |
 | 能否上图 | 不能上图的能力不能进稳态默认路径 | 同左 |
 | 并行度（支持哪些切分） | 现在只有单卡，但字段要留 | 同左 |
 | 证据编号 | **没有证据不许进默认路径**；有基线时证据里带同一窗口的比值 | 绝对数 + 与参考实现逐位/容差一致的记录 |
@@ -90,6 +122,12 @@
 
 > `measured_ratio` 因此在无基线时**留空**，但**证据不能留空**。
 > 空证据的提供者是"感觉能用"，不是"验证过能用"。
+
+**匹配的现状：名字级 + mixer 级，不是形状级。** `decide()` 只判断两件事——能力名在
+`VENDOR_PROVIDERS` 里有没有条目；`covers["mixer"]` 是否命中（GDN vs Mamba2）。manifest 里
+已有的 `head_dim` / `num_kv_heads` / `top_k` / `quantization` 还没有写成谓词，也不参与选择。
+所以计划期的"能力具备"只等于"名字有主"；具体形状能不能跑，由厂商在模型构造时判断，
+失败表现为运行时异常或静默降级。
 
 **验收**：正例一条、负例一条（"我声明不支持"必须能被验证）；数值与参考实现对得上；
 可上图的能力要给出捕获成功的证据；有基线时给同窗口成对比值，无基线时给绝对数，
@@ -105,7 +143,10 @@
 
 ## 4. 扩展点 C：接入点
 
-**只在现有 6 个机制不够用时才加。** 加一个就要在预算里占一格（上限 8）。
+**只在现有 6 个机制不够用时才加，而且"加"是改代码，不是改配置。** 具体动作是：往
+`contracts/plan.py` 的 `ACCESS_POINTS` 封闭列表里加一项，补安装/校验/卸载/失效探测四件套，
+并占一格预算（上限 8）。计划文件里凭空写一个新机制会被 `Plan.validate()` 拒绝——部署期
+只能从已定义的机制里选子集。
 
 一份合格的接入点必须带四件东西：
 

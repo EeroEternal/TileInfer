@@ -9,6 +9,10 @@
 > **B 未适配**（vLLM 已支持，vllm-ascend 没有模型级代码/验证，可能走通用路径，需 smoke test）。
 > vllm-ascend 支持表自己也写明"Models not listed may be verified independently"，
 > 所以 B 类不能直接断言"跑不了"。
+>
+> **本文是候选调研，不是选型决定。** 任何"首选/最合适"都只是静态排序，未与用户确认，
+> 不能当作已选目标或对比基线；实际对象以用户明确指定为准。`muse-glimmer-static.md`
+> 等静态分析也不是选型决定，不能反过来当作 M5 目标。
 
 ---
 
@@ -115,7 +119,11 @@
 
 ---
 
-## 5. 选型建议
+## 5. 候选评估（不是选型决定）
+
+> **本节不是选型决定。** M5 用哪个模型由用户/项目单独拍板；下表的"首选/备选"
+> 只是静态评估的相对排序，不能写成"已选目标"或"对比基线"。`muse-glimmer-static.md`
+> 等静态分析同样不是决定；以用户明确指定为准。
 
 ### 5.1 只做 Ascend 后端、冻结 vLLM 0.23
 
@@ -126,15 +134,16 @@
 
 | 模型 | vLLM 0.23 有模型？ | Ascend 缺什么 | 判断 |
 |---|---|---|---|
-| LFM2.5-24B-A2B | ✅ `Lfm2MoeForCausalLM` | ShortConv attention backend、causal conv1d、conv state、graph | **首选** |
-| Apertus-v1.5-8B | ✅ `ApertusForCausalLM` | XIELU fused op（已有 Python fallback） | 备选/算子试点 |
+| LFM2.5-24B-A2B | ✅ `Lfm2MoeForCausalLM` | ShortConv attention backend、causal conv1d、conv state、graph | 静态排序 1（**未选**） |
+| Apertus-v1.5-8B | ✅ `ApertusForCausalLM` | XIELU fused op（已有 Python fallback） | 另一候选/算子试点 |
 | Nemotron 3.5-30B-A3B | ✅ `NemotronHForCausalLM` | Mamba2 backend、state cache、graph | 不选：厂商 PR + 工作量大 |
 | Sarvam-30B | ✅ `SarvamMLAForCausalLM` | 可能无缺口；Ascend MLA 已存在 | 先 smoke |
 | Laguna-XS.2 | ✅ `LagunaForCausalLM` | sinks/SWA 已有；可能无缺口 | 先 smoke |
 | North / Granite 4.2 / Mellum2 | ✅ | 标准层，可能无缺口 | 不选 |
 | K2 / Flint / Clover / Raon | ❌ 0.23 没有 | 需要模型架构或引擎改动 | 不选 |
 
-**首选 LFM2.5-24B-A2B。** 理由：
+**在"只做 Ascend 后端、冻结 0.23"这个假设下，静态评估排序第一的是 LFM2.5-24B-A2B；
+这不是选型决定，也不是对比基线。** 评估理由：
 
 - 24B、40 层、30 个 ShortConv + 10 个 full attention、64 experts top-4、131K context；
 - vLLM 0.23 已有完整 `Lfm2MoeForCausalLM`，LFM2.5 的 config 字段（`conv_L_cache=3`、
@@ -153,7 +162,7 @@
 - LFM2.5 没有 MTP/Eagle，投机只能用 ngram；如果矩阵要求 MTP，这一格会是 N/A；
 - 厂商已经看过 ShortConv，如果后续重新开 PR，存在“做完被厂商覆盖”的风险。
 
-**备选 Apertus-v1.5-8B（算子试点，不是主模型）。**
+**另一候选 Apertus-v1.5-8B（算子试点，不是主模型）。**
 
 - 8.9B，唯一非标准件是 `XIELU` activation；vLLM 0.23 已有 `ApertusForCausalLM`；
 - `XIELU` 是 `CustomOp`，Ascend 上默认走 `forward_native` 的 Python fallback，

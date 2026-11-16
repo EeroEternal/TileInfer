@@ -39,7 +39,7 @@ v2 自带平台层的形态，v3 不再走那条路。本页 §1 的 v3 数字�
 | 声明层（`manifests/qwen3_6.py`） | ✅ | 40 层/30 GDN+10 full、16Q/2KV、256 experts top-8、8 项 required capability，纯数据可校验 |
 | 契约层（`contracts/`） | ✅ | 8 个 `Protocol` + plan/manifest/gap schema；未知 key、重复选择、超预算都拒绝 |
 | 决策层（`resolve/`） | ✅ | 纯函数；vendor 在→8/8 选 vendor、gap=0；vendor 不在→8 条 required gap、servable=False（这是"会不会服务不了"的判定，不是"要去补 8 个实现"的待办） |
-| 接入层（`bridge/`） | ✅ | 6 个具体钩子（plugin entry、dispatch、capture、attn select、config gate、init keys），4/6 类机制，预算 8 |
+| 接入层（`bridge/`） | ✅ | 6 个具体钩子（plugin entry、dispatch、capture、attn select、config gate、init keys），计划用 4/6 类机制；已定义 6、设计上限 8 |
 | 分层禁令 | ✅ | AST 守卫：只有 `tileinfer/bridge/` 可 import `vllm_ascend`；另有测试防止 carve-out 变空 |
 | 观测 | ✅ | capture/fallback 计数落 JSON（`SIGUSR1`/500 步/atexit）；API server 的零计数不再覆盖 EngineCore；算子级审计（`TILEINFER_AUDIT`）2026-11-12 跑通：23 类/903 实例，热路径全 vendor，3 个非 vendor 行均有解释，见 `notes/m1-op-audit.md` |
 | CLI / doctor | ✅ | `plan build/show/verify`、`tileinfer doctor`；doctor 在最终 metrics 上全 PASS |
@@ -87,7 +87,7 @@ v2 自带平台层的形态，v3 不再走那条路。本页 §1 的 v3 数字�
 |---|---|---|---|
 | **v1 寄生** | 是 | 短上下文与基线打平（0.91–1.09），补丁点散落十几处 | 代码冻结在 `legacy/`，作为 v3 接入点的素材 |
 | **v2 原生** | 否 | 能跑能对，但 TPOT 2.53×、TTFT 11.8×，图捕获未接 | 形态作废；内核、契约、计时、剖析工具保留 |
-| **v3 兼容层** | 是 | 控制模型 4K/128K 单流 C1–C4 过；262K L5 不过；6 个钩子/预算 8 | 目标形态，见 [`architecture.md`](architecture.md)、[`notes/m1-v3-bridge.md`](notes/m1-v3-bridge.md) |
+| **v3 兼容层** | 是 | 控制模型 4K/128K 单流 C1–C4 过；262K L5 不过；6 个钩子/已定义 6 类机制（上限 8） | 目标形态，见 [`architecture.md`](architecture.md)、[`notes/m1-v3-bridge.md`](notes/m1-v3-bridge.md) |
 
 ### 3.2 已作废的结论（保留在案，防止重犯）
 
