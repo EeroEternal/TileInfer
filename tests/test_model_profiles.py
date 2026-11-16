@@ -327,8 +327,8 @@ def _dummy_mixed_profile() -> ModelProfile:
 def test_mixed_attention_specs_turns_the_hybrid_kv_manager_on() -> None:
     """``mixed_attention_specs`` answers True despite ``hybrid is None``.
 
-    This is the MuseGlimmer decision: one group per attention spec type, so the sliding-window
-    allocator can drop out-of-window blocks instead of pinning every layer's full context.
+    The iRoPE decision: one group per attention spec type, so the sliding-window allocator can
+    drop out-of-window blocks instead of pinning every layer's full context.
     """
     mixed = profiles.register_profile(_dummy_mixed_profile())
     try:

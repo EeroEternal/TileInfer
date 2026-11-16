@@ -16,7 +16,7 @@ pytest.importorskip("vllm.reasoning")
 
 from vllm.reasoning import ReasoningParserManager  # noqa: E402
 
-from tileinfer.vllm.reasoning import AtemReasoningParser, SELF, USER  # noqa: E402
+from tileinfer.bridge.models.atem import AtemReasoningParser, SELF, USER  # noqa: E402
 
 
 class _FakeTokenizer:

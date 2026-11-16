@@ -135,6 +135,12 @@ class Plan:
     access_points: List[str] = field(default_factory=list)
     instrumentation: Dict[str, Any] = field(default_factory=dict)
     fallback_policy: str = "forbid"
+    #: Model implementation and chat-format parser this plan asks the layer to inject
+    #: (copied from the declaration).  Empty strings mean "the vendor serves the model and
+    #: the output is plain text".
+    model_impl: str = ""
+    reasoning_parser: str = ""
+    reasoning_parser_impl: str = ""
     plan_id: str = ""
     created_at: str = ""
     schema_version: int = SCHEMA_VERSION
@@ -154,6 +160,9 @@ class Plan:
             "selections": [s.as_dict() for s in self.selections],
             "access_points": sorted(self.access_points),
             "fallback_policy": self.fallback_policy,
+            "model_impl": self.model_impl,
+            "reasoning_parser": self.reasoning_parser,
+            "reasoning_parser_impl": self.reasoning_parser_impl,
         }
         blob = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(blob).hexdigest()[:16]
@@ -200,6 +209,9 @@ class Plan:
             "access_points": list(self.access_points),
             "instrumentation": dict(self.instrumentation),
             "fallback_policy": self.fallback_policy,
+            "model_impl": self.model_impl,
+            "reasoning_parser": self.reasoning_parser,
+            "reasoning_parser_impl": self.reasoning_parser_impl,
         }
 
     @classmethod
@@ -214,6 +226,9 @@ class Plan:
             "access_points",
             "instrumentation",
             "fallback_policy",
+            "model_impl",
+            "reasoning_parser",
+            "reasoning_parser_impl",
         }
         unknown = sorted(set(data) - known)
         if unknown:
@@ -225,6 +240,9 @@ class Plan:
             access_points=list(data.get("access_points", [])),
             instrumentation=dict(data.get("instrumentation", {})),
             fallback_policy=str(data.get("fallback_policy", "forbid")),
+            model_impl=str(data.get("model_impl", "")),
+            reasoning_parser=str(data.get("reasoning_parser", "")),
+            reasoning_parser_impl=str(data.get("reasoning_parser_impl", "")),
             plan_id=str(data.get("plan_id", "")),
             created_at=str(data.get("created_at", "")),
             schema_version=int(data.get("schema_version", SCHEMA_VERSION)),

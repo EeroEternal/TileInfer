@@ -36,11 +36,13 @@ def _vendor_env() -> Environment:
     )
 
 
-def test_eight_capabilities_and_their_order_is_stable() -> None:
-    assert len(CAPABILITIES) == 8
+def test_nine_capabilities_and_their_order_is_stable() -> None:
+    assert len(CAPABILITIES) == 9
     assert CAPABILITIES[0] is Capability.ATTENTION_FULL
+    assert CAPABILITIES[1] is Capability.ATTENTION_SLIDING
     assert [c.value for c in CAPABILITIES] == [
         "attention.full",
+        "attention.sliding",
         "attention.linear",
         "moe.routed",
         "norm.rms",
@@ -250,3 +252,117 @@ def test_engine_free_layers_import_in_a_clean_subprocess(tmp_path: pathlib.Path)
     )
     assert proc.returncode == 0, proc.stderr
     assert "clean" in proc.stdout
+
+
+# ---------------------------------------------------------------------------------------
+# The first vendor-absent declaration (MuseGlimmer): sliding layers, model injection
+# ---------------------------------------------------------------------------------------
+
+from tileinfer.manifests.muse_glimmer import MUSE_GLIMMER  # noqa: E402
+
+
+def test_muse_declaration_matches_the_checkpoint_facts() -> None:
+    m = MUSE_GLIMMER
+    m.validate()
+    assert m.num_layers == 52
+    assert m.layer_types.count("sliding_attention") == 39
+    assert m.layer_types.count("full_attention") == 13
+    # iRoPE: every fourth layer is global and carries no rotary embedding
+    assert tuple(i for i, t in enumerate(m.layer_types) if t == "full_attention") == tuple(
+        range(3, 52, 4)
+    )
+    assert m.attention.rope_disabled_layers == tuple(range(3, 52, 4))
+    assert m.attention.sliding_window == 2048
+    assert m.attention.num_heads == 32 and m.attention.num_kv_heads == 2
+    assert Capability.ATTENTION_SLIDING.value in m.required_capabilities
+    assert m.model_impl == "tileinfer.bridge.models.muse_glimmer"
+    assert m.reasoning_parser_impl == "tileinfer.bridge.models.atem:AtemReasoningParser"
+    assert m.reasoning_parser == "atem"
+    # a brand-new model may be declared before its C2 sample exists
+    assert m.benchmark == {}
+
+
+def test_sliding_declarations_must_be_consistent() -> None:
+    import dataclasses
+
+    with pytest.raises(ValueError, match="sliding_window is unset"):
+        dataclasses.replace(
+            MUSE_GLIMMER,
+            attention=dataclasses.replace(MUSE_GLIMMER.attention, sliding_window=None),
+        ).validate()
+    with pytest.raises(ValueError, match="no sliding_attention layer"):
+        dataclasses.replace(
+            QWEN3_6,
+            attention=dataclasses.replace(QWEN3_6.attention, sliding_window=64),
+        ).validate()
+    with pytest.raises(ValueError, match="attention.sliding capability"):
+        dataclasses.replace(
+            MUSE_GLIMMER,
+            required_capabilities=tuple(
+                c for c in MUSE_GLIMMER.required_capabilities if c != "attention.sliding"
+            ),
+        ).validate()
+
+
+def test_muse_decision_selects_vendor_everywhere_and_injects_only_the_model() -> None:
+    plan, report = decide(MUSE_GLIMMER, _vendor_env(), policy="vendor_first")
+    assert report.servable and not report.gaps
+    by_cap = {s.capability: s for s in plan.selections}
+    assert by_cap["attention.sliding"].source == "vendor"
+    assert by_cap["attention.full"].source == "vendor"
+    # nothing is filled by us at the implementation level; only the declaration is ours
+    assert all(s.source == "vendor" for s in plan.selections)
+    assert "model_table" in plan.access_points
+    assert plan.model_impl == MUSE_GLIMMER.model_impl
+    assert plan.reasoning_parser == "atem"
+    assert plan.reasoning_parser_impl == MUSE_GLIMMER.reasoning_parser_impl
+    # content-addressed round trip keeps the injection fields
+    again = Plan.from_dict(plan.as_dict())
+    assert again.model_impl == plan.model_impl
+    assert again.plan_id == plan.plan_id
+
+
+def test_model_table_seam_registers_the_model_and_parser(monkeypatch) -> None:
+    import types
+
+    from tileinfer.bridge import seams
+
+    calls: list = []
+    fake_model = types.ModuleType("fake_model_impl")
+    fake_model.register_config = lambda: calls.append("config") or {"config": "registered"}
+    fake_model.register_models = lambda: calls.append("models") or {"registered": True}
+
+    class FakeParser:
+        pass
+
+    fake_parser_mod = types.ModuleType("fake_parser_mod")
+    fake_parser_mod.FakeParser = FakeParser
+
+    registered: dict = {}
+    fake_manager = types.SimpleNamespace(
+        register_module=lambda name, module=None: registered.update({name: module})
+    )
+
+    monkeypatch.setitem(sys.modules, "fake_model_impl", fake_model)
+    monkeypatch.setitem(sys.modules, "fake_parser_mod", fake_parser_mod)
+
+    plan = Plan.from_dict(decide(MUSE_GLIMMER, _vendor_env())[0].as_dict())
+    plan.model_impl = "fake_model_impl"
+    plan.reasoning_parser = "atem"
+    plan.reasoning_parser_impl = "fake_parser_mod:FakeParser"
+
+    # The seam imports vllm.reasoning lazily; stub the engine so this stays a CPU test.
+    fake_vllm = types.ModuleType("vllm")
+    fake_reasoning = types.ModuleType("vllm.reasoning")
+    fake_reasoning.ReasoningParserManager = fake_manager
+    fake_vllm.reasoning = fake_reasoning
+    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+    monkeypatch.setitem(sys.modules, "vllm.reasoning", fake_reasoning)
+    result = seams.install_model_table(plan)
+    assert result.ok, result.detail
+    assert calls == ["config", "models"]
+    assert registered.get("atem") is FakeParser
+
+    # A vendor-served plan (no fields) is a no-op.
+    empty = seams.install_model_table(Plan.from_dict(decide(QWEN3_6, _vendor_env())[0].as_dict()))
+    assert empty.ok and "no model replacement" in empty.detail

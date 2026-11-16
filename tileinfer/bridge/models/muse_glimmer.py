@@ -1,4 +1,4 @@
-"""``tileinfer.vllm.models.muse_glimmer`` — MuseGlimmer text decoder for vLLM 0.23.
+"""``tileinfer.bridge.models.muse_glimmer`` — MuseGlimmer text decoder for vLLM 0.23.
 
 Backported from upstream vLLM main (``vllm/model_executor/models/muse_glimmer.py`` at
 ``ef5f913``, 2026-11-09) because the frozen stack carries **vLLM 0.23.0**, whose registry has
@@ -7,7 +7,7 @@ no MuseGlimmer architecture, and its bundled transformers (5.5.4) does not know
 
 * ``MuseGlimmerHFConfig`` + :func:`register_config` — a ``PretrainedConfig`` shim registered
   under ``muse_glimmer`` so ``AutoConfig.from_pretrained`` can parse the checkpoint at all
-  (same trick as ``tileinfer.vllm.config.Dsv41HFConfig``).
+  (the same AutoConfig shim trick the dsv41 adapter uses).
 * ``MuseGlimmerForConditionalGeneration`` + :func:`register_models` — the architecture,
   registered into ``ModelRegistry`` by class path so the parameter tree is imported only when
   such a checkpoint is actually resolved.
@@ -302,8 +302,7 @@ class MuseGlimmerAttention(nn.Module):
         # and the operator's non-PA checker rejects a strided ``value`` (ACLNN tiling error
         # 561002, ``paged_attention_checker.cpp: "In non-PA scenarios, value tensors must be
         # contiguous"``).  Upstream fixed the vendor side in cfb01b1c8 (#17925, first in
-        # v0.30.0); this copy is the model-side equivalent for pinned stacks and is harmless on
-        # the v2 native backend.
+        # v0.30.0); this copy is the model-side equivalent for pinned stacks.
         v = v.contiguous()
 
         attn_output = self.attn(q, k, v)
@@ -647,7 +646,7 @@ def register_models(registry=None) -> Dict[str, object]:
     """
     info: Dict[str, object] = {
         "arch": MODEL_ARCH,
-        "class_path": "tileinfer.vllm.models.muse_glimmer:MuseGlimmerForConditionalGeneration",
+        "class_path": "tileinfer.bridge.models.muse_glimmer:MuseGlimmerForConditionalGeneration",
         "registered": False,
         "detail": "",
     }
@@ -663,10 +662,10 @@ def register_models(registry=None) -> Dict[str, object]:
             registry = ModelRegistry
         registry.register_model(
             MODEL_ARCH,
-            "tileinfer.vllm.models.muse_glimmer:MuseGlimmerForConditionalGeneration",
+            "tileinfer.bridge.models.muse_glimmer:MuseGlimmerForConditionalGeneration",
         )
         info["registered"] = True
-        details.append(f"registered {MODEL_ARCH} -> tileinfer.vllm.models.muse_glimmer")
+        details.append(f"registered {MODEL_ARCH} -> tileinfer.bridge.models.muse_glimmer")
     except Exception as exc:  # noqa: BLE001 - a plugin step must never abort the boot
         details.append(f"registration failed: {exc!r}")
     info["detail"] = "; ".join(details)
