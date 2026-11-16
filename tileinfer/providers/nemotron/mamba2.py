@@ -297,8 +297,8 @@ def causal_conv1d_fn(
     following SSD scan into a constant/non-finite state.  Keeping the convolution here makes the
     Mamba2 provider's prefill path complete rather than partially vendor-backed.
     """
-    del (null_block_id, block_idx_first_scheduled_token, block_idx_last_scheduled_token,
-         initial_state_idx, num_computed_tokens, block_size_to_align, metadata, validate_data)
+    del (null_block_id, block_idx_first_scheduled_token, num_computed_tokens,
+         block_size_to_align, metadata, validate_data)
     if x.dim() != 2:
         raise ValueError(f"causal_conv1d_fn expects x [dim, tokens], got {tuple(x.shape)}")
     dim, total = x.shape
@@ -308,12 +308,32 @@ def causal_conv1d_fn(
     starts = _as_int_list(query_start_loc, device=x.device)
     if len(starts) < 2:
         starts = [0, total]
-    cache = _as_int_list(cache_indices, device=x.device) if cache_indices is not None else []
+    batch = len(starts) - 1
     initial = (
         _as_int_list(has_initial_state, device=x.device)
         if has_initial_state is not None
         else []
     )
+
+    # ``cache_indices`` is 1-D for the ordinary path, but a 2-D block table when
+    # ``is_mamba_cache_all`` is on (prefix caching / speculative verify).  The initial
+    # state is not necessarily row 0 of that table: vLLM gives us the block pointer in
+    # ``initial_state_idx``.  Flattening the table (the old code did) reads the wrong
+    # convolution taps during MTP verification, which silently changes the target logits.
+    if cache_indices is None:
+        read_lines = write_lines = list(range(batch))
+    else:
+        write_pointer = (
+            block_idx_last_scheduled_token
+            if block_idx_last_scheduled_token is not None
+            else initial_state_idx
+        )
+        if cache_indices.dim() == 2 and write_pointer is None:
+            write_pointer = torch.full(
+                (batch,), cache_indices.shape[1] - 1, device=cache_indices.device, dtype=torch.int64
+            )
+        read_lines = _conv_lines(batch, cache_indices, initial_state_idx, x.device).tolist()
+        write_lines = _conv_lines(batch, cache_indices, write_pointer, x.device).tolist()
 
     original_dtype = x.dtype
     work_dtype = conv_states.dtype if conv_states is not None else x.dtype
@@ -321,18 +341,21 @@ def causal_conv1d_fn(
     out = torch.zeros((dim, total), device=x.device, dtype=work_dtype)
     taps = width - 1
 
-    for seq in range(len(starts) - 1):
+    for seq in range(batch):
         start, end = int(starts[seq]), int(starts[seq + 1])
         if end <= start:
             continue
-        cache_line = int(cache[seq]) if cache else seq
-        if cache_line == int(pad_slot_id) or cache_line < 0:
+        read_line = int(read_lines[seq])
+        write_line = int(write_lines[seq])
+        if write_line == int(pad_slot_id) or write_line < 0:
             continue
-        if conv_states is not None and cache_line >= conv_states.shape[0]:
-            raise IndexError(f"conv cache line {cache_line} outside {conv_states.shape[0]}")
+        if conv_states is not None and (read_line >= conv_states.shape[0] or write_line >= conv_states.shape[0]):
+            raise IndexError(
+                f"conv cache line outside {conv_states.shape[0]}: read={read_line}, write={write_line}"
+            )
         use_initial = bool(initial[seq]) if initial else conv_states is not None
         if conv_states is not None and use_initial:
-            head = conv_states[cache_line, :, :taps].to(work_dtype)
+            head = conv_states[read_line, :, :taps].to(work_dtype)
         else:
             head = torch.zeros((dim, taps), device=x.device, dtype=work_dtype)
         full = torch.cat((head, xw[:, start:end]), dim=1)
@@ -345,7 +368,7 @@ def causal_conv1d_fn(
         ).squeeze(0)
         out[:, start:end] = _apply_activation(y, activation)
         if conv_states is not None and taps > 0:
-            conv_states[cache_line, :, :taps] = full[:, -taps:].to(conv_states.dtype)
+            conv_states[write_line, :, :taps] = full[:, -taps:].to(conv_states.dtype)
 
     return out.to(original_dtype)
 

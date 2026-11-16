@@ -125,6 +125,61 @@ def test_mamba2_chunk_scan_respects_varlen_boundaries_and_returns_chunk_states()
         torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-6)
 
 
+def test_mamba2_chunk_scan_varlen_one_token_with_initial_states() -> None:
+    """MTP verification runs a short varlen prefill with non-zero initial states."""
+    torch.manual_seed(41)
+    total, heads, hdim, dstate, groups = 2, 2, 2, 3, 1
+    x = torch.randn(total, heads, hdim)
+    dt = torch.randn(total, heads)
+    A = -torch.rand(heads)
+    B = torch.randn(total, groups, dstate)
+    C = torch.randn(total, groups, dstate)
+    D = torch.randn(heads, hdim)
+    dt_bias = torch.randn(heads)
+    initial = torch.randn(2, heads, hdim, dstate)
+    out = torch.empty_like(x)
+
+    final = mamba_chunk_scan_combined_varlen(
+        x,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size=128,
+        cu_seqlens=torch.tensor([0, 1, 2]),
+        cu_chunk_seqlens=torch.tensor([0, 1, 2]),
+        last_chunk_indices=torch.tensor([0, 1]),
+        seq_idx=torch.tensor([0, 1]),
+        out=out,
+        D=D,
+        dt_bias=dt_bias,
+        initial_states=initial,
+        dt_softplus=True,
+        return_intermediate_states=True,
+    )
+
+    expected = torch.empty_like(x)
+    expected_states = []
+    for seq in range(2):
+        part, state = _scalar_chunk(
+            x[seq : seq + 1],
+            dt[seq : seq + 1],
+            A,
+            B[seq : seq + 1],
+            C[seq : seq + 1],
+            D,
+            dt_bias,
+            initial[seq].clone(),
+            heads // groups,
+        )
+        expected[seq : seq + 1] = part
+        expected_states.append(state)
+    torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-6)
+    assert final.shape == (2, heads, hdim, dstate)
+    for got, want in zip(final, expected_states):
+        torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-6)
+
+
 def test_mamba2_selective_state_update_matches_one_token_recurrence() -> None:
     torch.manual_seed(11)
     batch, heads, hdim, dstate, groups = 2, 4, 3, 5, 2
@@ -273,6 +328,49 @@ def test_causal_conv1d_prefill_matches_manual_conv_and_updates_state() -> None:
     torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-6)
     torch.testing.assert_close(conv_states, expected_state, rtol=1e-5, atol=1e-6)
     assert out.abs().sum().item() > 0.0
+
+
+def test_causal_conv1d_prefill_honours_block_table_initial_state() -> None:
+    """A 2-D cache table must read ``initial_state_idx``, not the flattened row."""
+    torch.manual_seed(37)
+    dim, width, total = 3, 4, 4
+    taps = width - 1
+    x = torch.randn(dim, total)
+    weight = torch.randn(dim, width)
+    conv_states = torch.randn(5, dim, taps)
+    state_before = conv_states.clone()
+    starts = torch.tensor([0, 2, total], dtype=torch.int32)
+    # Two sequences, two blocks each; the initial block is the second one for seq 0.
+    cache = torch.tensor([[4, 3], [1, 2]], dtype=torch.int32)
+    initial_idx = torch.tensor([1, 0], dtype=torch.int32)
+    last_scheduled = torch.tensor([1, 1], dtype=torch.int32)
+    has_initial = torch.tensor([True, True])
+
+    out = causal_conv1d_fn(
+        x,
+        weight,
+        None,
+        conv_states,
+        starts,
+        cache_indices=cache,
+        has_initial_state=has_initial,
+        block_idx_last_scheduled_token=last_scheduled,
+        initial_state_idx=initial_idx,
+        activation=None,
+    )
+
+    read_lines = [int(cache[0, 1]), int(cache[1, 0])]
+    write_lines = [int(cache[0, 1]), int(cache[1, 1])]
+    expected = torch.empty_like(x)
+    expected_state = state_before.clone()
+    for seq, (start, end) in enumerate(((0, 2), (2, total))):
+        full = torch.cat((state_before[read_lines[seq]], x[:, start:end]), dim=1)
+        expected[:, start:end] = F.conv1d(
+            full.unsqueeze(0), weight.unsqueeze(1), None, groups=dim
+        ).squeeze(0)
+        expected_state[write_lines[seq]] = full[:, -taps:]
+    torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(conv_states, expected_state, rtol=1e-5, atol=1e-6)
 
 
 def test_mamba2_selective_state_update_replays_speculative_tokens() -> None:
