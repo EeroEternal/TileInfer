@@ -287,15 +287,10 @@ def causal_conv1d_fn(
 ) -> torch.Tensor:
     """Torch implementation of vLLM's prefill ``causal_conv1d_fn`` contract.
 
-    ``x`` is ``[dim, tokens]``.  For each sequence the incoming ``width - 1`` convolution
-    taps are read from ``conv_states[cache_indices[i]]`` when ``has_initial_state[i]`` is true,
-    and the last ``width - 1`` taps are written back to that cache line.  This mirrors the
-    vendor kernel's state ownership; APC block bookkeeping is accepted but not used by this
-    correctness path.
-
-    The vendor Ascend prefill kernel at the target geometry returns all zeros, which turns the
-    following SSD scan into a constant/non-finite state.  Keeping the convolution here makes the
-    Mamba2 provider's prefill path complete rather than partially vendor-backed.
+    ``x`` is ``[dim, tokens]``.  For each sequence the incoming convolution taps are read from
+    the cache line selected by ``cache_indices``/``initial_state_idx`` when
+    ``has_initial_state[i]`` is true, and the complete sliding window (``state_len`` columns,
+    which is ``width - 1 + num_speculative_tokens`` under speculative decoding) is written back.
     """
     del (null_block_id, block_idx_first_scheduled_token, num_computed_tokens,
          block_size_to_align, metadata, validate_data)
@@ -314,32 +309,35 @@ def causal_conv1d_fn(
         if has_initial_state is not None
         else []
     )
+    taps = width - 1
+    state_len = int(conv_states.shape[-1]) if conv_states is not None else taps
+    if state_len < taps:
+        raise ValueError(f"conv_state length {state_len} < width-1={taps}")
 
     # ``cache_indices`` is 1-D for the ordinary path, but a 2-D block table when
     # ``is_mamba_cache_all`` is on (prefix caching / speculative verify).  The initial
     # state is not necessarily row 0 of that table: vLLM gives us the block pointer in
-    # ``initial_state_idx``.  Flattening the table (the old code did) reads the wrong
-    # convolution taps during MTP verification, which silently changes the target logits.
+    # ``initial_state_idx``.
     if cache_indices is None:
         read_lines = write_lines = list(range(batch))
     else:
+        read_pointer = initial_state_idx
         write_pointer = (
             block_idx_last_scheduled_token
             if block_idx_last_scheduled_token is not None
-            else initial_state_idx
+            else read_pointer
         )
+        if cache_indices.dim() == 2 and read_pointer is None:
+            read_pointer = torch.zeros(batch, device=cache_indices.device, dtype=torch.int64)
         if cache_indices.dim() == 2 and write_pointer is None:
-            write_pointer = torch.full(
-                (batch,), cache_indices.shape[1] - 1, device=cache_indices.device, dtype=torch.int64
-            )
-        read_lines = _conv_lines(batch, cache_indices, initial_state_idx, x.device).tolist()
+            write_pointer = torch.zeros(batch, device=cache_indices.device, dtype=torch.int64)
+        read_lines = _conv_lines(batch, cache_indices, read_pointer, x.device).tolist()
         write_lines = _conv_lines(batch, cache_indices, write_pointer, x.device).tolist()
 
     original_dtype = x.dtype
     work_dtype = conv_states.dtype if conv_states is not None else x.dtype
     xw = x.to(work_dtype)
     out = torch.zeros((dim, total), device=x.device, dtype=work_dtype)
-    taps = width - 1
 
     for seq in range(batch):
         start, end = int(starts[seq]), int(starts[seq + 1])
@@ -355,7 +353,7 @@ def causal_conv1d_fn(
             )
         use_initial = bool(initial[seq]) if initial else conv_states is not None
         if conv_states is not None and use_initial:
-            head = conv_states[read_line, :, :taps].to(work_dtype)
+            head = conv_states[read_line, :, state_len - taps :].to(work_dtype)
         else:
             head = torch.zeros((dim, taps), device=x.device, dtype=work_dtype)
         full = torch.cat((head, xw[:, start:end]), dim=1)
@@ -367,11 +365,19 @@ def causal_conv1d_fn(
             groups=dim,
         ).squeeze(0)
         out[:, start:end] = _apply_activation(y, activation)
-        if conv_states is not None and taps > 0:
-            conv_states[write_line, :, :taps] = full[:, -taps:].to(conv_states.dtype)
-
+        if conv_states is not None:
+            # Keep the full window, not only the last ``width - 1`` taps: speculative decode
+            # indexes into the extra columns with ``num_accepted_tokens``.
+            if full.shape[1] >= state_len:
+                new_state = full[:, -state_len:]
+            else:
+                new_state = torch.cat(
+                    (torch.zeros((dim, state_len - full.shape[1]), device=x.device, dtype=work_dtype),
+                     full),
+                    dim=1,
+                )
+            conv_states[write_line, :, :state_len] = new_state.to(conv_states.dtype)
     return out.to(original_dtype)
-
 
 def _conv_lines(
     batch: int,
@@ -411,19 +417,30 @@ def causal_conv1d_update(
     initial_state_idx: Optional[torch.Tensor] = None,
     validate_data: bool = False,
 ) -> torch.Tensor:
-    """Torch ``causal_conv1d_update`` including speculative multi-token replay.
+    """Torch ``causal_conv1d_update`` including speculative multi-token rolling.
 
     Shapes are the vLLM contract: ``x`` is ``[tokens, dim]`` with ``query_start_loc``,
     ``[batch, dim]`` for one token per sequence, or ``[batch, dim, seqlen]``.  The cache line is
-    selected by ``conv_state_indices`` (optionally through the APC block pointers).  For MTP,
-    ``num_accepted_tokens[i]`` limits how many of sequence ``i``'s tokens are committed; all of
-    them must be convolved so the sliding window ends at the verified prefix.
+    selected by ``conv_state_indices`` (optionally through the APC block pointers).
+
+    With speculative decoding the cache holds ``width - 1 + num_spec`` columns.  ``num_accepted``
+    selects the history offset (``num_accepted - 1``), but the convolution and the cache must
+    still advance through **all** scheduled tokens: vLLM later reads the per-token SSM/conv state
+    at the accepted position.  Limiting the loop to accepted tokens (the old implementation) or
+    writing only the last ``width - 1`` columns leaves the target state one or more tokens behind.
     """
     del validate_data
-    # Graph capture needs a host-sync-free path.  Ordinary decode is one token per sequence;
-    # update that vectorised, and keep the per-token loop only for speculative/varlen batches.
+    _, width = weight.shape
+    taps = width - 1
+    state_len = int(conv_state.shape[-1])
+    if state_len < taps:
+        raise ValueError(f"conv_state state_len={state_len} < width-1={taps}")
+    spec = num_accepted_tokens is not None
+    # Graph capture needs a host-sync-free path.  Ordinary decode is one token per sequence with
+    # a compact (width-1 column) state; keep that vectorised.  Speculative batches take the
+    # rolling-window path below.
     single = False
-    if num_accepted_tokens is None:
+    if num_accepted_tokens is None and state_len == taps:
         if x.dim() == 2 and query_start_loc is None:
             single = True
             batch = x.shape[0]
@@ -438,10 +455,8 @@ def causal_conv1d_update(
             starts = None
     if single:
         dim = x.shape[1]
-        _, width = weight.shape
-        taps = width - 1
-        _, cache_dim, state_len = conv_state.shape
-        if cache_dim != dim or state_len < taps:
+        _, cache_dim, cache_len = conv_state.shape
+        if cache_dim != dim or cache_len < taps:
             raise ValueError("conv_state shape is incompatible with x/weight")
         read_lines = _conv_lines(
             conv_state_indices.size(0) if conv_state_indices is not None else batch,
@@ -504,12 +519,10 @@ def causal_conv1d_update(
     num_cache_lines, cache_dim, state_len = conv_state.shape
     if cache_dim != dim:
         raise ValueError(f"conv_state dim={cache_dim} != x dim={dim}")
-    _, width = weight.shape
-    taps = width - 1
     if state_len < taps:
         raise ValueError(f"conv_state state_len={state_len} < width-1={taps}")
     out = torch.empty_like(x, dtype=conv_state.dtype)
-    accepted = _as_int_list(num_accepted_tokens, device=x.device) if num_accepted_tokens is not None else []
+    accepted = _as_int_list(num_accepted_tokens, device=x.device) if spec else []
     cache_indices = conv_state_indices
     write_pointer = (
         block_idx_last_scheduled_token.reshape(-1).to(torch.int64)
@@ -522,11 +535,28 @@ def causal_conv1d_update(
         else write_pointer
     )
 
+    # vLLM's varlen kernel keeps the old part of the cache at a constant
+    # ``state_len - max_query_len`` width; shorter sequences write a correspondingly shorter
+    # effective window.  Using ``state_len - count`` here shifts mixed-length batches.
+    if qsl is not None:
+        counts = [int(qsl[i + 1]) - int(qsl[i]) for i in range(batch)]
+    elif x.dim() == 3:
+        counts = [x.shape[2]] * batch
+    else:
+        # [batch, dim] is one token per sequence.
+        counts = [1] * batch
+    max_count = int(max_query_len) if int(max_query_len) > 0 else max(counts or [0])
+    if max_count > state_len:
+        raise ValueError(f"max_query_len={max_count} exceeds conv state_len={state_len}")
+    old_count = state_len - max_count
+
     def _cache_line(seq: int, pointer: Optional[torch.Tensor]) -> int:
         if cache_indices is None:
             return seq
         if cache_indices.dim() == 1:
             return int(cache_indices[seq])
+        # Without APC, vLLM passes a 2-D table whose first column is the sequence's state slot;
+        # with APC, ``initial_state_idx``/``block_idx_last_scheduled_token`` select the block.
         pos = int(pointer[seq]) if pointer is not None and seq < len(pointer) else 0
         return int(cache_indices[seq, pos])
 
@@ -534,22 +564,14 @@ def causal_conv1d_update(
         if qsl is not None:
             start, end = int(qsl[seq]), int(qsl[seq + 1])
             count = end - start
-            if accepted:
-                count = max(0, min(count, int(accepted[seq])))
-            if count == 0:
-                continue
-            tokens = source[start : start + count].transpose(0, 1)
+            tokens = source[start:end].transpose(0, 1)
         else:
+            start = 0
             tokens = source[seq]
-            if tokens.dim() == 1:
-                tokens = tokens[:, None]
             count = tokens.shape[1]
-            if accepted:
-                count = max(0, min(count, int(accepted[seq])))
-                tokens = tokens[:, :count]
-            if count == 0:
-                continue
-
+            end = count
+        if count == 0:
+            continue
         read_line = _cache_line(seq, read_pointer)
         write_line = _cache_line(seq, write_pointer)
         if read_line == int(null_block_id) or write_line == int(null_block_id):
@@ -557,23 +579,70 @@ def causal_conv1d_update(
         if not (0 <= read_line < num_cache_lines and 0 <= write_line < num_cache_lines):
             raise IndexError(f"conv cache line out of range: read={read_line}, write={write_line}")
 
-        head = conv_state[read_line, :, state_len - taps :].to(torch.float32)
-        full = torch.cat((head, tokens.to(torch.float32)), dim=1)
-        y = F.conv1d(
-            full.unsqueeze(0),
-            weight.to(torch.float32).unsqueeze(1),
-            None if bias is None else bias.to(torch.float32),
-            groups=dim,
-        ).squeeze(0)
-        y = _apply_activation(y, activation)
-        if qsl is not None:
-            out[start : start + count] = y.transpose(0, 1).to(out.dtype)
+        # Read the state that precedes this verify step.  With speculative decoding the state
+        # table has one column per scheduled token; ``num_accepted - 1`` is the column that
+        # holds the state after the accepted prefix.  The convolution itself always needs the
+        # last ``width - 1`` taps, independently of how the cache window is laid out.
+        init_col = max(0, int(accepted[seq]) - 1) if spec and accepted else 0
+        if cache_indices is None:
+            read_line = write_line = seq
+        elif cache_indices.dim() == 1:
+            read_line = write_line = int(cache_indices[seq])
         else:
-            out[seq, :, :count] = y.to(out.dtype)
-        if taps:
-            conv_state[write_line, :, state_len - taps :] = full[:, -taps:].to(conv_state.dtype)
-    return out.to(x.dtype)
+            if read_pointer is not None:
+                read_line = int(cache_indices[seq, int(read_pointer[seq])])
+            else:
+                read_line = int(cache_indices[seq, min(init_col, cache_indices.shape[1] - 1)])
+            if write_pointer is not None:
+                write_line = int(cache_indices[seq, int(write_pointer[seq])])
+            else:
+                write_line = int(cache_indices[seq, 0])
+        if read_line == int(null_block_id) or write_line == int(null_block_id):
+            continue
+        if not (0 <= read_line < num_cache_lines):
+            raise IndexError(f"conv cache read line out of range: {read_line}")
+        window = conv_state[read_line].to(torch.float32)
+        if window.shape[1] < state_len:
+            window = torch.cat(
+                (torch.zeros((dim, state_len - window.shape[1]), device=x.device), window), dim=1
+            )
+        else:
+            window = window[:, -state_len:]
+        seq_out = []
+        x_tokens = tokens.to(torch.float32)
+        for t in range(count):
+            hist = window[:, -taps:] if taps else window[:, :0]
+            full = torch.cat((hist, x_tokens[:, t : t + 1]), dim=1)
+            y = F.conv1d(
+                full.unsqueeze(0),
+                weight.to(torch.float32).unsqueeze(1),
+                None if bias is None else bias.to(torch.float32),
+                groups=dim,
+            ).squeeze(0)
+            y_out = _apply_activation(y[:, -1], activation)
+            seq_out.append(y_out)
+            window = torch.cat((window[:, 1:], x_tokens[:, t : t + 1]), dim=1)
+            if cache_indices is not None and cache_indices.dim() == 2:
+                dst_col = min(t, cache_indices.shape[1] - 1)
+                dst_line = int(cache_indices[seq, dst_col])
+                if dst_line != int(null_block_id):
+                    if not (0 <= dst_line < num_cache_lines):
+                        raise IndexError(f"conv cache destination line out of range: {dst_line}")
+                    conv_state[dst_line] = window.to(conv_state.dtype)
 
+        y = torch.stack(seq_out, dim=1).to(out.dtype)
+        if qsl is not None:
+            out[start:end] = y.transpose(0, 1)
+        elif x.dim() == 3:
+            out[seq, :, :count] = y
+        else:
+            out[seq, :] = y[:, 0]
+        if cache_indices is not None and cache_indices.dim() == 1:
+            if write_line != int(null_block_id):
+                if not (0 <= write_line < num_cache_lines):
+                    raise IndexError(f"conv cache write line out of range: {write_line}")
+                conv_state[write_line] = window.to(conv_state.dtype)
+    return out.to(x.dtype)
 
 def _softplus_clamp(dt: torch.Tensor, dt_bias: torch.Tensor, enabled: bool) -> torch.Tensor:
     if enabled:
@@ -599,13 +668,16 @@ def _selective_state_update_varlen(
     out: Optional[torch.Tensor],
     num_accepted_tokens: Optional[torch.Tensor],
     cu_seqlens: torch.Tensor,
+    null_block_id: int,
 ) -> None:
-    """Speculative-decode update: replay every accepted token per sequence.
+    """Speculative-decode update with vLLM's per-token state slots.
 
-    vLLM's verification step passes ``x`` as concatenated multi-token sequences and
-    ``num_accepted_tokens`` for the prefix that actually committed.  Ignoring those (the
-    pre-MTP implementation did) leaves the SSM state one or more tokens behind, so the next
-    speculative step disagrees with the target even though the draft was verified.
+    For speculative decoding vLLM passes a 2-D ``state_batch_indices`` of shape
+    ``[batch, 1 + num_speculative_tokens]``.  ``num_accepted_tokens`` selects the **initial**
+    slot (``max(num_accepted - 1, 0)``), while the recurrence must still run over **every**
+    scheduled token and write each intermediate state to ``dst_state_batch_indices[seq, i]``.
+    The old implementation flattened the table and wrote only one state, so the target read the
+    state of the wrong draft token on the next verify step.
     """
     if state.dim() == 5:
         state = state.squeeze(1)
@@ -614,7 +686,6 @@ def _selective_state_update_varlen(
     if x.dim() != 3:
         raise ValueError(f"varlen x must be [tokens, heads, headdim], got {tuple(x.shape)}")
     slots, nheads, headdim, dstate = state.shape
-    tokens = x.shape[0]
     ngroups = B.shape[1]
     if nheads % ngroups:
         raise ValueError(f"nheads={nheads} is not divisible by ngroups={ngroups}")
@@ -636,49 +707,82 @@ def _selective_state_update_varlen(
     dt_bias_f = dt_bias.to(torch.float32)
     if dt_bias_f.dim() == 1:
         dt_bias_f = dt_bias_f[:, None]
+    if dt_bias_f.dim() != 2:
+        raise ValueError(f"dt_bias must be 1-D or 2-D, got {tuple(dt_bias.shape)}")
+    if dt_bias_f.shape[-1] == 1:
+        # The fused kernel receives a per-head bias expanded to [heads, head_dim]; expand the
+        # same way here so the batched verify math is identical to the ordinary decode path.
+        dt_bias_f = dt_bias_f.expand(nheads, headdim)
     b_rep = _repeat_groups(B.to(torch.float32), nheads)
     c_rep = _repeat_groups(C.to(torch.float32), nheads)
 
     starts = _as_int_list(cu_seqlens, device=x.device)
     if len(starts) < 2:
         return
-    src = (
-        state_batch_indices.reshape(-1).to(torch.int64)
-        if state_batch_indices is not None
-        else torch.arange(len(starts) - 1, device=state.device, dtype=torch.int64)
-    )
-    dst = (
-        dst_state_batch_indices.reshape(-1).to(torch.int64)
-        if dst_state_batch_indices is not None
-        else src
-    )
     accepted = _as_int_list(num_accepted_tokens, device=x.device) if num_accepted_tokens is not None else []
+    src_table = state_batch_indices
+    dst_table = dst_state_batch_indices if dst_state_batch_indices is not None else state_batch_indices
+    dst_2d = dst_table is not None and dst_table.dim() == 2
+
+    def slot(table: Optional[torch.Tensor], seq: int, token: int) -> int:
+        if table is None:
+            return seq
+        if table.dim() == 1:
+            return int(table[seq])
+        if token >= table.shape[1]:
+            raise IndexError(f"state slot table has {table.shape[1]} columns, need {token + 1}")
+        return int(table[seq, token])
 
     for seq in range(len(starts) - 1):
         start, end = int(starts[seq]), int(starts[seq + 1])
-        if end <= start:
-            continue
         count = end - start
-        if accepted:
-            count = max(0, min(count, int(accepted[seq])))
-        if count == 0:
+        if count <= 0:
             continue
-        src_slot, dst_slot = int(src[seq]), int(dst[seq])
-        if src_slot < 0 or src_slot >= slots or dst_slot < 0 or dst_slot >= slots:
-            raise IndexError(f"state slot out of range: src={src_slot}, dst={dst_slot}, slots={slots}")
-        current = state[src_slot].to(torch.float32)
-        for pos in range(start, start + count):
-            dtf = _softplus_clamp(dt[pos].to(torch.float32), dt_bias_f[:, 0], dt_softplus)
-            current = (
-                current * torch.exp(dtf[:, None, None] * a)
-                + dtf[:, None, None] * x[pos].to(torch.float32)[:, :, None] * b_rep[pos][:, None, :]
+        init_token = max(0, int(accepted[seq]) - 1) if accepted else 0
+        src_slot = slot(src_table, seq, init_token)
+        if src_slot == int(null_block_id):
+            current = torch.zeros((nheads, headdim, dstate), device=state.device, dtype=torch.float32)
+        else:
+            if src_slot < 0 or src_slot >= slots:
+                raise IndexError(f"state source slot out of range: {src_slot}, slots={slots}")
+            current = state[src_slot].to(torch.float32)
+        # The final destination for a 1-D table (ordinary decode) is written once, after the
+        # whole sequence; a 2-D table gets one state per scheduled token.
+        final_dst = slot(dst_table, seq, 0)
+        for offset, pos in enumerate(range(start, end)):
+            # Use the exact batch-one formulation of ``selective_state_update``.  A per-token
+            # loop with squeezed tensors is algebraically equivalent, but small broadcast /
+            # accumulation-order differences can flip near-tie target logits during verify.
+            xf1 = x[pos : pos + 1].to(torch.float32)
+            dt_t = dt[pos : pos + 1].to(torch.float32)
+            if dt_t.dim() == 2:
+                dt_t = dt_t.unsqueeze(-1)  # [1, heads, 1] so the bias broadcasts per head
+            dtf1 = _softplus_clamp(dt_t, dt_bias_f, dt_softplus)
+            b1 = _repeat_groups(B[pos : pos + 1].to(torch.float32), nheads)
+            c1 = _repeat_groups(C[pos : pos + 1].to(torch.float32), nheads)
+            state_in1 = current.unsqueeze(0)
+            decay1 = torch.exp(dtf1[..., None] * a)
+            state_out1 = (
+                state_in1 * decay1
+                + dtf1[..., None] * xf1[..., None] * b1[:, :, None, :]
             )
-            y = (current * c_rep[pos][:, None, :]).sum(dim=-1) + x[pos].to(torch.float32) * df
+            y = (state_out1 * c1[:, :, None, :]).sum(dim=-1) + xf1 * df
+            current = state_out1[0]
+            y = y[0]
             if z is not None:
                 y = y * F.silu(z[pos].to(torch.float32))
             out[pos].copy_(y.to(out.dtype))
-        state[dst_slot].copy_(current.to(state.dtype))
-
+            if dst_2d:
+                dst_slot = slot(dst_table, seq, offset)
+                if dst_slot != int(null_block_id):
+                    if dst_slot < 0 or dst_slot >= slots:
+                        raise IndexError(f"state destination slot out of range: {dst_slot}, slots={slots}")
+                    state[dst_slot].copy_(current.to(state.dtype))
+        if not dst_2d:
+            if final_dst != int(null_block_id):
+                if final_dst < 0 or final_dst >= slots:
+                    raise IndexError(f"state destination slot out of range: {final_dst}, slots={slots}")
+                state[final_dst].copy_(current.to(state.dtype))
 
 def selective_state_update(
     state: torch.Tensor,
@@ -707,7 +811,7 @@ def selective_state_update(
     tokens are replayed in state order so the target state stays exact.  The function is in-place
     on ``state`` and ``out`` like vLLM's kernel.
     """
-    del null_block_id, is_blackwell
+    del is_blackwell
     if cu_seqlens is not None and x.dim() == 3:
         _selective_state_update_varlen(
             state,
@@ -725,6 +829,7 @@ def selective_state_update(
             out,
             num_accepted_tokens,
             cu_seqlens,
+            null_block_id,
         )
         return
     if state.dim() == 3:
