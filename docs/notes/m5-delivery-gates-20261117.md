@@ -153,9 +153,40 @@ Reason: The JSON format is incorrect.
 早先按 9.1 的习惯设 60 会得到
 `Value 60 ... is out of range[120, 7200]`，这不是模型代码问题。后续重试用 600。
 
-结论：**TP=8 本轮没有拿到可用结果，MTP TP=8 也未验证**；这是共享环境/HCCL 根信息
-问题，不是 TileInfer 算子路径。TP=2/4/8 的旧记录来自本文件之外的更早窗口，不能拿来
-补这次的 TP=8 结论。
+### 4.1 继续尝试：从拓扑库生成 rootinfo
+
+18:45–18:51 继续用 CANN 自带的 `libtopoaddrinfo.so` 生成 rootinfo，而不是手写：
+
+- `PodGetRootinfo(dev, 8, ...)` 能返回每张卡的 `rank_list` 条目；本机的 `local_id`
+  是 **56–63**（不是 0–7），这解释了早先手写 `local_id=0..7` 为什么即使 JSON 能解析
+  也会失败；
+- 设备 0–3 的 `level_list` 各带 **4 个 EID** 地址，设备 4–7 的 `level_list` 的
+  `rank_addr_list` 是 **空**；把 8 个条目拼成一个 `rank_count=8` 的 rootinfo 后，HCCL
+  报：
+
+```text
+RankTableInfo::CheckAndInsert failed with the size of rank_addrs with the same id
+is different. levelId[sp4294967295_srv65535], rankAddrSize[0]
+```
+
+- 把 8 个条目的 `level_list` 清空、只保留 `local_id=56..63` 和
+  `topo_file_path=.../atlas_950_1.json`，HCCL 能建链，但模型 warmup 的 AllReduce
+  报 `TaskParamType::TASK_AICPU_KERNEL` / `AicpuAllReduceSoleMeshTwoShot_device`
+  → `ACL stream synchronize failed, error code:507018`；
+- 用 8 张卡的 vnic IPv4（192.168.2.199…192）填 `rank_addr_list` 后，HCCL 反而在
+  `hcclCommInitRootInfoConfig` 返回 error code 1；
+- 用同样的 EID 方式生成 **TP=4**（设备 0–3，rank_count=4）rootinfo，HCCL 建链后仍在
+  `HcclAllreduce` 失败；加 `HCCL_ALGO=Ring`、`HCCL_ENABLE_OPEN_AICPU=0` 也没有改变
+  失败点。
+
+这些尝试说明当前不是“只差一个 TP 参数”：**本机的 rootinfo/拓扑与 CANN 9.3 的
+AICPU AllReduce 路径不匹配**，TP=4 和 TP=8 都会在 AllReduce 处失败。所有临时
+rootinfo 已删除，`/etc/hccl_rootinfo.json` 恢复为空目录；没有留下系统改动，也没有
+改上游代码。
+
+结论：**TP=4/8 本轮都没有拿到可用结果，MTP 多卡也未验证**；这是共享环境/HCCL
+根信息与拓扑问题，不是 TileInfer 算子路径。TP=2/4/8 的旧记录来自本文件之外的更早
+窗口，不能拿来补这次的 TP=8 结论。
 
 ## 5. 仍未关闭 / 不能声明
 
