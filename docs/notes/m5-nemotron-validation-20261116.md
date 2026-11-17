@@ -6,8 +6,10 @@
 
 ## 0. 代码与栈
 
-- 远端 `/home/zxs/TileInfer`，提交 `ac567ca`（`fix(nemotron): keep causal-conv update graph-capture safe`）。
-  之前同一轮提交：`40e46b3`（speculative state update）、`bb4f06b`（speculative causal-conv update）。
+- 远端 `/home/zxs/TileInfer`，MTP 修复提交 `a368a04`
+  （`fix(nemotron): make MTP target verification lossless`，见 §5）。
+  之前的 conv/state 提交：`ac567ca`（`fix(nemotron): keep causal-conv update graph-capture safe`）、
+  `40e46b3`（speculative state update）、`bb4f06b`（speculative causal-conv update）。
 - vLLM 0.23.0 / vllm-ascend 0.23.0 / CANN 9.3.0 / Python 3.12.14 / torch_npu 2.10.0.post4。
 - 模型权重 `/home/models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16`（62 GB，14 shards）。
 - 目标 plan 仍为 `servable=false`；以下全部是 `TILEINFER_ALLOW_UNSERVABLE=1` 的 bring-up，
