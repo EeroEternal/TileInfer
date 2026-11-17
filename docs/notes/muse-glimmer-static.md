@@ -200,6 +200,10 @@ exact, TPOT unchanged.
 - **Vendor stack (vllm-ascend 0.23.0-950, read-only registration, same model): 37 ms/tok** —
   roughly 2x the v2 stack. Its attention path is the vendor's optimized FIA; the v2 stack's
   windowed staging + reference prefill is what costs the difference.
+  **`[待复核]`**: this line has no command, prompt or date, so it is a lead, not a baseline.
+  The 2026-11-17 re-validation on this repository's venv measured **41.3 ms/tok** (three runs,
+  cards 0/1/4); see
+  [`muse-glimmer-v3-validation-20261117.md`](muse-glimmer-v3-validation-20261117.md).
 
 ## Launch recipe (V3, vllm-ascend environment)
 
@@ -244,9 +248,13 @@ The bridge hosts vendor-absent models end to end, with no V2 involvement:
   `tileinfer/vllm/ops/families/dense.py`; the V2 plugin and profile registry no longer mention
   the model. The remaining v2 tree is archived under `legacy/v2/` and is not importable.
 - Usage: install the bridge in the vllm-ascend environment and set
-  `TILEINFER_MANIFEST=muse_glimmer` (or point `TILEINFER_PLAN` at a built plan).  Device
-  re-validation under the V3 layout is pending (no card available); the probe already showed
-  the vendor stack serves this model at 37 ms/tok with the parser registered.
+  `TILEINFER_MANIFEST=muse_glimmer` (or point `TILEINFER_PLAN` at a built plan).
+- **Device re-validation under the V3 layout: DONE on 2026-11-17** (8 × Ascend950PR, real
+  weights, single card): C1 pass; C3 pass (8 graphs @32K, 99/99 decode hits, 0 fallbacks);
+  C4 absolute 41 ms/tok, 175 tok/s at 8-way concurrency; cold start 38 s with a fresh cache.
+  Environment deltas vs the reference probe: transformers 5.5.4 + hub 1.33 (the checkpoint
+  tokenizer is `TokenizersBackend`), NNAL/ATB 9.2.0-beta.1, triton-ascend 3.2.2, CANN 9.3.0.
+  Commands and numbers: [`muse-glimmer-v3-validation-20261117.md`](muse-glimmer-v3-validation-20261117.md).
 
 Open: the C2 benchmark sample (first-token top-5) is not captured, so numeric acceptance is
 not wired yet.

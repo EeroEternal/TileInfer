@@ -78,7 +78,7 @@ LFM3 不是普通 dense Transformer，而是 **卷积 + 注意力混合** 结构
 | 层/文件 | 改动 | 为什么 | 效果 |
 |---|---|---|---|
 | `tileinfer/manifests/lfm3_1_7.py` + registry | 新增模型声明：24 层类型、16/4 头、head_dim 128、窗口 256、双 RoPE、短卷积 kernel 7、benchmark、perf、模块式 `model_impl` | 项目要求“声明先于实现”，所有决策从声明出发 | `tileinfer plan build` 可产出计划；缺口报告可计算；与 Qwen3.6 互不影响 |
-| `tileinfer/contracts/manifest.py` | 新增 `StateSpec`；`AttentionSpec` 增加 `sliding_window`、`rope_by_layer`；`ModelManifest` 增加 `state`、模块式 `model_impl`；允许 `conv`/`sliding_attention` | 原 schema 只能表达 full/linear + GDN | 能合法表达 LFM3 的卷积状态、滑窗、双 RoPE 和路线 O；合并 upstream 后 Qwen plan id 为 `079341ffd3f17b0d` |
+| `tileinfer/contracts/manifest.py` | 新增 `StateSpec`；`AttentionSpec` 增加 `sliding_window`、`rope_by_layer`；`ModelManifest` 增加 `state`、模块式 `model_impl`；允许 `conv`/`sliding_attention` | 原 schema 只能表达 full/linear + GDN | 能合法表达 LFM3 的卷积状态、滑窗、双 RoPE 和路线 O；合并 upstream 后 Qwen plan id 为 `5fc9d1720e9400bd` |
 | `tileinfer/resolve/decide.py` | 按 `state.kind` 区分 GDN/short_conv；`model_impl` 保留在 `Plan` 上并请求 `model_table`，不再生成 `model.arch` 计划行 | 厂商 `state.linear` 是 GDN，直接选会“假装覆盖”；模型注册由 `model_table` 统一负责 | LFM3 计划出现 `tileinfer.short_conv`，`plan.model_impl=tileinfer.bridge.models.lfm3`；Qwen 仍 8 条全厂商 |
 | `tileinfer/providers/catalog.py` | 新增 route-O 作用域的 short-conv provider 声明（覆盖、可图、并行、证据、删除条件） | 这是真实缺口，不是速度问题，也不能变成全局默认 | 计划可以选到 `tileinfer.short_conv`；`graphable=True` |
 | `tileinfer/providers/state/short_conv.py` | 纯 torch 的因果 depthwise 卷积与滚动状态；prefill/step/batch 三种入口 | 厂商没有短卷积状态实现 | 数学可独立在 CPU 测试；模型层只负责状态缓存/元数据 |
@@ -108,7 +108,7 @@ LFM3 不是普通 dense Transformer，而是 **卷积 + 注意力混合** 结构
 真实插件入口（没有手工调用 `install()`）。合并 upstream `model_impl` 机制后已用新计划在 LFM3 真权重上重跑：
 
 ```text
-[tileinfer] TileInfer v3 bridge: plan=497db0c9c88f09b3 model=LFM3-1.7B
+[tileinfer] TileInfer v3 bridge: plan=d0ded082891fbb99 model=LFM3-1.7B
 selections=7 ... access_points=6 |
 seams=config_gate,graph_hook,attn_select,impl_table,model_table | skipped=none
 OUT 0 ' Paris.\n\nThe capital of Japan is Tokyo.\n\nThe capital of Australia is Canberra'

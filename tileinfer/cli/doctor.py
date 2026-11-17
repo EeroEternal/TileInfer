@@ -128,6 +128,61 @@ def _check_support(report: Report, plan: Optional[Any]) -> None:
     report.add("model_support", status, detail)
 
 
+def _check_parallel(report: Report, plan: Optional[Any]) -> None:
+    """Gate the plan's parallel axes against the live environment and its selections.
+
+    A plan built for single-card must not be injected into a sharded run: a single-only
+    provider that receives locally sharded tensors produces wrong numbers, not an exception.
+    """
+    if plan is None:
+        report.add("parallel", SKIP, "no plan")
+        return
+    try:
+        from ..contracts.capabilities import parallel_supports
+        from ..resolve.probe import probe
+    except Exception as exc:  # pragma: no cover - defensive
+        report.add("parallel", FAIL, f"cannot import parallel helpers: {exc}")
+        return
+
+    env = probe()
+    live_axes = env.parallel_axes()
+    plan_axes = tuple(getattr(plan, "parallel", ("single",)))
+    if set(plan_axes) != set(live_axes):
+        report.add(
+            "parallel",
+            FAIL,
+            f"plan was built for parallel={list(plan_axes)} but this run is {list(live_axes)}; "
+            "rebuild with `tileinfer plan build --tp/--ep/--dp/--pp` "
+            "or set TILEINFER_TP_SIZE/TILEINFER_EP_SIZE/...",
+        )
+        return
+
+    try:
+        from ..providers import CANDIDATE_PROVIDERS
+        from ..providers.catalog import ROUTE_O_PROVIDERS
+
+        known = {provider.name: provider for provider in CANDIDATE_PROVIDERS}
+        known.update({provider.name: provider for provider in ROUTE_O_PROVIDERS.values()})
+    except Exception:  # pragma: no cover - optional in early bring-up
+        known = {}
+
+    bad = []
+    for selection in plan.selections:
+        if selection.source == "vendor":
+            continue
+        provider = known.get(selection.provider)
+        if provider is not None and not parallel_supports(provider.parallel, live_axes):
+            bad.append(f"{selection.provider} supports {list(provider.parallel)}")
+    if bad:
+        report.add(
+            "parallel",
+            FAIL,
+            f"non-vendor selections do not cover parallel={list(live_axes)}: {bad}",
+        )
+    else:
+        report.add("parallel", PASS, f"plan={list(plan_axes)} live={list(live_axes)}")
+
+
 def _check_imports(report: Report) -> None:
     root = pathlib.Path(__file__).resolve().parents[2]
     found = _scan_vendor_imports(root)
@@ -195,6 +250,7 @@ def _collect(report: Report, metrics_path: str) -> None:
     _check_versions(report)
     plan = _check_plan(report)
     _check_support(report, plan)
+    _check_parallel(report, plan)
     _check_imports(report)
     _check_bridge(report, plan)
     _check_metrics(report, metrics_path)

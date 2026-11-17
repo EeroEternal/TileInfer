@@ -42,7 +42,7 @@ providers / aot / observ / cli` 加进 engine-free 列表。
    装钩子 → 记录实际生效的 seam；任何异常不外抛。
 
 Plan 是内容寻址的，本次为 `7d00064d487af3f6`（合并 upstream v3 `model_impl` 机制后，
-同一 Qwen 声明重建的 plan id 为 `079341ffd3f17b0d`；下面的日志保留合并前的记录）：
+同一 Qwen 声明重建的 plan id 为 `5fc9d1720e9400bd`；下面的日志保留合并前的记录）：
 
 ```bash
 .venv_v3/bin/python -m tileinfer.cli.plan build \

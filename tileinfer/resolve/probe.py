@@ -13,7 +13,7 @@ import os
 import platform
 import sys
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 
 def _version(dist: str) -> Optional[str]:
@@ -51,9 +51,25 @@ def _device_type() -> Optional[str]:
     return None
 
 
+def _env_int(name: str, default: int = 1) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
 @dataclass
 class Environment:
-    """The facts the decision is allowed to see."""
+    """The facts the decision is allowed to see.
+
+    The parallel sizes are facts supplied by the deployment, not read from vLLM here: the
+    decision path is engine-free (``test_engine_free_layers_import_in_a_clean_subprocess``
+    asserts ``vllm`` is never imported), so ``probe`` takes them from ``TILEINFER_*_SIZE`` or
+    from the CLI.  A plan records them; the bridge can cross-check the live config later.
+    """
 
     vllm: Optional[str] = None
     vllm_ascend: Optional[str] = None
@@ -63,7 +79,31 @@ class Environment:
     has_vendor: bool = False
     has_tileinfer: bool = True
     vendor_backend: Optional[str] = None
+    tp_size: int = 1
+    ep_size: int = 1
+    dp_size: int = 1
+    pp_size: int = 1
     notes: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        for name in ("tp_size", "ep_size", "dp_size", "pp_size"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or value < 1:
+                raise ValueError(f"{name} must be a positive integer, got {value!r}")
+
+    def parallel_axes(self) -> Tuple[str, ...]:
+        """The active sharding axes, or ``("single",)`` when every size is 1."""
+        axes = tuple(
+            axis
+            for axis, size in (
+                ("tp", self.tp_size),
+                ("ep", self.ep_size),
+                ("dp", self.dp_size),
+                ("pp", self.pp_size),
+            )
+            if size > 1
+        )
+        return axes or ("single",)
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -75,12 +115,32 @@ class Environment:
             "has_vendor": self.has_vendor,
             "has_tileinfer": self.has_tileinfer,
             "vendor_backend": self.vendor_backend,
+            "tp_size": self.tp_size,
+            "ep_size": self.ep_size,
+            "dp_size": self.dp_size,
+            "pp_size": self.pp_size,
+            "parallel_axes": list(self.parallel_axes()),
             "notes": dict(self.notes),
         }
 
 
-def probe() -> Environment:
-    """Detect the stack.  Missing pieces are recorded, never raised."""
+def probe(
+    tp_size: Optional[int] = None,
+    ep_size: Optional[int] = None,
+    dp_size: Optional[int] = None,
+    pp_size: Optional[int] = None,
+) -> Environment:
+    """Detect the stack.  Missing pieces are recorded, never raised.
+
+    Parallel sizes come from the explicit arguments first, then ``TILEINFER_TP_SIZE`` /
+    ``TILEINFER_EP_SIZE`` / ``TILEINFER_DP_SIZE`` / ``TILEINFER_PP_SIZE``, then 1.
+    """
+    sizes = {
+        "tp_size": tp_size if tp_size is not None else _env_int("TILEINFER_TP_SIZE"),
+        "ep_size": ep_size if ep_size is not None else _env_int("TILEINFER_EP_SIZE"),
+        "dp_size": dp_size if dp_size is not None else _env_int("TILEINFER_DP_SIZE"),
+        "pp_size": pp_size if pp_size is not None else _env_int("TILEINFER_PP_SIZE"),
+    }
     env = Environment(
         vllm=_version("vllm"),
         vllm_ascend=_version("vllm_ascend"),
@@ -88,7 +148,9 @@ def probe() -> Environment:
         device_type=_device_type(),
         has_vendor=_module_present("vllm_ascend"),
         has_tileinfer=_module_present("tileinfer"),
+        **sizes,
     )
+    env.notes["parallel_source"] = "cli/env" if any(v > 1 for v in sizes.values()) else "single"
     if env.has_vendor:
         # The A5 backend class is stable for the 0.23 line; recording it makes a version
         # drift visible in the plan instead of only in a stack trace.

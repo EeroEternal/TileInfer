@@ -40,7 +40,7 @@ python -m tileinfer.cli.plan build \
     --model /home/models/LFM3-1.7B --out /tmp/lfm3-plan-real.json
 ```
 
-The plan rebuilt after the v3 `model_impl` merge is `497db0c9c88f09b3` (7 selections,
+The plan rebuilt after the v3 `model_impl` merge is `d0ded082891fbb99` (7 selections,
 6 access points, `state.linear` from `tileinfer.short_conv`,
 `model_impl=tileinfer.bridge.models.lfm3`).  It has no `model.arch` row: the model is
 registered through the module's `register_config()` / `register_models()` actors.
@@ -62,7 +62,7 @@ python -c "from vllm import LLM; ..."
 Observed log (no manual `install()` call):
 
 ```text
-[tileinfer] TileInfer v3 bridge: plan=497db0c9c88f09b3 model=LFM3-1.7B selections=7
+[tileinfer] TileInfer v3 bridge: plan=d0ded082891fbb99 model=LFM3-1.7B selections=7
 (...) access_points=6 fallback=forbid | seams=config_gate,graph_hook,attn_select,
 impl_table,model_table | skipped=none | metrics=/tmp/tileinfer-v3-metrics.json
 OUT: ' Paris.\n\nThe capital of Japan is Tokyo.\n\nThe capital of Australia is Canberra'
@@ -129,7 +129,7 @@ OK
 
 The C1/C2/C3 rerun changed only the model-registration mechanism, not the model math, so
 the C4 numbers below are retained from the same implementation and were **not re-measured**
-under plan `497db0c9c88f09b3`.  A post-merge smoke run (1024-token prompt, 64 output tokens,
+under plan `d0ded082891fbb99`.  A post-merge smoke run (1024-token prompt, 64 output tokens,
 conc=1) finished in 0.534 s end to end (~120 tok/s), consistent with the table; it is not a
 p50/p90 gate measurement.
 
