@@ -11,6 +11,8 @@ import torch
 import torch.nn.functional as F
 
 from tileinfer.providers.nemotron.mamba2 import (
+    _causal_conv1d_update_capture,
+    _selective_state_update_capture,
     causal_conv1d_fn,
     causal_conv1d_update,
     mamba_chunk_scan_combined_varlen,
@@ -670,3 +672,104 @@ def test_mamba2_selective_state_update_varlen_matches_decode_with_full_dt_bias()
         ).sum(-1) + x[pos] * D
         torch.testing.assert_close(out[pos], expected, rtol=1e-5, atol=1e-6)
         torch.testing.assert_close(state[int(dst[0, pos])], current, rtol=1e-5, atol=1e-6)
+
+
+def test_captured_spec_conv_matches_eager_uniform_batch() -> None:
+    """Graph capture uses a tensor-only conv; it must match the eager rolling window."""
+    torch.manual_seed(71)
+    dim, width, batch, count = 3, 4, 2, 2
+    taps, state_len = width - 1, width
+    conv_state = torch.randn(5, dim, state_len)
+    eager_state, capture_state = conv_state.clone(), conv_state.clone()
+    weight = torch.randn(dim, width)
+    bias = torch.randn(dim)
+    x = torch.randn(batch * count, dim)
+    indices = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+    accepted = torch.tensor([1, 2], dtype=torch.int32)
+    qsl = torch.tensor([0, count, batch * count], dtype=torch.int32)
+
+    eager_out = causal_conv1d_update(
+        x,
+        eager_state,
+        weight,
+        bias,
+        activation="silu",
+        conv_state_indices=indices,
+        num_accepted_tokens=accepted,
+        query_start_loc=qsl,
+        max_query_len=count,
+    )
+    capture_out = _causal_conv1d_update_capture(
+        x,
+        capture_state,
+        weight,
+        bias,
+        "silu",
+        indices,
+        accepted,
+        qsl,
+        0,
+        None,
+        None,
+    )
+    torch.testing.assert_close(capture_out, eager_out, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(capture_state, eager_state, rtol=1e-5, atol=1e-6)
+
+
+def test_captured_spec_state_matches_eager_uniform_batch() -> None:
+    """Graph capture uses a batched tensor-only SSM; it must match eager per-token math."""
+    torch.manual_seed(73)
+    heads, hdim, dstate, groups = 4, 3, 5, 2
+    slots, batch, count = 12, 2, 2
+    state = torch.randn(slots, heads, hdim, dstate)
+    eager_state, capture_state = state.clone(), state.clone()
+    x = torch.randn(batch * count, heads, hdim)
+    dt = torch.randn(batch * count, heads, hdim)
+    A = -torch.rand(heads)
+    B = torch.randn(batch * count, groups, dstate)
+    C = torch.randn(batch * count, groups, dstate)
+    D = torch.randn(heads, hdim)
+    dt_bias = torch.randn(heads, hdim)
+    src = torch.tensor([[1, 2], [3, 4]], dtype=torch.int64)
+    dst = torch.tensor([[5, 6], [7, 8]], dtype=torch.int64)
+    accepted = torch.tensor([1, 2], dtype=torch.int32)
+    qsl = torch.tensor([0, count, batch * count], dtype=torch.int32)
+    eager_out = torch.empty_like(x)
+    capture_out = torch.empty_like(x)
+
+    selective_state_update(
+        eager_state,
+        x,
+        dt,
+        A,
+        B,
+        C,
+        D,
+        dt_bias,
+        dt_softplus=True,
+        state_batch_indices=src,
+        dst_state_batch_indices=dst,
+        out=eager_out,
+        num_accepted_tokens=accepted,
+        cu_seqlens=qsl,
+    )
+    _selective_state_update_capture(
+        capture_state,
+        x,
+        dt,
+        A,
+        B,
+        C,
+        D,
+        dt_bias,
+        None,
+        True,
+        src,
+        dst,
+        capture_out,
+        accepted,
+        qsl,
+        0,
+    )
+    torch.testing.assert_close(capture_out, eager_out, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(capture_state, eager_state, rtol=1e-5, atol=1e-6)
