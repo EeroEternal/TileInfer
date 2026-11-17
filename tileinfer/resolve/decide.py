@@ -52,7 +52,9 @@ def _candidates(capability: Capability, manifest: ModelManifest) -> List:
     return [
         provider
         for provider in CANDIDATE_PROVIDERS
-        if provider.capability is capability and _covers(provider, manifest)
+        if provider.capability is capability
+        and provider.status == "candidate"
+        and _covers(provider, manifest)
     ]
 
 
@@ -86,23 +88,17 @@ def _select(
 ) -> Tuple[List[Selection], List[Gap]]:
     selections: List[Selection] = []
     gaps: List[Gap] = []
-    state_kind = getattr(manifest.state, "kind", None) if manifest.state else None
     for cap_name in manifest.required_capabilities:
         capability = Capability(cap_name)
         vendor = VENDOR_PROVIDERS.get(capability)
         ours = TILEINFER_PROVIDERS.get(capability)
-        if capability is Capability.STATE_LINEAR:
-            if state_kind == "short_conv":
-                # The vendor state entry is GDN.  A declaration that states a different
-                # recurrent flavour (short convolution) uses its own model-scoped provider.
-                vendor = None
-                ours = ROUTE_O_PROVIDERS.get(capability)
-            else:
-                # A GDN declaration must not use the short-conv route provider.  Other
-                # state providers (for example a declared Mamba2 candidate) are kept and
-                # left to ``_covers`` to decide.
-                if ours is not None and ours.name == "tileinfer.short_conv":
-                    ours = None
+        # Model-scoped providers only exist for declarations that ship a model_impl.  They
+        # still go through ``_covers``; a short-conv provider cannot answer Qwen's GDN state
+        # just because both spell ``state.linear``.
+        if ours is None and manifest.model_impl:
+            ours = ROUTE_O_PROVIDERS.get(capability)
+        if ours is not None and ours.scope == "model" and not manifest.model_impl:
+            ours = None
         order = ("vendor", "tileinfer") if policy == "vendor_first" else ("tileinfer", "vendor")
 
         if allow_candidates:
@@ -273,9 +269,11 @@ def decide(
         },
         fallback_policy="forbid",
         model_impl=manifest.model_impl,
+        config_impl=manifest.config_impl,
         reasoning_parser=manifest.reasoning_parser,
         reasoning_parser_impl=manifest.reasoning_parser_impl,
         servable=servable,
+        support=dict(manifest.support),
     )
     plan.validate()
 

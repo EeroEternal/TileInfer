@@ -9,7 +9,10 @@
 > C2 仅 token/text 通过（logprob top-5 未通过）；C3 短稳态 31/31 命中、0 回退（metrics 文件默认只写捕获快照），
 > MTP 无损性失败；TP=2/4/8 后来用全新 cache 重试均通过，早先 TP=8 的 HCCL rootinfo 报错是共享环境瞬时状态。
 > 证据与命令见 [`m5-nemotron-validation-20261116.md`](m5-nemotron-validation-20261116.md)。
-> **不要默认开 MTP，也不要对外说“已支持”。**
+
+> **2026-11-17 更新**：当前树已验证 `.venv_lfm3`（transformers 5.17.0）可跑 C1/C3；
+> `nemotron_h` config 别名由 plan 的 `config_impl` 驱动，不再硬编码在 `install.py`。
+> 文中 `.venv_v3` 命令是历史机器记录，当前 checkout 优先用 `.venv_lfm3`。
 
 ---
 
@@ -92,8 +95,10 @@ PY
 ### 1.2 vLLM 0.23 的 `nemotron_h` AutoConfig 别名
 
 vLLM 0.23.0 自带 `NemotronHConfig`，但它的 `_CONFIG_REGISTRY` 没有 `nemotron_h` 项；
-Transformers 4.57 下 `ModelConfig` 会在模型代码之前直接失败。TileInfer 的 bridge 在
-`ModelConfig` 之前注册 vLLM 自带的类（`tileinfer/bridge/nemotron_config.py`），不修改上游源码。
+Transformers 4.57 下 `ModelConfig` 会在模型代码之前直接失败。P0 之后，这个别名不再硬编码在
+`install.py`，而是由 manifest 的
+`config_impl="tileinfer.bridge.nemotron_config:register_nemotron_h_alias"` 驱动：bridge 在
+`ModelConfig` 之前导入 `tileinfer/bridge/nemotron_config.py` 并执行 actor，不修改上游源码。
 如果 bridge 被 `TILEINFER_V3=0` 关闭，这个别名不会注册；因此目标服务不要关 bridge。
 
 ### 1.3 目标 plan（不注册 draft）
@@ -102,7 +107,8 @@ Transformers 4.57 下 `ModelConfig` 会在模型代码之前直接失败。TileI
 过 config gate。用离线工具生成临时 plan：
 
 ```bash
-.venv_v3/bin/python tools/nemotron/build_plan.py --allow-candidates --out "$PLAN"
+# 本机可用 .venv_lfm3（transformers 5.17）；历史机器用 .venv_v3
+.venv_lfm3/bin/python tools/nemotron/build_plan.py --allow-candidates --out "$PLAN"
 ```
 
 输出会明确 `servable=false`、`gaps=["state.linear"]`；这是 bring-up 用的 plan，不是支持声明。

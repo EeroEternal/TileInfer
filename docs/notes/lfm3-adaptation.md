@@ -45,6 +45,12 @@ The plan rebuilt after the v3 `model_impl` merge is `497db0c9c88f09b3` (7 select
 `model_impl=tileinfer.bridge.models.lfm3`).  It has no `model.arch` row: the model is
 registered through the module's `register_config()` / `register_models()` actors.
 
+**P0/P1 update (2026-11-17):** the bridge now carries the shared `WeightMapSpec` and
+`StateLayout`; LFM3's `load_weights()` uses `LFM3_WEIGHT_MAP` and its `_padded_state_len()`
+uses `short_conv_state_layout()`. The vllm-ascend global-RoPE patch is registered as
+`lfm3_rope_global_buffer` in `tileinfer/bridge/compat_hooks.py`. C1 was re-run after the
+migration (same plan, same output); C2/C4 were not repeated as a full p50/p90 gate.
+
 C1/C2/C3 were rerun with this plan on the real checkpoint:
 
 ```bash

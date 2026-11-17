@@ -114,6 +114,20 @@ def _check_plan(report: Report) -> Optional[Any]:
         return None
 
 
+def _check_support(report: Report, plan: Optional[Any]) -> None:
+    if plan is None:
+        report.add("model_support", SKIP, "no plan")
+        return
+    support = dict(getattr(plan, "support", {}) or {})
+    if not support:
+        report.add("model_support", SKIP, "declaration has no support metadata")
+        return
+    text = str(support.get("text", "unknown"))
+    status = PASS if text in {"verified", "partial"} else FAIL
+    detail = ", ".join(f"{key}={value}" for key, value in sorted(support.items()))
+    report.add("model_support", status, detail)
+
+
 def _check_imports(report: Report) -> None:
     root = pathlib.Path(__file__).resolve().parents[2]
     found = _scan_vendor_imports(root)
@@ -180,6 +194,7 @@ def _check_metrics(report: Report, path: Optional[str] = None) -> None:
 def _collect(report: Report, metrics_path: str) -> None:
     _check_versions(report)
     plan = _check_plan(report)
+    _check_support(report, plan)
     _check_imports(report)
     _check_bridge(report, plan)
     _check_metrics(report, metrics_path)

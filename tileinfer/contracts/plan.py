@@ -142,12 +142,16 @@ class Plan:
     #: (copied from the declaration).  Empty strings mean "the vendor serves the model and
     #: the output is plain text".
     model_impl: str = ""
+    config_impl: str = ""
     reasoning_parser: str = ""
     reasoning_parser_impl: str = ""
     #: The decision's gap report verdict.  Stored in the plan so the bridge cannot install a
     #: provider for a model the decision already called unservable; older plan files that predate
     #: this field load as ``True`` for compatibility.
     servable: bool = True
+    #: Verification-scope metadata copied from the declaration.  Deliberately excluded from
+    #: ``compute_id``: recording that MTP failed does not change the deployment decision.
+    support: Dict[str, Any] = field(default_factory=dict)
     plan_id: str = ""
     created_at: str = ""
     schema_version: int = SCHEMA_VERSION
@@ -172,6 +176,8 @@ class Plan:
             "reasoning_parser_impl": self.reasoning_parser_impl,
             "servable": self.servable,
         }
+        if self.config_impl:
+            payload["config_impl"] = self.config_impl
         blob = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(blob).hexdigest()[:16]
 
@@ -223,9 +229,11 @@ class Plan:
             "instrumentation": dict(self.instrumentation),
             "fallback_policy": self.fallback_policy,
             "model_impl": self.model_impl,
+            "config_impl": self.config_impl,
             "reasoning_parser": self.reasoning_parser,
             "reasoning_parser_impl": self.reasoning_parser_impl,
             "servable": bool(self.servable),
+            "support": dict(self.support),
         }
 
     @classmethod
@@ -241,9 +249,11 @@ class Plan:
             "instrumentation",
             "fallback_policy",
             "model_impl",
+            "config_impl",
             "reasoning_parser",
             "reasoning_parser_impl",
             "servable",
+            "support",
         }
         unknown = sorted(set(data) - known)
         if unknown:
@@ -256,9 +266,11 @@ class Plan:
             instrumentation=dict(data.get("instrumentation", {})),
             fallback_policy=str(data.get("fallback_policy", "forbid")),
             model_impl=str(data.get("model_impl", "")),
+            config_impl=str(data.get("config_impl", "")),
             reasoning_parser=str(data.get("reasoning_parser", "")),
             reasoning_parser_impl=str(data.get("reasoning_parser_impl", "")),
             servable=bool(data.get("servable", True)),
+            support=dict(data.get("support", {})),
             plan_id=str(data.get("plan_id", "")),
             created_at=str(data.get("created_at", "")),
             schema_version=int(data.get("schema_version", SCHEMA_VERSION)),

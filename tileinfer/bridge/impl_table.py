@@ -138,22 +138,26 @@ def _install_mamba2_ascend_spec_metadata(report: ImplReport) -> None:
 
 def _install_nemotron_moe(report: ImplReport) -> None:
     """Install the vLLM/vllm-ascend non-gated MoE adapters (bridge code, not a kernel)."""
-    from tileinfer.bridge import nemotron_moe
+    from tileinfer.bridge.compat_hooks import install_compat_hook
 
-    for name, fn in (
-        ("non_gated_guard", nemotron_moe.install_non_gated_guard),
-        ("ascend_non_gated_experts", nemotron_moe.install_ascend_non_gated_experts),
-        ("nemotron_shared_alias", nemotron_moe.install_nemotron_shared_alias),
+    for hook in (
+        "nemotron_non_gated_guard",
+        "nemotron_ascend_non_gated_experts",
+        "nemotron_shared_alias",
     ):
         try:
-            ok = bool(fn())
+            result = install_compat_hook(hook)
         except Exception as exc:  # noqa: BLE001 - report, never take the process down
-            report.failed[name] = f"{type(exc).__name__}: {exc}"
+            report.failed[hook] = f"{type(exc).__name__}: {exc}"
             continue
-        if ok:
-            report.installed.append(f"moe:{name}")
+        if result.get("ok") and not result.get("disabled"):
+            report.installed.append(f"moe:{hook}")
+        elif result.get("disabled"):
+            # The provider is being installed; a deliberately disabled vendor hook means
+            # the path is incomplete, so fail closed rather than silently run without it.
+            report.failed[f"moe:{hook}"] = result.get("detail", "hook disabled")
         else:
-            report.failed[f"moe:{name}"] = "adapter returned False (target unavailable)"
+            report.failed[f"moe:{hook}"] = result.get("detail", "hook failed")
 
 
 PROVIDER_BINDERS: Mapping[str, Callable[[ImplReport], None]] = {
@@ -204,11 +208,19 @@ def install(plan: Any) -> ImplReport:
         )
 
     seen: set[str] = set()
+    from tileinfer.providers import find_provider
+
     for selection in non_vendor:
         name = str(selection.provider)
         if name in seen:
             continue
         seen.add(name)
+        spec = find_provider(name)
+        if spec is not None and spec.install == "model_impl":
+            # The provider is called directly by our model implementation; there is no
+            # vLLM operator-table target to bind.  The declaration, not the seam, decides.
+            report.skipped.append(f"{name}: consumed inside model_impl")
+            continue
         binder = PROVIDER_BINDERS.get(name)
         if binder is None:
             report.ok = False

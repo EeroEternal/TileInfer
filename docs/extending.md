@@ -88,11 +88,34 @@ delta_h 一组算子（状态读写归 `state.linear`）。能力→算子的绑
 `tileinfer/bridge/impl_table.py` 按计划里的**非厂商 selection**逐条安装 provider。两者在
 vendor 选择下都返回厂商原路径，不做任何替换。`impl_table` 不维护全局算子表，也不允许
 "看到非厂商选择就先装一遍"；没有 `impl_table` 接入点、没有对应 selection、或 provider 名
-未知，都必须失败而不是猜。`model_table` 仍是空实现（没有整模型替换需求）。
+未知，都必须失败而不是猜。`model_table` 已由 MuseGlimmer（模型 + parser）和 LFM3
+（模型 + `register_config`）使用，不再是空实现。
 
-当前 L4 只有 Nemotron 的两个**候选**：`tileinfer.mamba2_state` 和
-`tileinfer.nemotron_moe`。它们可以在显式构造的 bring-up 计划里被选中并测试安装，但不会
-自动进入默认计划；真权重 C1/C2 通过前，Nemotron 的计划仍是 `servable=false`。
+当前 L4 的声明包括 LFM3 的 `tileinfer.short_conv`（模型作用域、由模型内部消费）和
+Nemotron 的两个**候选**：`tileinfer.mamba2_state`、`tileinfer.nemotron_moe`。候选可以在
+显式构造的 bring-up 计划里被选中并测试安装，但不会自动进入默认计划；真权重 C1/C2 通过前，
+Nemotron 的计划仍是 `servable=false`。
+
+**Provider 生命周期字段（P0）**：选择不再由 seam 认识 provider 名字决定，而是由声明决定：
+
+| 字段 | 值 | 作用 |
+|---|---|---|
+| `status` | `default` / `candidate` | `candidate` 只能经 `allow_candidates` 的 bring-up 进入计划，计划仍 `servable=false` |
+| `scope` | `global` / `model` | `model` 只在声明了 `model_impl` 的模型内生效，避免 short-conv 误选 Qwen 的 GDN |
+| `install` | `impl_table` / `model_impl` / `vendor_hook` | 装进算子表、由我们的模型直接调用，或通过 vendor 钩子生效 |
+| `graph_safe` | `bool` | 已实测图捕获/replay/无 host 同步，而不仅是“形状上可图” |
+| `evidence_level` | `candidate` / `cpu` / `device-c1..c4` / `verified` | 机器可读的证据成熟度，和自由文本 `evidence` 分开 |
+
+`install_impl_table()` 不再硬编码 `tileinfer.short_conv`：它按 `ProviderSpec.install` 跳过
+模型内部消费的 provider，只把真正的算子表条目交给 binder。
+
+**P1 共享工具**：模型接入的重复劳动已经收敛到三个位置：
+
+| 工具 | 位置 | 解决的问题 |
+|---|---|---|
+| `WeightMapSpec` | `tileinfer/bridge/weight_map.py` | 声明 rename / stacked qkv·w13 / skip prefix / expert remap / FP32 前缀，`load_weights()` 统一执行 |
+| `StateLayout` | `tileinfer/models/state_layout.py` | 计算逻辑 state、Ascend 页对齐后的 shape、blocks；LFM3 short-conv 已完成迁移 |
+| `CompatHook` | `tileinfer/bridge/compat_hooks.py` | 统一登记 vendor monkeypatch / platform guard / rope patch / model-side numeric fix，带 disable env、delete_when 和 evidence；Nemotron/LFM3 已接入 |
 
 ### 3.5 v2 归档规则（硬约束）
 

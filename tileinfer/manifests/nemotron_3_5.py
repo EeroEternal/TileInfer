@@ -100,5 +100,14 @@ NEMOTRON_3_5_DRAFT = ModelManifest(
         "top5": [],
         "pending": "HF/transformers reference run on the real weights",
     },
+    support={
+        "text": "partial",
+        "vision": "not_applicable",
+        "mtp": "failed",
+        "quant": ["bf16"],
+        "tp": ["1", "2", "4", "8"],
+        "max_context_verified": 131072,
+    },
+    config_impl="tileinfer.bridge.nemotron_config:register_nemotron_h_alias",
     source="docs/notes/m5-nemotron-config.json; docs/notes/m5-nemotron-declaration.md",
 )

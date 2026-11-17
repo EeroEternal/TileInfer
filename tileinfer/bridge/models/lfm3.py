@@ -50,12 +50,14 @@ def _patch_ascend_rope() -> str:
 def register_config() -> Dict[str, str]:
     """Install the LFM3 transformers/rope compatibility shims (idempotent)."""
     from ...models.lfm3.compat import apply as apply_lfm3_compat
+    from ..compat_hooks import install_compat_hook
 
     apply_lfm3_compat()
+    rope = install_compat_hook("lfm3_rope_global_buffer")
     return {
         "model_type": "lfm3",
         "transformers_compat": "applied",
-        "ascend_rope_patch": _patch_ascend_rope(),
+        "ascend_rope_patch": rope.get("detail", "unknown"),
     }
 
 
