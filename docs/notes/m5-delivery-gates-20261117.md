@@ -67,6 +67,28 @@ python tools/nemotron/check_c2_logprobs.py \
 `--require-sequence` 用于需要逐 token 的场景；C2 默认不要求整条采样轨迹（MTP 门才是
 逐 token 门）。
 
+逐 step 的辅助统计（不改变门禁结果）：
+
+```bash
+python tools/nemotron/summarize_c2_steps.py   --hf-steps /tmp/m5-hf-c2-all-steps.json   --service /tmp/m5-service-c2-logprobs.json   --out /tmp/m5-c2-steps-summary.json
+```
+
+| prompt | steps | 同 top-1 | tie 另一 top-1 | top-1 不同且非 tie | 每 step top-5≥4 | 每 step Δlogprob≤0.5 | 全部条件同时满足 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `The capital of France is` | 32 | 31 | 0 | 1（step31） | 24 | 31 | 24 |
+| `def fibonacci(n):` | 32 | 32 | 0 | 0 | 32 | 32 | 32 |
+| `Explain ... sky ...` | 32 | 18 | 1 | 13 | 18 | 19 | 18 |
+| `北京是中国的` | 32 | 4 | 0 | 28 | 5 | 4 | 4 |
+
+这说明：
+
+- code prompt 的整条 32-token 轨迹在 top-1/top-5/logprob 三项都过；
+- capital 的 31/32 步 top-1 相同，唯一不同是 step31（不是 tie），但不少 step 的
+  top-5 集合只有 3 个交集，所以“每步 top-5≥4”不是整条轨迹都能过；
+- sky 从 step19 起进入真实分叉（不是 tie），Chinese 从 step4 起分叉；
+- 因此 C2 只能按“首 token 分布 + 显式容差”声明，不能把 capital/sky/Chinese 的
+  32-token 轨迹写成与 HF 全同。
+
 ## 3. MTP + C3 图证据
 
 | 场景 | token 等价 | 墙钟（同窗口） | C3 metrics |
