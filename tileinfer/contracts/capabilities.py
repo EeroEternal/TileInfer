@@ -49,6 +49,33 @@ CAPABILITIES: Tuple[Capability, ...] = (
     Capability.QUANT_VERIFY,
 )
 
+#: Closed vocabulary for ``ProviderSpec.parallel``.  ``single`` means every parallel axis is
+#: 1; ``tp``/``ep``/``dp``/``pp`` mean "correct when that axis is larger than 1".  A provider
+#: that runs both single-card and under TP declares ``("single", "tp")``; one that has only
+#: been validated single-card declares ``("single",)`` and is refused under any sharding.  This
+#: is data, not a new access point: adding a parallel dimension must never grow the mechanism
+#: budget.
+PARALLEL_MODES: Tuple[str, ...] = ("single", "tp", "ep", "dp", "pp")
+
+
+def normalize_parallel(axes: Sequence[str]) -> Tuple[str, ...]:
+    """Validate and de-duplicate a parallel declaration (order preserved)."""
+    values = tuple(dict.fromkeys(str(axis) for axis in axes))
+    if not values:
+        raise ValueError("parallel must name at least one mode")
+    unknown = sorted(set(values) - set(PARALLEL_MODES))
+    if unknown:
+        raise ValueError(
+            f"unknown parallel modes {unknown}; known: {list(PARALLEL_MODES)}"
+        )
+    return values
+
+
+def parallel_supports(supported: Sequence[str], required: Sequence[str]) -> bool:
+    """Whether ``supported`` covers every axis in ``required`` (empty means single-card)."""
+    needed = set(required) or {"single"}
+    return needed <= set(supported)
+
 
 @runtime_checkable
 class AttentionContract(Protocol):
@@ -182,6 +209,7 @@ class ProviderSpec:
             raise ValueError("a provider needs a name and an importable implementation path")
         if self.source not in {"vendor", "tileinfer", "vendored", "reference"}:
             raise ValueError(f"unknown provider source {self.source!r}")
+        normalize_parallel(self.parallel)
         if self.measured_ratio is not None and not self.evidence:
             raise ValueError(
                 f"provider {self.name!r} declares a measured ratio without an evidence id"

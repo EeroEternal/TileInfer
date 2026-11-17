@@ -15,6 +15,11 @@ from typing import Dict
 
 from ..contracts.capabilities import Capability, ProviderSpec
 
+#: The vendor platform owns sharding (TP/EP/DP/PP), so its implementations are declared
+#: usable under every axis.  This is a statement about the platform, not a TileInfer claim:
+#: when the vendor is selected, TileInfer installs nothing on the request path.
+_VENDOR_PARALLEL = ("single", "tp", "ep", "dp", "pp")
+
 VENDOR_PROVIDERS: Dict[Capability, ProviderSpec] = {
     Capability.ATTENTION_FULL: ProviderSpec(
         capability=Capability.ATTENTION_FULL,
@@ -22,6 +27,7 @@ VENDOR_PROVIDERS: Dict[Capability, ProviderSpec] = {
         impl="vllm_ascend.attention.attention_v1.AscendAttentionBackend",
         source="vendor",
         graphable=True,
+        parallel=_VENDOR_PARALLEL,
         measured_ratio=1.0,
         evidence="baseline",
         delete_when="never - this is the baseline",
@@ -32,6 +38,7 @@ VENDOR_PROVIDERS: Dict[Capability, ProviderSpec] = {
         impl="vllm_ascend.attention.attention_v1.AscendAttentionBackend",
         source="vendor",
         graphable=True,
+        parallel=_VENDOR_PARALLEL,
         measured_ratio=1.0,
         evidence=(
             "baseline: the same Ascend attention backend serves the windowed layers "
@@ -46,6 +53,7 @@ VENDOR_PROVIDERS: Dict[Capability, ProviderSpec] = {
         impl="vllm_ascend.ops.gdn_attn_builder.AscendGDNAttentionBackend",
         source="vendor",
         graphable=True,
+        parallel=_VENDOR_PARALLEL,
         measured_ratio=1.0,
         evidence="baseline",
         delete_when="never - this is the baseline",
@@ -56,6 +64,7 @@ VENDOR_PROVIDERS: Dict[Capability, ProviderSpec] = {
         impl="vllm_ascend.ops.fused_moe",
         source="vendor",
         graphable=True,
+        parallel=_VENDOR_PARALLEL,
         measured_ratio=1.0,
         evidence="baseline",
         delete_when="never - this is the baseline",
@@ -66,6 +75,7 @@ VENDOR_PROVIDERS: Dict[Capability, ProviderSpec] = {
         impl="vllm_ascend.ops.layernorm",
         source="vendor",
         graphable=True,
+        parallel=_VENDOR_PARALLEL,
         measured_ratio=1.0,
         evidence="baseline",
         delete_when="never - this is the baseline",
@@ -76,6 +86,7 @@ VENDOR_PROVIDERS: Dict[Capability, ProviderSpec] = {
         impl="vllm_ascend.ops.rotary_embedding",
         source="vendor",
         graphable=True,
+        parallel=_VENDOR_PARALLEL,
         measured_ratio=1.0,
         evidence="baseline",
         delete_when="never - this is the baseline",
@@ -86,6 +97,7 @@ VENDOR_PROVIDERS: Dict[Capability, ProviderSpec] = {
         impl="vllm_ascend.sample",
         source="vendor",
         graphable=True,
+        parallel=_VENDOR_PARALLEL,
         measured_ratio=1.0,
         evidence="baseline",
         delete_when="never - this is the baseline",
@@ -96,6 +108,7 @@ VENDOR_PROVIDERS: Dict[Capability, ProviderSpec] = {
         impl="vllm_ascend.ops.gdn",
         source="vendor",
         graphable=True,
+        parallel=_VENDOR_PARALLEL,
         covers={"mixer": "gdn"},
         measured_ratio=1.0,
         evidence="baseline",
@@ -107,6 +120,7 @@ VENDOR_PROVIDERS: Dict[Capability, ProviderSpec] = {
         impl="vllm_ascend.quantization",
         source="vendor",
         graphable=True,
+        parallel=_VENDOR_PARALLEL,
         measured_ratio=1.0,
         evidence="baseline",
         delete_when="never - this is the baseline",

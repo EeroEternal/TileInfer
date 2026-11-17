@@ -4,7 +4,7 @@
 > 目标形态见 [`architecture.md`](architecture.md)，验收口径见 [`acceptance.md`](acceptance.md)，
 > 数字见 [`performance.md`](performance.md)。
 >
-> 最后核对：**2026-11-12 21:03**，代码 `aa97b16`（M5 Nemotron 离线任务；v3 主体 `6f41866`），
+> 最后核对：**2026-11-17 19:30**，基线 `d69b9da` + 本次 Muse/multicard 增量（v2 已归档），
 > 单卡 Ascend950PR，CANN 9.3.0。
 
 ---
@@ -69,12 +69,13 @@ v2 自带平台层的形态，v3 不再走那条路。本页 §1 的 v3 数字�
 |---|---|---|
 | **补缺口还是空的** | Qwen3.6 的 8 项能力厂商全覆盖，gap=0 是"没有缺口"，不是"补完了"；**M5 Nemotron 已有两个候选 provider**（`tileinfer.mamba2_state`、`tileinfer.nemotron_moe`），默认仍不选，plan `servable=false` | M5 已做真权重单卡 bring-up，证据见 [`notes/m5-nemotron-validation-20261116.md`](notes/m5-nemotron-validation-20261116.md)；C2 logprob/C3 稳态/MTP 仍未闭合 |
 | **M5 Nemotron 真权重** | 单卡 TP=1 可服务；短文本 token/text 与 HF 一致（单 prompt）；8K–261K 长度可完成；图捕获 2/6 张，32-token 31/31、8K 7/7、128K 3/3、4 路并发 15/15 命中/0 回退；2/4 路并发和冷启动通过；TP=2/4/8 已通过（TP8 未做图/MTP）；MTP 无损性失败 | 不能写成“已支持”；详见 [`notes/m5-nemotron-validation-20261116.md`](notes/m5-nemotron-validation-20261116.md) |
-| **图捕获** | v3 已接上（厂商捕获 + 我们计数）；4K 8 张、32K 6 张、MTP 6 张（PIECEWISE，FULL=0），均 0 回退；MTP+32K 6 图/0 回退；`impl_table`/`model_table` 两个机制仍是空实现 | 非 vendor 实现还没有落点；128K 组合未验 |
+| **图捕获** | v3 已接上（厂商捕获 + 我们计数）；4K 8 张、32K 6 张、MTP 6 张（PIECEWISE，FULL=0），均 0 回退；MTP+32K 6 图/0 回退。`model_table` 已被 MuseGlimmer 使用，`impl_table` 已有真实 binder 与 Nemotron 候选（默认不选） | 128K 组合未验；非 vendor 默认仍未 promote |
+| **MuseGlimmer-30B（厂商缺失架构）** | C1 ✅；C3 ✅（32K 8 图；4K 99/99 decode 命中、0 回退）；C4 绝对值 **41 ms/tok**、8 路并发 **175 tok/s**、冷启动 **38 s**（fresh cache）；**C2 ❌**：`benchmark={}`，first-token top-5/logprob 未采集 | **不能写“已支持”**；证据见 [`notes/muse-glimmer-v3-validation-20261117.md`](notes/muse-glimmer-v3-validation-20261117.md)，复现见 [`quickstart-muse-950.md`](quickstart-muse-950.md) |
 | **投机解码 / MTP** | S2/S3 按 B 质量等价过：套件 8/8、needle 8K/16K/32K 9/9、同请求两次 `same`、4K 93.9% / 1.35×；图 6 张、0 回退。严格逐位不成立（256 token 中 85.9% 相同、第 58 token 分叉），明确非逐位。S4 32K 部分：9/9、TTFT 1.037×、6 图/0 回退，acceptance 81–88%、128K 未测。证据见 [`notes/m1-spec-quality.md`](notes/m1-spec-quality.md) | S2/S3 过；S4 仅 32K 部分；非逐位 |
 | **TPOT / 首字** | v3 M1：单流 0.907–1.016× / 0.999–1.001×；4K 1.000× / 0.999×；长上下文 8K/16K/32K：TTFT 1.008–1.011×、TPOT 0.999–1.002× | 门已过（本机、本参数） |
 | **长上下文** | **L1–L4 已过**（8K/16K/32K/128K；128K 单流，3/3 needle 逐 token 同，峰值 HBM 107,374 MB）；**L5 262K 不过**：d90 两臂 256 token、v3 500 token 均未答出、C4 TPOT 1.1019×/吞吐 0.9076×。当前 33K/4 用于投机/并发，128K 需 `max-num-seqs=1`。证据见 [`notes/m1-long-context.md`](notes/m1-long-context.md) | 实际质量上限 128K；262K 不声明支持 |
 | **量化** | 只做 bf16 | 未验证组合一律不声明支持 |
-| **TP / EP / 多卡** | 明确延后 | 优先级最低 |
+| **TP / EP / 多卡** | **Phase 0 + Qwen3.6 TP=2 运行验证（2026-11-17）**：环境探测 tp/ep/dp/pp、plan 记录并行、单卡-only provider 多卡下 fail-closed、`doctor` 有 parallel 门；TP=2 实测 health 65 s、captured_graphs=6（PIECEWISE 3 + FULL 3）、decode 15/15 命中、fallbacks=0、全厂商实现。**C2 跨 TP 不过**：TP=2 与 TP=1 第 7 token 分叉，首 token logprob 差 0.0193、top-5 最大差 0.1237；TP=2 自身可复现。**仍不支持**：我方 provider 未做 TP 数值验证、EP 未实现、性能未测。**环境注意**：本机需临时移走空的 `/etc/hccl_rootinfo.json` 才能建 HCCL 组（已恢复，属宿主问题）。见 [`notes/multicard-tp2-verification-20261117.md`](notes/multicard-tp2-verification-20261117.md)、[`notes/qwen36-c2-tp1-vs-tp2-20261117.md`](notes/qwen36-c2-tp1-vs-tp2-20261117.md) |
 | **冷缓存 / 首次启动** | 控制模型免测（[matrix §1.9](verification-matrix.md)）；M5 部署时再量 | M2 预编译门要单独回答 |
 | **128K / 262K** | 128K 已过：TTFT 0.9433×、TPOT 0.9884×、吞吐 1.0117×、峰值 107,374 MB。262K：d10/d50 可答，d90 两臂 256 token、v3 500 token 均未答出；C4 TPOT 1.1019×、吞吐 0.9076×；峰值 107,376 MB、2 图/0 回退。40,960/8 的 OOM 是 8 seq 放大，不代表 128K/1 不可行 | 262K 能起但不过质量/C4；不要当支持 |
 
