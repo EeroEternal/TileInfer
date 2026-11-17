@@ -295,8 +295,9 @@ def test_muse_declaration_matches_the_checkpoint_facts() -> None:
     assert m.model_impl == "tileinfer.bridge.models.muse_glimmer"
     assert m.reasoning_parser_impl == "tileinfer.bridge.models.atem:AtemReasoningParser"
     assert m.reasoning_parser == "atem"
-    # a brand-new model may be declared before its C2 sample exists
-    assert m.benchmark == {}
+    # C2 is frozen once the float32 oracle has run on the real weights
+    assert m.benchmark
+    assert m.benchmark["first_token"] == " Paris"
 
 
 def test_sliding_declarations_must_be_consistent() -> None:

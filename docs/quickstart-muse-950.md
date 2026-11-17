@@ -76,8 +76,17 @@ curl -s localhost:8360/v1/chat/completions -H 'Content-Type: application/json' -
   "max_tokens":64,"temperature":0}'
 ```
 
-Expected: HTTP 200, non-empty `reasoning`/`content`. Numeric acceptance (C2) is **not**
-wired yet; see `docs/notes/muse-glimmer-v3-validation-20261117.md` §6.
+Expected: HTTP 200, non-empty `reasoning`/`content`.
+
+C2 (numeric parity) uses the frozen first-token top-5 in the manifest:
+
+```bash
+python tools/muse/c2_oracle.py --out /tmp/muse-c2.json   # float32 CPU oracle (optional)
+python tools/muse/check_c2.py --base-url http://127.0.0.1:8360
+```
+
+The checker exits 0 when the token set matches and the logprobs are inside the declared bf16
+tolerance. See `docs/notes/muse-glimmer-v3-validation-20261117.md` §4.1.
 
 ## 6. Troubleshooting
 

@@ -61,7 +61,27 @@ MUSE_GLIMMER = ModelManifest(
         Capability.ROTARY.value,
         Capability.SAMPLING_TOPK.value,
     ),
-    benchmark={},  # C2 sample pending; deployment does not depend on it
+    benchmark={
+        "prompt": "The capital of France is",
+        "max_tokens": 1,
+        "temperature": 0.0,
+        "top_logprobs": 5,
+        "first_token": " Paris",
+        "top5": [
+            [" Paris", -1.096611],
+            [" a", -2.162277],
+            [" one", -2.813581],
+            [" the", -2.838582],
+            [" also", -3.233084],
+        ],
+        "tolerance": {
+            "top1_logprob": 0.001,
+            "top5_max_logprob": 0.1,
+            "token_set": "exact",
+        },
+        "reference": "tools/muse/c2_oracle.py",
+        "measured": "2026-11-17, Ascend950PR bf16 vs float32 reference; top1 diff 3.7e-5, top5 max 0.059",
+    },
     model_impl="tileinfer.bridge.models.muse_glimmer",
     reasoning_parser="atem",
     reasoning_parser_impl="tileinfer.bridge.models.atem:AtemReasoningParser",

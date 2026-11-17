@@ -251,8 +251,10 @@ The bridge hosts vendor-absent models end to end, with no V2 involvement:
   tokenizer is `TokenizersBackend`), NNAL/ATB 9.2.0-beta.1, triton-ascend 3.2.2, CANN 9.3.0.
   Commands and numbers: [`muse-glimmer-v3-validation-20261117.md`](muse-glimmer-v3-validation-20261117.md).
 
-Open: the C2 benchmark sample (first-token top-5) is not captured, so numeric acceptance is
-not wired yet.
+C2 is now wired: `manifests/muse_glimmer.py` carries a first-token top-5 frozen from the
+float32 CPU oracle (`tools/muse/c2_oracle.py`), with a declared bf16 tolerance and a
+`tools/muse/check_c2.py` checker. The served model matched the oracle's token set exactly
+(top-1 diff 3.7e-5; max top-5 diff 0.059).
 
 ## Pre-existing .ernest test failures (not from this work, verified via git stash)
 
