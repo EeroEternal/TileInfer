@@ -73,6 +73,9 @@ vllm-ascend 已经适配的模型走它；它没适配的模型，我们把缺�
 | [`docs/hardware-checklist.md`](docs/hardware-checklist.md) | 上机点亮清单（操作手册，不是架构） |
 | [`docs/known-issues.md`](docs/known-issues.md) | 踩过的坑与复盘（读它能省几天） |
 | [`docs/performance.md`](docs/performance.md) | 性能口径、基线、测量方法 |
+| [`docs/verification-matrix.md`](docs/verification-matrix.md) | 一个模型“在役”的完整矩阵（C1–C4、长上下文、图、投机、并发、冷启动） |
+| [`docs/development-rules.md`](docs/development-rules.md) | **规范性**：v3 新代码放哪、provider 怎么装、证据门槛 |
+| [`docs/quickstart-muse-950.md`](docs/quickstart-muse-950.md) | 本机跑 MuseGlimmer-30B 的自包含配方（环境、权重校验、启动、排错） |
 | `docs/notes/` | 契约转录、事实清单、历史归档 |
 
 > 历史文档已归档到 `docs/notes/archive/`，头部标了 SUPERSEDED，**不要按它们建目录或改代码**。

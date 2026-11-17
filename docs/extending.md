@@ -170,7 +170,7 @@ vendor 选择下都返回厂商原路径，不做任何替换。`impl_table` 不
 
 | 项 | 现状 | 什么时候做 |
 |---|---|---|
-| 并行（TP/EP/PP） | 单卡 | 有第二张卡再谈 |
+| 并行（TP/EP/PP） | Phase 0：环境/计划/provider 已有并行声明与 fail-closed 门禁；provider 仍只声明单卡，故多卡下被拒绝。数值支持未验证 | TP=2 起逐 provider 验证；EP 单独做，见 [`notes/multicard-phase0.md`](notes/multicard-phase0.md) |
 | 量化方案 | bf16 一条路 | 有明确模型需求时，按模型逐个开 |
 | 混合批 / 投机解码 | 只支持单 query token | 视作"注意力契约扩展"，单独一轮 |
 | 新硬件 | 只有昇腾 950 | 出现第二块卡时加一组提供者；**只有那块卡没有厂商平台时**，才由我们提供平台（昇腾不属于这种情况） |

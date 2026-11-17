@@ -16,7 +16,9 @@ import json
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
+
+from .capabilities import normalize_parallel
 
 SCHEMA_VERSION = 1
 
@@ -148,11 +150,20 @@ class Plan:
     #: provider for a model the decision already called unservable; older plan files that predate
     #: this field load as ``True`` for compatibility.
     servable: bool = True
+    #: Parallel axes this plan was computed for (``("single",)`` or a subset of
+    #: ``("tp","ep","dp","pp")``).  Like the version triangle this is a gate: a plan built for
+    #: single-card must not be injected into a sharded run, where a single-only provider would
+    #: compute on locally sharded tensors and produce wrong numbers instead of an error.  Older
+    #: plan files that predate this field load as ``("single",)``.
+    parallel: Tuple[str, ...] = ("single",)
     plan_id: str = ""
     created_at: str = ""
     schema_version: int = SCHEMA_VERSION
 
     def __post_init__(self) -> None:
+        # Normalise before the content-addressed id is computed, so two spellings of the
+        # same parallel configuration cannot produce different plan ids.
+        self.parallel = normalize_parallel(self.parallel)
         if not self.plan_id:
             self.plan_id = self.compute_id()
         if not self.created_at:
@@ -171,6 +182,7 @@ class Plan:
             "reasoning_parser": self.reasoning_parser,
             "reasoning_parser_impl": self.reasoning_parser_impl,
             "servable": self.servable,
+            "parallel": list(self.parallel),
         }
         blob = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(blob).hexdigest()[:16]
@@ -210,6 +222,7 @@ class Plan:
                 raise ValueError(f"selection {selection.capability!r} has no implementation")
         if self.fallback_policy not in {"forbid", "count"}:
             raise ValueError("fallback_policy must be 'forbid' or 'count'")
+        normalize_parallel(self.parallel)
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -226,6 +239,7 @@ class Plan:
             "reasoning_parser": self.reasoning_parser,
             "reasoning_parser_impl": self.reasoning_parser_impl,
             "servable": bool(self.servable),
+            "parallel": list(self.parallel),
         }
 
     @classmethod
@@ -244,6 +258,7 @@ class Plan:
             "reasoning_parser",
             "reasoning_parser_impl",
             "servable",
+            "parallel",
         }
         unknown = sorted(set(data) - known)
         if unknown:
@@ -259,6 +274,7 @@ class Plan:
             reasoning_parser=str(data.get("reasoning_parser", "")),
             reasoning_parser_impl=str(data.get("reasoning_parser_impl", "")),
             servable=bool(data.get("servable", True)),
+            parallel=tuple(data.get("parallel", ("single",))),
             plan_id=str(data.get("plan_id", "")),
             created_at=str(data.get("created_at", "")),
             schema_version=int(data.get("schema_version", SCHEMA_VERSION)),
@@ -290,8 +306,10 @@ class Plan:
         for selection in self.selections:
             counts[selection.provider] = counts.get(selection.provider, 0) + 1
         providers = ", ".join(f"{name}={n}" for name, n in sorted(counts.items())) or "none"
+        parallel = "+".join(self.parallel)
         return (
             f"plan={self.plan_id} model={self.model.name} "
             f"selections={len(self.selections)} ({providers}) "
-            f"access_points={len(self.access_points)} fallback={self.fallback_policy}"
+            f"access_points={len(self.access_points)} fallback={self.fallback_policy} "
+            f"parallel={parallel}"
         )

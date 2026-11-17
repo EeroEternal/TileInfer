@@ -160,6 +160,26 @@ Qwen3.6 是**控制模型**，用来校准 TileInfer 在厂商已支持路径上
 
 ---
 
+## 1bis. MuseGlimmer-30B（厂商缺失架构，V3 bridge）
+
+> 2026-11-17 单卡 Ascend950PR，真权重，`max-model-len 32768 / max-num-seqs 8 /
+> gpu-memory-utilization 0.85`。完整命令与原始数字见
+> [`notes/muse-glimmer-v3-validation-20261117.md`](notes/muse-glimmer-v3-validation-20261117.md)。
+> **状态：Bring-up；C2 未过，不能写“支持”。**
+
+| # | 场景 | 证据 | 门 | MuseGlimmer |
+|---|---|---|---|---|
+| C1 | 端到端服务 | `/v1/models` + chat 200，ATEM parser 生效 | 能返回完整输出 | ✅ |
+| C2 | 数值一致 | `benchmark={}`；无 top-5/logprob | 参考实现容差内 | ❌ 未采集 |
+| C3 | 图捕获 | 32K 8 图（PIECEWISE 4 + FULL 4）；4K 99/99 命中、0 回退 | 捕获 > 0 且回退 = 0 | ✅（单轮） |
+| C4 | 性能 | 单流 41 ms/tok；1K/8K/32K TTFT 424/1998/3817 ms（eager）、328/1260/3752 ms（graph）；8 路并发 175 tok/s | 无厂商基线 → 绝对口径 | ⚠️ 仅单轮绝对数 |
+| P1 | 并发 8 | 956-token prompt × 8，64 输出：2.92 s、175 tok/s | 完成 + 计数 | ✅ |
+| L1–L3 | 8K/16K/32K | 6,356 / 25,256 prompt tokens 完成；更长未测 | 按模型上限 | ⚠️ 32K 已测，128K 未测 |
+| K1 | 冷启动 | fresh `VLLM_CACHE_ROOT`：38 s 到 ready（weights 2.08 s，engine 1.93 s） | 可测量 | ✅ |
+| MTP | 投机 | 该 checkpoint 无 MTP | 显式声明不支持 | N/A（显式） |
+
+未验证格：128K+ 长上下文、图 × 长上下文组合、C2 数值、无厂商基线 A/B。
+
 ## 2. 新模型附加项（M5+）
 
 0. 先过**版本 gate V0**：确认这台 950 能否拿到更新的 vllm-ascend build；拿不到就冻结

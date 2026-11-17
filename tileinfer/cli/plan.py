@@ -35,7 +35,12 @@ def build(args: argparse.Namespace) -> int:
     config = _read_config(args.model)
     key = args.manifest_id or manifest_key_from_config(config)
     manifest = find_manifest(key)
-    env = probe()
+    env = probe(
+        tp_size=args.tp,
+        ep_size=args.ep,
+        dp_size=args.dp,
+        pp_size=args.pp,
+    )
     plan, report = decide(
         manifest, env, policy=args.policy, allow_candidates=bool(args.allow_candidates)
     )
@@ -97,6 +102,18 @@ def main(argv: Optional[list] = None) -> int:
         action="store_true",
         help="select declared candidates for a labelled bring-up plan (still servable=false)",
     )
+    for axis, flag in (("tp", "--tp"), ("ep", "--ep"), ("dp", "--dp"), ("pp", "--pp")):
+        p_build.add_argument(
+            flag,
+            type=int,
+            default=None,
+            dest=axis,
+            metavar="N",
+            help=(
+                f"{axis.upper()} size the plan is computed for "
+                f"(default: TILEINFER_{axis.upper()}_SIZE or 1)"
+            ),
+        )
     p_build.set_defaults(func=build)
 
     p_show = sub.add_parser("show", help="print a plan")

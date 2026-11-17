@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from typing import List, Optional, Tuple
 
-from ..contracts.capabilities import Capability
+from ..contracts.capabilities import Capability, parallel_supports
 from ..contracts.gaps import Gap, GapReport
 from ..contracts.manifest import ModelManifest
 from ..contracts.plan import (
@@ -56,6 +56,10 @@ def _candidates(capability: Capability, manifest: ModelManifest) -> List:
     ]
 
 
+def _eligible_candidates(capability: Capability, manifest: ModelManifest, env: Environment) -> List:
+    return [provider for provider in _candidates(capability, manifest) if _parallel_ok(provider, env)]
+
+
 POLICIES = ("vendor_first", "tileinfer_first")
 
 
@@ -76,6 +80,19 @@ def _covers(provider, manifest: ModelManifest) -> bool:
     if wanted_model is not None and wanted_model != manifest.model_type:
         return False
     return True
+
+
+def _parallel_ok(provider, env: Environment) -> bool:
+    """Whether a provider was declared safe for the environment's active sharding axes.
+
+    A single-card-only provider (``parallel=("single",)``) is never selected under TP/EP/DP/PP.
+    This is the fail-closed half of multi-card support: the layer refuses rather than running a
+    provider on locally sharded tensors, where the failure mode is wrong numbers, not an
+    exception.  The vendor declares every axis (its platform owns sharding).
+    """
+    if provider is None:
+        return True
+    return parallel_supports(provider.parallel, env.parallel_axes())
 
 
 def _select(
@@ -113,6 +130,7 @@ def _select(
                 provider
                 for provider in _candidates(capability, manifest)
                 if provider.covers.get("model_type") == manifest.model_type
+                and _parallel_ok(provider, env)
             ]
             if overrides:
                 candidate = overrides[0]
@@ -144,7 +162,13 @@ def _select(
 
         chosen: Optional[Selection] = None
         for source in order:
-            if source == "vendor" and env.has_vendor and vendor is not None and _covers(vendor, manifest):
+            if (
+                source == "vendor"
+                and env.has_vendor
+                and vendor is not None
+                and _covers(vendor, manifest)
+                and _parallel_ok(vendor, env)
+            ):
                 chosen = Selection(
                     capability=capability.value,
                     provider=vendor.name,
@@ -154,7 +178,12 @@ def _select(
                     graphable=vendor.graphable,
                 )
                 break
-            if source == "tileinfer" and ours is not None and _covers(ours, manifest):
+            if (
+                source == "tileinfer"
+                and ours is not None
+                and _covers(ours, manifest)
+                and _parallel_ok(ours, env)
+            ):
                 chosen = Selection(
                     capability=capability.value,
                     provider=ours.name,
@@ -169,7 +198,7 @@ def _select(
             selections.append(chosen)
             continue
         if allow_candidates:
-            candidates = _candidates(capability, manifest)
+            candidates = _eligible_candidates(capability, manifest, env)
             if candidates:
                 candidate = candidates[0]
                 selections.append(
@@ -202,10 +231,17 @@ def _select(
             if not env.has_vendor
             else "vllm-ascend is installed but does not advertise this capability"
         )
-        candidates = _candidates(capability, manifest)
+        all_candidates = _candidates(capability, manifest)
+        candidates = _eligible_candidates(capability, manifest, env)
         if candidates:
             names = ", ".join(provider.name for provider in candidates)
             reason += f"; TileInfer candidate(s) implemented but not default until target C1/C2: {names}"
+        elif all_candidates:
+            blocked = ", ".join(provider.name for provider in all_candidates)
+            reason += (
+                f"; TileInfer candidate(s) exist but declare no support for "
+                f"parallel={list(env.parallel_axes())}: {blocked}"
+            )
         gaps.append(
             Gap(
                 capability=capability.value,
@@ -276,6 +312,7 @@ def decide(
         reasoning_parser=manifest.reasoning_parser,
         reasoning_parser_impl=manifest.reasoning_parser_impl,
         servable=servable,
+        parallel=env.parallel_axes(),
     )
     plan.validate()
 
@@ -288,6 +325,8 @@ def decide(
             f"policy={policy}",
             f"vendor={env.vllm_ascend or 'missing'}",
             f"device={env.device_type or 'unknown'}",
+            f"parallel={list(env.parallel_axes())} "
+            f"(tp={env.tp_size}, ep={env.ep_size}, dp={env.dp_size}, pp={env.pp_size})",
             "the layer selects implementations; it does not own platform/worker/KV/graph",
             f"allow_candidates={bool(allow_candidates)}",
         ],
