@@ -23,7 +23,7 @@ Status: **C1 pass; C2 within declared tolerance; C3 pass; C4 pass (conc=1 refere
 | L2 decision | `decide()` keeps `model_impl` on the `Plan` and adds the `model_table` access point; `state.linear` stays vendor GDN for Qwen3.6 and selects `tileinfer.short_conv` only when the declaration says `kind="short_conv"` |
 | L4 provider | `providers/state/short_conv.py` (pure torch causal depthwise conv + rolling state); `providers/catalog.py` declares it as a route-O-scoped provider with evidence and delete condition |
 | L5 bridge | `install_model_table()` imports `tileinfer.bridge.models.lfm3` and calls its `register_config()` / `register_models()` actors; `install_impl_table()` recognises the short-conv provider as consumed by the model; `model_table` is critical when the plan requests it |
-| Model | `tileinfer/models/lfm3/model.py`: gated short conv with vLLM short-conv state metadata, sliding/full GQA with per-head output gate and QK RMSNorm, zero-tail partial RoPE, sandwich norms, SwiGLU, stacked qkv/w13 weight loading, short-conv state shape padded to the Ascend attention page size |
+| Model | `tileinfer/bridge/models/lfm3_model.py`: gated short conv with vLLM short-conv state metadata, sliding/full GQA with per-head output gate and QK RMSNorm, zero-tail partial RoPE, sandwich norms, SwiGLU, stacked qkv/w13 weight loading, short-conv state shape padded to the Ascend attention page size |
 | Registration | `tileinfer/bridge/models/lfm3.py`: `register_config()` applies the transformers/rope shims and disables the vllm-ascend global rope buffer; `register_models()` registers `Lfm3ForCausalLM` by class path |
 
 ## Reproduction

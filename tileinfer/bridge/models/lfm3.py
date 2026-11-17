@@ -8,8 +8,9 @@ LFM3 has no upstream vLLM architecture, so the declaration names this module as 
 * :func:`register_models` — register ``Lfm3ForCausalLM`` in vLLM's ``ModelRegistry`` by
   class path, so the parameter tree is imported only when such a checkpoint is resolved.
 
-The model implementation itself stays in ``tileinfer.models.lfm3``; that package is
-engine-free by rule, so it must not be imported at module import time here.
+The model implementation lives next to this module in ``tileinfer.bridge.models.lfm3_model``
+so that the vLLM-facing parameter tree stays inside the bridge layer; the declaration only
+names this registration module.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from __future__ import annotations
 from typing import Any, Dict
 
 MODEL_ARCH = "Lfm3ForCausalLM"
-MODEL_IMPL = "tileinfer.models.lfm3.model:Lfm3ForCausalLM"
+MODEL_IMPL = "tileinfer.bridge.models.lfm3_model:Lfm3ForCausalLM"
 
 
 def _patch_ascend_rope() -> str:
