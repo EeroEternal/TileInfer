@@ -90,6 +90,7 @@ def _bind_attribute(path: str, impl: Callable[..., Any]) -> str:
 def _install_mamba2(report: ImplReport) -> None:
     from tileinfer.providers.nemotron import mamba2
 
+    _install_mamba2_ascend_spec_metadata(report)
     for op, paths in _MAMBA2_TARGETS.items():
         impl = getattr(mamba2, op)
         bound = 0
@@ -104,6 +105,35 @@ def _install_mamba2(report: ImplReport) -> None:
                 report.installed.append(path)
         if bound == 0:
             report.failed[op] = "no vLLM target resolves (version/module drift)"
+
+
+def _install_mamba2_ascend_spec_metadata(report: ImplReport) -> None:
+    """Let vllm-ascend's V1 runner hand speculative metadata to the Mamba2 builder.
+
+    The Ascend runner forwards ``num_accepted_tokens`` / ``num_decode_draft_tokens_cpu`` only
+    when the builder is an instance of ``GDNAttentionMetadataBuilder``.  Mamba2 needs the same
+    arguments: without them a 1+draft target verification batch is classified as a prefill and
+    the SSM/conv state advances by both draft tokens instead of the accepted prefix.  Widening
+    the runner's builder tuple is a bridge change; no vLLM or vllm-ascend source is edited.
+    """
+    try:
+        from vllm.v1.attention.backends.mamba2_attn import (
+            Mamba2AttentionMetadataBuilder as _mamba2_builder,
+        )
+    except Exception:
+        return
+    try:
+        import vllm_ascend.worker.model_runner_v1 as _runner
+    except Exception:
+        return
+    try:
+        current = _runner.GDNAttentionMetadataBuilder
+        builders = current if isinstance(current, tuple) else (current,)
+        if _mamba2_builder not in builders:
+            _runner.GDNAttentionMetadataBuilder = (*builders, _mamba2_builder)
+        report.installed.append("mamba2:ascend_spec_metadata")
+    except Exception as exc:  # noqa: BLE001 - report the bridge failure, never crash import
+        report.failed["mamba2:ascend_spec_metadata"] = f"{type(exc).__name__}: {exc}"
 
 
 def _install_nemotron_moe(report: ImplReport) -> None:

@@ -373,11 +373,51 @@ def test_causal_conv1d_prefill_honours_block_table_initial_state() -> None:
     torch.testing.assert_close(conv_states, expected_state, rtol=1e-5, atol=1e-6)
 
 
+def test_causal_conv1d_prefill_keeps_full_spec_window() -> None:
+    """Prompt prefill must preserve the extra speculative columns in the conv cache."""
+    torch.manual_seed(61)
+    dim, width, total = 3, 4, 5
+    taps = width - 1
+    state_len = taps + 1
+    x = torch.randn(dim, total)
+    weight = torch.randn(dim, width)
+    bias = torch.randn(dim)
+    conv_states = torch.randn(4, dim, state_len)
+    before = conv_states.clone()
+    starts = torch.tensor([0, 3, total], dtype=torch.int32)
+    cache = torch.tensor([1, 2], dtype=torch.int32)
+    has_initial = torch.tensor([True, False])
+
+    out = causal_conv1d_fn(
+        x,
+        weight,
+        bias,
+        conv_states,
+        starts,
+        cache_indices=cache,
+        has_initial_state=has_initial,
+        activation=None,
+    )
+
+    expected = torch.empty_like(x)
+    expected_state = before.clone()
+    for seq, (start, end) in enumerate(((0, 3), (3, total))):
+        line = int(cache[seq])
+        head = before[line, :, state_len - taps :] if bool(has_initial[seq]) else torch.zeros(dim, taps)
+        full = torch.cat((head, x[:, start:end]), dim=1)
+        expected[:, start:end] = F.conv1d(
+            full.unsqueeze(0), weight.unsqueeze(1), bias, groups=dim
+        ).squeeze(0)
+        expected_state[line] = full[:, -state_len:]
+    torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(conv_states, expected_state, rtol=1e-5, atol=1e-6)
+
+
 def test_mamba2_selective_state_update_replays_speculative_tokens() -> None:
     """MTP commits multiple accepted tokens; the SSM state must advance through all of them."""
     torch.manual_seed(41)
     heads, hdim, dstate, groups = 2, 2, 3, 1
-    slots = 4
+    slots = 5
     state = torch.randn(slots, heads, hdim, dstate)
     state_before = state.clone()
     lengths = [2, 1]
@@ -389,8 +429,8 @@ def test_mamba2_selective_state_update_replays_speculative_tokens() -> None:
     C = torch.randn(total, groups, dstate)
     D = torch.randn(heads, hdim)
     dt_bias = torch.randn(heads)
-    src = torch.tensor([0, 2])
-    dst = torch.tensor([1, 3])
+    src = torch.tensor([1, 2])
+    dst = torch.tensor([3, 4])
     cu = torch.tensor([0, sum(lengths[:1]), total], dtype=torch.int32)
     accepted = torch.tensor(lengths, dtype=torch.int32)
     out = torch.empty_like(x)
@@ -426,6 +466,110 @@ def test_mamba2_selective_state_update_replays_speculative_tokens() -> None:
             ).sum(-1) + x[pos] * D
             torch.testing.assert_close(out[pos], expected, rtol=1e-5, atol=1e-6)
         torch.testing.assert_close(state[int(dst[seq])], current, rtol=1e-5, atol=1e-6)
+
+
+def test_mamba2_selective_state_update_uses_spec_token_slots() -> None:
+    """vLLM's speculative SSM update reads the accepted slot and writes every draft slot."""
+    torch.manual_seed(47)
+    heads, hdim, dstate, groups = 2, 2, 3, 1
+    slots = 9
+    state = torch.randn(slots, heads, hdim, dstate)
+    state_before = state.clone()
+    lengths = [2, 1]
+    total = sum(lengths)
+    x = torch.randn(total, heads, hdim)
+    dt = torch.randn(total, heads)
+    A = -torch.rand(heads)
+    B = torch.randn(total, groups, dstate)
+    C = torch.randn(total, groups, dstate)
+    D = torch.randn(heads, hdim)
+    dt_bias = torch.randn(heads)
+    # seq 0 accepted 1 -> reads column 0; seq 1 accepted 2 -> reads column 1.
+    src = torch.tensor([[1, 2], [3, 4]], dtype=torch.int64)
+    dst = torch.tensor([[5, 6], [7, 8]], dtype=torch.int64)
+    accepted = torch.tensor([1, 2], dtype=torch.int32)
+    cu = torch.tensor([0, lengths[0], total], dtype=torch.int32)
+    out = torch.empty_like(x)
+
+    selective_state_update(
+        state,
+        x,
+        dt,
+        A,
+        B,
+        C,
+        D,
+        dt_bias,
+        dt_softplus=True,
+        state_batch_indices=src,
+        dst_state_batch_indices=dst,
+        out=out,
+        num_accepted_tokens=accepted,
+        cu_seqlens=cu,
+    )
+
+    for seq, count in enumerate(lengths):
+        current = state_before[int(src[seq, int(accepted[seq]) - 1])].clone()
+        start = int(cu[seq])
+        for offset in range(count):
+            pos = start + offset
+            d = torch.nn.functional.softplus(dt[pos] + dt_bias)
+            current = current * torch.exp(d[:, None, None] * A[:, None, None])
+            current = current + d[:, None, None] * x[pos][:, :, None] * B[pos].repeat_interleave(
+                heads // groups, dim=0
+            )[:, None, :]
+            expected = (
+                current * C[pos].repeat_interleave(heads // groups, dim=0)[:, None, :]
+            ).sum(-1) + x[pos] * D
+            torch.testing.assert_close(out[pos], expected, rtol=1e-5, atol=1e-6)
+            torch.testing.assert_close(
+                state[int(dst[seq, offset])], current, rtol=1e-5, atol=1e-6
+            )
+
+
+def test_causal_conv1d_update_rolls_full_spec_window() -> None:
+    """The conv cache advances by every scheduled token and keeps a full rolling window."""
+    torch.manual_seed(53)
+    dim, width, batch = 3, 4, 2
+    taps = width - 1
+    state_len = taps + 1
+    conv_state = torch.randn(5, dim, state_len)
+    before = conv_state.clone()
+    weight = torch.randn(dim, width)
+    bias = torch.randn(dim)
+    lengths = [2, 1]
+    total = sum(lengths)
+    x = torch.randn(total, dim)
+    indices = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+    accepted = torch.tensor([1, 2], dtype=torch.int32)
+    qsl = torch.tensor([0, lengths[0], total], dtype=torch.int32)
+
+    out = causal_conv1d_update(
+        x,
+        conv_state,
+        weight,
+        bias,
+        activation=None,
+        conv_state_indices=indices,
+        num_accepted_tokens=accepted,
+        query_start_loc=qsl,
+        max_query_len=max(lengths),
+    )
+
+    for seq, count in enumerate(lengths):
+        line = int(indices[seq, int(accepted[seq]) - 1])
+        window = before[line].clone()
+        start = int(qsl[seq])
+        for t in range(count):
+            hist = window[:, -taps:]
+            full = torch.cat((hist, x[start + t][:, None]), dim=1)
+            expected = F.conv1d(
+                full.unsqueeze(0), weight.unsqueeze(1), bias, groups=dim
+            ).squeeze(0)[:, -1]
+            torch.testing.assert_close(out[start + t], expected, rtol=1e-5, atol=1e-6)
+            window = torch.cat((window[:, 1:], x[start + t][:, None]), dim=1)
+            dst = int(indices[seq, min(t, indices.shape[1] - 1)])
+            torch.testing.assert_close(conv_state[dst], window, rtol=1e-5, atol=1e-6)
 
 
 def test_causal_conv1d_update_replays_speculative_tokens() -> None:
@@ -465,4 +609,64 @@ def test_causal_conv1d_update_replays_speculative_tokens() -> None:
             full.unsqueeze(0), weight.unsqueeze(1), bias, groups=dim
         ).squeeze(0).T
         torch.testing.assert_close(out[start : start + count], expected, rtol=1e-5, atol=1e-6)
-        torch.testing.assert_close(conv_state[line], full[:, -taps:], rtol=1e-5, atol=1e-6)
+        window = before[line].clone()
+        for t in range(count):
+            window = torch.cat((window[:, 1:], x[start + t][:, None]), dim=1)
+        torch.testing.assert_close(
+            conv_state[line], window, rtol=1e-5, atol=1e-6
+        )
+
+
+def test_mamba2_selective_state_update_varlen_matches_decode_with_full_dt_bias() -> None:
+    """Spec verify must reproduce the ordinary decode math for a full [heads, head_dim] bias.
+
+    vLLM passes ``dt`` as [tokens, heads, head_dim] during target verification and an expanded
+    ``dt_bias`` of [heads, head_dim].  The varlen path must keep the head-dim axis and add the
+    complete bias; flattening the bias or squeezing ``dt`` silently changes the softplus term.
+    """
+    torch.manual_seed(53)
+    heads, hdim, dstate, groups = 4, 3, 5, 2
+    slots = 7
+    state = torch.randn(slots, heads, hdim, dstate)
+    before = state.clone()
+    x = torch.randn(2, heads, hdim)
+    dt = torch.randn(2, heads, hdim)
+    A = -torch.rand(heads)
+    B = torch.randn(2, groups, dstate)
+    C = torch.randn(2, groups, dstate)
+    D = torch.randn(heads, hdim)
+    dt_bias = torch.randn(heads, hdim)
+    src = torch.tensor([[2, 3]])
+    dst = torch.tensor([[4, 5]])
+    out = torch.empty_like(x)
+
+    selective_state_update(
+        state,
+        x,
+        dt,
+        A,
+        B,
+        C,
+        D,
+        dt_bias,
+        dt_softplus=True,
+        state_batch_indices=src,
+        dst_state_batch_indices=dst,
+        out=out,
+        num_accepted_tokens=torch.tensor([2], dtype=torch.int32),
+        cu_seqlens=torch.tensor([0, 2], dtype=torch.int32),
+    )
+
+    # accepted=2 selects src[0, 1] == 3 as the initial state for this verify step.
+    current = before[3].clone()
+    for pos in range(2):
+        d = torch.nn.functional.softplus(dt[pos] + dt_bias)
+        current = current * torch.exp(d[..., None] * A[:, None, None])
+        current = current + d[..., None] * x[pos][:, :, None] * B[pos].repeat_interleave(
+            heads // groups, dim=0
+        )[:, None, :]
+        expected = (
+            current * C[pos].repeat_interleave(heads // groups, dim=0)[:, None, :]
+        ).sum(-1) + x[pos] * D
+        torch.testing.assert_close(out[pos], expected, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(state[int(dst[0, pos])], current, rtol=1e-5, atol=1e-6)

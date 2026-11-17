@@ -145,29 +145,62 @@ MTP 的 varlen 仍走逐 token 循环。
   审计器看不到 `apply` 的 forward 计数，属于解释项，不是静默回退）；
 - `ReLUSquaredActivation` 在并发轮有 437 次调用，`Mixer2RMSNormGated` 23 次。
 
-## 5. MTP：失败，不要开启
+## 5. MTP：无损性已修复并通过（2026-11-17）
 
-真权重 MTP 服务可以起，`NemotronHMTPModel`、drafter 加载、`/metrics` 均有记录：
+真权重 MTP 服务可以起，`NemotronHMTPModel`、drafter 加载、`/metrics` 均有记录；
+修复前同样 prompt、temperature 0 的 MTP 输出与非 MTP greedy 输出不一致
+（` Paris.</think>Paris is the capital of France.` vs
+` Paris.  \nThe capital of Germany is Berlin.  \nThe capital of`），因此当时 MTP 质量门判失败。
+本节记录 2026-11-17 的根因定位与修复后证据。旧失败现场保留在 git 历史中，不再作为当前结论。
 
-- `spec_decode_num_drafts_total=14`，`spec_decode_num_accepted_tokens_total=8`；
-- 同样 prompt、temperature 0、max_tokens 16，MTP 输出
-  ` Paris.</think>Paris is the capital of France.`
-  非 MTP 输出 ` Paris.  \nThe capital of Germany is Berlin.  \nThe capital of`；
-- 两次 MTP 结果确定，但不是非 MTP 的 greedy 结果。speculative decoding 应当无损；
-  当前 MTP 路径不满足这一条。
-- 隔离实验（都保持 fresh `VLLM_CACHE_ROOT`，只改一个变量）：
-  1. 临时跳过 `selective_state_update` 绑定、走厂商 state 更新：输出仍是
-     ` Paris.</think>Paris is the capital of France.`；
-  2. 临时跳过 `causal_conv1d_update` 绑定、走厂商 conv 更新：输出仍是同一串；
-  3. `--no-async-scheduling`：`Asynchronous scheduling is disabled`，输出仍相同
-     （drafts=7 / accepted=4）；
-  4. `method=nemotron_h_mtp`（显式名）也被规范化为 `method=mtp`，输出仍相同；
-  5. `draft_sample_method=greedy` + `rejection_sample_method=standard` 仍相同。
-  因此**不是我们补的 state / conv update 单独导致的**；差异在 MTP 的 draft/验证链。
+### 5.1 根因
 
-已补的 `selective_state_update` / `causal_conv1d_update` 多 token 重放没有修复该差异，
-因此**不是我们的 state/conv 补丁单独能解释的**；在查清 MTP 验证链之前，MTP 质量门判失败，
-不能用 MTP 输出作为模型正确性证据，也不要默认开启。
+两个缺口叠加，都在 **我们自己的 bridge/provider**，没有修改 vLLM/vllm-ascend 源码：
+
+1. **Ascend V1 runner 只把 speculative metadata 转发给 GDN builder。**
+   `NPUModelRunner` 用 `isinstance(builder, GDNAttentionMetadataBuilder)` 决定是否传入
+   `num_accepted_tokens` / `num_decode_draft_tokens_cpu`；Mamba2 的
+   `Mamba2AttentionMetadataBuilder` 不是该类型，1+draft 的 target verify 被当成 prefill，
+   SSM/conv state 按“两个 draft 都接受”推进。bridge 把 Mamba2 builder 加入 runner 的 builder
+   元组（`tileinfer/bridge/impl_table.py` 的 `ascend_spec_metadata`），不改上游源码。
+2. **varlen selective update 的逐 token 公式与 single-token decode 公式不同形。**
+   target verify 的 `dt` 是 `[tokens, 64, 64]`（heads×head_dim），`dt_bias` 是 `[64, 64]`；
+   旧 varlen 路径在逐 token 循环里压缩/广播这两者，layer0 的 `ssu` 输出范数
+   `2143.231934`，而同一 state/同一 token 的 single-token 路径是 `1996.194458`（约 7%），
+   足以让 `.` 与 `.\n` 这种接近并列的 target logits 翻转。修复为**每个 verify token 都使用
+   与 ordinary decode 相同的 batch-one 公式**：保留 head_dim 轴、加完整 `[heads, head_dim]`
+   bias、用 `state[accepted-1]` 作为起点、逐 token 写回 `dst_state_batch_indices`。
+   `tileinfer/providers/nemotron/mamba2.py` 的 varlen 路径即此实现。
+
+关键定位证据（同一 prompt、同一 layer0）：
+
+| 量 | 非 MTP single decode | 修复前 MTP varlen |
+|---|---:|---:|
+| conv 输出范数 | 56.158230 | 56.177052 |
+| selective 输出范数 | 1996.194458 | 2143.231934 |
+| state sum | 12820.72265625 | 12820.72265625 |
+| `dtf0` / B norm / C norm | 1.2961817 / 6.713455 / 6.799973 | 相同 |
+
+state、B/C、`dtf0` 都相同而 selective 输出差 7%，把问题收敛到 varlen 的逐 token 公式；
+改成 batch-one 公式后 selective 范数恢复为 `1996.194458`，首个 token 即与非 MTP 一致。
+
+### 5.2 验证（token ids 逐 token 比较，不只看文本）
+
+服务：`--enforce-eager --mamba-cache-mode align --enable-prefix-caching`，
+`TILEINFER_PLAN=/tmp/m5-nemotron-plan-20261117.json TILEINFER_ALLOW_UNSERVABLE=1`；
+不再需要任何 `TILEINFER_DEBUG_*` / `TILEINFER_SPEC_*` 环境变量，bridge 默认安装 runner 补丁。
+
+| 场景 | 结果 |
+|---|---|
+| 6 个 prompt（英文/代码/中文/数字续写），16–32 tokens | token ids 与文本全部逐 token 相同 |
+| 同 prompt 128 tokens | token ids 全部相同；重复请求结果相同 |
+| `all`（无 prefix caching）+ 6 prompt | token ids 全部相同 |
+| `align` + prefix caching + 6 prompt | token ids 全部相同 |
+| `max-num-seqs=2` 两路并发、24 tokens | 两路 token ids 均与非 MTP 相同 |
+
+因此：**MTP 的 greedy 输出已经逐 token 复现非 MTP greedy 输出**。这不等于模型/厂商支持声明：
+目标 plan 仍是 `servable=false`，默认不开启 MTP；需要显式 bring-up 开关和上述验证过的
+配置才能用于证据采集。
 
 ## 6. TP=2/4/8 与共享环境
 
@@ -203,10 +236,10 @@ TP=8 下尚未做 C3 图和 MTP。
 | 并发 2/4 路 | 可完成，4 路约 22 tok/s（短输出） |
 | 冷启动 | 42 s 到 health，首 token 0.33 s（全新 cache） |
 | 算子审计 | 390 实例；1 个有解释的 suspicious；无静默回退证据 |
-| MTP 无损性 | 失败 |
+| MTP 无损性 | 通过（6 prompt / 32–128 tokens，token ids 逐 token 相同；align/all、2 路并发） |
 | TP=2/4/8 | 通过（TP8 输出与 TP1 一致；未做 TP8 图/MTP） |
 
 因此：**不能对外说“vllm-ascend 已支持 Nemotron 3.5 Lightning”。** 可以说的是：
 在单张 Ascend950PR 上，通过 v3 provider 补齐 Mamba2 conv/SSD/state 与非门控 relu2 MoE 后，
 真权重短文本、C3 短稳态、2/4 路并发、冷启动、TP=2/4/8 和 261K 长度可以跑通；
-C2 logprob 和 MTP 仍未闭合。
+C2 logprob 仍未闭合；MTP 无损性已闭合，但 plan 仍为 `servable=false`，不对外声明支持。
