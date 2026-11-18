@@ -20,6 +20,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+pytest.importorskip("tilelang")
 from tileinfer.kernels.moe import (
     moe_down_align,
     moe_gate_up_swiglu_align,

@@ -7,7 +7,6 @@ package hidden.
 
 from __future__ import annotations
 
-import json
 import pathlib
 import subprocess
 import sys
@@ -17,7 +16,7 @@ import pytest
 from tileinfer.contracts.capabilities import CAPABILITIES, Capability, ProviderSpec
 from tileinfer.contracts.gaps import Gap, GapReport
 from tileinfer.contracts.manifest import ModelManifest
-from tileinfer.contracts.plan import ACCESS_POINTS, MAX_ACCESS_POINTS, Plan, Selection
+from tileinfer.contracts.plan import ACCESS_POINTS, MAX_ACCESS_POINTS, Plan
 from tileinfer.manifests import MANIFESTS, QWEN3_6, find_manifest
 from tileinfer.resolve.decide import decide
 from tileinfer.resolve.probe import Environment

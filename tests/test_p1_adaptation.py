@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -49,6 +50,7 @@ def test_weight_map_reports_fp32_parameter_prefixes() -> None:
 
 
 def test_weight_map_loads_a_fused_parameter_through_weight_loader() -> None:
+    pytest.importorskip("vllm")
     class Layer(nn.Module):
         def __init__(self) -> None:
             super().__init__()

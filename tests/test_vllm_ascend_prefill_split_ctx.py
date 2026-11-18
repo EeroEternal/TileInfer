@@ -21,6 +21,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+pytest.importorskip("tilelang")
 from tileinfer.plan import frontier_page_splits
 
 

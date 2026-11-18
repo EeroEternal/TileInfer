@@ -498,6 +498,9 @@ def test_no_vendor_decision_reports_all_gaps_without_hardware(tmp_path: Path) ->
 
 
 def test_nemotron_static_audit_is_read_only_and_reports_unknowns(tmp_path: Path) -> None:
+    prefix = ROOT / ".venv_v3/lib/python3.12/site-packages/vllm"
+    if not prefix.is_dir():
+        pytest.skip("static audit needs the vendored vllm tree at .venv_v3/...")
     out = tmp_path / "nemotron.json"
     subprocess.run(
         [sys.executable, "tools/nemotron/static_audit.py", "--out", str(out)],
