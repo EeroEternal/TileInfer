@@ -34,6 +34,7 @@ ENGINE_FREE_PATHS: Tuple[str, ...] = (
     "manifests",
     "resolve",
     "providers",
+    "models",
     "aot",
     "observ",
     "cli",

@@ -3,7 +3,7 @@
 The vendor state provider is GDN (``vllm_ascend.ops.gdn``), which cannot serve an LFM3
 gated depthwise convolution.  This module is the pure-torch implementation of the fused
 unit: one causal depthwise convolution plus its rolling state.  The vLLM layer in
-``tileinfer/models/lfm3`` owns the metadata and buffer plumbing; the numbers live here so
+``tileinfer/bridge/models/lfm3_model.py`` owns the metadata and buffer plumbing; the numbers live here so
 they can be tested on CPU.
 """
 

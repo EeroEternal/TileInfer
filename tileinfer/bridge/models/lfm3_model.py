@@ -10,7 +10,6 @@ cache and metadata plumbing.
 
 from __future__ import annotations
 
-import math
 from collections.abc import Iterable
 from itertools import islice
 
@@ -44,7 +43,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import (
     HasInnerState,
     IsHybrid,
@@ -57,7 +55,6 @@ from vllm.model_executor.models.utils import (
     PPMissingLayer,
     WeightsMapper,
     extract_layer_index,
-    is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -65,7 +62,9 @@ from vllm.model_executor.models.utils import (
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
+from ...models.state_layout import short_conv_state_layout
 from ...providers.state.short_conv import ShortConvState
+from ..weight_map import LFM3_WEIGHT_MAP, load_weights as load_mapped_weights
 
 
 def _padded_state_len(
@@ -75,19 +74,10 @@ def _padded_state_len(
     num_kv_heads: int,
     dtype_size: int,
 ) -> int:
-    """Pad the tiny convolution state to vllm-ascend's attention page size.
-
-    The Ascend mamba patch asserts that the per-block SSM page equals
-    ``128 * head_dim * num_kv_heads * dtype_size`` bytes.  A short convolution state is
-    ``dim * (kernel - 1) * dtype_size`` bytes, far smaller, so the state allocation is padded;
-    the math still uses only the first ``kernel - 1`` slots.
-    """
-    state_len = kernel - 1
-    target = 128 * head_dim * num_kv_heads * dtype_size
-    base = dim * state_len * dtype_size
-    blocks = max(1, math.ceil(base / target))
-    padded = (blocks * target) // (dim * dtype_size)
-    return max(state_len, padded)
+    """Backwards-compatible wrapper around the shared :class:`StateLayout` arithmetic."""
+    return short_conv_state_layout(
+        dim, kernel, head_dim, num_kv_heads, dtype_size
+    ).padded_len
 
 
 class Lfm3MLP(nn.Module):
@@ -579,35 +569,7 @@ class Lfm3Model(nn.Module):
         return self.embedding_norm(hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            (".qkv_proj", ".q_proj", "q"),
-            (".qkv_proj", ".k_proj", "k"),
-            (".qkv_proj", ".v_proj", "v"),
-            (".w13", ".w1", 0),
-            (".w13", ".w3", 1),
-        ]
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-        for name, loaded_weight in weights:
-            if ".conv." in name:
-                name = name.replace(".conv.", ".short_conv.", 1)
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name + "." not in name:
-                    continue
-                name = name.replace(weight_name + ".", param_name + ".")
-                if is_pp_missing_parameter(name, self):
-                    continue
-                param = params_dict[name]
-                param.weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                if is_pp_missing_parameter(name, self):
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params
+        return load_mapped_weights(self, weights, LFM3_WEIGHT_MAP)
 
 
 class Lfm3ForCausalLM(

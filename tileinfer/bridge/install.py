@@ -135,14 +135,6 @@ def install() -> bool:
         if _INSTALLED:
             return True
         try:
-            # Runs before ModelConfig regardless of which model the plan names.  The alias
-            # is a no-op when vLLM already registers it; a failure is reported, never raised.
-            from tileinfer.bridge.nemotron_config import register_nemotron_h_alias
-
-            _STATUS["configs"] = register_nemotron_h_alias()
-        except Exception as exc:  # noqa: BLE001 - optional compatibility aid
-            _STATUS["configs"] = {"name": "nemotron_h", "registered": False, "detail": repr(exc)}
-        try:
             live = _versions()
             _STATUS["versions"] = live
             plan, source = _load_plan()
@@ -157,6 +149,22 @@ def install() -> bool:
                 _STATUS["skipped"] = gate
                 logger.warning("TileInfer v3 bridge: %s; not injecting", gate)
                 return False
+
+            # Config adapters run here, before vLLM constructs ModelConfig.  They are
+            # plan-driven (no model-specific import in this module) and load-bearing: a
+            # failed adapter would leave the model unparseable, so fail closed.
+            if plan.config_impl:
+                from .config_adapter import install_config_adapter
+
+                config = install_config_adapter(plan.config_impl)
+                _STATUS["configs"] = config
+                if not config.get("ok"):
+                    _STATUS["skipped"] = f"config adapter failed: {config.get('detail')}"
+                    logger.warning(
+                        "TileInfer v3 bridge: config adapter failed (%s); not injecting",
+                        config.get("detail"),
+                    )
+                    return False
 
             metrics.COUNTERS.plan_id = plan.plan_id
             instrumentation = plan.instrumentation or {}

@@ -32,6 +32,11 @@ ROUTE_O_PROVIDERS: Dict[Capability, ProviderSpec] = {
         evidence="docs/notes/lfm3-adaptation.md",
         delete_when="vllm-ascend gains a short-conv state layer usable by LFM3",
         notes="torch causal conv1d; consumed inside the LFM3 route-O model",
+        status="default",
+        scope="model",
+        install="model_impl",
+        graph_safe=True,
+        evidence_level="device-c3",
     ),
 }
 

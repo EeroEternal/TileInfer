@@ -8,8 +8,9 @@ LFM3 has no upstream vLLM architecture, so the declaration names this module as 
 * :func:`register_models` — register ``Lfm3ForCausalLM`` in vLLM's ``ModelRegistry`` by
   class path, so the parameter tree is imported only when such a checkpoint is resolved.
 
-The model implementation itself stays in ``tileinfer.models.lfm3``; that package is
-engine-free by rule, so it must not be imported at module import time here.
+The model implementation lives next to this module in ``tileinfer.bridge.models.lfm3_model``
+so that the vLLM-facing parameter tree stays inside the bridge layer; the declaration only
+names this registration module.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from __future__ import annotations
 from typing import Any, Dict
 
 MODEL_ARCH = "Lfm3ForCausalLM"
-MODEL_IMPL = "tileinfer.models.lfm3.model:Lfm3ForCausalLM"
+MODEL_IMPL = "tileinfer.bridge.models.lfm3_model:Lfm3ForCausalLM"
 
 
 def _patch_ascend_rope() -> str:
@@ -49,12 +50,14 @@ def _patch_ascend_rope() -> str:
 def register_config() -> Dict[str, str]:
     """Install the LFM3 transformers/rope compatibility shims (idempotent)."""
     from ...models.lfm3.compat import apply as apply_lfm3_compat
+    from ..compat_hooks import install_compat_hook
 
     apply_lfm3_compat()
+    rope = install_compat_hook("lfm3_rope_global_buffer")
     return {
         "model_type": "lfm3",
         "transformers_compat": "applied",
-        "ascend_rope_patch": _patch_ascend_rope(),
+        "ascend_rope_patch": rope.get("detail", "unknown"),
     }
 
 

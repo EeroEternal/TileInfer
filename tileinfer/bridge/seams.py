@@ -202,25 +202,6 @@ def install_impl_table(plan: Any) -> SeamResult:
     """
     if plan is None:
         return SeamResult("impl_table", False, "no plan")
-    non_vendor = [
-        s
-        for s in plan.selections
-        if s.source != "vendor" and s.capability != "model.arch"
-    ]
-    if not non_vendor:
-        return SeamResult("impl_table", True, "no non-vendor selections (vendor table kept)")
-    consumed = [
-        s
-        for s in non_vendor
-        if s.provider == "tileinfer.short_conv"
-        and s.capability == "state.linear"
-    ]
-    if len(consumed) == len(non_vendor):
-        return SeamResult(
-            "impl_table",
-            True,
-            "short-conv provider is consumed inside the route-O model",
-        )
     try:
         from .impl_table import install as install_providers
 
@@ -230,6 +211,8 @@ def install_impl_table(plan: Any) -> SeamResult:
             "impl_table", False, f"provider table failed: {type(exc).__name__}: {exc}"
         )
     detail = report.summary()
+    if report.skipped:
+        detail += " | skipped: " + "; ".join(report.skipped)
     if report.failed:
         detail += " | " + "; ".join(f"{k}: {v}" for k, v in report.failed.items())
     return SeamResult("impl_table", report.ok, detail)

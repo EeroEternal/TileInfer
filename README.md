@@ -39,8 +39,10 @@ vllm-ascend 已经适配的模型走它；它没适配的模型，我们把缺�
 
 ## 现在是什么状态
 
-- **v3 接入层已建成（M1）**：`tileinfer/bridge/`（6 个接入点 + 版本门 + 指标）、`contracts/`、
-  `resolve/`、`manifests/`、`cli/` 均已实现；`pyproject.toml` 只注册
+- **v3 接入层已建成（M1 + P0/P1）**：`tileinfer/bridge/`（6 个接入点 + 版本门 + 指标）、
+  `contracts/`、`resolve/`、`manifests/`、`cli/` 均已实现；P0 增加了 provider 生命周期字段、
+  config adapter、manifest/plan `support`；P1 增加了 `WeightMapSpec`、`StateLayout`、
+  `CompatHook`。`pyproject.toml` 只注册
   `vllm.general_plugins → tileinfer.bridge.install:install`，不注册平台插件。当前进度与每条断点见
   [`docs/status.md`](docs/status.md)。
 - **v2 运行时（`tileinfer/vllm/`）已归档到 `legacy/v2/`**，不在安装包内、不可 import。v3 的
@@ -49,6 +51,38 @@ vllm-ascend 已经适配的模型走它；它没适配的模型，我们把缺�
 - 已有资产：注意力 / GDN / MoE / 采样四族内核、`plan/run` 注意力契约、分相计时的剖析工具、
   v1 时代在役过的 vllm-ascend 插件（冻结在 `legacy/`）。
 - 性能数字一律以 [`docs/performance.md`](docs/performance.md) 为准，**不要从 README 或旧文档引用**。
+
+### 已经接入的模型（不要把“C1 跑通”当成“完整支持”）
+
+| 模型 | 路线 | 当前状态 | 证据 |
+|---|---|---|---|
+| **Qwen3.6-35B-A3B** | vendor-only 控制模型 | 8/8 vendor、gap=0；4K–128K C1–C4 过；262K L5 不过 | [`docs/notes/m1-v3-bridge.md`](docs/notes/m1-v3-bridge.md) |
+| **MuseGlimmer-30B** | 路线 O，text-only | C1 通过、C3 8 图/8 命中/0 回退；C2/C4 未闭合，vision 未实现 | [`docs/notes/muse-glimmer-static.md`](docs/notes/muse-glimmer-static.md) |
+| **LFM3-1.7B** | 路线 O + short-conv provider | C1/C3 通过；C2/C4 有历史证据，P1 后未重做完整 p50/p90；单卡、无量化/MTP | [`docs/notes/lfm3-adaptation.md`](docs/notes/lfm3-adaptation.md) |
+| **Nemotron-3.5-30B-A3B** | vendor 模型 + config + candidate providers | C1/C3 通过；plan `servable=false`，C2 logprob 和 MTP 未过 | [`docs/notes/m5-nemotron-validation-20261116.md`](docs/notes/m5-nemotron-validation-20261116.md) |
+
+### 适配层现在长什么样
+
+```text
+manifest（说明书）
+  → decide（计划员：vendor / provider / model_impl / config_impl）
+  → plan（装配清单，内容寻址）
+  → bridge（唯一 import vLLM 的层）
+       ├─ plugin_entry / config_gate   入口与配置翻译/注册
+       ├─ model_table      注册/model 实现
+       ├─ impl_table       注册 provider
+       ├─ attn_select      注意力后端选择
+       ├─ method_wrap      包装方法
+       └─ graph_hook       图捕获计数
+```
+
+P0/P1 的新增内容包括 `ProviderSpec` 的 status/scope/install/graph_safe/evidence_level、
+manifest/plan 的 `config_impl` 和 `support`，以及四个工具：
+
+- `tileinfer/bridge/config_adapter.py`：`config_impl` 的标准入口；
+- `tileinfer/bridge/weight_map.py`：权重改名 / 融合 / skip / expert remap；
+- `tileinfer/models/state_layout.py`：state 逻辑形状、Ascend 页对齐、padded shape；
+- `tileinfer/bridge/compat_hooks.py`：vendor hook / platform guard / rope patch / model-side fix 的登记、禁用和删除条件。
 
 ## 文档地图
 
@@ -89,7 +123,9 @@ vllm-ascend 已经适配的模型走它；它没适配的模型，我们把缺�
 |---|---|
 | `tileinfer/kernels/` | TileLang 算子（attention / GDN / MoE / sampling） |
 | `legacy/v2/tileinfer/vllm/` | **v2 形态**的后端本体（平台层、worker hook、attention 后端、图捕获）——源码归档，v3 不 import、不安装、不测试 |
-| `tileinfer/models/` | 上游没有的模型实现（DeepSeek-V4.1 是样例） |
+| `tileinfer/bridge/models/` | 路线 O 的 vLLM 模型实现与注册模块（MuseGlimmer、LFM3、Nemotron config hooks） |
+| `tileinfer/models/` | engine-free 模型辅助：`state_layout.py`、LFM3 compat 等；**不 import vLLM** |
+| `tileinfer/bridge/` | 唯一 import vLLM 的装配层：config/model/impl 表、兼容 hook、指标 |
 | `tileinfer/serving/` | serving 侧工具（分相计时、bucket、planner） |
 | `legacy/` | v1/v2 冻结归档：不打包、不测试、不再增长，只作 A/B 参照与素材库 |
 | `reference/vllm-0.23/` | vLLM 0.23 关键模块逐字副本，只为让 `file:line` 引用可核对，**不许改** |
@@ -99,7 +135,12 @@ vllm-ascend 已经适配的模型走它；它没适配的模型，我们把缺�
 ## 环境
 
 - 硬件：1 × Ascend950PR（单卡是当前唯一验证过的形态）
-- 栈：CANN 9.3.0、torch 2.13.0、torch_npu、vLLM 0.23.0、tilelang 0.1.15
+- 本机验证栈（2026-11-17）：CANN 9.3.0、torch 2.10.0+cpu、torch_npu 2.10.0.post4、
+  vLLM 0.23.0、vllm-ascend 0.23.0、tilelang 0.1.15。
+- LFM3 / Muse / Nemotron 真权重 C1 使用 `.venv_lfm3`（transformers 5.17.0）；还需要
+  `PYTHONPATH=/home/zxs/triton-ascend-3.2.2:$PYTHONPATH`，否则 `vllm-ascend` 的 block table
+  会走到错误的 Triton 实现。
+- 通用 CPU 契约测试可用 zxs 的 4.57.6 环境；LFM3/Muse/Nemotron 的 NPU 运行请用 5.17 环境。
 - 统一入口：`source scripts/env-ascend102.sh`。**环境定义必须在仓库里**，不许只活在临时目录。
 
 ## License

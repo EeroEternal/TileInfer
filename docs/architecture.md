@@ -65,11 +65,11 @@
 | 层 | 职责 | 它**不知道**什么 | 现状 |
 |---|---|---|---|
 | **L0 入口** | 部署期唯一的人机接口：算计划、编内核、校验、解释"为什么走这条路" | 内核怎么写 | 🟡 只有剖析工具的雏形 |
-| **L1 模型层** | 每个模型一份**声明**（结构、注意力变体序列、KV 分组、量化、依赖的能力、基准样例）；上游没有的模型实现也在这里 | 谁来提供实现 | 🟡 有模型实现，没有声明 |
+| **L1 模型层** | 每个模型一份**声明**（结构、注意力变体序列、KV 分组、量化、依赖的能力、基准样例）；config/weight/state 的纯数学和兼容逻辑也在这里。**会 import vLLM 的模型类放在 L5 `bridge/models/`** | 谁来提供实现 | 🟢 Qwen3.6、MuseGlimmer、LFM3、Nemotron 声明已落盘；路线 O 模型实现在 `bridge/models/` |
 | **L2 决策层** | 把（声明 × 现场能力 × 策略）解成一张计划表 + 一份缺口清单 | 实现长什么样 | 🟡 有零散开关，无计划产物 |
 | **L3 契约层** | 9 类能力契约（注意力 full / 滑窗 sliding / 线性 / MoE / 归一化 / 旋转 / 采样 / 状态 / 量化），纯接口 | 引擎、NPU、模型名 | 🟡 注意力已有 plan/run 契约 |
-| **L4 提供者层** | **只收厂商缺口的实现**（自研 / 引入 / 参考）；厂商原生的条目只进计划表、不进本层。每个声明覆盖范围、是否可上图、并行度、证据（有基线给比值，无基线给绝对数 + 参考一致性） | 决策、引擎 | 🟡 Nemotron 两个候选（Mamba2 / 非门控 MoE），非默认；真权重 C1/C2 未过 |
-| **L5 选择性拦截层** | 唯一允许 import 上游的层；把计划翻译成"换哪张表、包哪个方法"。**不占平台槽位** | 模型、策略 | 🟡 v3 bridge seams 已接；v2 已归档到 `legacy/v2/`，不在安装包内 |
+| **L4 提供者层** | **只收厂商缺口的实现**（自研 / 引入 / 参考）；厂商原生的条目只进计划表、不进本层。每个声明覆盖范围、生命周期（default/candidate）、作用域（global/model）、安装方式、graph_safe、证据（有基线给比值，无基线给绝对数 + 参考一致性） | 决策、引擎 | 🟡 LFM3 `tileinfer.short_conv`（模型作用域，C1/C3 过）；Nemotron 两个候选（Mamba2 / 非门控 MoE），非默认，C2 未过 |
+| **L5 选择性拦截层** | 唯一允许 import 上游的层；把计划翻译成"换哪张表、包哪个方法"；路线 O 的 vLLM 模型实现、config adapter、weight map、compat hooks 也在这里。**不占平台槽位** | 模型、策略 | 🟢 `model_table` 已用于 MuseGlimmer/LFM3，`impl_table` 已用于 LFM3/Nemotron；v2 已归档到 `legacy/v2/` |
 | **L6 内核层** | 内核 + 预编译内核集 + 内容寻址缓存 | 引擎、契约 | ✅ 四族内核已建，预编译未做 |
 
 **为什么是这个切法**：不是为了好看，是为了**测得住**。L3 能在没有卡的机器上跑单测；
@@ -123,8 +123,8 @@ L2 能凭声明和"假能力"算出完整决策；L5 是唯一会因上游升级
 tileinfer/
 ├── cli/           # L0  部署期入口：构建 / 启动 / 体检 / 解释
 ├── manifests/     # L1  每个模型一份声明（单一真相）
-├── models/        # L1  上游没有的模型实现（路线 O）
-├── weights/       # L1  权重映射规则（改名 / 切分 / 转置）
+├── models/        # L1  engine-free 模型辅助（state_layout / compat / 纯数学）
+├── weights/       # L1  计划：权重映射规则（当前落在 L5 bridge/weight_map.py）
 ├── resolve/       # L2  能力探测 + 决策 + 计划 + 缺口清单
 ├── contracts/     # L3  8 类契约（纯接口，可 CPU 测）
 ├── providers/     # L4  厂商缺口的实现，按来源分目录（厂商已覆盖的不进）
@@ -138,8 +138,9 @@ tileinfer/
 |---|---|---|---|---|
 | `cli/` | L0 | 算计划、编内核、体检、解释 | 不许在内核/契约里被 import | `scripts/ti_trace.py`（只有剖析） |
 | `manifests/` | L1 | 描述"这个模型需要什么" | 不许写"该用谁的实现"（那是决策输出） | 无 |
-| `models/` | L1 | 上游没有的模型结构 | 不许直接调引擎内部 API，只调契约 | `models/dsv41/` |
-| `weights/` | L1 | 权重名与切分规则 | 不许写算子逻辑 | 散在模型实现里 |
+| `models/` | L1 | engine-free 模型辅助：state layout、config/compat、纯数学 | 不许 import vLLM；会 import 的模型类放 `bridge/models/` | `state_layout.py`、`lfm3/compat.py` |
+| `bridge/models/` | L5 | 路线 O 的 vLLM 模型实现与注册（`model_impl`） | 不许被 L2/L3/L4/L6 import | `muse_glimmer.py`、`lfm3_model.py`、`lfm3.py` |
+| `weights/` | L1 | 计划：权重映射声明 | 当前实现为 `bridge/weight_map.py`；不写算子 | `WeightMapSpec` |
 | `resolve/` | L2 | 探测、决策、计划、缺口 | 不许 import 任何实现或引擎 | `vllm/compat/patches.py` 的零散开关 |
 | `contracts/` | L3 | 9 类接口定义 | 不许 import 引擎 / NPU / 具体实现 | `legacy/v2/tileinfer/vllm/attn/` 里的 plan/run（与实现混在一起） |
 | `providers/` | L4 | 缺口的实现 + 声明（覆盖范围、可上图、并行度、证据） | 不许做决策、不许 import 决策层；**不许收厂商已能正确部署的能力** | `kernels/`、`legacy/v2/tileinfer/vllm/ops/families/`（归档，按缺口取用，否则不碰） |

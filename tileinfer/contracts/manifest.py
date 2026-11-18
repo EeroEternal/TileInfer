@@ -230,10 +230,17 @@ class ModelManifest:
     #: vendor has no architecture for it (``register_config`` / ``register_models`` actors).
     #: Empty means "the vendor already serves the model".
     model_impl: str = ""
+    #: Dotted module path + actor that normalises/registers a checkpoint config before
+    #: ``ModelConfig`` is built.  Empty means the vendor config path is sufficient.  The
+    #: actor defaults to ``register``; ``module:actor`` selects a different entry point.
+    config_impl: str = ""
     #: CLI name and ``module:Class`` path of the reasoning/chat-format parser, when the
     #: checkpoint speaks a private channel protocol (``--reasoning-parser <name>``).
     reasoning_parser: str = ""
     reasoning_parser_impl: str = ""
+    #: Machine-readable verification scope (text/vision/mtp/quant/tp/context), so a plan,
+    #: doctor report, or evidence page cannot turn "C1 ran" into "fully supported".
+    support: Dict[str, Any] = field(default_factory=dict)
     source: str = "docs/notes/op-coverage-qwen36.md"
     schema_version: int = MANIFEST_SCHEMA_VERSION
 
@@ -333,7 +340,11 @@ class ModelManifest:
 
     @property
     def fingerprint(self) -> str:
-        payload = json.dumps(self.as_dict(), sort_keys=True, separators=(",", ":")).encode()
+        data = dict(self.as_dict())
+        # Support is evidence metadata, not a deployment fact: recording that MTP failed
+        # must not change a content-addressed plan id (and therefore the plan itself).
+        data.pop("support", None)
+        payload = json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
         import hashlib
 
         return hashlib.sha256(payload).hexdigest()[:16]
@@ -360,8 +371,11 @@ class ModelManifest:
             "model_impl": self.model_impl,
             "reasoning_parser": self.reasoning_parser,
             "reasoning_parser_impl": self.reasoning_parser_impl,
+            "support": dict(self.support),
             "source": self.source,
         }
+        if self.config_impl:
+            data["config_impl"] = self.config_impl
         if self.state is not None:
             data["state"] = self.state.as_dict()
         if self.mamba is not None:
