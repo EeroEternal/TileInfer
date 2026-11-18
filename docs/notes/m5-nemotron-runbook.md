@@ -14,6 +14,14 @@
 > `nemotron_h` config 别名由 plan 的 `config_impl` 驱动，不再硬编码在 `install.py`。
 > 文中 `.venv_v3` 命令是历史机器记录，当前 checkout 优先用 `.venv_lfm3`。
 
+> **2026-11-18 更新**：单卡 TP=1、真权重、`servable=false`；图模式 greedy MTP 已逐 token
+> 等价（512 token、4 路 32 token、32K/130K prompt 8 token），C3 图门全部命中/0 回退；
+> C2 教师强制 top-1/top-5 rank 通过（dt floor 修复 capital step31），绝对 logprob 差只作诊断。
+> **本轮交付只要求 TP=1；TP=8 out-of-scope**，历史 TP2/4/8 结果保留但不作为本轮阻塞。
+> 证据与命令见 [`m5-delivery-gates-20261117.md`](m5-delivery-gates-20261117.md) 与
+> [`m5-nemotron-validation-20261116.md`](m5-nemotron-validation-20261116.md)。
+> **不要默认开 MTP，也不要对外说“已支持”或“TP8 已支持”。**
+
 ---
 
 ## 0. 部署前检查表（全部满足才申请）

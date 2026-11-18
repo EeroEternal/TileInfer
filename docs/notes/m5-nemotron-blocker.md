@@ -66,8 +66,8 @@ rootinfo 已删除，`/etc/hccl_rootinfo.json` 已恢复为空目录。
    不对外声明支持。
 
 C2 参考与逐 step 统计已落地在
-[`m5-delivery-gates-20261117.md`](m5-delivery-gates-20261117.md)；C2 严格 1e-4 仍不过，
-只有声明 tie/0.5 容差的 C2-ref 通过。
+[`m5-delivery-gates-20261117.md`](m5-delivery-gates-20261117.md)；C2 教师强制 top-1/top-5 rank
+已通过；本 blocker 只保留 TP=8 共享环境问题，TP=8 为 out-of-scope，不阻塞单卡交付。
 
 ## 不做什么
 

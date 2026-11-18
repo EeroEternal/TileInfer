@@ -40,9 +40,6 @@ DEFAULT_ATOL = 2e-2
 DEFAULT_TIE_LOGIT_TOL = 0.25
 
 
-def _is_byte_fragment(token: str) -> bool:
-    return not token or "\ufffd" in token
-
 
 def check(
     hf_steps: dict[str, Any],

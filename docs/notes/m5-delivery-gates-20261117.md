@@ -52,7 +52,7 @@ step31 的 top-1 从 `n` 翻成 `The`。修复：
 ### 2.2 本轮证据
 
 工具：`tools/nemotron/check_c2_teacher.py`；原始捕获
-`/tmp/m5-service-c2-teacher-ids2.json`；参考 `/tmp/m5-hf-c2-all-steps.json`。
+`artifacts/nemotron/c2/m5-service-c2-teacher-ids2.json`；参考 `artifacts/nemotron/c2/m5-hf-c2-all-steps.json`。
 
 | prompt | top-1 id 相同 | near-tie | top-1 不同 | max `|Δlogprob|`（诊断） | mean |
 |---|---:|---:|---:|---:|---:|
@@ -74,9 +74,9 @@ token，显示 -13.44；正确值是 `logprobs.token_logprobs[0]`。工具比较
 
 ```bash
 python3 tools/nemotron/check_c2_teacher.py \
-  --hf-steps /tmp/m5-hf-c2-all-steps.json \
-  --service /tmp/m5-service-c2-teacher-ids2.json \
-  --out /tmp/m5-c2-teacher-ids2-gate.json
+  --hf-steps artifacts/nemotron/c2/m5-hf-c2-all-steps.json \
+  --service artifacts/nemotron/c2/m5-service-c2-teacher-ids2.json \
+  --out artifacts/nemotron/c2/m5-c2-teacher-ids2-gate.json
 # exit 0
 ```
 
@@ -97,15 +97,15 @@ python3 tools/nemotron/check_c2_teacher.py \
 
 “全同”是比较服务返回的 `token_ids` 与文本；证据文件：
 
-- `/tmp/m5-graph-base-512.json`、`/tmp/m5-graph-mtp-512.json`
-- `/tmp/m5-4way-base.json`、`/tmp/m5-4way-mtp.json`
-- `/tmp/m5-long-base.json`、`/tmp/m5-long-mtp-32000.json`、`/tmp/m5-long-mtp-130000.json`
+- `artifacts/nemotron/mtp/m5-graph-base-512.json`、`artifacts/nemotron/mtp/m5-graph-mtp-512.json`
+- `artifacts/nemotron/mtp/m5-4way-base.json`、`artifacts/nemotron/mtp/m5-4way-mtp.json`
+- `artifacts/nemotron/mtp/m5-long-base.json`、`artifacts/nemotron/mtp/m5-long-mtp-32000.json`、`artifacts/nemotron/mtp/m5-long-mtp-130000.json`
 - 对应 `*-metrics.json`
 
 所有 metrics 均通过：
 
 ```bash
-python tools/nemotron/check_c3_metrics.py /tmp/m5-*-metrics.json
+python tools/nemotron/check_c3_metrics.py artifacts/nemotron/mtp/m5-*-metrics.json
 ```
 
 MTP 图是 `PIECEWISE`、`FULL=0`，这是 MTP 的预期形态；baseline 是
