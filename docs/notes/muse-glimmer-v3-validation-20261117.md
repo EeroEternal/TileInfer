@@ -111,17 +111,6 @@ prefill takes 30.3 s (TTFT). This machine is ~11% slower than the
 or date, so by `performance.md` §1 it is `[待复核]`, not a baseline. Most plausible source
 of the gap is the NNAL build (9.2.0-beta.1 against CANN 9.3), not the card.
 
-## 5. Weight integrity (incident + check)
-
-The first copy of `model-00002-of-00002.safetensors` had a **2,719,744,000-byte zero prefix**
-(`4096 × 664000`), i.e. a preallocated hole materialised by a copy; the safetensors header
-length read as 0 and vLLM failed with `invalid JSON in header`. After re-upload the header is
-11,720 bytes, 89 tensors, `data_start + max_end == file_size`. Shard 1 (50 GB, 1347 tensors)
-was always valid.
-
-Every delivery must run a header/index check before serving; `scripts/verify-safetensors.py`
-does that and exits non-zero on a truncated/zeroed header.
-
 ## 4.1 C2 — numeric parity against a float32 CPU oracle
 
 `tools/muse/c2_oracle.py` is an independent pure-torch float32 implementation (no vLLM, no
@@ -145,6 +134,37 @@ python tools/muse/c2_oracle.py --out /tmp/muse-c2.json
 python tools/muse/check_c2.py --base-url http://127.0.0.1:8360
 ```
 
+## 4.2 TP=2 (two cards) — 128K x 4 and C2
+
+Host prerequisite (not TileInfer code): `/etc/hccl_rootinfo.json` is an **empty directory** on
+this box. HCCL cannot parse it, so TP>1 fails with `hcclCommInitRootInfoConfig ... Failed to
+parse the ranktable file`. The directory was moved aside for the duration of these runs and
+restored afterwards; no code or workflow change encodes this workaround.
+
+TP=2 setup: cards 2+3, `--tensor-parallel-size 2`, `max-model-len 131072`,
+`max-num-seqs 4`, `gpu-memory-utilization 0.85`; ready in 52–54 s.
+
+| test | result |
+|---|---|
+| C2 (`check_c2.py --tp-size 2`) | token set exact; top-1 diff **0.001138** (TP tolerance 0.002), top-5 max 0.058; **pass** |
+| 125K single | TTFT **18.4 s**, TPOT **30.6 ms** (TP=1: 30.3 s / 48.4 ms) |
+| 4 x 125K, prefix cache disabled | 4/4 requests x 64 tokens; wall **76.1 s**; max TTFT **74.2 s** |
+| 4 x 125K, prefix cache enabled | 3.0 s wall (identical prompts reuse the first prefill; not a capacity number) |
+
+The TP=1 C2 tolerance stays at 1e-3; TP=2 uses the separately declared `tolerance_tp`
+(2e-3), because tensor-parallel reductions change the bf16 rounding.
+
+## 5. Weight integrity (incident + check)
+
+The first copy of `model-00002-of-00002.safetensors` had a **2,719,744,000-byte zero prefix**
+(`4096 × 664000`), i.e. a preallocated hole materialised by a copy; the safetensors header
+length read as 0 and vLLM failed with `invalid JSON in header`. After re-upload the header is
+11,720 bytes, 89 tensors, `data_start + max_end == file_size`. Shard 1 (50 GB, 1347 tensors)
+was always valid.
+
+Every delivery must run a header/index check before serving; `scripts/verify-safetensors.py`
+does that and exits non-zero on a truncated/zeroed header.
+
 ## 6. Gates
 
 | Gate | State |
@@ -164,10 +184,9 @@ C4 absolute gate for this vendor-absent model (declared here, measured on one 95
 | cold start (fresh cache) | ≤ 120 s | 38 s | ✅ |
 
 Measured beyond the gate (not gated): 125K prompt / 64 output -> TTFT 30.3 s, TPOT 48.4 ms;
-16-way 331 tok/s; 32-way 608 tok/s; 128K x 2 concurrency passes, 128K x 4 crashes the
-EngineCore on one card.
+16-way 331 tok/s; 32-way 608 tok/s; 128K x 2 concurrency passes on one card, 128K x 4 needs
+TP=2 (74.2 s max TTFT, see §4.2).
 
-What is still open: 128K x 4 concurrency (needs TP2 or a lower context/seq budget), and a
-same-stack vendor A/B (the vendor can serve this model only with the same registration, so it
+What is still open: a same-stack vendor A/B (the vendor can serve this model only with the same registration, so it
 is not an independent baseline). None of those block the C1–C4 statement above, but they must
 be listed as unverified.

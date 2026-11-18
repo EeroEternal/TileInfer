@@ -67,6 +67,24 @@ Notes:
 - The ATEM parser is required for this checkpoint: content arrives in the `reasoning` channel
   until the model switches to the user channel.
 
+## 4.1 TP=2
+
+Host prerequisite: this box has `/etc/hccl_rootinfo.json` as an **empty directory**, which
+makes HCCL fail with `Failed to parse the ranktable file`. Move it aside for the run and put it
+back afterwards; do not encode this in the service.
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=2,3
+python -m vllm.entrypoints.openai.api_server --model /home/models/Muse-Glimmer-30B \
+  --served-model-name muse --trust-remote-code --max-model-len 131072 \
+  --max-num-seqs 4 --gpu-memory-utilization 0.85 --reasoning-parser atem \
+  --tensor-parallel-size 2 --port 8360
+python tools/muse/check_c2.py --base-url http://127.0.0.1:8360 --tp-size 2
+```
+
+Measured on 2026-11-18: 125K single -> TTFT 18.4 s / TPOT 30.6 ms; 128K x 4 (prefix cache off)
+-> 4/4 x 64 tokens, wall 76.1 s, max TTFT 74.2 s.
+
 ## 5. Smoke
 
 ```bash

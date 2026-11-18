@@ -79,6 +79,11 @@ MUSE_GLIMMER = ModelManifest(
             "top5_max_logprob": 0.1,
             "token_set": "exact",
         },
+        "tolerance_tp": {
+            "top1_logprob": 0.002,
+            "top5_max_logprob": 0.1,
+            "token_set": "exact",
+        },
         "reference": "tools/muse/c2_oracle.py",
         "measured": "2026-11-17, Ascend950PR bf16 vs float32 reference; top1 diff 3.7e-5, top5 max 0.059",
     },

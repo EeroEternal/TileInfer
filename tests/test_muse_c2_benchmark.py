@@ -27,6 +27,9 @@ def test_c2_top5_is_ordered_and_has_a_declared_tolerance() -> None:
     assert float(tolerance["top1_logprob"]) > 0
     assert float(tolerance["top5_max_logprob"]) > 0
     assert tolerance["token_set"] == "exact"
+    tp_tolerance = MUSE_GLIMMER.benchmark["tolerance_tp"]
+    assert float(tp_tolerance["top1_logprob"]) > float(tolerance["top1_logprob"])
+    assert tp_tolerance["token_set"] == "exact"
 
 
 def test_manifest_still_validates() -> None:

@@ -24,6 +24,7 @@ def main() -> int:
     parser.add_argument("--model", default="muse")
     parser.add_argument("--manifest", default="muse_glimmer")
     parser.add_argument("--json-out", default="")
+    parser.add_argument("--tp-size", type=int, default=1)
     args = parser.parse_args()
 
     manifest = find_manifest(args.manifest)
@@ -32,6 +33,8 @@ def main() -> int:
         print(f"{args.manifest} has no benchmark sample", file=sys.stderr)
         return 1
     tolerance = sample.get("tolerance", {})
+    if args.tp_size > 1 and "tolerance_tp" in sample:
+        tolerance = sample["tolerance_tp"]
     top1_tol = float(tolerance.get("top1_logprob", 0.0))
     top5_tol = float(tolerance.get("top5_max_logprob", 0.0))
 
@@ -71,6 +74,7 @@ def main() -> int:
         "top1_tolerance": top1_tol,
         "top5_max_logprob_diff": max_diff,
         "top5_tolerance": top5_tol,
+        "tp_size": args.tp_size,
         "pass": bool(first_match and tokens_match and top1_diff <= top1_tol and max_diff <= top5_tol),
     }
     text = json.dumps(report, ensure_ascii=False, indent=1)
