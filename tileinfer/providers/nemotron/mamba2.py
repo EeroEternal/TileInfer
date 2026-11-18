@@ -90,8 +90,12 @@ def _chunk_output(
     work = torch.float32
 
     xf = x.to(work)
-    dtf = _softplus_dt(dt.to(work), None if dt_bias is None else dt_bias.to(work), dt_softplus)
-    dtf = torch.clamp(dtf, float(dt_limit[0]), float(dt_limit[1]))
+    # HF's slow path keeps dt in the activation dtype through softplus/clamp and only then
+    # combines it with the float32 A.  Reproduce that order: doing softplus in float32 changes
+    # the bf16 rounding of small dt values and drifts the decode trajectory.
+    dtf = _softplus_dt(dt, dt_bias, dt_softplus)
+    # NemotronH sets time_step_min=1e-3 even though vLLM passes dt_limit=(0, inf).
+    dtf = torch.clamp(dtf, max(float(dt_limit[0]), 1e-3), float(dt_limit[1])).to(work)
     af = A.to(work)
     bf = _repeat_groups(B.to(work), h)
     cf = _repeat_groups(C.to(work), h)
@@ -379,6 +383,24 @@ def causal_conv1d_fn(
             conv_states[write_line, :, :state_len] = new_state.to(conv_states.dtype)
     return out.to(original_dtype)
 
+def _is_stream_capturing() -> bool:
+    """True while an ACL graph is being captured.
+
+    The speculative entry points keep a host-metadata loop for eager execution (it handles
+    arbitrary per-sequence lengths), but that loop cannot run inside capture: reading
+    ``query_start_loc``/``num_accepted_tokens`` would issue a synchronous D2H copy.  During
+    capture vLLM's decode batch has a uniform token count per sequence, so the dedicated
+    tensor-only paths below can be captured instead.  On CPU this is always false.
+    """
+    npu = getattr(torch, "npu", None)
+    if npu is None or not hasattr(npu, "is_current_stream_capturing"):
+        return False
+    try:
+        return bool(npu.is_current_stream_capturing())
+    except Exception:  # pragma: no cover - defensive, platform dependent
+        return False
+
+
 def _conv_lines(
     batch: int,
     indices: Optional[torch.Tensor],
@@ -400,6 +422,110 @@ def _conv_lines(
     if lines.numel() != batch:
         raise ValueError(f"expected {batch} cache lines, got {lines.numel()}")
     return lines
+
+
+def _write_conv_lines(
+    conv_state: torch.Tensor,
+    lines: torch.Tensor,
+    window: torch.Tensor,
+    null_block_id: int,
+) -> None:
+    """Write one window per sequence to tensor-selected cache lines.
+
+    ``null_block_id`` entries must not be touched.  Keep the existing line instead of using a
+    data-dependent host mask: that makes the write capturable and preserves the eager semantics.
+    """
+    mask = lines != int(null_block_id)
+    safe = lines.clamp(min=0).to(torch.int64)
+    keep = conv_state.index_select(0, safe).to(torch.float32)
+    src = torch.where(mask[:, None, None], window, keep)
+    conv_state.index_copy_(0, safe, src.to(conv_state.dtype))
+
+
+def _causal_conv1d_update_capture(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    activation: object,
+    conv_state_indices: Optional[torch.Tensor],
+    num_accepted_tokens: Optional[torch.Tensor],
+    query_start_loc: torch.Tensor,
+    null_block_id: int,
+    block_idx_last_scheduled_token: Optional[torch.Tensor],
+    initial_state_idx: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Tensor-only speculative convolution for ACL graph capture.
+
+    vLLM's captured decode batch has the same number of scheduled tokens for every sequence.
+    Reading that number from ``x``/``query_start_loc`` shapes is free; reading the tensor values
+    is not (and is exactly what failed with ``rtMemcpy ... stream is capturing``).  The rolling
+    window is therefore built for all sequences at once, with per-token scatter to the 2-D
+    destination table used by speculative Mamba2.
+    """
+    if x.dim() != 2:
+        raise RuntimeError("captured speculative conv expects 2-D [tokens, dim] input")
+    batch = int(query_start_loc.numel()) - 1
+    if batch <= 0 or x.shape[0] % batch:
+        raise RuntimeError(
+            f"captured speculative conv has non-uniform batch: tokens={x.shape[0]}, "
+            f"query_start_loc={query_start_loc.numel()}"
+        )
+    count = x.shape[0] // batch
+    dim = x.shape[1]
+    taps = weight.shape[1] - 1
+    state_len = int(conv_state.shape[-1])
+    if taps > state_len:
+        raise ValueError(f"conv_state state_len={state_len} < width-1={taps}")
+
+    dst_table: Optional[torch.Tensor]
+    if conv_state_indices is None:
+        read_lines = torch.arange(batch, device=x.device, dtype=torch.int64)
+        dst_table = None
+        write_lines = read_lines
+    elif conv_state_indices.dim() == 1:
+        read_lines = conv_state_indices[:batch].to(torch.int64)
+        write_lines = read_lines
+        dst_table = None
+    else:
+        dst_table = conv_state_indices
+        pos = (
+            initial_state_idx.reshape(-1)[:batch].to(torch.int64)
+            if initial_state_idx is not None
+            else (
+                (num_accepted_tokens.reshape(-1)[:batch].to(torch.int64) - 1).clamp(min=0)
+                if num_accepted_tokens is not None
+                else torch.zeros(batch, device=x.device, dtype=torch.int64)
+            )
+        )
+        read_lines = dst_table.gather(1, pos[:, None]).squeeze(1).to(torch.int64)
+        write_lines = _conv_lines(batch, dst_table, block_idx_last_scheduled_token, x.device)
+
+    hist = conv_state.index_select(0, read_lines).to(torch.float32)
+    hist = hist[:, :, state_len - taps :] if taps else hist[:, :, :0]
+    x_seq = x.reshape(batch, count, dim).transpose(1, 2).to(torch.float32)
+    full = torch.cat((hist, x_seq), dim=2)
+    y = F.conv1d(
+        full,
+        weight.to(torch.float32).unsqueeze(1),
+        None if bias is None else bias.to(torch.float32),
+        groups=dim,
+    )
+    y = _apply_activation(y, activation)
+    out = torch.empty_like(x, dtype=conv_state.dtype)
+    out.copy_(y.transpose(1, 2).reshape(x.shape).to(out.dtype))
+
+    if dst_table is None:
+        window = full[:, :, -state_len:]
+        _write_conv_lines(conv_state, write_lines, window, null_block_id)
+    else:
+        cols = dst_table.shape[1]
+        if cols < count:
+            raise RuntimeError(f"conv destination table has {cols} columns, need {count}")
+        for t in range(count):
+            window = torch.cat((hist, x_seq[:, :, : t + 1]), dim=2)[:, :, -state_len:]
+            _write_conv_lines(conv_state, dst_table[:, t], window, null_block_id)
+    return out.to(x.dtype)
 
 
 def causal_conv1d_update(
@@ -436,6 +562,24 @@ def causal_conv1d_update(
     if state_len < taps:
         raise ValueError(f"conv_state state_len={state_len} < width-1={taps}")
     spec = num_accepted_tokens is not None
+    # Graph capture cannot read query_start_loc/num_accepted_tokens on the host.  Captured
+    # speculative decode has a uniform per-sequence token count, so use the tensor-only path.
+    if spec and _is_stream_capturing():
+        if query_start_loc is None:
+            raise RuntimeError("captured speculative conv requires query_start_loc")
+        return _causal_conv1d_update_capture(
+            x,
+            conv_state,
+            weight,
+            bias,
+            activation,
+            conv_state_indices,
+            num_accepted_tokens,
+            query_start_loc,
+            int(null_block_id),
+            block_idx_last_scheduled_token,
+            initial_state_idx,
+        )
     # Graph capture needs a host-sync-free path.  Ordinary decode is one token per sequence with
     # a compact (width-1 column) state; keep that vectorised.  Speculative batches take the
     # rolling-window path below.
@@ -649,7 +793,7 @@ def _softplus_clamp(dt: torch.Tensor, dt_bias: torch.Tensor, enabled: bool) -> t
         dt = F.softplus(dt + dt_bias)
     else:
         dt = dt + dt_bias
-    return torch.clamp(dt, 0.0, float("inf"))
+    return torch.clamp(dt, 1e-3, float("inf"))
 
 
 def _selective_state_update_varlen(
@@ -693,6 +837,26 @@ def _selective_state_update_varlen(
         out = torch.empty_like(x)
     if z is not None and z.dim() != 3:
         raise ValueError(f"z must be [tokens, heads, headdim], got {tuple(z.shape)}")
+    if _is_stream_capturing():
+        _selective_state_update_capture(
+            state,
+            x,
+            dt,
+            A,
+            B,
+            C,
+            D,
+            dt_bias,
+            z,
+            dt_softplus,
+            state_batch_indices,
+            dst_state_batch_indices,
+            out,
+            num_accepted_tokens,
+            cu_seqlens,
+            null_block_id,
+        )
+        return
 
     a = A.to(torch.float32)
     if a.dim() == 1:
@@ -783,6 +947,141 @@ def _selective_state_update_varlen(
                 if final_dst < 0 or final_dst >= slots:
                     raise IndexError(f"state destination slot out of range: {final_dst}, slots={slots}")
                 state[final_dst].copy_(current.to(state.dtype))
+
+
+def _write_state_slots(
+    state: torch.Tensor,
+    slots: torch.Tensor,
+    value: torch.Tensor,
+    null_block_id: int,
+) -> None:
+    """Scatter states to tensor-selected slots without a host read (capture-safe)."""
+    mask = slots != int(null_block_id)
+    safe = slots.clamp(min=0).to(torch.int64)
+    keep = state.index_select(0, safe).to(torch.float32)
+    src = torch.where(mask[:, None, None, None], value, keep)
+    state.index_copy_(0, safe, src.to(state.dtype))
+
+
+def _selective_state_update_capture(
+    state: torch.Tensor,
+    x: torch.Tensor,
+    dt: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    D: torch.Tensor,
+    dt_bias: torch.Tensor,
+    z: Optional[torch.Tensor],
+    dt_softplus: bool,
+    state_batch_indices: Optional[torch.Tensor],
+    dst_state_batch_indices: Optional[torch.Tensor],
+    out: Optional[torch.Tensor],
+    num_accepted_tokens: Optional[torch.Tensor],
+    cu_seqlens: torch.Tensor,
+    null_block_id: int,
+) -> None:
+    """Tensor-only speculative SSM update for ACL graph capture.
+
+    Same arithmetic as the eager batch-one loop, but the batch dimension is vectorised and no
+    tensor value is read on the host.  vLLM's captured decode batch has a uniform token count;
+    the count comes from shapes, the accepted/source/destination slots from device tensors.
+    """
+    if state.dim() == 5:
+        state = state.squeeze(1)
+    if state.dim() != 4:
+        raise ValueError(f"state must be [slots, heads, headdim, dstate], got {tuple(state.shape)}")
+    if x.dim() != 3:
+        raise ValueError(f"captured varlen x must be [tokens, heads, headdim], got {tuple(x.shape)}")
+    slots, nheads, headdim, dstate = state.shape
+    batch = int(cu_seqlens.numel()) - 1
+    if batch <= 0 or x.shape[0] % batch:
+        raise RuntimeError(
+            f"captured speculative state has non-uniform batch: tokens={x.shape[0]}, "
+            f"cu_seqlens={cu_seqlens.numel()}"
+        )
+    count = x.shape[0] // batch
+    if B.shape[1] == 0 or nheads % B.shape[1]:
+        raise ValueError(f"nheads={nheads} is not divisible by ngroups={B.shape[1]}")
+    if out is None:
+        out = torch.empty_like(x)
+
+    a = A.to(torch.float32)
+    if a.dim() == 1:
+        a = a[:, None, None].expand(nheads, headdim, dstate)
+    elif a.dim() == 2:
+        a = a[:, None, :].expand(nheads, headdim, -1)
+    elif a.dim() != 3:
+        raise ValueError(f"A must be 1-D, 2-D or 3-D, got {tuple(A.shape)}")
+    df = D.to(torch.float32)
+    if df.dim() == 1:
+        df = df[:, None]
+    dt_bias_f = dt_bias.to(torch.float32)
+    if dt_bias_f.dim() == 1:
+        dt_bias_f = dt_bias_f[:, None]
+    if dt_bias_f.dim() != 2:
+        raise ValueError(f"dt_bias must be 1-D or 2-D, got {tuple(dt_bias.shape)}")
+    if dt_bias_f.shape[-1] == 1:
+        dt_bias_f = dt_bias_f.expand(nheads, headdim)
+
+    src_table = state_batch_indices
+    dst_table = dst_state_batch_indices if dst_state_batch_indices is not None else src_table
+    if src_table is None:
+        src_slots = torch.arange(batch, device=x.device, dtype=torch.int64)
+    elif src_table.dim() == 1:
+        src_slots = src_table[:batch].to(torch.int64)
+    else:
+        pos = (
+            (num_accepted_tokens.reshape(-1)[:batch].to(torch.int64) - 1).clamp(min=0)
+            if num_accepted_tokens is not None
+            else torch.zeros(batch, device=x.device, dtype=torch.int64)
+        )
+        src_slots = src_table.gather(1, pos[:, None]).squeeze(1).to(torch.int64)
+
+    if dst_table is None:
+        dst_slots = src_slots
+        dst_2d = False
+    elif dst_table.dim() == 1:
+        dst_slots = dst_table[:batch].to(torch.int64)
+        dst_2d = False
+    else:
+        if dst_table.shape[1] < count:
+            raise RuntimeError(f"state destination table has {dst_table.shape[1]} columns, need {count}")
+        dst_slots = dst_table[:, :count].to(torch.int64)
+        dst_2d = True
+
+    x_r = x.reshape(batch, count, nheads, headdim).to(torch.float32)
+    dt_r = dt.reshape(batch, count, *dt.shape[1:]).to(torch.float32)
+    if dt_r.dim() == 3:
+        dt_r = dt_r.unsqueeze(-1)  # [B, count, heads, 1]
+    b_r = B.reshape(batch, count, *B.shape[1:]).to(torch.float32)
+    c_r = C.reshape(batch, count, *C.shape[1:]).to(torch.float32)
+    z_r = None
+    if z is not None:
+        z_r = z.reshape(batch, count, *z.shape[1:]).to(torch.float32)
+        if z_r.dim() == 3:
+            z_r = z_r.unsqueeze(-1)
+
+    src_mask = (src_slots != int(null_block_id))[:, None, None, None]
+    state_in = state.index_select(0, src_slots.clamp(min=0)).to(torch.float32) * src_mask
+    out_r = out.reshape(batch, count, nheads, headdim)
+    for t in range(count):
+        dtf = _softplus_clamp(dt_r[:, t], dt_bias_f, dt_softplus)
+        b1 = _repeat_groups(b_r[:, t], nheads)
+        c1 = _repeat_groups(c_r[:, t], nheads)
+        xf = x_r[:, t]
+        decay = torch.exp(dtf[..., None] * a)
+        state_out = state_in * decay + dtf[..., None] * xf[..., None] * b1[:, :, None, :]
+        y = (state_out * c1[:, :, None, :]).sum(dim=-1) + xf * df
+        if z_r is not None:
+            y = y * F.silu(z_r[:, t])
+        out_r[:, t].copy_(y.to(out.dtype))
+        state_in = state_out
+        if dst_2d:
+            _write_state_slots(state, dst_slots[:, t], state_out, null_block_id)
+    if not dst_2d:
+        _write_state_slots(state, dst_slots, state_in, null_block_id)
+
 
 def selective_state_update(
     state: torch.Tensor,

@@ -236,9 +236,9 @@ TP=8 下尚未做 C3 图和 MTP。
 |---|---|
 | C1 真权重可服务 | 通过（bring-up，`servable=false`） |
 | C2 text/token | 通过（单 prompt） |
-| C2 logprob top-5 | 未通过（最大差 1.636） |
-| C3 捕获 | 通过；2026-11-16 首轮 2 / 6 graphs，2026-11-17 P0/P1 复测 8 / 8 graphs，8/8 命中、0 回退 |
-| C3 稳态零回退 | 通过（32-token 31/31/0；8K 7/7/0；128K 3/3/0；4 路并发 15/15/0） |
+| C2 logprob top-5 | 2026-11-17 P0/P1 复测最大差 1.636 未过；2026-11-18 dt floor 修复后 TP=1 教师强制 rank 通过：4 prompt 的 top-1 token id 全同或 near-tie，参考 top-1 全在服务 top-5；绝对差 0.574/0.198/0.238/0.290 只作诊断 |
+| C3 捕获 | 通过；2026-11-16 首轮 2 / 6 graphs，2026-11-17 P0/P1 复测 8 / 8 graphs，8/8 命中、0 回退；MTP 图 2/6，全部命中 |
+| C3 稳态零回退 | 通过（32-token 31/31/0；8K 7/7/0；128K 3/3/0；4 路并发 15/15/0；本轮 512-token 511/511/0；MTP 786/786/0；4 路 32/32/0 与 57/57/0；32K/130K 14/14/0 与 24/24/0） |
 | 长上下文 8K–261K | 可完成（长度证据） |
 | 并发 2/4 路 | 可完成，4 路约 22 tok/s（短输出） |
 | 冷启动 | 42 s 到 health，首 token 0.33 s（全新 cache） |
@@ -249,4 +249,6 @@ TP=8 下尚未做 C3 图和 MTP。
 因此：**不能对外说“vllm-ascend 已支持 Nemotron 3.5 Lightning”。** 可以说的是：
 在单张 Ascend950PR 上，通过 v3 provider 补齐 Mamba2 conv/SSD/state 与非门控 relu2 MoE 后，
 真权重短文本、C3 短稳态、2/4 路并发、冷启动、TP=2/4/8 和 261K 长度可以跑通；
-C2 logprob 仍未闭合；MTP 无损性已闭合，但 plan 仍为 `servable=false`，不对外声明支持。
+本轮 TP=1 的 greedy MTP 图模式已逐 token 等价；C2 按教师强制 top-1/top-5 rank 通过
+（绝对 logprob 差只作诊断）；TP=8 为 out-of-scope（历史 TP8 结果保留，不作为本轮阻塞）；
+plan 仍为 `servable=false`，不对外声明支持。

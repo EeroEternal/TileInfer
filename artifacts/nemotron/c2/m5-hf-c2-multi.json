@@ -1,0 +1,328 @@
+{
+  "model": "/home/models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
+  "dtype": "bfloat16",
+  "device": "cpu",
+  "transformers": "5.5.4",
+  "torch": "2.10.0+cpu",
+  "max_new_tokens": 32,
+  "generated_at": "2026-11-17T17:07:38+0800",
+  "results": [
+    {
+      "prompt": "The capital of France is",
+      "prompt_token_ids": [
+        1784,
+        8961,
+        1307,
+        5498,
+        1395
+      ],
+      "generated_token_ids": [
+        6993,
+        1046,
+        1256,
+        1010,
+        1784,
+        8961,
+        1307,
+        10787,
+        1395,
+        10874,
+        1046,
+        1256,
+        1010,
+        1784,
+        8961,
+        1307,
+        16507,
+        1395,
+        15512,
+        1046,
+        1256,
+        1010,
+        1784,
+        8961,
+        1307,
+        18940,
+        1395,
+        14288,
+        1046,
+        1256,
+        1010,
+        1110
+      ],
+      "text": " Paris.  \nThe capital of Germany is Berlin.  \nThe capital of Italy is Rome.  \nThe capital of Spain is Madrid.  \nn",
+      "first_token_top5": [
+        {
+          "token_id": 6993,
+          "token": " Paris",
+          "logit": 16.75,
+          "logprob": -0.14051379263401031
+        },
+        {
+          "token_id": 10874,
+          "token": " Berlin",
+          "logit": 13.1875,
+          "logprob": -3.7030138969421387
+        },
+        {
+          "token_id": 1603,
+          "token": " **",
+          "logit": 13.125,
+          "logprob": -3.7655138969421387
+        },
+        {
+          "token_id": 68521,
+          "token": " Brussels",
+          "logit": 11.625,
+          "logprob": -5.265513896942139
+        },
+        {
+          "token_id": 7893,
+          "token": " London",
+          "logit": 11.4375,
+          "logprob": -5.453013896942139
+        }
+      ],
+      "seconds": 8.6
+    },
+    {
+      "prompt": "def fibonacci(n):",
+      "prompt_token_ids": [
+        3149,
+        9111,
+        87539,
+        4990,
+        4244
+      ],
+      "generated_token_ids": [
+        1092,
+        1110,
+        1293,
+        1693,
+        1308,
+        9120,
+        1032,
+        1048,
+        13249,
+        1110,
+        1369,
+        1850,
+        14573,
+        1092,
+        1110,
+        1293,
+        16445,
+        1308,
+        2351,
+        1032,
+        1049,
+        13249,
+        1110,
+        1369,
+        1850,
+        1766,
+        1048,
+        33824,
+        1110,
+        1293,
+        16445,
+        1308
+      ],
+      "text": "\\n    if n <= 0:\\n        return []\\n    elif n == 1:\\n        return [0]\\n    elif n",
+      "first_token_top5": [
+        {
+          "token_id": 1092,
+          "token": "\\",
+          "logit": 17.0,
+          "logprob": -1.344137191772461
+        },
+        {
+          "token_id": 1693,
+          "token": " if",
+          "logit": 16.25,
+          "logprob": -2.094137191772461
+        },
+        {
+          "token_id": 1261,
+          "token": " a",
+          "logit": 16.125,
+          "logprob": -2.219137191772461
+        },
+        {
+          "token_id": 1032,
+          "token": " ",
+          "logit": 16.0,
+          "logprob": -2.344137191772461
+        },
+        {
+          "token_id": 1256,
+          "token": "  ",
+          "logit": 15.8125,
+          "logprob": -2.531637191772461
+        }
+      ],
+      "seconds": 19.9
+    },
+    {
+      "prompt": "Explain in one sentence why the sky is blue:",
+      "prompt_token_ids": [
+        2763,
+        44122,
+        1294,
+        1925,
+        19286,
+        5782,
+        1278,
+        21283,
+        1395,
+        10991,
+        1058
+      ],
+      "generated_token_ids": [
+        1531,
+        21283,
+        1395,
+        10991,
+        3147,
+        1278,
+        15248,
+        1681,
+        24233,
+        2058,
+        1269,
+        3701,
+        24701,
+        63233,
+        1307,
+        4391,
+        1319,
+        23493,
+        1321,
+        90317,
+        1041,
+        2081,
+        2224,
+        7934,
+        63233,
+        1319,
+        2338,
+        1321,
+        19502,
+        1577,
+        1256,
+        1010
+      ],
+      "text": " The sky is blue because the Earth's atmosphere scatters shorter wavelengths of light (blue and violet) more than longer wavelengths (red and yellow).  \n",
+      "first_token_top5": [
+        {
+          "token_id": 1531,
+          "token": " The",
+          "logit": 15.5625,
+          "logprob": -2.0783612728118896
+        },
+        {
+          "token_id": 1429,
+          "token": " \"",
+          "logit": 15.375,
+          "logprob": -2.2658612728118896
+        },
+        {
+          "token_id": 1445,
+          "token": " {",
+          "logit": 15.1875,
+          "logprob": -2.4533612728118896
+        },
+        {
+          "token_id": 1256,
+          "token": "  ",
+          "logit": 14.5625,
+          "logprob": -3.0783612728118896
+        },
+        {
+          "token_id": 1957,
+          "token": " _",
+          "logit": 14.5,
+          "logprob": -3.1408612728118896
+        }
+      ],
+      "seconds": 25.2
+    },
+    {
+      "prompt": "北京是中国的",
+      "prompt_token_ids": [
+        40600,
+        2499,
+        23841,
+        2713
+      ],
+      "generated_token_ids": [
+        17606,
+        16834,
+        1625,
+        40600,
+        2713,
+        125192,
+        26786,
+        7565,
+        2499,
+        83168,
+        13544,
+        1818,
+        40600,
+        13544,
+        4126,
+        1256,
+        1010,
+        42850,
+        53297,
+        5020,
+        7121,
+        1144,
+        1727,
+        1256,
+        1010,
+        1045,
+        1349,
+        1046,
+        1032,
+        47183,
+        1727,
+        47183
+      ],
+      "text": "首都，北京的主要语言是普通话（北京话）。  \n选项分析：  \n- A. 上海：上海",
+      "first_token_top5": [
+        {
+          "token_id": 17606,
+          "token": "首",
+          "logit": 16.25,
+          "logprob": -1.6734474897384644
+        },
+        {
+          "token_id": 26535,
+          "token": "一个",
+          "logit": 15.875,
+          "logprob": -2.048447608947754
+        },
+        {
+          "token_id": 18589,
+          "token": "第一",
+          "logit": 15.0625,
+          "logprob": -2.860947608947754
+        },
+        {
+          "token_id": 125192,
+          "token": "主要",
+          "logit": 14.375,
+          "logprob": -3.548447608947754
+        },
+        {
+          "token_id": 56330,
+          "token": "经济",
+          "logit": 14.3125,
+          "logprob": -3.610947608947754
+        }
+      ],
+      "seconds": 11.7
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "pid": 1006986,
+  "plan_id": "1fa2827ab06e73fb",
+  "capture_calls": 1,
+  "captured_graphs": 2,
+  "capture_keys": {
+    "PIECEWISE": 1,
+    "FULL": 1
+  },
+  "cudagraph_mode": "FULL_AND_PIECEWISE",
+  "capture_done": true,
+  "decode_calls": 511,
+  "decode_graph_hits": 511,
+  "decode_fallbacks": 0,
+  "none_after_capture": 1,
+  "attention_backend": "vllm_ascend.attention.attention_v1.AscendAttentionBackend",
+  "errors": 0,
+  "uptime_s": 229.418
+}
