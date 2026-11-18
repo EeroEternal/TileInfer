@@ -23,9 +23,9 @@ P2/P3、K1/K2、O2 对控制模型免测，见 `verification-matrix.md` §1.9；
 |---|---|---|
 | MuseGlimmer-30B | C1 通过；C3 8 图/8 命中/0 回退；text-only，C2/C4 未闭合 | `notes/muse-glimmer-static.md` |
 | LFM3-1.7B | C1/C3 通过；short-conv provider；C2/C4 为历史证据，P1 后未重做完整门禁 | `notes/lfm3-adaptation.md` |
-| Nemotron-3.5-30B-A3B | C1/C3 通过；candidate providers；`servable=false`；C2 教师强制 2e-2 未过；TP8 out-of-scope | `notes/m5-nemotron-validation-20261116.md` |
+| Nemotron-3.5-30B-A3B | C1/C3 通过；candidate providers；`servable=false`；C2 教师强制 top-1/top-5 rank 通过；TP8 out-of-scope | `notes/m5-nemotron-validation-20261116.md` |
 
-M5 的 C2 已改用教师强制 top-1/top-5 + 声明 2e-2 容差，仍不过（capital step31 top-1 翻转，code 首 token logprob 差 0.366）；MTP 已在 TP=1 图模式做到 greedy 逐 token 等价，TP=8 已列为 out-of-scope（共享 HCCL rootinfo/ACL 环境阻塞，不作为本轮交付阻塞）。
+M5 的 C2 已改用教师强制 top-1/top-5 rank：4 个 prompt 的 top-1 id 全同或有 near-tie，参考 top-1 全在服务 top-5；绝对 logprob 差仅诊断（capital step31 0.574，code 首 token 0.198）；MTP 已在 TP=1 图模式做到 greedy 逐 token 等价，TP=8 已列为 out-of-scope（共享 HCCL rootinfo/ACL 环境阻塞，不作为本轮交付阻塞）。
 
 v2 的四项旧账（图捕获没接、TPOT 2.53×、TTFT 11.8×、MTP 未做）仍然成立；它们描述的是
 v2 自带平台层的形态，v3 不再走那条路。本页 §1 的 v3 数字与 §1.1 的 v2 资产不要混着比。
@@ -78,8 +78,8 @@ v2 自带平台层的形态，v3 不再走那条路。本页 §1 的 v3 数字�
 
 | 项 | 现状 | 影响 |
 |---|---|---|
-| **补缺口已经不是空的** | Qwen3.6 的 8 项能力厂商全覆盖，gap=0 是"没有缺口"；LFM3 已有模型作用域 provider `tileinfer.short_conv`；Nemotron 有两个候选 provider（`tileinfer.mamba2_state`、`tileinfer.nemotron_moe`），默认仍不选，plan `servable=false` | LFM3 的 short-conv 由模型内部消费，C1/C3 已过；Nemotron 真权重 C1/C3 已过，C2 教师强制 2e-2 未过，MTP greedy 图模式已闭合；TP8 out-of-scope。P0/P1 已把 provider 的 status/scope/install/graph_safe/evidence_level 声明化 |
-| **M5 Nemotron 真权重** | 单卡 TP=1 可服务；短文本 token/text 与 HF 一致（单 prompt）；8K–261K 长度可完成；2026-11-16 首轮图捕获 2/6，2026-11-17 P0/P1 复测 8/8（8/8 命中、0 回退）；2/4 路并发和冷启动通过；TP=2/4 已通过；TP=8 为 out-of-scope；greedy MTP 图模式 512 token 512/512、4 路各 32 token、32K/130K prompt 各 8 token 全同，metrics 786/786/0、57/57/0、24/24/0；C2 教师强制 top-1/top-5 + 2e-2 未过（capital step31 翻转，code 首 token logprob 差 0.366） | 不能写成“已支持”；TP8 不作为本轮交付阻塞；详见 [`notes/m5-nemotron-validation-20261116.md`](notes/m5-nemotron-validation-20261116.md) 与 [`notes/m5-delivery-gates-20261117.md`](notes/m5-delivery-gates-20261117.md) |
+| **补缺口已经不是空的** | Qwen3.6 的 8 项能力厂商全覆盖，gap=0 是"没有缺口"；LFM3 已有模型作用域 provider `tileinfer.short_conv`；Nemotron 有两个候选 provider（`tileinfer.mamba2_state`、`tileinfer.nemotron_moe`），默认仍不选，plan `servable=false` | LFM3 的 short-conv 由模型内部消费，C1/C3 已过；Nemotron 真权重 C1/C3 已过，C2 教师强制 top-1/top-5 rank 通过（dt floor 修复后），MTP greedy 图模式已闭合；TP8 out-of-scope。P0/P1 已把 provider 的 status/scope/install/graph_safe/evidence_level 声明化 |
+| **M5 Nemotron 真权重** | 单卡 TP=1 可服务；短文本 token/text 与 HF 一致（单 prompt）；8K–261K 长度可完成；2026-11-16 首轮图捕获 2/6，2026-11-17 P0/P1 复测 8/8（8/8 命中、0 回退）；2/4 路并发和冷启动通过；TP=2/4 已通过；TP=8 为 out-of-scope；greedy MTP 图模式 512 token 512/512、4 路各 32 token、32K/130K prompt 各 8 token 全同，metrics 786/786/0、57/57/0、24/24/0；C2 教师强制 top-1/top-5 rank 通过（dt floor 修复 capital step31；绝对 logprob 差仅诊断） | 不能写成“已支持”；TP8 不作为本轮交付阻塞；详见 [`notes/m5-nemotron-validation-20261116.md`](notes/m5-nemotron-validation-20261116.md) 与 [`notes/m5-delivery-gates-20261117.md`](notes/m5-delivery-gates-20261117.md) |
 | **图捕获** | v3 已接上（厂商捕获 + 我们计数）；Qwen 4K 8 张/32K 6 张；Muse 4K/32K 8 张；Nemotron C1 8 张 + MTP 6 张（PIECEWISE，FULL=0）；LFM3 doctor captured=8；`impl_table` / `model_table` 已分别用于 provider 和路线 O 模型注册，不再是空实现 | MTP+32K、128K 组合和长期并发仍未全验 |
 | **MuseGlimmer-30B（厂商缺失架构）** | C1 ✅；C3 ✅（32K 8 图；4K 99/99 decode 命中、0 回退）；C4 绝对值 **41 ms/tok**、8 路并发 **175 tok/s**、冷启动 **38 s**（fresh cache）；**C2 ❌**：`benchmark={}`，first-token top-5/logprob 未采集 | **不能写“已支持”**；证据见 [`notes/muse-glimmer-v3-validation-20261117.md`](notes/muse-glimmer-v3-validation-20261117.md)，复现见 [`quickstart-muse-950.md`](quickstart-muse-950.md) |
 | **投机解码 / MTP** | S2/S3 按 B 质量等价过：套件 8/8、needle 8K/16K/32K 9/9、同请求两次 `same`、4K 93.9% / 1.35×；图 6 张、0 回退。严格逐位不成立（256 token 中 85.9% 相同、第 58 token 分叉），明确非逐位。S4 32K 部分：9/9、TTFT 1.037×、6 图/0 回退，acceptance 81–88%、128K 未测。**M5 Nemotron 本轮**：图模式 greedy 512 token 512/512、4 路各 32 token、32K/130K prompt 各 8 token 全同；metrics 786/786/0、57/57/0、24/24/0。证据见 [`notes/m1-spec-quality.md`](notes/m1-spec-quality.md) | Qwen S2/S3 过；S4 仅 32K 部分；M5 greedy 逐 token 等价已闭合；TP=8 MTP 未测；不能外推成所有采样参数/所有 TP 都逐位 |

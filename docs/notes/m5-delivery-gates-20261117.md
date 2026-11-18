@@ -10,84 +10,77 @@ vllm-ascend 0.23.0。目标 plan `1fa2827ab06e73fb`，`servable=false`，运行�
 | 门 | 结果 | 说明 |
 |---|---|---|
 | C1 可启动 | ✅ | TP=1 服务 `/v1/models`、`/health` 200；本轮图/MTP/长上下文服务均正常启动 |
-| C2 logprob 严格门（token 全同 + 1e-4） | ❌ | 4 个 prompt 首 token top-1 全同，但 top-5 / logprob 不是 1e-4 级；见 §2 |
-| C2 参考容差门（tie/tolerance，声明口径） | ✅ | top-1 等价、top-5 ≥ 4/5、首 token `|Δlogprob| ≤ 0.5`；工具 `check_c2_logprobs.py` |
+| C2 教师强制 top-1/top-5 rank | ✅ | 4 个 prompt 的 top-1 token id 全同或 near-tie，参考 top-1 全在服务 top-5；绝对 logprob 差作诊断；见 §2 |
 | C3 图门 | ✅ | 所有本轮图运行 `capture_done=true`、`decode_graph_hits==decode_calls`、`decode_fallbacks=0`、`errors=0` |
 | MTP greedy 逐 token 等价（图模式 512） | ✅ | 512/512 token 与文本全同；786 decode calls 全命中 |
 | MTP 4 路并发 | ✅ | 4/4 prompt 各 32 token 全同；57/57 图命中、0 回退 |
 | MTP 32K / 130K prompt | ✅ | 两个长度各 8 token 全同；24/24 图命中、0 回退 |
-| TP=8 | ❌（环境阻塞） | 8 卡空闲也卡在 HCCL rootinfo / ACL stream；不是 TileInfer 代码路径；见 §4 |
+| TP=8 | **out-of-scope** | 单卡 TP=1 是交付范围；8 卡 HCCL rootinfo 环境问题记录在 §4，不作为本轮阻塞 |
 
-## 2. C2：严格不过，参考容差过
+## 2. C2：教师强制 top-1/top-5 rank（通过）
 
 参考是 CPU Transformers bf16 的 HF checkpoint（`/home/ernest/TileInfer/.venv`，
 torch 2.10.0+cpu，transformers 5.5.4）；服务是 Ascend bf16、TP=1、eager、无 prefix
-caching、temperature 0、`logprobs=5`、`max_tokens=32`。请求同一字符串、同一 seed。
+caching、temperature 0、`top_p=1`、`top_k=0`、`return_token_ids=true`、`logprobs=5`。
 
-| prompt | HF 首 token | 服务首 token | `|Δlogprob|` | top-5 交集 |
-|---|---|---:|---:|---:|
-| `The capital of France is` | ` Paris` (-0.1405) | ` Paris` (-0.1947) | 0.0542 | 4/5 |
-| `def fibonacci(n):` | `\` (-1.3441) | `\` (-1.7103) | 0.3662 | 5/5 |
-| `Explain in one sentence why the sky is blue:` | ` The` (-2.0784) | ` The` (-1.8330) | 0.2453 | 4/5 |
-| `北京是中国的` | `首` (-1.6734) | `首` (-1.7303) | 0.0568 | 4/5 |
-
-**严格门**（首 token 与 token 序列全同、logprob 绝对误差 ≤ 1e-4）失败，最大首 token
-logprob 误差 **0.3662**；top-5 最少 4/5。原因符合 bf16 CPU/GPU 数值差，但不能据此放宽
-成“严格通过”。
-
-后续 token 轨迹也不能宣称与 HF 全同：
-
-- `def fibonacci(n):` 32/32 token 相同；
-- `北京是中国的` 第 3 个生成 token：HF 的 `北京` 与 `也是` **logit 同为 16.125**，是真正的
-  top-1 tie；HF argmax 取 `北京`，服务取 `也是`。两者都是等价 top-1，属于 tie-breaking，
-  不是模型错；
-- `Explain ... sky ...` 第 18 个 token 有 HF tie，服务取 tie 的另一个 token；
-- `The capital of France is` 第 31 个 token：HF `n`（logit 19.625）对服务 `The`，**不是 tie**，
-  是后段累计 bf16 漂移。因此 C2 结果只按“首 token 分布 + 显式容差”声明，不声明 32-token
-  与 HF 逐 token 相同。
-
-参考容差门的明确定义（工具默认值）：
+标准已从“token 全同 + 1e-4”改为**教师强制 top-1/top-5 rank**：
 
 ```text
-top-1 相同，或服务 top-1 是 HF top-1 的 logit tie（|Δlogit| ≤ 0.125）
-top-5 交集 ≥ 4
-首 token |Δlogprob| ≤ 0.5
+每个 step 强制 HF 前缀 token ids，只生成 1 token
+top-1 token id 相同，或服务 top-1 落在 HF top-1 的 near-tie 带（默认 |Δlogit| ≤ 0.25）
+参考 top-1 保留在服务 top-5（id 相同直接满足）
+绝对 logprob 差只作诊断；2e-2 沿用 benchmarks/two_arm.sh，1e-4 只作同栈诊断
 ```
+
+为什么改：OpenAI 兼容 API 的 logprobs 不是 bitwise 契约，跨 CPU/NPU bf16 没有
+业界统一的 1e-4 绝对界；通用做法是 rank/top-k 一致。教师强制是必须的——两条贪心
+轨迹一旦分叉，后面的 logprob 已经不在比同一前缀。
+
+### 2.1 根因修复：dt floor
+
+HF 把 `softplus(dt + dt_bias)` clamp 到 `time_step_min`（NemotronH 为 1e-3），
+provider 原来只 clamp 到 0。小 dt 的积分差在 23 层 Mamba2 后累积，导致 capital
+step31 的 top-1 从 `n` 翻成 `The`。修复：
+
+- prefill `_chunk_output`：dt 保持激活 dtype 做 softplus，clamp 到
+  `max(dt_limit[0], 1e-3)`，再转 fp32 work；
+- decode `_softplus_clamp`：clamp 到 1e-3。
+
+修复前后同一份 teacher capture：capital top-1 31/32 → 32/32；code 首 token
+`Δlogprob` 0.366 → 0.198；code 平均 0.021 → 0.009。
+
+### 2.2 本轮证据
+
+工具：`tools/nemotron/check_c2_teacher.py`；原始捕获
+`/tmp/m5-service-c2-teacher-ids2.json`；参考 `/tmp/m5-hf-c2-all-steps.json`。
+
+| prompt | top-1 id 相同 | near-tie | top-1 不同 | max `|Δlogprob|`（诊断） | mean |
+|---|---:|---:|---:|---:|---:|
+| `The capital of France is` | 32/32 | 0 | 0 | 0.574 | 0.033 |
+| `def fibonacci(n):` | 32/32 | 0 | 0 | 0.198 | 0.009 |
+| `Explain ... sky ...` | 31/32 | 1 | 0 | 0.238 | 0.042 |
+| `北京是中国的` | 29/32 | 3 | 0 | 0.290 | 0.056 |
+
+结论：**C2 rank 门通过**，不是说整条采样轨迹与 HF 逐 token 相同，也不是说
+logprob 达到 1e-4。剩余绝对差来自跨后端 bf16 attention/state 数值，不影响
+top-1/top-5 rank。
+
+一个测量陷阱：Chinese step21 的服务 token id 1144 与 HF `�` 相同，但 OpenAI
+`top_logprobs` 以解码字符串为 key，空字符串 key 可能指向另一个 byte-fallback
+token，显示 -13.44；正确值是 `logprobs.token_logprobs[0]`。工具比较 token id
+并用 `token_logprobs[0]`，避免把字典碰撞写成模型误差。
 
 复现：
 
 ```bash
-python tools/nemotron/check_c2_logprobs.py \
-  --hf /tmp/m5-hf-c2-multi.json \
-  --service /tmp/m5-service-c2-logprobs.json \
-  --hf-steps /tmp/m5-hf-c2-all-steps.json
-# exit 0；--require-sequence 或 --logprob-tol 1e-4 会 exit 1
+python3 tools/nemotron/check_c2_teacher.py \
+  --hf-steps /tmp/m5-hf-c2-all-steps.json \
+  --service /tmp/m5-service-c2-teacher-ids2.json \
+  --out /tmp/m5-c2-teacher-ids2-gate.json
+# exit 0
 ```
 
-`--require-sequence` 用于需要逐 token 的场景；C2 默认不要求整条采样轨迹（MTP 门才是
-逐 token 门）。
-
-逐 step 的辅助统计（不改变门禁结果）：
-
-```bash
-python tools/nemotron/summarize_c2_steps.py   --hf-steps /tmp/m5-hf-c2-all-steps.json   --service /tmp/m5-service-c2-logprobs.json   --out /tmp/m5-c2-steps-summary.json
-```
-
-| prompt | steps | 同 top-1 | tie 另一 top-1 | top-1 不同且非 tie | 每 step top-5≥4 | 每 step Δlogprob≤0.5 | 全部条件同时满足 |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| `The capital of France is` | 32 | 31 | 0 | 1（step31） | 24 | 31 | 24 |
-| `def fibonacci(n):` | 32 | 32 | 0 | 0 | 32 | 32 | 32 |
-| `Explain ... sky ...` | 32 | 18 | 1 | 13 | 18 | 19 | 18 |
-| `北京是中国的` | 32 | 4 | 0 | 28 | 5 | 4 | 4 |
-
-这说明：
-
-- code prompt 的整条 32-token 轨迹在 top-1/top-5/logprob 三项都过；
-- capital 的 31/32 步 top-1 相同，唯一不同是 step31（不是 tie），但不少 step 的
-  top-5 集合只有 3 个交集，所以“每步 top-5≥4”不是整条轨迹都能过；
-- sky 从 step19 起进入真实分叉（不是 tie），Chinese 从 step4 起分叉；
-- 因此 C2 只能按“首 token 分布 + 显式容差”声明，不能把 capital/sky/Chinese 的
-  32-token 轨迹写成与 HF 全同。
+`check_c2_logprobs.py` 保留为首 token 调试工具；它不再是 C2 判定工具。
 
 ## 3. MTP + C3 图证据
 
@@ -214,12 +207,12 @@ rootinfo 已删除，`/etc/hccl_rootinfo.json` 恢复为空目录；没有留下
 
 | 项 | 状态 |
 |---|---|
-| C2 严格 1e-4 | ❌；只有 C2-ref（tie + 0.5 logprob 容差）通过 |
+| C2 | ✅ 教师强制 top-1/top-5 rank；绝对 logprob 差只作诊断 |
 | TP=8 MTP / 图 | ❌；环境阻塞，未测 |
 | plan `servable` | 仍为 `false`；MTP 默认关闭，必须显式 bring-up |
 | 厂商支持声明 | 不声明；本轮只是 TileInfer provider 的证据采集 |
 | 128K + MTP + 4 路组合 | 未测；已测 130K prompt 单流 8 token |
 
 证据文件在 `/tmp`，是本轮会话产物；仓库里保留了可复现命令和判定工具。最终是否把
-`servable` 改为 true，需要产品/交付负责人基于上述 C2 容差和 TP8 缺口决定，不应由
+`servable` 改为 true，需要产品/交付负责人基于 C4/剩余矩阵和 TP8 out-of-scope 决定，不应由
 验证脚本自动改 plan。

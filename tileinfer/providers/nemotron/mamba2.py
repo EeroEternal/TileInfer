@@ -90,8 +90,12 @@ def _chunk_output(
     work = torch.float32
 
     xf = x.to(work)
-    dtf = _softplus_dt(dt.to(work), None if dt_bias is None else dt_bias.to(work), dt_softplus)
-    dtf = torch.clamp(dtf, float(dt_limit[0]), float(dt_limit[1]))
+    # HF's slow path keeps dt in the activation dtype through softplus/clamp and only then
+    # combines it with the float32 A.  Reproduce that order: doing softplus in float32 changes
+    # the bf16 rounding of small dt values and drifts the decode trajectory.
+    dtf = _softplus_dt(dt, dt_bias, dt_softplus)
+    # NemotronH sets time_step_min=1e-3 even though vLLM passes dt_limit=(0, inf).
+    dtf = torch.clamp(dtf, max(float(dt_limit[0]), 1e-3), float(dt_limit[1])).to(work)
     af = A.to(work)
     bf = _repeat_groups(B.to(work), h)
     cf = _repeat_groups(C.to(work), h)
@@ -789,7 +793,7 @@ def _softplus_clamp(dt: torch.Tensor, dt_bias: torch.Tensor, enabled: bool) -> t
         dt = F.softplus(dt + dt_bias)
     else:
         dt = dt + dt_bias
-    return torch.clamp(dt, 0.0, float("inf"))
+    return torch.clamp(dt, 1e-3, float("inf"))
 
 
 def _selective_state_update_varlen(
