@@ -175,11 +175,13 @@ Qwen3.6 是**控制模型**，用来校准 TileInfer 在厂商已支持路径上
 | C3 | 图捕获 | 32K 8 图（PIECEWISE 4 + FULL 4）；4K 99/99 命中、0 回退 | 捕获 > 0 且回退 = 0 | ✅（单轮） |
 | C4 | 性能 | 单流 41 ms/tok；8K TTFT 1.26 s（graph）；128K TTFT 30.3 s / TPOT 48.4 ms；8 路 175 tok/s；冷启动 38 s | 绝对门：TPOT≤100ms、8K TTFT≤3s、8路≥100 tok/s、冷启动≤120s | ✅ |
 | P1 | 并发 8/16/32 | 956-token prompt，64 输出：175 / 331 / 608 tok/s；max TTFT 280 / 253 / 413 ms | 完成 + 计数 | ✅ |
+| P2 | 128K × 2 并发 | 125,002-token prompt × 2，64 输出：128 tokens、33.7 s、max TTFT 30.4 s | 完成 + 计数 | ✅ |
+| P3 | 128K × 4 并发 | 同 prompt × 4：EngineCore crash（`EngineDeadError`），单卡 0.9 利用率 | 完成 + 计数 | ❌ 需 TP2 / 降上下文 |
 | L1–L4 | 8K/16K/32K/125K | 6,356 / 25,256 / 125,002 prompt tokens 完成；125K 为单流+图 | 按模型上限 | ✅ |
 | K1 | 冷启动 | fresh `VLLM_CACHE_ROOT`：38 s 到 ready（weights 2.08 s，engine 1.93 s） | 可测量 | ✅ |
 | MTP | 投机 | 该 checkpoint 无 MTP | 显式声明不支持 | N/A（显式） |
 
-未验证格：128K × 并发组合、独立厂商 A/B。
+未验证格：128K × 4 并发（单卡引擎崩溃，需 TP2/降上下文）、独立厂商 A/B。
 
 ## 2. 新模型附加项（M5+）
 

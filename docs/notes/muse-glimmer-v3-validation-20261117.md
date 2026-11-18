@@ -85,6 +85,14 @@ Concurrency (956-token prompts, 64 output each; 8-way on the default run, 16/32-
 | 16-way graph | 3.09 s | **331.4** | 253.0 ms |
 | 32-way graph | 3.37 s | **608.0** | 413.2 ms |
 
+Long-context concurrency (125,002-token prompts, 64 output, `max-model-len 131072`,
+`max-num-seqs 4`, `gpu-memory-utilization 0.9`):
+
+| mode | result |
+|---|---|
+| 2-way | ✅ both requests returned 64 tokens; 33.7 s wall; max TTFT 30.4 s |
+| 4-way | ❌ EngineCore crash (`EngineDeadError`) after prefill started; single-card capacity/engine limit |
+
 Cold start (fresh `VLLM_CACHE_ROOT`, eager, `max-model-len 8192`): **38 s** from launch to
 `Application startup complete`; weights load 2.08 s, engine init 1.93 s.
 
@@ -148,8 +156,10 @@ C4 absolute gate for this vendor-absent model (declared here, measured on one 95
 | cold start (fresh cache) | ≤ 120 s | 38 s | ✅ |
 
 Measured beyond the gate (not gated): 125K prompt / 64 output -> TTFT 30.3 s, TPOT 48.4 ms;
-16-way 331 tok/s; 32-way 608 tok/s.
+16-way 331 tok/s; 32-way 608 tok/s; 128K x 2 concurrency passes, 128K x 4 crashes the
+EngineCore on one card.
 
-What is still open: 128K × concurrency combinations, and a same-stack vendor A/B (the vendor
-can serve this model only with the same registration, so it is not an independent baseline).
-None of those block the C1–C4 statement above, but they must be listed as unverified.
+What is still open: 128K x 4 concurrency (needs TP2 or a lower context/seq budget), and a
+same-stack vendor A/B (the vendor can serve this model only with the same registration, so it
+is not an independent baseline). None of those block the C1–C4 statement above, but they must
+be listed as unverified.
