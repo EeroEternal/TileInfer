@@ -20,10 +20,30 @@ importable and has no compatibility shims in the installed package; v3 code must
 
 from __future__ import annotations
 
+from .catalog import ROUTE_O_PROVIDERS
 from .nemotron import CANDIDATES, MAMBA2_STATE, NEMOTRON_MOE
 
 #: Declared candidates, not defaults.  ``resolve.decide.TILEINFER_PROVIDERS`` stays empty until
 #: a candidate has target real-weight C1/C2 evidence; see ``docs/extending.md`` §3.
 CANDIDATE_PROVIDERS = CANDIDATES
 
-__all__ = ["MAMBA2_STATE", "NEMOTRON_MOE", "CANDIDATE_PROVIDERS"]
+#: Every declaration the bridge may need to resolve by name.  This is deliberately a name
+#: lookup, not a selection: the plan still decides which provider is installed.
+PROVIDER_SPECS = {
+    **{provider.name: provider for provider in ROUTE_O_PROVIDERS.values()},
+    **{provider.name: provider for provider in CANDIDATE_PROVIDERS},
+}
+
+
+def find_provider(name: str):
+    """Return the declaration for ``name``, or ``None`` for an unknown/vendor name."""
+    return PROVIDER_SPECS.get(name)
+
+
+__all__ = [
+    "MAMBA2_STATE",
+    "NEMOTRON_MOE",
+    "CANDIDATE_PROVIDERS",
+    "PROVIDER_SPECS",
+    "find_provider",
+]

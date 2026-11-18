@@ -4,8 +4,9 @@
 > 目标形态见 [`architecture.md`](architecture.md)，验收口径见 [`acceptance.md`](acceptance.md)，
 > 数字见 [`performance.md`](performance.md)。
 >
-> 最后核对：**2026-11-17 19:30**，基线 `d69b9da` + 本次 Muse/multicard 增量（v2 已归档），
-> 单卡 Ascend950PR，CANN 9.3.0。
+> 最后核对：**2026-11-17 20:45**，`upstream/main` 4b67795（P0/P1 + Muse/multicard）+ 本次 C2 增量
+> （provider 生命周期、config adapter、support、WeightMapSpec、StateLayout、CompatHook 已在主线），
+> 单卡 Ascend950PR，CANN 9.3.0，真权重 C1 环境 `.venv_lfm3`（transformers 5.17）。
 
 ---
 
@@ -15,6 +16,14 @@
 "声明 → 决策 → 选实现 → 补缺口"。** Qwen3.6 作为**控制模型**，核心路径 4K/8K/16K/32K/128K
 的 C1–C4 已过；**L5 262K 不过**（d90 检索失败、C4 TPOT/吞吐超门），不能写成"262K 支持"。
 P2/P3、K1/K2、O2 对控制模型免测，见 `verification-matrix.md` §1.9；M5 新模型仍全验。
+
+2026-11-17 的路线 O 现状：
+
+| 模型 | 状态 | 证据 |
+|---|---|---|
+| MuseGlimmer-30B | C1/C2/C3/C4 通过（C2 fp32 oracle 容差内，C4 绝对门）；128K/厂商 A/B 未验 | `notes/muse-glimmer-v3-validation-20261117.md` |
+| LFM3-1.7B | C1/C3 通过；short-conv provider；C2/C4 为历史证据，P1 后未重做完整门禁 | `notes/lfm3-adaptation.md` |
+| Nemotron-3.5-30B-A3B | C1/C3 通过；candidate providers；`servable=false`；C2 logprob/MTP 未过 | `notes/m5-nemotron-validation-20261116.md` |
 
 v2 的四项旧账（图捕获没接、TPOT 2.53×、TTFT 11.8×、MTP 未做）仍然成立；它们描述的是
 v2 自带平台层的形态，v3 不再走那条路。本页 §1 的 v3 数字与 §1.1 的 v2 资产不要混着比。
@@ -39,7 +48,7 @@ v2 自带平台层的形态，v3 不再走那条路。本页 §1 的 v3 数字�
 | 声明层（`manifests/qwen3_6.py`） | ✅ | 40 层/30 GDN+10 full、16Q/2KV、256 experts top-8、8 项 required capability，纯数据可校验 |
 | 契约层（`contracts/`） | ✅ | 8 个 `Protocol` + plan/manifest/gap schema；未知 key、重复选择、超预算都拒绝 |
 | 决策层（`resolve/`） | ✅ | 纯函数；vendor 在→8/8 选 vendor、gap=0；vendor 不在→8 条 required gap、servable=False（这是"会不会服务不了"的判定，不是"要去补 8 个实现"的待办） |
-| 接入层（`bridge/`） | ✅ | 6 个具体钩子（plugin entry、dispatch、capture、attn select、config gate、init keys），计划用 4/6 类机制；已定义 6、设计上限 8 |
+| 接入层（`bridge/`） | ✅ | 6 个接入点：`plugin_entry`、`impl_table`、`model_table`、`attn_select`、`method_wrap`、`graph_hook`；`config_gate` 是 plugin entry 下的配置 seam。Muse/LFM3 已用 `model_table`，LFM3/Nemotron 已用 `impl_table` |
 | 分层禁令 | ✅ | AST 守卫：只有 `tileinfer/bridge/` 可 import `vllm_ascend`；另有测试防止 carve-out 变空 |
 | 观测 | ✅ | capture/fallback 计数落 JSON（`SIGUSR1`/500 步/atexit）；API server 的零计数不再覆盖 EngineCore；算子级审计（`TILEINFER_AUDIT`）2026-11-12 跑通：23 类/903 实例，热路径全 vendor，3 个非 vendor 行均有解释，见 `notes/m1-op-audit.md` |
 | CLI / doctor | ✅ | `plan build/show/verify`、`tileinfer doctor`；doctor 在最终 metrics 上全 PASS |
@@ -67,9 +76,9 @@ v2 自带平台层的形态，v3 不再走那条路。本页 §1 的 v3 数字�
 
 | 项 | 现状 | 影响 |
 |---|---|---|
-| **补缺口还是空的** | Qwen3.6 的 8 项能力厂商全覆盖，gap=0 是"没有缺口"，不是"补完了"；**M5 Nemotron 已有两个候选 provider**（`tileinfer.mamba2_state`、`tileinfer.nemotron_moe`），默认仍不选，plan `servable=false` | M5 已做真权重单卡 bring-up，证据见 [`notes/m5-nemotron-validation-20261116.md`](notes/m5-nemotron-validation-20261116.md)；C2 logprob/C3 稳态/MTP 仍未闭合 |
-| **M5 Nemotron 真权重** | 单卡 TP=1 可服务；短文本 token/text 与 HF 一致（单 prompt）；8K–261K 长度可完成；图捕获 2/6 张，32-token 31/31、8K 7/7、128K 3/3、4 路并发 15/15 命中/0 回退；2/4 路并发和冷启动通过；TP=2/4/8 已通过（TP8 未做图/MTP）；MTP 无损性失败 | 不能写成“已支持”；详见 [`notes/m5-nemotron-validation-20261116.md`](notes/m5-nemotron-validation-20261116.md) |
-| **图捕获** | v3 已接上（厂商捕获 + 我们计数）；4K 8 张、32K 6 张、MTP 6 张（PIECEWISE，FULL=0），均 0 回退；MTP+32K 6 图/0 回退。`model_table` 已被 MuseGlimmer 使用，`impl_table` 已有真实 binder 与 Nemotron 候选（默认不选） | 128K 组合未验；非 vendor 默认仍未 promote |
+| **补缺口已经不是空的** | Qwen3.6 的 8 项能力厂商全覆盖，gap=0 是"没有缺口"；LFM3 已有模型作用域 provider `tileinfer.short_conv`；Nemotron 有两个候选 provider（`tileinfer.mamba2_state`、`tileinfer.nemotron_moe`），默认仍不选，plan `servable=false` | LFM3 的 short-conv 由模型内部消费，C1/C3 已过；Nemotron 真权重 C1/C3 已过，但 C2 logprob/稳态/MTP 仍未闭合。P0/P1 已把 provider 的 status/scope/install/graph_safe/evidence_level 声明化 |
+| **M5 Nemotron 真权重** | 单卡 TP=1 可服务；短文本 token/text 与 HF 一致（单 prompt）；8K–261K 长度可完成；2026-11-16 首轮图捕获 2/6，2026-11-17 P0/P1 复测 8/8（8/8 命中、0 回退）；2/4 路并发和冷启动通过；TP=2/4/8 已通过（TP8 未做图/MTP）；MTP 无损性失败 | 不能写成“已支持”；详见 [`notes/m5-nemotron-validation-20261116.md`](notes/m5-nemotron-validation-20261116.md) |
+| **图捕获** | v3 已接上（厂商捕获 + 我们计数）；Qwen 4K 8 张/32K 6 张；Muse 4K/32K 8 张；Nemotron C1 8 张；LFM3 doctor captured=8；`impl_table` / `model_table` 已分别用于 provider 和路线 O 模型注册，不再是空实现 | MTP+32K、128K 组合和长期并发仍未全验 |
 | **MuseGlimmer-30B（厂商缺失架构）** | C1 ✅；C2 ✅（fp32 CPU oracle：top-5 token 全同，top-1 差 3.7e-5，最大差 0.059，容差已写入 manifest）；C3 ✅（32K 8 图；4K 99/99 命中、0 回退）；C4 ✅ 绝对门（TPOT 41 ms、8K TTFT 1.26 s、8 路 175 tok/s、冷启动 38 s） | 仍开放：128K/长上下文×图组合、同栈厂商 A/B；证据见 [`notes/muse-glimmer-v3-validation-20261117.md`](notes/muse-glimmer-v3-validation-20261117.md)，复现见 [`quickstart-muse-950.md`](quickstart-muse-950.md) |
 | **投机解码 / MTP** | S2/S3 按 B 质量等价过：套件 8/8、needle 8K/16K/32K 9/9、同请求两次 `same`、4K 93.9% / 1.35×；图 6 张、0 回退。严格逐位不成立（256 token 中 85.9% 相同、第 58 token 分叉），明确非逐位。S4 32K 部分：9/9、TTFT 1.037×、6 图/0 回退，acceptance 81–88%、128K 未测。证据见 [`notes/m1-spec-quality.md`](notes/m1-spec-quality.md) | S2/S3 过；S4 仅 32K 部分；非逐位 |
 | **TPOT / 首字** | v3 M1：单流 0.907–1.016× / 0.999–1.001×；4K 1.000× / 0.999×；长上下文 8K/16K/32K：TTFT 1.008–1.011×、TPOT 0.999–1.002× | 门已过（本机、本参数） |
@@ -116,7 +125,7 @@ v2 自带平台层的形态，v3 不再走那条路。本页 §1 的 v3 数字�
 ## 5. 上机第一件事
 
 ```bash
-cd /home/userlist/zxs/TileInfer
+cd /path/to/TileInfer
 source scripts/env-ascend102.sh
 npu-smi info | head -20            # 先确认卡是空的（本项目不抢别人的卡）
 python3 scripts/ti_trace.py config
@@ -136,8 +145,9 @@ python3 scripts/ti_trace.py run --preset smoke
 | 卡 | 1 × Ascend950PR，131072 MB HBM |
 | CANN | 9.3.0，在 `.work/cann930/install/cann` |
 | 版本策略 | 冻结 vLLM 0.23.0 / vllm-ascend 0.23.0-**950**；M5 前做 V0 gate，见 [`notes/version-strategy.md`](notes/version-strategy.md) |
-| Python（本题后端） | `.venv_native213`：torch 2.13.0+cpu、vLLM 0.23.0、tilelang 0.1.15 |
-| Python（基线 A/B） | `.venv_baseline`：vllm-ascend 0.23，不含 tileinfer |
+| Python（本题后端） | `.venv_lfm3`（本机 2026-11-17 验证）：transformers 5.17.0、torch 2.10.0+cpu、torch_npu 2.10.0.post4、vLLM 0.23.0、tilelang 0.1.15 |
+| Python（CPU 契约） | zxs 的 4.57.6 环境；通用 CPU 用例可用，但注意 editable 指向 zxs 仓库 |
+| Triton / Ascend | 真权重 C1 需 `PYTHONPATH=/home/zxs/triton-ascend-3.2.2:$PYTHONPATH`，否则 block table 会走错误 Triton 实现 |
 | TileLang 缓存 | `$HOME/tl_cache_213`（**不要放进仓库**） |
 | 统一入口 | `source scripts/env-ascend102.sh` |
 
@@ -160,6 +170,10 @@ python3 scripts/ti_trace.py run --preset smoke
 
 **结论**：这是独立的一轮排查任务。在它被修掉之前：判断某次改动有没有破坏东西，
 用逐文件跑，不要用整套的红绿。设备侧测试是另一套入口。
+
+2026-11-17 P0/P1 目标用例（`test_p0_adaptation`、`test_p1_adaptation`、v3 contracts、LFM3、
+Nemotron、impl_table、plan、layer_deps 等）全部通过；真权重 C1 已重跑 Muse/LFM3/Nemotron，
+均出 token，Muse/Nemotron C3 为 8 图/8 命中/0 回退。
 
 ---
 

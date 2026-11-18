@@ -3,6 +3,13 @@
 Target: `/home/models/Muse-Glimmer-30B` (52 dense layers, hidden 6656, 32Q/2KV GQA @ head_dim
 128, iRoPE: 39 sliding-window + 13 full-attention layers, untied lm_head).
 
+**2026-11-17 update (P0/P1):** re-verified C1/C3 on the current tree with `.venv_lfm3`
+(transformers 5.17.0) and `PYTHONPATH=/home/zxs/triton-ascend-3.2.2`. Output:
+`' Paris. It is the most populous'`; graph metrics: 8 captured graphs (PIECEWISE 4 + FULL 4),
+8/8 decode hits, 0 fallbacks. C2 and C4 were measured separately in
+[`muse-glimmer-v3-validation-20261117.md`](muse-glimmer-v3-validation-20261117.md); this
+P0/P1 run did not repeat them.
+
 **Runtime form: V3 only.** The declaration lives in `tileinfer/manifests/muse_glimmer.py`; the
 upstream-facing implementation lives in `tileinfer/bridge/models/` (`muse_glimmer.py` for the
 architecture + AutoConfig shim, `atem.py` for the chat parser) and is injected by the

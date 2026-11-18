@@ -15,6 +15,11 @@
 - 目标 plan 仍为 `servable=false`；以下全部是 `TILEINFER_ALLOW_UNSERVABLE=1` 的 bring-up，
   不是“vllm-ascend 已支持该模型”。
 
+> 2026-11-17 P0/P1 复测：用 `tools/nemotron/make_shim.py` + `build_plan.py --allow-candidates`
+> 和 `.venv_lfm3`（transformers 5.17）重跑 C1，输出
+> `' Paris.  \nThe capital of Germany'`；config adapter 由 plan 的 `config_impl` 驱动。
+> C3 为 8 张图（PIECEWISE 4 + FULL 4）、8/8 命中、0 回退。C2 logprob 和 MTP 仍未闭合。
+
 ## 1. C1：真权重服务
 
 单卡 TP=1，NPU 2，`--max-model-len 8192 --max-num-seqs 1 --gpu-memory-utilization 0.90`，
@@ -232,7 +237,7 @@ TP=8 下尚未做 C3 图和 MTP。
 | C1 真权重可服务 | 通过（bring-up，`servable=false`） |
 | C2 text/token | 通过（单 prompt） |
 | C2 logprob top-5 | 未通过（最大差 1.636） |
-| C3 捕获 | 通过（2 / 6 graphs） |
+| C3 捕获 | 通过；2026-11-16 首轮 2 / 6 graphs，2026-11-17 P0/P1 复测 8 / 8 graphs，8/8 命中、0 回退 |
 | C3 稳态零回退 | 通过（32-token 31/31/0；8K 7/7/0；128K 3/3/0；4 路并发 15/15/0） |
 | 长上下文 8K–261K | 可完成（长度证据） |
 | 并发 2/4 路 | 可完成，4 路约 22 tok/s（短输出） |

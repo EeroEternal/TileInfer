@@ -104,6 +104,12 @@ LFM3_1_7 = ModelManifest(
             "status": "pass_conc1_reference",
         },
     },
+    support={
+        "text": "verified",
+        "vision": "not_applicable",
+        "mtp": "not_applicable",
+        "quant": ["bf16"],
+    },
     source="docs/notes/lfm3-adaptation.md",
     model_impl="tileinfer.bridge.models.lfm3",
 )

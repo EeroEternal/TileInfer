@@ -42,7 +42,7 @@ providers / aot / observ / cli` 加进 engine-free 列表。
    装钩子 → 记录实际生效的 seam；任何异常不外抛。
 
 Plan 是内容寻址的，本次为 `7d00064d487af3f6`（合并 upstream v3 `model_impl` 机制后，
-同一 Qwen 声明重建的 plan id 为 `079341ffd3f17b0d`；下面的日志保留合并前的记录）：
+同一 Qwen 声明重建的 plan id 为 `5fc9d1720e9400bd`；下面的日志保留合并前的记录）：
 
 ```bash
 .venv_v3/bin/python -m tileinfer.cli.plan build \
@@ -62,9 +62,11 @@ Plan 是内容寻址的，本次为 `7d00064d487af3f6`（合并 upstream v3 `mod
 | 5 | attn_select | `NPUPlatform.get_attn_backend_cls` | 按 plan 返回实现；vendor 选择原样返回 | 否 |
 | 6 | method_wrap | `NPUPlatform.check_and_update_config` | 校验 plan.arch == 实际 checkpoint.arch，不匹配 fail-closed | 否 |
 
-已定义 6 类机制、计划用 4 类（入口 / 注意力选择 / 方法包装 / 图捕获）；`impl_table` /
-`model_table` 两个机制留了空实现（非 vendor 选择时才写表），不占当前钩子数。
-设计上限是 8，但加机制要改封闭列表，不是运行期可填的配置。所有钩子都带 `_tileinfer_*` 幂等标记。
+已定义 6 类机制、计划用 4 类（入口 / 注意力选择 / 方法包装 / 图捕获）。M1 时 `impl_table` /
+`model_table` 两个机制留了空实现；**2026-11-17 更新：`model_table` 已用于 MuseGlimmer/LFM3
+的模型（和 parser）注册，`impl_table` 已用于 LFM3 short-conv 与 Nemotron candidate providers**，
+不再是空实现。设计上限是 8，但加机制要改封闭列表，不是运行期可填的配置。所有钩子都带
+`_tileinfer_*` 幂等标记。
 
 负向门已单独验证：
 

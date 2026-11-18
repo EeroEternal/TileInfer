@@ -59,6 +59,10 @@
 | 代码形态 | **v2 已归档**到 `legacy/v2/tileinfer/vllm/`（约 21 k 行，自带平台层）；v3 只做 vllm-ascend 之上的选择与计数，安装路径是 `tileinfer/bridge/` |
 | 已知断点 | 图捕获未接、投机解码未开始、TPOT 2.53× / 首字 11.8× |
 
+> 2026-11-17 本机验证补充：当前真权重 C1 使用 `.venv_lfm3`（transformers 5.17.0、
+> torch 2.10.0+cpu、torch_npu 2.10.0.post4），并需要
+> `PYTHONPATH=/home/zxs/triton-ascend-3.2.2`。CPU 契约测试仍可用 zxs 的 4.57.6 环境。
+
 **已经建成、不要重做的**：注意力 / GDN / MoE / 采样四族内核、`plan/run` 注意力契约、
 混相计时与剖析工具、v1 时代的 vllm-ascend 插件（冻结在 `legacy/`）。
 

@@ -85,5 +85,11 @@ MUSE_GLIMMER = ModelManifest(
     model_impl="tileinfer.bridge.models.muse_glimmer",
     reasoning_parser="atem",
     reasoning_parser_impl="tileinfer.bridge.models.atem:AtemReasoningParser",
+    support={
+        "text": "verified",
+        "vision": "not_implemented",
+        "mtp": "not_implemented",
+        "quant": ["bf16"],
+    },
     source="docs/notes/muse-glimmer-static.md",
 )

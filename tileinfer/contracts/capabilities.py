@@ -203,12 +203,45 @@ class ProviderSpec:
     evidence: str = ""
     delete_when: str = ""
     notes: str = ""
+    #: Selection lifecycle.  ``candidate`` may only enter a plan through an explicit
+    #: bring-up (``allow_candidates``) and keeps the plan unservable; ``default`` is eligible
+    #: for normal vendor-first selection.
+    status: str = "default"
+    #: Where the declaration applies.  ``global`` is the aspect/state provider table;
+    #: ``model`` only applies when the declaration ships a ``model_impl`` and consumes the
+    #: provider inside that model (LFM3 short-conv).
+    scope: str = "global"
+    #: How the bridge installs it: an operator-table entry, a provider consumed by our model
+    #: implementation, or a vendor hook (platform guard / monkeypatch).
+    install: str = "impl_table"
+    #: Measured under ACL graph capture (replay, no host sync, no fallback), not merely
+    #: "this implementation is graph-shaped".
+    graph_safe: bool = False
+    #: Machine-readable evidence maturity, independent of the free-form ``evidence`` path.
+    evidence_level: str = "declared"
 
     def validate(self) -> None:
         if not self.name or not self.impl:
             raise ValueError("a provider needs a name and an importable implementation path")
         if self.source not in {"vendor", "tileinfer", "vendored", "reference"}:
             raise ValueError(f"unknown provider source {self.source!r}")
+        if self.status not in {"default", "candidate"}:
+            raise ValueError(f"unknown provider status {self.status!r}")
+        if self.scope not in {"global", "model"}:
+            raise ValueError(f"unknown provider scope {self.scope!r}")
+        if self.install not in {"impl_table", "model_impl", "vendor_hook"}:
+            raise ValueError(f"unknown provider install mode {self.install!r}")
+        if self.evidence_level not in {
+            "declared",
+            "candidate",
+            "cpu",
+            "device-c1",
+            "device-c2",
+            "device-c3",
+            "device-c4",
+            "verified",
+        }:
+            raise ValueError(f"unknown provider evidence level {self.evidence_level!r}")
         normalize_parallel(self.parallel)
         if self.measured_ratio is not None and not self.evidence:
             raise ValueError(
@@ -234,4 +267,9 @@ class ProviderSpec:
             "evidence": self.evidence,
             "delete_when": self.delete_when,
             "notes": self.notes,
+            "status": self.status,
+            "scope": self.scope,
+            "install": self.install,
+            "graph_safe": self.graph_safe,
+            "evidence_level": self.evidence_level,
         }

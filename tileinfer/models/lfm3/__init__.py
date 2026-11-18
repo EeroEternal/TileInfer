@@ -1,7 +1,12 @@
-"""LFM3 route-O model implementation."""
+"""Engine-free LFM3 helpers.
+
+The vLLM-facing model lives in ``tileinfer.bridge.models.lfm3_model``.  This package keeps
+only the transformers compatibility shim, which is imported by the bridge's
+``register_config`` actor before vLLM reads the checkpoint config.
+"""
 
 from __future__ import annotations
 
-from .model import Lfm3ForCausalLM
+from .compat import apply
 
-__all__ = ["Lfm3ForCausalLM"]
+__all__ = ["apply"]

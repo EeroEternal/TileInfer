@@ -86,6 +86,13 @@ QWEN3_6 = ModelManifest(
         "recorded_at": "2026-11-12T14:47:00+08:00",
         "recorded_on": "Ascend950PR, CANN 9.3.0, vllm-ascend 0.23.0",
     },
+    support={
+        "text": "verified",
+        "vision": "not_verified",
+        "mtp": "verified",
+        "quant": ["bf16"],
+        "max_context_verified": 131072,
+    },
     source="docs/notes/op-coverage-qwen36.md; /home/models/Qwen3.6-35B-A3B/config.json",
 )
 

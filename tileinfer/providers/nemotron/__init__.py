@@ -27,6 +27,11 @@ MAMBA2_STATE = ProviderSpec(
         "candidate, not a default: target-geometry CPU reference and dummy launch "
         "mechanics pass; real-weight C1/C2 and C3 graph capture are still pending"
     ),
+    status="candidate",
+    scope="global",
+    install="impl_table",
+    graph_safe=True,
+    evidence_level="device-c3",
 )
 
 NEMOTRON_MOE = ProviderSpec(
@@ -45,6 +50,11 @@ NEMOTRON_MOE = ProviderSpec(
         "candidate, not a default: the torch fused_experts path and the Ascend non-gated "
         "hook are implemented and CPU-tested; target real-weight C2 is pending"
     ),
+    status="candidate",
+    scope="global",
+    install="impl_table",
+    graph_safe=True,
+    evidence_level="device-c3",
 )
 
 CANDIDATES = (MAMBA2_STATE, NEMOTRON_MOE)
