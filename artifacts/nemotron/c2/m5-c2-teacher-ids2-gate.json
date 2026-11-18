@@ -1,0 +1,59 @@
+{
+  "ok": true,
+  "criteria": {
+    "kind": "rank",
+    "tie_logit_tol": 0.25,
+    "reference_top1_in_top5": true,
+    "atol_diagnostic": 0.02
+  },
+  "prompts": [
+    {
+      "prompt": "The capital of France is",
+      "ok": true,
+      "steps": 32,
+      "same_top1": 32,
+      "tied_top1": 0,
+      "top1_mismatch": 0,
+      "max_logprob_delta": 0.574037991464138,
+      "mean_logprob_delta": 0.03336180749624873,
+      "failures": [],
+      "errors": []
+    },
+    {
+      "prompt": "def fibonacci(n):",
+      "ok": true,
+      "steps": 32,
+      "same_top1": 32,
+      "tied_top1": 0,
+      "top1_mismatch": 0,
+      "max_logprob_delta": 0.1979825496673584,
+      "mean_logprob_delta": 0.00926030037135206,
+      "failures": [],
+      "errors": []
+    },
+    {
+      "prompt": "Explain in one sentence why the sky is blue:",
+      "ok": true,
+      "steps": 32,
+      "same_top1": 31,
+      "tied_top1": 1,
+      "top1_mismatch": 0,
+      "max_logprob_delta": 0.23835957050323486,
+      "mean_logprob_delta": 0.04244189332143833,
+      "failures": [],
+      "errors": []
+    },
+    {
+      "prompt": "北京是中国的",
+      "ok": true,
+      "steps": 32,
+      "same_top1": 29,
+      "tied_top1": 3,
+      "top1_mismatch": 0,
+      "max_logprob_delta": 0.28991103172302246,
+      "mean_logprob_delta": 0.055926060260958366,
+      "failures": [],
+      "errors": []
+    }
+  ]
+}
