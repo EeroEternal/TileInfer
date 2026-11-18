@@ -85,6 +85,14 @@ Concurrency (956-token prompts, 64 output each; 8-way on the default run, 16/32-
 | 16-way graph | 3.09 s | **331.4** | 253.0 ms |
 | 32-way graph | 3.37 s | **608.0** | 413.2 ms |
 
+Long-context recall (125,059-token chat prompt, secret `7391` at the head or middle, greedy,
+`max_tokens 512`):
+
+| placement | result | completion tokens | elapsed |
+|---|---|---:|---:|
+| head | ✅ content is exactly `7391` | 101 | 34.7 s |
+| middle | ✅ content is exactly `7391` | 138 | 37.2 s |
+
 Long-context concurrency (125,002-token prompts, 64 output, `max-model-len 131072`,
 `max-num-seqs 4`, `gpu-memory-utilization 0.9`):
 
