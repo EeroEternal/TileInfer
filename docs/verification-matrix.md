@@ -162,23 +162,24 @@ Qwen3.6 是**控制模型**，用来校准 TileInfer 在厂商已支持路径上
 
 ## 1bis. MuseGlimmer-30B（厂商缺失架构，V3 bridge）
 
-> 2026-11-17 单卡 Ascend950PR，真权重，`max-model-len 32768 / max-num-seqs 8 /
-> gpu-memory-utilization 0.85`。完整命令与原始数字见
+> 2026-11-17/18 单卡 Ascend950PR，真权重。基础矩阵 `max-model-len 32768 / max-num-seqs 8 /
+> gpu-memory-utilization 0.85`；128K 与 16/32 路使用 `max-model-len 131072 / max-num-seqs 32 /
+> gpu-memory-utilization 0.9`。完整命令与原始数字见
 > [`notes/muse-glimmer-v3-validation-20261117.md`](notes/muse-glimmer-v3-validation-20261117.md)。
-> **状态：C1–C4 已过（C2 用 fp32 oracle + 声明容差；C4 用绝对门）。128K/组合格未验。**
+> **状态：C1–C4 已过（C2 用 fp32 oracle + 声明容差；C4 用绝对门）。128K 单流/图、8/16/32 路已验；128K×并发组合未验。**
 
 | # | 场景 | 证据 | 门 | MuseGlimmer |
 |---|---|---|---|---|
 | C1 | 端到端服务 | `/v1/models` + chat 200，ATEM parser 生效 | 能返回完整输出 | ✅ |
 | C2 | 数值一致 | fp32 CPU oracle；top-5 全同，top-1 差 3.7e-5、最大 0.059（容差 1e-3 / 0.1） | 参考实现容差内 | ✅ |
 | C3 | 图捕获 | 32K 8 图（PIECEWISE 4 + FULL 4）；4K 99/99 命中、0 回退 | 捕获 > 0 且回退 = 0 | ✅（单轮） |
-| C4 | 性能 | 单流 41 ms/tok；8K TTFT 1.26 s（graph）；8 路 175 tok/s；冷启动 38 s | 绝对门：TPOT≤100ms、8K TTFT≤3s、8路≥100 tok/s、冷启动≤120s | ✅ |
-| P1 | 并发 8 | 956-token prompt × 8，64 输出：2.92 s、175 tok/s | 完成 + 计数 | ✅ |
-| L1–L3 | 8K/16K/32K | 6,356 / 25,256 prompt tokens 完成；更长未测 | 按模型上限 | ⚠️ 32K 已测，128K 未测 |
+| C4 | 性能 | 单流 41 ms/tok；8K TTFT 1.26 s（graph）；128K TTFT 30.3 s / TPOT 48.4 ms；8 路 175 tok/s；冷启动 38 s | 绝对门：TPOT≤100ms、8K TTFT≤3s、8路≥100 tok/s、冷启动≤120s | ✅ |
+| P1 | 并发 8/16/32 | 956-token prompt，64 输出：175 / 331 / 608 tok/s；max TTFT 280 / 253 / 413 ms | 完成 + 计数 | ✅ |
+| L1–L4 | 8K/16K/32K/125K | 6,356 / 25,256 / 125,002 prompt tokens 完成；125K 为单流+图 | 按模型上限 | ✅ |
 | K1 | 冷启动 | fresh `VLLM_CACHE_ROOT`：38 s 到 ready（weights 2.08 s，engine 1.93 s） | 可测量 | ✅ |
 | MTP | 投机 | 该 checkpoint 无 MTP | 显式声明不支持 | N/A（显式） |
 
-未验证格：128K+ 长上下文、图 × 长上下文组合、C2 数值、无厂商基线 A/B。
+未验证格：128K × 并发组合、独立厂商 A/B。
 
 ## 2. 新模型附加项（M5+）
 

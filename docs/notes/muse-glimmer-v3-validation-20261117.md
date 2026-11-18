@@ -73,19 +73,24 @@ character length).
 | 6,356 | graph | **1,259.9 ms** | 41.0 ms | 24.8 |
 | 25,256 | eager | 3,817.3 ms | 40.9 ms | 24.8 |
 | 25,256 | graph | 3,752.0 ms | 41.1 ms | 24.7 |
+| 125,002 | graph | 30,329.7 ms | 48.4 ms | 20.7 |
 
-Concurrency (8 requests, 956-token prompts, 64 output each, `max-num-seqs 8`):
+Concurrency (956-token prompts, 64 output each; 8-way on the default run, 16/32-way with
+`max-num-seqs 32`, `max-model-len 131072`, `gpu-memory-utilization 0.9`):
 
 | mode | wall | output tok/s | max TTFT |
 |---|---:|---:|---:|
-| eager | 2.92 s | **175.4** | 280.0 ms |
-| graph | 2.93 s | 174.6 | 286.5 ms |
+| 8-way eager | 2.92 s | 175.4 | 280.0 ms |
+| 8-way graph | 2.93 s | 174.6 | 286.5 ms |
+| 16-way graph | 3.09 s | **331.4** | 253.0 ms |
+| 32-way graph | 3.37 s | **608.0** | 413.2 ms |
 
 Cold start (fresh `VLLM_CACHE_ROOT`, eager, `max-model-len 8192`): **38 s** from launch to
 `Application startup complete`; weights load 2.08 s, engine init 1.93 s.
 
-Absolute single-stream decode is ~41 ms/token (24.5 tok/s), stable across 1K/8K/32K prompts
-and across cards (0/1/4 measured: 41.29–41.32 ms). This machine is ~11% slower than the
+Absolute single-stream decode is ~41 ms/token (24.5 tok/s) for ≤32K prompts, stable across
+cards (0/1/4 measured: 41.29–41.32 ms); at 125K prompt it is 48.4 ms/token, and the 125K
+prefill takes 30.3 s (TTFT). This machine is ~11% slower than the
 **unverified** 37 ms/tok line in `muse-glimmer-static.md`; that line has no command, prompt
 or date, so by `performance.md` §1 it is `[待复核]`, not a baseline. Most plausible source
 of the gap is the NNAL build (9.2.0-beta.1 against CANN 9.3), not the card.
@@ -131,7 +136,7 @@ python tools/muse/check_c2.py --base-url http://127.0.0.1:8360
 | C1 能跑 | ✅ (HTTP 200, chat completions, reasoning + content channels) |
 | C2 跑对 | ✅ top-5 token set exact; top-1 diff 3.7e-5; max top-5 diff 0.059 within the declared bf16 tolerance |
 | C3 能上图 | ✅ (8 graphs @32K; 99/99 hits, 0 fallbacks @4K) |
-| C4 跑得快 | ✅ absolute gate (below); no vendor A/B, 128K/combo grid still open |
+| C4 跑得快 | ✅ absolute gate (below); 128K single-stream/graph and 16/32-way concurrency measured; no vendor A/B |
 
 C4 absolute gate for this vendor-absent model (declared here, measured on one 950PR):
 
@@ -142,7 +147,9 @@ C4 absolute gate for this vendor-absent model (declared here, measured on one 95
 | 8-way throughput | ≥ 100 tok/s | 175.4 tok/s | ✅ |
 | cold start (fresh cache) | ≤ 120 s | 38 s | ✅ |
 
-What is still open: 128K / long-context × graph combinations, and a same-stack vendor A/B
-(the vendor can serve this model only with the same registration, so it is not an independent
-baseline). None of those block the C1–C4 statement above, but they must be listed as
-unverified.
+Measured beyond the gate (not gated): 125K prompt / 64 output -> TTFT 30.3 s, TPOT 48.4 ms;
+16-way 331 tok/s; 32-way 608 tok/s.
+
+What is still open: 128K × concurrency combinations, and a same-stack vendor A/B (the vendor
+can serve this model only with the same registration, so it is not an independent baseline).
+None of those block the C1–C4 statement above, but they must be listed as unverified.
