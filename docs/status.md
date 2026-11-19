@@ -4,8 +4,9 @@
 > 目标形态见 [`architecture.md`](architecture.md)，验收口径见 [`acceptance.md`](acceptance.md)，
 > 数字见 [`performance.md`](performance.md)。
 >
-> 最后核对：**2026-11-18 21:20**，多卡交付增量（模型级并行门、跨 TP C2 口径、Muse TP=2 的
-> C2/C3、Qwen TP=4、HCCL rootinfo 预检）；单卡/双卡 Ascend950PR，CANN 9.3.0。
+> 最后核对：**2026-11-19 17:30**，Muse TP=2 的 C4 与 128K×图收口（vendor-absent 在役）；
+> 多卡交付增量（模型级并行门、跨 TP C2 口径、Qwen TP=4、HCCL rootinfo 预检）；
+> 单卡/双卡 Ascend950PR，CANN 9.3.0。
 > 多卡交付边界见 [`notes/multicard-deliverable-20261118.md`](notes/multicard-deliverable-20261118.md)。
 
 ---
@@ -21,7 +22,7 @@ P2/P3、K1/K2、O2 对控制模型免测，见 `verification-matrix.md` §1.9；
 
 | 模型 | 状态 | 证据 |
 |---|---|---|
-| MuseGlimmer-30B | C1/C2/C3/C4 通过（C2 fp32 oracle 容差内，C4 绝对门）；TP=2 已验（C2 容差 1.14e-3 ≤ 2e-3、128K×4）；厂商 A/B 未验 | `notes/muse-glimmer-v3-validation-20261117.md` |
+| MuseGlimmer-30B | **在役（vendor-absent，绝对门）**：C1–C4 通过（单卡 + TP=2；C2 容差内，C4 TPOT 24 ms、8K TTFT 0.62 s、8 路 279 tok/s、冷启动 75 s）；128K×图/needle 通过；无独立厂商基线（N/A） | `notes/muse-glimmer-v3-validation-20261117.md` |
 | LFM3-1.7B | C1/C3 通过；short-conv provider；C2/C4 为历史证据，P1 后未重做完整门禁 | `notes/lfm3-adaptation.md` |
 | Nemotron-3.5-30B-A3B | C1/C3 通过；candidate providers；`servable=false`；C2 教师强制 top-1/top-5 rank 通过；TP8 out-of-scope | `notes/m5-nemotron-validation-20261116.md` |
 
@@ -81,12 +82,12 @@ v2 自带平台层的形态，v3 不再走那条路。本页 §1 的 v3 数字�
 | **补缺口已经不是空的** | Qwen3.6 的 8 项能力厂商全覆盖，gap=0 是"没有缺口"；LFM3 已有模型作用域 provider `tileinfer.short_conv`；Nemotron 有两个候选 provider（`tileinfer.mamba2_state`、`tileinfer.nemotron_moe`），默认仍不选，plan `servable=false` | LFM3 的 short-conv 由模型内部消费，C1/C3 已过；Nemotron 真权重 C1/C3 已过，C2 教师强制 top-1/top-5 rank 通过（dt floor 修复后），MTP greedy 图模式已闭合；TP8 out-of-scope。P0/P1 已把 provider 的 status/scope/install/graph_safe/evidence_level 声明化 |
 | **M5 Nemotron 真权重** | 单卡 TP=1 可服务；短文本 token/text 与 HF 一致（单 prompt）；8K–261K 长度可完成；2026-11-16 首轮图捕获 2/6，2026-11-17 P0/P1 复测 8/8（8/8 命中、0 回退）；2/4 路并发和冷启动通过；TP=2/4 已通过；TP=8 为 out-of-scope；greedy MTP 图模式 512 token 512/512、4 路各 32 token、32K/130K prompt 各 8 token 全同，metrics 786/786/0、57/57/0、24/24/0；C2 教师强制 top-1/top-5 rank 通过（dt floor 修复 capital step31；绝对 logprob 差仅诊断） | 不能写成“已支持”；TP8 不作为本轮交付阻塞；详见 [`notes/m5-nemotron-validation-20261116.md`](notes/m5-nemotron-validation-20261116.md) 与 [`notes/m5-delivery-gates-20261117.md`](notes/m5-delivery-gates-20261117.md) |
 | **图捕获** | v3 已接上（厂商捕获 + 我们计数）；Qwen 4K 8 张/32K 6 张；Muse 4K/32K 8 张；Nemotron C1 8 张 + MTP 6 张（PIECEWISE，FULL=0）；LFM3 doctor captured=8；`impl_table` / `model_table` 已分别用于 provider 和路线 O 模型注册，不再是空实现 | MTP+32K、128K 组合和长期并发仍未全验 |
-| **MuseGlimmer-30B（厂商缺失架构）** | C1 ✅；C2 ✅（fp32 CPU oracle：top-5 token 全同，top-1 差 3.7e-5，最大差 0.059，容差已写入 manifest）；C3 ✅（32K 8 图；4K 99/99 命中、0 回退）；C4 ✅ 绝对门（TPOT 41 ms、8K TTFT 1.26 s、8 路 175 tok/s、冷启动 38 s）；128K 单流 30.3 s/48.4 ms；8/16/32 路 175/331/608 tok/s；125K needle head/middle 均答出 `7391`；TP=2 下 125K 单流 18.4 s/30.6 ms、128K×4 74.2 s max TTFT（C2 TP 容差 2e-3） | 仍开放：同栈厂商 A/B；TP=2 需宿主 HCCL workaround；证据见 [`notes/muse-glimmer-v3-validation-20261117.md`](notes/muse-glimmer-v3-validation-20261117.md)，复现见 [`quickstart-muse-950.md`](quickstart-muse-950.md) |
+| **MuseGlimmer-30B（厂商缺失架构，在役）** | C1 ✅；C2 ✅（fp32 CPU oracle：top-5 token 全同，top-1 差 3.7e-5，最大差 0.059，容差已写入 manifest；TP=2 容差 1.14e-3 ≤ 2e-3）；C3 ✅（32K 8 图；4K 99/99、TP=2 6 图/99/99、128K×图 6 图/14/14，均 0 回退；128K needle 125,325 → `7391`、150/150）；C4 ✅ 绝对门（单卡 TPOT 41 ms、8K TTFT 1.26 s、8 路 175 tok/s、冷启动 38 s；**TP=2 TPOT 24 ms、8K TTFT 0.62 s、8 路 279 tok/s、冷启动 75 s**）；128K 单流 30.3 s/48.4 ms；8/16/32 路 175/331/608 tok/s；128K×4 TP=2 74.2 s max TTFT | 无未闭合门；**独立厂商 A/B = N/A**（厂商无该架构，按绝对门）；TP=2 需宿主 HCCL workaround；证据见 [`notes/muse-glimmer-v3-validation-20261117.md`](notes/muse-glimmer-v3-validation-20261117.md)，复现见 [`quickstart-muse-950.md`](quickstart-muse-950.md) |
 | **投机解码 / MTP** | S2/S3 按 B 质量等价过：套件 8/8、needle 8K/16K/32K 9/9、同请求两次 `same`、4K 93.9% / 1.35×；图 6 张、0 回退。严格逐位不成立（256 token 中 85.9% 相同、第 58 token 分叉），明确非逐位。S4 32K 部分：9/9、TTFT 1.037×、6 图/0 回退，acceptance 81–88%、128K 未测。**M5 Nemotron 本轮**：图模式 greedy 512 token 512/512、4 路各 32 token、32K/130K prompt 各 8 token 全同；metrics 786/786/0、57/57/0、24/24/0。证据见 [`notes/m1-spec-quality.md`](notes/m1-spec-quality.md) | Qwen S2/S3 过；S4 仅 32K 部分；M5 greedy 逐 token 等价已闭合；TP=8 MTP 未测；不能外推成所有采样参数/所有 TP 都逐位 |
 | **TPOT / 首字** | v3 M1：单流 0.907–1.016× / 0.999–1.001×；4K 1.000× / 0.999×；长上下文 8K/16K/32K：TTFT 1.008–1.011×、TPOT 0.999–1.002× | 门已过（本机、本参数） |
 | **长上下文** | **L1–L4 已过**（8K/16K/32K/128K；128K 单流，3/3 needle 逐 token 同，峰值 HBM 107,374 MB）；**L5 262K 不过**：d90 两臂 256 token、v3 500 token 均未答出、C4 TPOT 1.1019×/吞吐 0.9076×。当前 33K/4 用于投机/并发，128K 需 `max-num-seqs=1`。证据见 [`notes/m1-long-context.md`](notes/m1-long-context.md) | 实际质量上限 128K；262K 不声明支持 |
 | **量化** | 只做 bf16 | 未验证组合一律不声明支持 |
-| **TP / EP / 多卡** | **Phase 0 + 模型级并行门（2026-11-18）**：环境探测 tp/ep/dp/pp、plan 记录并行、provider 与 **route-O 模型**都按 `parallel` fail-closed（`ModelManifest.parallel` 只对自带模型实现生效，厂商模型不受阻）、`doctor` 有 parallel 与 HCCL rootinfo 门。已验：Qwen3.6 **TP=2/4** 的 C1/C3（6 图、命中 15/15 与 99/99、0 回退），跨 TP C2 **不声明**（无 `tolerance_tp`，第 7 token 分叉）；**TP=8 首个请求挂起（未验证）**；**MuseGlimmer TP=2** 的 C2（token 集合相同、top-1 1.14e-3 ≤ 2e-3）、C3（6 图/99/99/0 回退）与 128K×4。仍未做：LFM3/Nemotron 的 provider TP、EP、TP 性能。**环境注意**：本机需临时移走空的 `/etc/hccl_rootinfo.json` 才能建 HCCL 组（已恢复，属宿主问题；doctor 会提前报出）。交付边界与"可声称/不可声称"见 [`notes/multicard-deliverable-20261118.md`](notes/multicard-deliverable-20261118.md)；证据见 [`notes/multicard-tp2-verification-20261117.md`](notes/multicard-tp2-verification-20261117.md)、[`notes/qwen36-tp4-tp8-20261118.md`](notes/qwen36-tp4-tp8-20261118.md) |
+| **TP / EP / 多卡** | **Phase 0 + 模型级并行门（2026-11-18）**：环境探测 tp/ep/dp/pp、plan 记录并行、provider 与 **route-O 模型**都按 `parallel` fail-closed（`ModelManifest.parallel` 只对自带模型实现生效，厂商模型不受阻）、`doctor` 有 parallel 与 HCCL rootinfo 门。已验：Qwen3.6 **TP=2/4** 的 C1/C3（6 图、命中 15/15 与 99/99、0 回退），跨 TP C2 **不声明**（无 `tolerance_tp`，第 7 token 分叉）；**TP=8 首个请求挂起（未验证）**；**MuseGlimmer TP=2** 的 C1–C4（C2 1.14e-3 ≤ 2e-3；C3 6 图/99/99/0 回退；C4 TPOT 24 ms、8K TTFT 0.62 s、8 路 279 tok/s、冷启动 75 s）以及 128K×图（6 图/14/14/0 回退）与 needle（125,325 → `7391`）。仍未做：LFM3/Nemotron 的 provider TP、EP、Qwen TP 性能。**环境注意**：本机需临时移走空的 `/etc/hccl_rootinfo.json` 才能建 HCCL 组（已恢复，属宿主问题；doctor 会提前报出）。交付边界与"可声称/不可声称"见 [`notes/multicard-deliverable-20261118.md`](notes/multicard-deliverable-20261118.md)；证据见 [`notes/multicard-tp2-verification-20261117.md`](notes/multicard-tp2-verification-20261117.md)、[`notes/qwen36-tp4-tp8-20261118.md`](notes/qwen36-tp4-tp8-20261118.md) |
 | **冷缓存 / 首次启动** | 控制模型免测（[matrix §1.9](verification-matrix.md)）；M5 部署时再量 | M2 预编译门要单独回答 |
 | **128K / 262K** | 128K 已过：TTFT 0.9433×、TPOT 0.9884×、吞吐 1.0117×、峰值 107,374 MB。262K：d10/d50 可答，d90 两臂 256 token、v3 500 token 均未答出；C4 TPOT 1.1019×、吞吐 0.9076×；峰值 107,376 MB、2 图/0 回退。40,960/8 的 OOM 是 8 seq 放大，不代表 128K/1 不可行 | 262K 能起但不过质量/C4；不要当支持 |
 

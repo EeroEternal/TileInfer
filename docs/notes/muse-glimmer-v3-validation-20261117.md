@@ -142,12 +142,16 @@ parse the ranktable file`. The directory was moved aside for the duration of the
 restored afterwards; no code or workflow change encodes this workaround.
 
 TP=2 setup: cards 2+3, `--tensor-parallel-size 2`, `max-model-len 131072`,
-`max-num-seqs 4`, `gpu-memory-utilization 0.85`; ready in 52–54 s.
+`max-num-seqs 4`, `gpu-memory-utilization 0.85`; warm start 52–54 s, **fresh-cache cold
+start 75.2 s** (2026-11-19 re-measure).
 
 | test | result |
 |---|---|
 | C2 (`check_c2.py --tp-size 2`) | token set exact; top-1 diff **0.001138** (TP tolerance 0.002), top-5 max 0.058; **pass** |
 | C3 (100 output tokens, `SIGUSR1` to both workers) | **6 graphs** (PIECEWISE 3 + FULL 3), `decode_calls=99`, `decode_graph_hits=99`, `decode_fallbacks=0`, `errors=0`; backend = vendor `AscendAttentionBackend` |
+| C4 (`tools/muse/perf_probe.py`) | 995-token: TTFT **0.126 s** / TPOT **23.9 ms**; 8,675-token: TTFT **0.619 s** / TPOT **24.1 ms**; 8-way: **279.4 tok/s**, max TTFT 0.252 s, 8/8 completed; cold start **75.2 s** — all pass the absolute gate |
+| 128K × graph | 125,891-token prompt: **6 graphs**, `decode_calls=14`, `hits=14`, `fallbacks=0`; the cold 118,691-token request had TTFT 16.9 s (the 125K repeat is prefix-cache warm: 1.48 s) |
+| 128K needle | 125,325-token chat, secret at the middle: content exactly **`7391`**, `finish=stop`; metrics `decode_calls=150`, `hits=150`, `fallbacks=0`, `none_after_capture=125` |
 | 125K single | TTFT **18.4 s**, TPOT **30.6 ms** (TP=1: 30.3 s / 48.4 ms) |
 | 4 x 125K, prefix cache disabled | 4/4 requests x 64 tokens; wall **76.1 s**; max TTFT **74.2 s** |
 | 4 x 125K, prefix cache enabled | 3.0 s wall (identical prompts reuse the first prefill; not a capacity number) |
@@ -173,7 +177,8 @@ does that and exits non-zero on a truncated/zeroed header.
 | C1 能跑 | ✅ (HTTP 200, chat completions, reasoning + content channels) |
 | C2 跑对 | ✅ top-5 token set exact; top-1 diff 3.7e-5; max top-5 diff 0.059 within the declared bf16 tolerance |
 | C3 能上图 | ✅ (8 graphs @32K; 99/99 hits, 0 fallbacks @4K) |
-| C4 跑得快 | ✅ absolute gate (below); 128K single-stream/graph and 16/32-way concurrency measured; no vendor A/B |
+| C4 跑得快 | ✅ absolute gate (below); 128K single-stream/graph, 16/32-way concurrency and 128K x 4 on TP=2 measured; no vendor A/B |
+| C4 TP=2 | ✅ TPOT **23.9–24.1 ms**, 8K TTFT **0.62 s**, 8-way **279.4 tok/s**, cold start **75.2 s** — within the same absolute gate |
 
 C4 absolute gate for this vendor-absent model (declared here, measured on one 950PR):
 
@@ -188,6 +193,9 @@ Measured beyond the gate (not gated): 125K prompt / 64 output -> TTFT 30.3 s, TP
 16-way 331 tok/s; 32-way 608 tok/s; 128K x 2 concurrency passes on one card, 128K x 4 needs
 TP=2 (74.2 s max TTFT, see §4.2).
 
-What is still open: a same-stack vendor A/B (the vendor can serve this model only with the same registration, so it
-is not an independent baseline). None of those block the C1–C4 statement above, but they must
-be listed as unverified.
+What is still open: **a same-stack vendor A/B is N/A**, not open — vLLM/vllm-ascend has no
+architecture for this model, so there is no independent vendor arm to compare against; per
+[`acceptance.md`](../acceptance.md) §2.1 the absolute gate is the correct branch. TP=8 is not
+applicable (30B fits on two cards; the host TP=8 path is separately blocked). With the TP=2
+C4 and 128K×graph rows above, the C1–C4 + matrix cells for this model are either measured or
+explicitly N/A.

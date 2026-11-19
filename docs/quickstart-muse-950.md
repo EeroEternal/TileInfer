@@ -85,6 +85,25 @@ python tools/muse/check_c2.py --base-url http://127.0.0.1:8360 --tp-size 2
 Measured on 2026-11-18: 125K single -> TTFT 18.4 s / TPOT 30.6 ms; 128K x 4 (prefix cache off)
 -> 4/4 x 64 tokens, wall 76.1 s, max TTFT 74.2 s.
 
+### 4.2 C4 probe (TP=2)
+
+`tools/muse/perf_probe.py` measures streaming TTFT/TPOT and concurrency without inferring
+latency from the completion length:
+
+```bash
+python tools/muse/perf_probe.py --base-url http://127.0.0.1:8360 \
+  --prompt-tokens 1300 --max-tokens 64 --runs 2          # ~1K prompt
+python tools/muse/perf_probe.py --base-url http://127.0.0.1:8360 \
+  --prompt-tokens 12000 --max-tokens 64                  # ~8.7K prompt
+python tools/muse/perf_probe.py --base-url http://127.0.0.1:8360 \
+  --prompt-tokens 1300 --max-tokens 64 --concurrency 8   # 8-way
+```
+
+Measured TP=2 (cards 2+3, `max-model-len 32768`, `max-num-seqs 8`): TTFT 0.126 s / TPOT
+23.9 ms at ~1K; TTFT 0.619 s / TPOT 24.1 ms at 8.7K; 8-way **279 tok/s** (max TTFT 0.252 s);
+fresh-cache cold start **75.2 s**. 128K x graph: 125,891 tokens -> 6 graphs, 14/14 hits,
+0 fallbacks; 128K needle 125,325 tokens -> content `7391`.
+
 ## 5. Smoke
 
 ```bash

@@ -166,23 +166,25 @@ Qwen3.6 是**控制模型**，用来校准 TileInfer 在厂商已支持路径上
 > gpu-memory-utilization 0.85`；128K 与 16/32 路使用 `max-model-len 131072 / max-num-seqs 32 /
 > gpu-memory-utilization 0.9`。完整命令与原始数字见
 > [`notes/muse-glimmer-v3-validation-20261117.md`](notes/muse-glimmer-v3-validation-20261117.md)。
-> **状态：C1–C4 已过（C2 用 fp32 oracle + 声明容差；C4 用绝对门）。128K 单流/图、8/16/32 路已验；128K×并发组合未验。**
+> **状态：C1–C4 已过（单卡 + TP=2；C2 用 fp32 oracle + 声明容差，C4 用绝对门）。128K 单流/图、128K needle、8/16/32 路、128K×4、TP=2 C4 已验；无独立厂商基线（N/A，厂商无该架构）。**
 
 | # | 场景 | 证据 | 门 | MuseGlimmer |
 |---|---|---|---|---|
 | C1 | 端到端服务 | `/v1/models` + chat 200，ATEM parser 生效 | 能返回完整输出 | ✅ |
 | C2 | 数值一致 | fp32 CPU oracle；top-5 全同，top-1 差 3.7e-5、最大 0.059（容差 1e-3 / 0.1） | 参考实现容差内 | ✅ |
 | C2-TP | 跨 TP 数值 | `check_c2.py --tp-size 2`：token 集合相同，top-1 差 **1.14e-3**（`tolerance_tp` 2e-3），top-5 max 0.058；TP=1/TP=2 各自复跑一致 | 按 [`acceptance.md`](acceptance.md) §2.1.1 的声明容差 | ✅ TP=2 |
-| C3 | 图捕获 | 32K 8 图（PIECEWISE 4 + FULL 4）；4K 99/99 命中、0 回退；**TP=2：6 图、99/99、0 回退** | 捕获 > 0 且回退 = 0 | ✅（单轮） |
+| C3 | 图捕获 | 32K 8 图（PIECEWISE 4 + FULL 4）；4K 99/99 命中、0 回退；**TP=2：6 图、99/99、0 回退**；**128K×图：125,891 tokens、6 图、14/14、0 回退**；128K needle 125,325 tokens → content `7391`、150/150、0 回退 | 捕获 > 0 且回退 = 0 | ✅ |
 | C4 | 性能 | 单流 41 ms/tok；8K TTFT 1.26 s（graph）；128K TTFT 30.3 s / TPOT 48.4 ms；8 路 175 tok/s；冷启动 38 s | 绝对门：TPOT≤100ms、8K TTFT≤3s、8路≥100 tok/s、冷启动≤120s | ✅ |
+| C4-TP | TP=2 性能 | TPOT **23.9–24.1 ms**；8,675-token TTFT **0.62 s**；8 路 **279.4 tok/s**（max TTFT 0.252 s）；fresh-cache 冷启动 **75.2 s** | 同一绝对门 | ✅ TP=2 |
 | P1 | 并发 8/16/32 | 956-token prompt，64 输出：175 / 331 / 608 tok/s；max TTFT 280 / 253 / 413 ms | 完成 + 计数 | ✅ |
 | P2 | 128K × 2 并发 | 125,002-token prompt × 2，64 输出：128 tokens、33.7 s、max TTFT 30.4 s | 完成 + 计数 | ✅ |
 | P3 | 128K × 4 并发 | TP=2、关 prefix cache：4/4 × 64 token，wall 76.1 s，max TTFT 74.2 s | 完成 + 计数 | ✅（TP=2；宿主 HCCL workaround） |
 | L1–L4 | 8K/16K/32K/125K | 6,356 / 25,256 / 125,002 prompt tokens 完成；125K 为单流+图；125K needle head/middle 都答出 `7391` | 按模型上限 | ✅ |
-| K1 | 冷启动 | fresh `VLLM_CACHE_ROOT`：38 s 到 ready（weights 2.08 s，engine 1.93 s） | 可测量 | ✅ |
+| K1 | 冷启动 | fresh `VLLM_CACHE_ROOT`：单卡 38 s；**TP=2 75.2 s** 到 ready（weights 2.08 s，engine 1.93 s） | 可测量；≤120 s（TP=2 绝对门） | ✅ |
 | MTP | 投机 | 该 checkpoint 无 MTP | 显式声明不支持 | N/A（显式） |
 
-未验证格：独立厂商 A/B。TP=2 需要宿主把空的 `/etc/hccl_rootinfo.json` 临时移走（已恢复）。
+未验证格：**独立厂商 A/B = N/A**（vLLM/vllm-ascend 无该架构，按
+`acceptance.md` §2.1 用绝对门）。TP=2 需要宿主把空的 `/etc/hccl_rootinfo.json` 临时移走（已恢复）。
 跨 TP 的 C2 按 [`acceptance.md`](acceptance.md) §2.1.1 判（manifest 的 `tolerance_tp`）；LFM3 与
 Nemotron 的 provider TP 尚未验证（LFM3 单卡 fail-closed；Nemotron 候选单卡）。
 
