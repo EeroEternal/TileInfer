@@ -172,7 +172,8 @@ Qwen3.6 是**控制模型**，用来校准 TileInfer 在厂商已支持路径上
 |---|---|---|---|---|
 | C1 | 端到端服务 | `/v1/models` + chat 200，ATEM parser 生效 | 能返回完整输出 | ✅ |
 | C2 | 数值一致 | fp32 CPU oracle；top-5 全同，top-1 差 3.7e-5、最大 0.059（容差 1e-3 / 0.1） | 参考实现容差内 | ✅ |
-| C3 | 图捕获 | 32K 8 图（PIECEWISE 4 + FULL 4）；4K 99/99 命中、0 回退 | 捕获 > 0 且回退 = 0 | ✅（单轮） |
+| C2-TP | 跨 TP 数值 | `check_c2.py --tp-size 2`：token 集合相同，top-1 差 **1.14e-3**（`tolerance_tp` 2e-3），top-5 max 0.058；TP=1/TP=2 各自复跑一致 | 按 [`acceptance.md`](acceptance.md) §2.1.1 的声明容差 | ✅ TP=2 |
+| C3 | 图捕获 | 32K 8 图（PIECEWISE 4 + FULL 4）；4K 99/99 命中、0 回退；**TP=2：6 图、99/99、0 回退** | 捕获 > 0 且回退 = 0 | ✅（单轮） |
 | C4 | 性能 | 单流 41 ms/tok；8K TTFT 1.26 s（graph）；128K TTFT 30.3 s / TPOT 48.4 ms；8 路 175 tok/s；冷启动 38 s | 绝对门：TPOT≤100ms、8K TTFT≤3s、8路≥100 tok/s、冷启动≤120s | ✅ |
 | P1 | 并发 8/16/32 | 956-token prompt，64 输出：175 / 331 / 608 tok/s；max TTFT 280 / 253 / 413 ms | 完成 + 计数 | ✅ |
 | P2 | 128K × 2 并发 | 125,002-token prompt × 2，64 输出：128 tokens、33.7 s、max TTFT 30.4 s | 完成 + 计数 | ✅ |
@@ -182,6 +183,26 @@ Qwen3.6 是**控制模型**，用来校准 TileInfer 在厂商已支持路径上
 | MTP | 投机 | 该 checkpoint 无 MTP | 显式声明不支持 | N/A（显式） |
 
 未验证格：独立厂商 A/B。TP=2 需要宿主把空的 `/etc/hccl_rootinfo.json` 临时移走（已恢复）。
+跨 TP 的 C2 按 [`acceptance.md`](acceptance.md) §2.1.1 判（manifest 的 `tolerance_tp`）；LFM3 与
+Nemotron 的 provider TP 尚未验证（LFM3 单卡 fail-closed；Nemotron 候选单卡）。
+
+## 1.10 并行配置（TP）——控制模型与 route-O
+
+> 规则见 [`acceptance.md`](acceptance.md) §2.1.1：跨并行配置的 C2 必须由 manifest 的
+> `benchmark.tolerance_tp` 显式声明；没有声明就只能写 C1/C3/C4。
+> 这里的 C1/C3 是"能跑/能上图"，不是"数值等价"。
+
+| 模型 | 配置 | 结果 | 结论 |
+|---|---|---|---|
+| Qwen3.6（控制，厂商路径） | TP=2 | health 65 s；6 图；decode 15/15；0 回退 | ✅ C1/C3 |
+| Qwen3.6（控制，厂商路径） | TP=4 | health 75 s；6 图；decode 99/99；0 回退 | ✅ C1/C3 |
+| Qwen3.6（控制，厂商路径） | TP=8 | health 90 s；捕获 6 图；**首个请求挂起**（shared-memory broadcast starvation），`decode_calls=0` | ❌ 未验证 |
+| MuseGlimmer（route-O） | TP=2 | C2 容差内（1.14e-3 ≤ 2e-3）；6 图；99/99；0 回退；128K×4 | ✅ C1/C2/C3 |
+| LFM3（route-O） | TP≥2 | short-conv 显式单卡；模型声明 `("single",)` | 显式拒绝（fail-closed） |
+| Nemotron（route-O 候选） | TP≥2 | 候选 provider 单卡；manifest `support.tp=["1"]` | 显式拒绝（fail-closed） |
+
+Qwen3.6 的跨 TP C2 **不声明**（无 `tolerance_tp`；TP=1/TP=2 第 7 token 分叉）。TP=8 的
+挂起是厂商/HCCL/图路径问题，细节见 [`notes/qwen36-tp4-tp8-20261118.md`](notes/qwen36-tp4-tp8-20261118.md)。
 
 ## 2. 新模型附加项（M5+）
 

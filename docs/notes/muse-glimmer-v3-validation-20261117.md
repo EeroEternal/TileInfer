@@ -147,6 +147,7 @@ TP=2 setup: cards 2+3, `--tensor-parallel-size 2`, `max-model-len 131072`,
 | test | result |
 |---|---|
 | C2 (`check_c2.py --tp-size 2`) | token set exact; top-1 diff **0.001138** (TP tolerance 0.002), top-5 max 0.058; **pass** |
+| C3 (100 output tokens, `SIGUSR1` to both workers) | **6 graphs** (PIECEWISE 3 + FULL 3), `decode_calls=99`, `decode_graph_hits=99`, `decode_fallbacks=0`, `errors=0`; backend = vendor `AscendAttentionBackend` |
 | 125K single | TTFT **18.4 s**, TPOT **30.6 ms** (TP=1: 30.3 s / 48.4 ms) |
 | 4 x 125K, prefix cache disabled | 4/4 requests x 64 tokens; wall **76.1 s**; max TTFT **74.2 s** |
 | 4 x 125K, prefix cache enabled | 3.0 s wall (identical prompts reuse the first prefill; not a capacity number) |

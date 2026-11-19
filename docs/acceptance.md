@@ -53,6 +53,22 @@ C2 和 C4 都写着"与基线比"。**基线不是永远存在**——我们要�
 > 见 [`extending.md`](extending.md) §3.0。C2/C4 的门槛只用来证明"我们这层没变慢"，
 > 不是用来证明"我们再实现一遍有意义"。
 
+### 2.1.1 跨并行配置（TP/EP/DP/PP）的 C2
+
+C2 的严格门是**同一配置**（同 TP/EP/DP/PP）下的逐位一致。换并行配置是**另一个数值
+配置**：同一个模型、同一个请求，TP=1 与 TP=2 会因为归约顺序、MoE 分块和 bf16 舍入产生
+差异，greedy 会把它放大（本机 Qwen3.6：第 7 个 token 分叉，首 token logprob 差 0.0193）。
+
+因此跨并行配置的 C2 **必须显式声明，不能默认成立**：
+
+- 声明写在 manifest 的 `benchmark.tolerance_tp`：`top1_logprob`、`top5_max_logprob`、
+  `token_set: exact`。没有这个字段 = **不声明跨 TP C2**，只能声明 C1/C3/C4；
+- 判定：token 集合逐位相同 + top-1/top-5 差值在容差内 + **同一配置复跑一致**；
+- 容差必须比单配置的 `tolerance` 宽（bf16 下 TP 的数值差异更大），并在验证矩阵留证据；
+- 反例：Qwen3.6 没有 `tolerance_tp`，跨 TP 首 token 差 0.0193、第 7 token 分叉，所以只能
+  写"TP=2 可运行"，不能写"TP=2 跑对"；
+- 正例：MuseGlimmer 声明 `tolerance_tp.top1_logprob=2e-3`，实测 1.14e-3、token 集合相同 → 过。
+
 ### 2.2 每模型验证矩阵（C1–C4 是最小集，不是全部）
 
 C1–C4 只覆盖"短上下文、不投机"的一条路径。一个模型要判"在役"，还必须过同一张
