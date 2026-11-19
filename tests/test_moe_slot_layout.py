@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import torch
 
+import pytest
+pytest.importorskip("tilelang")
 from tileinfer.kernels.moe import em_upper_bound, slot_layout_from_group_list
 from tileinfer.testing.moe_reference import build_slot_layout, gather_slots
 

@@ -69,12 +69,44 @@ registry 与审计脚本预期不一致），与本次改动无关。
 
 **接入点数量不变（仍是 6 个）**；契约层没有新增机制，只是给已有声明加了一个维度。
 
-## 4. 下一步（Phase 1，未做）
+## 4. Phase 1 进展（2026-11-18）
 
-1. 先闭合 TP1 的 Nemotron C2/MTP（否则 TP 没有正确对照）；
-2. TP=2 数值正确：Mamba2 head/state 按 TP 切、MoE 先做 TP-shard（`expert_map` 留给 EP）；
-3. TP=2 过 C1/C2 后再 4/8；随后补 C3 图、MTP、长上下文、并发；
-4. EP 单独做（`providers/moe.py` 的 `expert_map` 骨架接 all-to-all）；
+Provider 级门禁之外，补上了**模型级**门禁，并把第一个 route-O 模型的 TP 固化：
+
+| 文件 | 改动 |
+|---|---|
+| `tileinfer/contracts/manifest.py` | `ModelManifest.parallel`（默认 `("single",)`，仅 route-O 生效；非默认才写入 `as_dict`/fingerprint） |
+| `tileinfer/resolve/decide.py` | route-O 模型在环境轴不被 `manifest.parallel` 覆盖时，追加 required gap `model.parallel`、`servable=false`；厂商模型不拦 |
+| `tileinfer/cli/doctor.py` | 加载 plan 的 manifest，route-O 模型声明不覆盖现场轴 → `parallel` FAIL |
+| `tileinfer/manifests/muse_glimmer.py` | `parallel=("single","tp")`（依据 TP=2 的 C1/C2/C3 与 `tolerance_tp`） |
+| `tileinfer/manifests/lfm3_1_7.py` | 显式 `parallel=("single",)`（short-conv 未做 TP，fail-closed） |
+| `tileinfer/manifests/nemotron_3_5.py` | `support.tp` 改为 `["1"]`，注明候选 provider 单卡、fail-closed |
+| `docs/acceptance.md` | 新增 §2.1.1：跨并行配置的 C2 必须由 `benchmark.tolerance_tp` 显式声明 |
+| `docs/verification-matrix.md` | Muse 增加 `C2-TP` 行（1.14e-3 ≤ 2e-3，token 集合相同） |
+
+MuseGlimmer 的 TP=2 设备证据（125K 单流 18.4 s/30.6 ms、128K×4 74.2 s max TTFT）见
+[`muse-glimmer-v3-validation-20261117.md`](muse-glimmer-v3-validation-20261117.md) §4.2。
+
+**2026-11-18 设备补充**（卡 0-7，HCCL rootinfo 临时移走/恢复）：
+
+- **Muse TP=2 C3**：6 图（PIECEWISE 3 + FULL 3）、`decode_calls=99`、99/99 命中、
+  `fallbacks=0`、0 errors；补上之前缺的"TP 下图捕获"证据；
+- **Qwen3.6 TP=4**：health 75 s、6 图、99/99 命中、0 回退；
+- **Qwen3.6 TP=8**：health 90 s、捕获 6 图，但**首个请求挂起**（`Running: 1 reqs`、
+  `No available shared memory broadcast block found in 60 seconds`、`decode_calls=0`）；
+  记为未验证，不写成支持。细节见 [`qwen36-tp4-tp8-20261118.md`](qwen36-tp4-tp8-20261118.md)。
+
+工具：`doctor` 新增 `hccl_rootinfo` 预检（空目录/空文件/非法 JSON 会直接说明原因），
+`scripts/tp-smoke.sh <model> <tp>` 做 plan+doctor 预检并打印设备命令（不占卡）。
+
+## 5. 仍未做
+
+1. **LFM3 provider TP**：short-conv 的 depthwise 通道切分 + state 布局；验证后再加 `tp`。
+2. **Nemotron provider TP**：先闭合 TP1 的 C2/MTP，再做 Mamba2（本地 head/state）与
+   MoE TP-shard（`expert_map` 留给 EP）。
+3. **Qwen3.6 TP=8** 的挂起（厂商/HCCL/图路径）；TP=2/4 已过 C1/C3。TP 下的性能/并发/
+   长上下文仍未做；控制模型，点到为止。
+4. **EP / DP / PP**：EP 单独做；DP 主要校验 metrics 按 rank；PP 延后。
 5. `prewarm`/AOT 的规格乘上每 rank 的 local heads（只在我们自己的 TileLang 内核进多卡时需要）。
 
 停止条件：让 provider TP 安全需要改/绕过厂商分布式 plumbing → 收缩为"厂商并行可用、我方

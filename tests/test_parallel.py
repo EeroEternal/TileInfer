@@ -11,6 +11,8 @@ to add later without changing the architecture:
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 from tileinfer.contracts.capabilities import (
@@ -21,6 +23,7 @@ from tileinfer.contracts.capabilities import (
 )
 from tileinfer.contracts.plan import Plan
 from tileinfer.manifests.lfm3_1_7 import LFM3_1_7
+from tileinfer.manifests.muse_glimmer import MUSE_GLIMMER
 from tileinfer.manifests.nemotron_3_5 import NEMOTRON_3_5_DRAFT
 from tileinfer.manifests.qwen3_6 import QWEN3_6
 from tileinfer.resolve.decide import decide
@@ -97,11 +100,13 @@ def test_vendor_selection_survives_tp_and_the_plan_records_it() -> None:
 
 
 def test_single_only_provider_is_refused_under_tp() -> None:
-    # LFM3's short-conv state provider is declared single-card only (honest today), so a
-    # TP=2 plan must report the capability as a gap instead of installing it.
+    # LFM3 is route O: both the model class and its short-conv state provider are declared
+    # single-card only, so a TP=2 plan must report both gaps instead of installing either.
     plan, report = decide(LFM3_1_7, _vendor_env(tp_size=2))
     assert report.servable is False
-    assert [gap.capability for gap in report.gaps] == ["state.linear"]
+    capabilities = [gap.capability for gap in report.gaps]
+    assert "state.linear" in capabilities
+    assert "model.parallel" in capabilities
     assert plan.selection("state.linear") is None
 
 
@@ -114,6 +119,41 @@ def test_candidates_are_refused_under_tp_and_the_reason_says_why() -> None:
     gap = next(g for g in report.gaps if g.capability == "state.linear")
     assert "no support for parallel" in gap.reason
     assert "tileinfer.mamba2_state" in gap.reason
+
+
+def test_route_o_model_parallel_is_declared_and_gated() -> None:
+    # MuseGlimmer is our model class and has TP evidence; a TP=2 plan is servable.
+    assert MUSE_GLIMMER.parallel == ("single", "tp")
+    plan, report = decide(MUSE_GLIMMER, _vendor_env(tp_size=2))
+    assert report.servable is True
+    assert plan.parallel == ("tp",)
+
+    # LFM3's short convolution is single-card only; TP must fail closed at the model level,
+    # not just at the provider level, because the model class itself is ours.
+    plan, report = decide(LFM3_1_7, _vendor_env(tp_size=2))
+    assert report.servable is False
+    model_gap = next(g for g in report.gaps if g.capability == "model.parallel")
+    assert model_gap.required
+    assert "parallel=['single']" in model_gap.reason
+
+
+def test_vendor_served_model_is_not_gated_by_its_single_default() -> None:
+    # A vendor-served manifest (no model_impl) leaves sharding to vllm-ascend: Qwen3.6 at
+    # TP=2 must stay servable even though the manifest does not carry a TP claim of ours.
+    plan, report = decide(QWEN3_6, _vendor_env(tp_size=2))
+    assert report.servable is True
+    assert plan.parallel == ("tp",)
+    assert not any(g.capability == "model.parallel" for g in report.gaps)
+
+
+def test_manifest_rejects_an_invalid_parallel_claim() -> None:
+    with pytest.raises(ValueError, match="unknown parallel modes"):
+        dataclasses.replace(LFM3_1_7, parallel=("tensor",)).validate()
+
+
+def test_muse_tp_claim_has_a_cross_tp_c2_tolerance() -> None:
+    assert "tolerance_tp" in MUSE_GLIMMER.benchmark
+    assert "tp" in MUSE_GLIMMER.parallel
 
 
 def test_plan_round_trips_its_parallel_axes() -> None:

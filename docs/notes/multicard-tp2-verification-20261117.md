@@ -143,7 +143,7 @@ mv /etc/hccl_rootinfo.json.bak-empty /etc/hccl_rootinfo.json   # 已恢复
 | bridge 在 TP 进程安装、全厂商选择 | ✅ |
 | C1 能跑（health + 完整输出） | ✅ |
 | C3 能上图（6 图 / 15 命中 / 0 回退） | ✅ |
-| C2 跑对（与 TP1/HF 逐位或容差） | 未做（本轮只发了一个请求，没有对照） |
+| C2 跑对（跨 TP） | **不声明**：Qwen3.6 没有 `benchmark.tolerance_tp`，且实测第 7 token 分叉（见 [`qwen36-c2-tp1-vs-tp2-20261117.md`](qwen36-c2-tp1-vs-tp2-20261117.md)）；按 [`acceptance.md`](../acceptance.md) §2.1.1，只能写"TP=2 可运行" |
 | 性能（TTFT/TPOT/吞吐） | 未测 |
 | 我方 provider 的 TP 数值 | 未涉及（全厂商路径） |
 
@@ -159,5 +159,9 @@ mv /etc/hccl_rootinfo.json.bak-empty /etc/hccl_rootinfo.json   # 已恢复
 
 ## 6. 下一步
 
-1. **C2**：同一请求在 TP=1 与 TP=2 下比较 token / logprobs（或与 HF 参考），补上"跑对"；
-2. 再谈 Phase 1（我方 provider 的 TP 数值正确性）——本轮没有触发任何非厂商实现。
+1. **C2 口径已定**（[`acceptance.md`](../acceptance.md) §2.1.1，2026-11-18）：同配置是严格门；
+   跨 TP 只有在 manifest 声明 `tolerance_tp` 时才判。Qwen3.6 未声明，所以保持"可运行、
+   非数值等价"，不补"跨 TP 跑对"。
+2. **Provider TP**：MuseGlimmer（route O）已声明 `parallel=("single","tp")` 并有 TP=2 证据
+   （见 [`muse-glimmer-v3-validation-20261117.md`](muse-glimmer-v3-validation-20261117.md) §4.2）；
+   LFM3 与 Nemotron 的 provider TP 仍未做，当前 fail-closed。

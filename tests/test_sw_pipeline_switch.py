@@ -22,6 +22,7 @@ import os
 
 import pytest
 
+pytest.importorskip("tilelang")
 from tileinfer.kernels.attention import paged_decode_ascend950 as mod
 
 

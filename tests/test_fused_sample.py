@@ -9,6 +9,7 @@ import math
 
 import pytest
 
+pytest.importorskip("tilelang")
 from tileinfer.kernels.sampling import fused_sample as fs
 
 

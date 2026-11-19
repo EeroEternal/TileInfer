@@ -27,6 +27,37 @@ from typing import Any, Dict, List, Optional, Tuple
 
 PASS, FAIL, SKIP = "PASS", "FAIL", "SKIP"
 
+#: HCCL's default rankTable/rootinfo path.  If it exists, HCCL treats it as an input file;
+#: an empty *directory* there makes TP>1 fail with ``RootInfoDetect failed`` before any
+#: network exchange.  Checked by ``doctor`` so the failure is explained before a run.
+HCCL_ROOTINFO = "/etc/hccl_rootinfo.json"
+
+
+def hccl_rootinfo_problem(path: Optional[str] = None) -> str:
+    """Return a human-readable problem with the HCCL rootinfo path, or ``""``.
+
+    Pure enough to unit-test: it only inspects the given path.  A missing path is the
+    healthy case (HCCL falls back to its own rootinfo exchange).
+    """
+    target = path or os.environ.get("TILEINFER_HCCL_ROOTINFO", HCCL_ROOTINFO)
+    if not os.path.exists(target):
+        return ""
+    if os.path.isdir(target):
+        return (
+            f"{target} is a directory; HCCL reads it as a rankTable file and TP>1 fails "
+            "with RootInfoDetect. Remove/fix it on the host (do not encode this in code)."
+        )
+    if not os.path.isfile(target):
+        return f"{target} is not a regular file; HCCL cannot use it as a rankTable file."
+    try:
+        if os.path.getsize(target) == 0:
+            return f"{target} is an empty file; HCCL cannot parse it as a rankTable."
+        with open(target, encoding="utf-8") as fh:
+            json.load(fh)
+    except Exception as exc:
+        return f"{target} is not valid JSON ({type(exc).__name__}: {exc})."
+    return ""
+
 
 class Report:
     def __init__(self) -> None:
@@ -173,14 +204,54 @@ def _check_parallel(report: Report, plan: Optional[Any]) -> None:
         provider = known.get(selection.provider)
         if provider is not None and not parallel_supports(provider.parallel, live_axes):
             bad.append(f"{selection.provider} supports {list(provider.parallel)}")
+
+    # Route-O models ship their own class, so their declared axes matter even when every
+    # capability row is vendor-served (MuseGlimmer is exactly this case).
+    try:
+        from ..manifests import find_manifest
+
+        manifest = find_manifest(plan.model.manifest)
+    except Exception:
+        manifest = None
+    if manifest is not None and getattr(manifest, "model_impl", ""):
+        if not parallel_supports(manifest.parallel, live_axes):
+            bad.append(
+                f"model {manifest.manifest_id} declares parallel={list(manifest.parallel)}"
+            )
     if bad:
         report.add(
             "parallel",
             FAIL,
-            f"non-vendor selections do not cover parallel={list(live_axes)}: {bad}",
+            f"parallel={list(live_axes)} is not covered by: {bad}",
         )
     else:
         report.add("parallel", PASS, f"plan={list(plan_axes)} live={list(live_axes)}")
+
+
+def _check_hccl_rootinfo(report: Report) -> None:
+    """Before a sharded run, verify HCCL's rootinfo path is not a directory/empty file."""
+    try:
+        from ..resolve.probe import probe
+
+        env = probe()
+    except Exception as exc:
+        report.add("hccl_rootinfo", FAIL, f"cannot probe the environment: {exc}")
+        return
+    if all(
+        size == 1
+        for size in (env.tp_size, env.ep_size, env.dp_size, env.pp_size)
+    ):
+        report.add("hccl_rootinfo", SKIP, "single-card run; HCCL rootinfo not required")
+        return
+    problem = hccl_rootinfo_problem()
+    if problem:
+        report.add("hccl_rootinfo", FAIL, problem)
+    else:
+        report.add(
+            "hccl_rootinfo",
+            PASS,
+            f"{os.environ.get('TILEINFER_HCCL_ROOTINFO', HCCL_ROOTINFO)} is absent or valid",
+        )
 
 
 def _check_imports(report: Report) -> None:
@@ -249,8 +320,8 @@ def _check_metrics(report: Report, path: Optional[str] = None) -> None:
 def _collect(report: Report, metrics_path: str) -> None:
     _check_versions(report)
     plan = _check_plan(report)
-    _check_support(report, plan)
     _check_parallel(report, plan)
+    _check_hccl_rootinfo(report)
     _check_imports(report)
     _check_bridge(report, plan)
     _check_metrics(report, metrics_path)

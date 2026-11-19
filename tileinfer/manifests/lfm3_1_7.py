@@ -112,4 +112,8 @@ LFM3_1_7 = ModelManifest(
     },
     source="docs/notes/lfm3-adaptation.md",
     model_impl="tileinfer.bridge.models.lfm3",
+    # Validated single-card only.  LFM3's short convolution is depthwise over the full
+    # channel count, so TP would need a per-rank channel shard and a verified state layout;
+    # until that exists the decision refuses TP instead of feeding it sharded tensors.
+    parallel=("single",),
 )

@@ -6,7 +6,9 @@ Target: `/home/models/Muse-Glimmer-30B` (52 dense layers, hidden 6656, 32Q/2KV G
 **2026-11-17 update (P0/P1):** re-verified C1/C3 on the current tree with `.venv_lfm3`
 (transformers 5.17.0) and `PYTHONPATH=/home/zxs/triton-ascend-3.2.2`. Output:
 `' Paris. It is the most populous'`; graph metrics: 8 captured graphs (PIECEWISE 4 + FULL 4),
-8/8 decode hits, 0 fallbacks. C2/C4 were not re-measured in this run.
+8/8 decode hits, 0 fallbacks. C2 and C4 were measured separately in
+[`muse-glimmer-v3-validation-20261117.md`](muse-glimmer-v3-validation-20261117.md); this
+P0/P1 run did not repeat them.
 
 **Runtime form: V3 only.** The declaration lives in `tileinfer/manifests/muse_glimmer.py`; the
 upstream-facing implementation lives in `tileinfer/bridge/models/` (`muse_glimmer.py` for the
@@ -256,8 +258,10 @@ The bridge hosts vendor-absent models end to end, with no V2 involvement:
   tokenizer is `TokenizersBackend`), NNAL/ATB 9.2.0-beta.1, triton-ascend 3.2.2, CANN 9.3.0.
   Commands and numbers: [`muse-glimmer-v3-validation-20261117.md`](muse-glimmer-v3-validation-20261117.md).
 
-Open: the C2 benchmark sample (first-token top-5) is not captured, so numeric acceptance is
-not wired yet.
+C2 is now wired: `manifests/muse_glimmer.py` carries a first-token top-5 frozen from the
+float32 CPU oracle (`tools/muse/c2_oracle.py`), with a declared bf16 tolerance and a
+`tools/muse/check_c2.py` checker. The served model matched the oracle's token set exactly
+(top-1 diff 3.7e-5; max top-5 diff 0.059).
 
 ## Pre-existing .ernest test failures (not from this work, verified via git stash)
 

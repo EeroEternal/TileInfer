@@ -67,6 +67,24 @@ Notes:
 - The ATEM parser is required for this checkpoint: content arrives in the `reasoning` channel
   until the model switches to the user channel.
 
+## 4.1 TP=2
+
+Host prerequisite: this box has `/etc/hccl_rootinfo.json` as an **empty directory**, which
+makes HCCL fail with `Failed to parse the ranktable file`. Move it aside for the run and put it
+back afterwards; do not encode this in the service.
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=2,3
+python -m vllm.entrypoints.openai.api_server --model /home/models/Muse-Glimmer-30B \
+  --served-model-name muse --trust-remote-code --max-model-len 131072 \
+  --max-num-seqs 4 --gpu-memory-utilization 0.85 --reasoning-parser atem \
+  --tensor-parallel-size 2 --port 8360
+python tools/muse/check_c2.py --base-url http://127.0.0.1:8360 --tp-size 2
+```
+
+Measured on 2026-11-18: 125K single -> TTFT 18.4 s / TPOT 30.6 ms; 128K x 4 (prefix cache off)
+-> 4/4 x 64 tokens, wall 76.1 s, max TTFT 74.2 s.
+
 ## 5. Smoke
 
 ```bash
@@ -76,8 +94,17 @@ curl -s localhost:8360/v1/chat/completions -H 'Content-Type: application/json' -
   "max_tokens":64,"temperature":0}'
 ```
 
-Expected: HTTP 200, non-empty `reasoning`/`content`. Numeric acceptance (C2) is **not**
-wired yet; see `docs/notes/muse-glimmer-v3-validation-20261117.md` §6.
+Expected: HTTP 200, non-empty `reasoning`/`content`.
+
+C2 (numeric parity) uses the frozen first-token top-5 in the manifest:
+
+```bash
+python tools/muse/c2_oracle.py --out /tmp/muse-c2.json   # float32 CPU oracle (optional)
+python tools/muse/check_c2.py --base-url http://127.0.0.1:8360
+```
+
+The checker exits 0 when the token set matches and the logprobs are inside the declared bf16
+tolerance. See `docs/notes/muse-glimmer-v3-validation-20261117.md` §4.1.
 
 ## 6. Troubleshooting
 

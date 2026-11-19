@@ -28,11 +28,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install pytest pytest-timeout
+          pip install pytest pytest-timeout safetensors numpy
           pip install -e .
 
       - name: Run the device-free suite
-        run: pytest tests -m "not npu" -q -p no:warnings
+        run: python -m pytest tests -m "not npu" -q -p no:warnings
 
       - name: Smoke-test the public API on CPU
         run: python examples/quickstart.py --backend reference --device cpu

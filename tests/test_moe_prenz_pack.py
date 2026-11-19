@@ -10,6 +10,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+pytest.importorskip("tilelang")
 from tileinfer.kernels.moe.prenz import (
     compact_nz_c0,
     pack_nd_to_compact_nz,

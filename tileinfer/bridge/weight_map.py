@@ -13,13 +13,10 @@ contains no engine objects.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
-from typing import Any, Iterable, Mapping, Optional, Sequence, Tuple
+from dataclasses import dataclass
+from typing import Any, Iterable, Mapping, Optional, Tuple
 
 import torch
-
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.utils import is_pp_missing_parameter
 
 
 @dataclass(frozen=True)
@@ -100,6 +97,9 @@ def load_weights(
     spec: WeightMapSpec,
 ) -> set[str]:
     """Load ``weights`` into ``module`` using ``spec`` and return loaded parameter names."""
+    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+    from vllm.model_executor.models.utils import is_pp_missing_parameter
+
     params = dict(module.named_parameters())
     loaded: set[str] = set()
     for raw_name, tensor in weights:
