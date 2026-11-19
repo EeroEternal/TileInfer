@@ -70,11 +70,6 @@ _STATUS: Dict[str, Any] = {
 }
 
 
-def _python_key(version: str) -> str:
-    parts = version.split(".")
-    return ".".join(parts[:2])
-
-
 def _versions() -> Dict[str, str]:
     import importlib.metadata
 
@@ -111,17 +106,22 @@ def _load_plan() -> tuple[Optional[Plan], Optional[str]]:
 
 
 def _gate(plan: Plan, live: Dict[str, str]) -> Optional[str]:
-    planned = plan.versions
-    if not os.environ.get("TILEINFER_BRIDGE_IGNORE_VERSIONS"):
-        for key, planned_value, live_value in (
-            ("vllm", planned.vllm, live["vllm"]),
-            ("vllm_ascend", planned.vllm_ascend, live["vllm_ascend"]),
-        ):
-            if planned_value != live_value:
-                return f"version gate: plan {key}={planned_value}, live={live_value}"
-        if _python_key(planned.python) != _python_key(live["python"]):
-            return f"version gate: plan python={planned.python}, live={live['python']}"
-    return None
+    from .runtime_gate import check_plan
+
+    axes = None
+    if not os.environ.get("TILEINFER_BRIDGE_IGNORE_PARALLEL"):
+        try:
+            from ..resolve.probe import probe
+
+            axes = probe().parallel_axes()
+        except Exception:
+            axes = None
+    return check_plan(
+        plan,
+        live,
+        parallel_axes=axes,
+        check_versions=not os.environ.get("TILEINFER_BRIDGE_IGNORE_VERSIONS"),
+    )
 
 
 def install() -> bool:
@@ -150,21 +150,21 @@ def install() -> bool:
                 logger.warning("TileInfer v3 bridge: %s; not injecting", gate)
                 return False
 
-            # Config adapters run here, before vLLM constructs ModelConfig.  They are
-            # plan-driven (no model-specific import in this module) and load-bearing: a
-            # failed adapter would leave the model unparseable, so fail closed.
-            if plan.config_impl:
-                from .config_adapter import install_config_adapter
+            # One ordered adapter pipeline: config adapter -> model register_config ->
+            # register_models -> parser.  It must run before vLLM constructs ModelConfig,
+            # and the model_table seam later reuses the cached result.
+            from .model_adapters import ModelAdapters
 
-                config = install_config_adapter(plan.config_impl)
-                _STATUS["configs"] = config
-                if not config.get("ok"):
-                    _STATUS["skipped"] = f"config adapter failed: {config.get('detail')}"
-                    logger.warning(
-                        "TileInfer v3 bridge: config adapter failed (%s); not injecting",
-                        config.get("detail"),
-                    )
-                    return False
+            adapters = ModelAdapters.from_plan(plan)
+            adapter_result = adapters.install()
+            _STATUS["model_adapters"] = adapter_result.as_dict()
+            if adapters.requested and not adapter_result.ok:
+                _STATUS["skipped"] = f"model adapters failed: {adapter_result.detail}"
+                logger.warning(
+                    "TileInfer v3 bridge: model adapters failed (%s); not injecting",
+                    adapter_result.detail,
+                )
+                return False
 
             metrics.COUNTERS.plan_id = plan.plan_id
             instrumentation = plan.instrumentation or {}

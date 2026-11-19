@@ -112,6 +112,11 @@ NEMOTRON_3_5_DRAFT = ModelManifest(
         "tp_note": "vendor path only; candidate providers are single-card and fail closed",
         "max_context_verified": 131072,
     },
+    hooks=(
+        "nemotron_non_gated_guard",
+        "nemotron_ascend_non_gated_experts",
+        "nemotron_shared_alias",
+    ),
     config_impl="tileinfer.bridge.nemotron_config:register_nemotron_h_alias",
     source="docs/notes/m5-nemotron-config.json; docs/notes/m5-nemotron-declaration.md",
 )

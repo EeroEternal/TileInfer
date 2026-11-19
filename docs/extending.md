@@ -75,7 +75,7 @@
 | **不可图** | 厂商能跑对，但该路径无法图捕获 | bridge 的接入点，**不是**提供者 |
 
 **它是什么**：一个能力契约的一条实现。三条来源：自研、引入（带来源与许可）、参考实现。
-"厂商原生"不是本层的来源——它是决策层可以直接选的条目（`resolve/vendor.py`），
+"厂商原生"不是本层的来源——它是决策层可以直接选的条目（`providers/vendor.py`），
 进计划表，不进 `providers/`。
 
 **能力不是算子。** 8 个 capability 是**契约粒度**，一个能力可以覆盖一组算子：`attention.linear`
@@ -96,6 +96,10 @@ Nemotron 的两个**候选**：`tileinfer.mamba2_state`、`tileinfer.nemotron_mo
 显式构造的 bring-up 计划里被选中并测试安装，但不会自动进入默认计划；真权重 C1/C2 通过前，
 Nemotron 的计划仍是 `servable=false`。
 
+**Provider 只有一套查找（P2）**：`providers/registry.py` 汇集 vendor / global /
+route-O / candidate 四类来源；`decide`、`doctor`、`impl_table` 都通过
+`find_provider()` / `providers_for()` 查询，不再各自拼表。
+
 **Provider 生命周期字段（P0）**：选择不再由 seam 认识 provider 名字决定，而是由声明决定：
 
 | 字段 | 值 | 作用 |
@@ -107,7 +111,24 @@ Nemotron 的计划仍是 `servable=false`。
 | `evidence_level` | `candidate` / `cpu` / `device-c1..c4` / `verified` | 机器可读的证据成熟度，和自由文本 `evidence` 分开 |
 
 `install_impl_table()` 不再硬编码 `tileinfer.short_conv`：它按 `ProviderSpec.install` 跳过
-模型内部消费的 provider，只把真正的算子表条目交给 binder。
+模型内部消费的 provider，只把真正的算子表条目交给 binder。`impl_table` 的 binder 现在由
+`ProviderSpec.install_actor` 声明（`module:function`），不再维护第二张
+`PROVIDER_BINDERS` 表。
+
+**统一模型 actor 流水线与安装动作（P2）**：`bridge/model_adapters.py` 按固定顺序执行
+config adapter → `model.register_config` → `model.register_models` → parser，并在
+`InstallResult` 中统一报告；`install_model_table` 与插件入口共用这条流水线及缓存。
+`ProviderSpec.install_actions` 现在可以声明 `impl_bind` / `vendor_patch` / `model_call`
+三种动作，`impl_table` 只执行声明，不再维护 binder 名称表。manifest 的 `hooks` 会进入
+`Plan.hooks`，`Plan.mechanisms` 记录实际会发生的注入类别。
+
+**统一安装结果与 plan 审计（P2）**：config adapter、model actor、provider binder、
+compat hook、seam 都返回 `InstallResult(ok/installed/skipped/failed/detail)`；`model_table`
+会把 actor 的 `{"registered": False}` 视为失败，不再 fail-open。`Plan.mechanisms` 记录实际
+注入动作（`config_adapter`、`model_register`、`impl_bind`、`model_call`、`vendor_patch` 等），
+`Plan.hooks` 记录声明要求的 CompatHook 名称；两者都不进入 plan id，属于审计元数据。
+`manifest.support` 现在是受校验的 `SupportSpec`，状态只允许
+`verified/partial/failed/not_applicable/not_implemented/not_verified`。
 
 **P1 共享工具**：模型接入的重复劳动已经收敛到三个位置：
 

@@ -31,11 +31,11 @@ from ..contracts.plan import (
 )
 from .probe import Environment
 from .vendor import VENDOR_PROVIDERS
-from ..providers.catalog import ROUTE_O_PROVIDERS
+from ..providers.global_ import GLOBAL_PROVIDERS
+from ..providers.registry import candidate_providers, global_provider, route_providers
 
-#: Global default providers.  Empty today, and empty is correct: candidates and route-O
-#: providers are model-scoped and must not become defaults for unrelated declarations.
-TILEINFER_PROVIDERS: dict = {}
+#: Compatibility alias.  Tests and bring-up tools may add a temporary default to this dict.
+TILEINFER_PROVIDERS = GLOBAL_PROVIDERS
 
 
 def _candidates(capability: Capability, manifest: ModelManifest) -> List:
@@ -45,16 +45,10 @@ def _candidates(capability: Capability, manifest: ModelManifest) -> List:
     in the gap report (so the gap is visibly implementable, not a blocker) without entering
     ``TILEINFER_PROVIDERS`` (which would make the plan claim support).
     """
-    try:
-        from ..providers import CANDIDATE_PROVIDERS
-    except Exception:  # pragma: no cover - providers are optional during early bring-up
-        return []
     return [
         provider
-        for provider in CANDIDATE_PROVIDERS
-        if provider.capability is capability
-        and provider.status == "candidate"
-        and _covers(provider, manifest)
+        for provider in candidate_providers(capability)
+        if provider.status == "candidate" and _covers(provider, manifest)
     ]
 
 
@@ -108,12 +102,18 @@ def _select(
     for cap_name in manifest.required_capabilities:
         capability = Capability(cap_name)
         vendor = VENDOR_PROVIDERS.get(capability)
-        ours = TILEINFER_PROVIDERS.get(capability)
-        # Model-scoped providers only exist for declarations that ship a model_impl.  They
-        # still go through ``_covers``; a short-conv provider cannot answer Qwen's GDN state
-        # just because both spell ``state.linear``.
+        ours = global_provider(capability)
+        # Model-scoped providers only exist for declarations that ship a model_impl.  A
+        # capability may have more than one model-scoped declaration, so match by covers.
         if ours is None and manifest.model_impl:
-            ours = ROUTE_O_PROVIDERS.get(capability)
+            ours = next(
+                (
+                    provider
+                    for provider in route_providers(capability)
+                    if _covers(provider, manifest)
+                ),
+                None,
+            )
         if ours is not None and ours.scope == "model" and not manifest.model_impl:
             ours = None
         order = ("vendor", "tileinfer") if policy == "vendor_first" else ("tileinfer", "vendor")
@@ -302,6 +302,43 @@ def decide(
     for name in access:
         assert name in ACCESS_POINTS
 
+    mechanisms: List[str] = ["plugin_entry", "attn_select", "method_wrap", "graph_hook"]
+    if manifest.config_impl:
+        mechanisms.append("config_adapter")
+    if manifest.model_impl:
+        mechanisms.append("model_register")
+    if manifest.reasoning_parser:
+        mechanisms.append("parser_register")
+    if manifest.hooks:
+        mechanisms.append("vendor_patch")
+    try:
+        from ..providers import find_provider
+
+        for selection in selections:
+            if selection.source == "vendor":
+                continue
+            spec = find_provider(selection.provider)
+            if spec is None:
+                continue
+            actions = tuple(getattr(spec, "install_actions", ()) or ())
+            if actions:
+                for action in actions:
+                    if action.kind == "impl_bind":
+                        mechanisms.append("impl_bind")
+                    elif action.kind == "model_call":
+                        mechanisms.append("model_call")
+                    elif action.kind == "vendor_patch":
+                        mechanisms.append("vendor_patch")
+            elif spec.install == "impl_table":
+                mechanisms.append("impl_bind")
+            elif spec.install == "model_impl":
+                mechanisms.append("model_call")
+            elif spec.install == "vendor_hook":
+                mechanisms.append("vendor_patch")
+    except Exception:  # pragma: no cover - providers are optional during early bring-up
+        pass
+    mechanisms = list(dict.fromkeys(mechanisms))
+
     plan = Plan(
         model=ModelRef(
             name=manifest.name,
@@ -330,6 +367,8 @@ def decide(
         servable=servable,
         support=dict(manifest.support),
         parallel=env.parallel_axes(),
+        mechanisms=tuple(mechanisms),
+        hooks=tuple(manifest.hooks),
     )
     plan.validate()
 

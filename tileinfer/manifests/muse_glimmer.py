@@ -119,5 +119,6 @@ MUSE_GLIMMER = ModelManifest(
         "tp": ["1", "2"],
         "max_context_verified": 131072,
     },
+    hooks=("muse_v_contiguous",),
     source="docs/notes/muse-glimmer-static.md",
 )

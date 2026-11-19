@@ -11,7 +11,7 @@ The implementations are pure torch and import no engine symbol.  Installation is
 
 from __future__ import annotations
 
-from ...contracts.capabilities import Capability, ProviderSpec
+from ...contracts.capabilities import Capability, InstallAction, ProviderSpec
 
 MAMBA2_STATE = ProviderSpec(
     capability=Capability.STATE_LINEAR,
@@ -30,6 +30,7 @@ MAMBA2_STATE = ProviderSpec(
     status="candidate",
     scope="global",
     install="impl_table",
+    install_actions=(InstallAction("impl_bind", actor="tileinfer.bridge.impl_table:_install_mamba2"),),
     graph_safe=True,
     evidence_level="device-c3",
 )
@@ -52,7 +53,12 @@ NEMOTRON_MOE = ProviderSpec(
     ),
     status="candidate",
     scope="global",
-    install="impl_table",
+    install="vendor_hook",
+    install_actions=(
+        InstallAction("vendor_patch", hook="nemotron_non_gated_guard"),
+        InstallAction("vendor_patch", hook="nemotron_ascend_non_gated_experts"),
+        InstallAction("vendor_patch", hook="nemotron_shared_alias"),
+    ),
     graph_safe=True,
     evidence_level="device-c3",
 )

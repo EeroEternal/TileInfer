@@ -15,34 +15,20 @@ from __future__ import annotations
 import importlib
 import logging
 import os
-from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Mapping, Sequence
+from typing import Any, Callable, Dict, List, Sequence
+
+from .results import InstallResult
 
 logger = logging.getLogger("tileinfer.bridge.impl_table")
 
-__all__ = ["install", "PROVIDER_BINDERS", "ImplReport"]
+__all__ = ["install", "ImplReport"]
 
 
-@dataclass
-class ImplReport:
-    ok: bool = True
-    installed: List[str] = field(default_factory=list)
-    failed: Dict[str, str] = field(default_factory=dict)
-    skipped: List[str] = field(default_factory=list)
+class ImplReport(InstallResult):
+    """Provider-binder result; the common install-result type with a fixed name."""
 
-    def as_dict(self) -> Dict[str, Any]:
-        return {
-            "ok": self.ok,
-            "installed": list(self.installed),
-            "failed": dict(self.failed),
-            "skipped": list(self.skipped),
-        }
-
-    def summary(self) -> str:
-        return (
-            f"impl_table: {len(self.installed)} installed, {len(self.failed)} failed, "
-            f"{len(self.skipped)} skipped"
-        )
+    def __init__(self) -> None:
+        super().__init__(name="impl_table")
 
 
 # The vLLM 0.23 names.  The aliases are needed because the mixers import the names by value.
@@ -136,36 +122,6 @@ def _install_mamba2_ascend_spec_metadata(report: ImplReport) -> None:
         report.failed["mamba2:ascend_spec_metadata"] = f"{type(exc).__name__}: {exc}"
 
 
-def _install_nemotron_moe(report: ImplReport) -> None:
-    """Install the vLLM/vllm-ascend non-gated MoE adapters (bridge code, not a kernel)."""
-    from tileinfer.bridge.compat_hooks import install_compat_hook
-
-    for hook in (
-        "nemotron_non_gated_guard",
-        "nemotron_ascend_non_gated_experts",
-        "nemotron_shared_alias",
-    ):
-        try:
-            result = install_compat_hook(hook)
-        except Exception as exc:  # noqa: BLE001 - report, never take the process down
-            report.failed[hook] = f"{type(exc).__name__}: {exc}"
-            continue
-        if result.get("ok") and not result.get("disabled"):
-            report.installed.append(f"moe:{hook}")
-        elif result.get("disabled"):
-            # The provider is being installed; a deliberately disabled vendor hook means
-            # the path is incomplete, so fail closed rather than silently run without it.
-            report.failed[f"moe:{hook}"] = result.get("detail", "hook disabled")
-        else:
-            report.failed[f"moe:{hook}"] = result.get("detail", "hook failed")
-
-
-PROVIDER_BINDERS: Mapping[str, Callable[[ImplReport], None]] = {
-    "tileinfer.mamba2_state": _install_mamba2,
-    "tileinfer.nemotron_moe": _install_nemotron_moe,
-}
-
-
 def install(plan: Any) -> ImplReport:
     """Install the plan's non-vendor providers through the v3 ``impl_table`` seam.
 
@@ -216,15 +172,64 @@ def install(plan: Any) -> ImplReport:
             continue
         seen.add(name)
         spec = find_provider(name)
-        if spec is not None and spec.install == "model_impl":
-            # The provider is called directly by our model implementation; there is no
-            # vLLM operator-table target to bind.  The declaration, not the seam, decides.
+        if spec is None:
+            report.ok = False
+            report.failed[name] = "no v3 provider binder for unknown provider (refusing to guess)"
+            continue
+
+        actions = tuple(getattr(spec, "install_actions", ()) or ())
+        if actions:
+            before = len(report.failed)
+            for action in actions:
+                if action.kind == "model_call":
+                    report.skipped.append(f"{name}: consumed inside model_impl")
+                    continue
+                if action.kind == "vendor_patch":
+                    from .compat_hooks import install_compat_hook
+
+                    result = install_compat_hook(action.hook)
+                    if result.ok and not result.get("disabled"):
+                        report.installed.append(f"{name}:{action.hook}")
+                    else:
+                        report.failed[f"{name}:{action.hook}"] = result.detail or "hook failed"
+                    continue
+                if action.kind == "impl_bind":
+                    try:
+                        module_name, _, actor = action.actor.partition(":")
+                        binder = getattr(importlib.import_module(module_name), actor)
+                        binder(report)
+                    except Exception as exc:  # noqa: BLE001
+                        report.failed[f"{name}:{action.actor}"] = (
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                    continue
+                report.failed[f"{name}:{action.kind}"] = "unknown install action"
+            if len(report.failed) > before:
+                report.ok = False
+            else:
+                report.installed.append(f"provider:{name}")
+            continue
+
+        # Legacy declaration path (install_actor / install=model_impl).  New providers
+        # should use install_actions so this branch eventually disappears.
+        if spec.install == "model_impl":
             report.skipped.append(f"{name}: consumed inside model_impl")
             continue
-        binder = PROVIDER_BINDERS.get(name)
+        binder = None
+        if spec.install_actor:
+            try:
+                module_name, _, actor = spec.install_actor.partition(":")
+                binder = getattr(importlib.import_module(module_name), actor)
+            except Exception as exc:  # noqa: BLE001
+                report.ok = False
+                report.failed[name] = (
+                    f"cannot resolve install_actor {spec.install_actor!r}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                continue
         if binder is None:
             report.ok = False
-            report.failed[name] = "no v3 provider binder (refusing to guess)"
+            report.failed[name] = "no v3 provider binder (no install_actions declared)"
             continue
         before = len(report.failed)
         binder(report)
