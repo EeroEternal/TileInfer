@@ -21,7 +21,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from .capabilities import CAPABILITIES, Capability
+from .capabilities import CAPABILITIES, Capability, normalize_parallel
 
 MANIFEST_SCHEMA_VERSION = 1
 
@@ -230,6 +230,13 @@ class ModelManifest:
     #: vendor has no architecture for it (``register_config`` / ``register_models`` actors).
     #: Empty means "the vendor already serves the model".
     model_impl: str = ""
+    #: Parallel axes this model implementation has been validated under.  It is enforced
+    #: only when ``model_impl`` is set (route O: the model class is ours).  A vendor-served
+    #: manifest leaves sharding to the vendor, so the decision must not block its TP path.
+    #: A route-O model that has only been validated single-card keeps ``("single",)`` and is
+    #: refused under any sharding axis; ``("single", "tp")`` is a claim that must be backed
+    #: by ``benchmark.tolerance_tp`` (cross-TP C2) and the verification matrix.
+    parallel: Tuple[str, ...] = ("single",)
     #: Dotted module path + actor that normalises/registers a checkpoint config before
     #: ``ModelConfig`` is built.  Empty means the vendor config path is sufficient.  The
     #: actor defaults to ``register``; ``module:actor`` selects a different entry point.
@@ -249,6 +256,7 @@ class ModelManifest:
             raise ValueError("unsupported manifest schema version")
         if not self.name or not self.manifest_id or not self.arch:
             raise ValueError("manifest needs name, manifest_id and arch")
+        normalize_parallel(self.parallel)
         if len(self.layer_types) != self.num_layers:
             raise ValueError(
                 f"layer_types has {len(self.layer_types)} entries for {self.num_layers} layers"
@@ -376,6 +384,10 @@ class ModelManifest:
         }
         if self.config_impl:
             data["config_impl"] = self.config_impl
+        # Omit the default so a vendor-served / single-card declaration keeps its old
+        # byte-identical shape (and plan id); a sharded claim is part of the model identity.
+        if self.parallel != ("single",):
+            data["parallel"] = list(self.parallel)
         if self.state is not None:
             data["state"] = self.state.as_dict()
         if self.mamba is not None:

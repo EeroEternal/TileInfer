@@ -264,6 +264,25 @@ def decide(
     if policy not in POLICIES:
         raise ValueError(f"unknown policy {policy!r}; known: {POLICIES}")
     selections, gaps = _select(manifest, env, policy, allow_candidates=allow_candidates)
+
+    # Route-O models ship their own model class, so the layer owns their sharding
+    # correctness.  A declaration that has only been validated single-card must not be
+    # installed under TP/EP/DP/PP even when every capability provider is fine: the model
+    # class itself would receive locally sharded tensors.  Vendor-served manifests leave
+    # sharding to the vendor and are deliberately not gated here.
+    model_parallel_reason = ""
+    if manifest.model_impl and not parallel_supports(manifest.parallel, env.parallel_axes()):
+        model_parallel_reason = (
+            f"model implementation {manifest.model_impl} declares parallel="
+            f"{list(manifest.parallel)} but the environment is {list(env.parallel_axes())}"
+        )
+        gaps.append(
+            Gap(
+                capability="model.parallel",
+                required=True,
+                reason=model_parallel_reason,
+            )
+        )
     servable = not any(g.required for g in gaps)
 
     # Route O: the declaration names the module that owns the missing upstream model.
@@ -325,6 +344,8 @@ def decide(
             f"device={env.device_type or 'unknown'}",
             f"parallel={list(env.parallel_axes())} "
             f"(tp={env.tp_size}, ep={env.ep_size}, dp={env.dp_size}, pp={env.pp_size})",
+            f"model_parallel={list(manifest.parallel)}"
+            + (f"; blocked: {model_parallel_reason}" if model_parallel_reason else ""),
             "the layer selects implementations; it does not own platform/worker/KV/graph",
             f"allow_candidates={bool(allow_candidates)}",
         ],

@@ -105,7 +105,11 @@ NEMOTRON_3_5_DRAFT = ModelManifest(
         "vision": "not_applicable",
         "mtp": "failed",
         "quant": ["bf16"],
-        "tp": ["1", "2", "4", "8"],
+        # Vendor-path TP=2/4/8 bring-up only: our Mamba2/MoE candidates declare
+        # parallel=("single",) and the decision refuses them under sharding until they are
+        # validated.  Do not read this as provider TP support.
+        "tp": ["1"],
+        "tp_note": "vendor path only; candidate providers are single-card and fail closed",
         "max_context_verified": 131072,
     },
     config_impl="tileinfer.bridge.nemotron_config:register_nemotron_h_alias",

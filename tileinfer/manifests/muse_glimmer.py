@@ -88,6 +88,7 @@ MUSE_GLIMMER = ModelManifest(
         "measured": "2026-11-17, Ascend950PR bf16 vs float32 reference; top1 diff 3.7e-5, top5 max 0.059",
     },
     model_impl="tileinfer.bridge.models.muse_glimmer",
+    parallel=("single", "tp"),
     reasoning_parser="atem",
     reasoning_parser_impl="tileinfer.bridge.models.atem:AtemReasoningParser",
     support={
