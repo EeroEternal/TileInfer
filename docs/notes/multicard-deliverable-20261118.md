@@ -12,7 +12,7 @@
 | 3 | **Route-O 模型级 fail-closed**：自带模型类声明 `parallel`，不支持则 `servable=false` | ✅ | `contracts/manifest.py`、`resolve/decide.py`、`cli/doctor.py` |
 | 4 | 跨 TP 的 C2 口径：必须由 `benchmark.tolerance_tp` 显式声明 | ✅ | [`acceptance.md`](../acceptance.md) §2.1.1 |
 | 5 | `doctor` 的 parallel 门 + **HCCL rootinfo 预检** | ✅ | `cli/doctor.py`；`tests/test_hccl_preflight.py` |
-| 6 | MuseGlimmer TP=2：C1/C2/C3 + 128K×4 | ✅ | [`muse-glimmer-v3-validation-20261117.md`](muse-glimmer-v3-validation-20261117.md) §4.2（C2 1.14e-3 ≤ 2e-3；6 图、99/99、0 回退） |
+| 6 | MuseGlimmer TP=2：C1/C2/C3/**C4** + 128K×图/needle + 128K×4 | ✅ | [`muse-glimmer-v3-validation-20261117.md`](muse-glimmer-v3-validation-20261117.md) §4.2（C2 1.14e-3 ≤ 2e-3；C4 TPOT 24 ms、8K TTFT 0.62 s、8 路 279 tok/s、冷启动 75 s；128K×图 14/14、0 回退；needle `7391`） |
 | 7 | Qwen3.6 TP=2/4：C1/C3（厂商路径） | ✅ | [`qwen36-tp4-tp8-20261118.md`](qwen36-tp4-tp8-20261118.md)（6 图、99/99、0 回退） |
 | 8 | TP 预检脚本 | ✅ | `scripts/tp-smoke.sh <model> <tp>`（plan+doctor，不占卡） |
 
@@ -20,7 +20,7 @@
 
 **可以写：**
 - 多卡下不会装错：单卡-only 的 provider 和 route-O 模型会被拒绝（`servable=false`）；
-- **MuseGlimmer 在 TP=2 下 C1/C2/C3 通过**（C2 在声明的 `tolerance_tp` 内），128K×4 可跑；
+- **MuseGlimmer 在 TP=2 下 C1–C4 通过**（C2 在声明的 `tolerance_tp` 内；C4 为绝对门），128K×图/needle、128K×4 可跑；
 - **Qwen3.6 在 TP=2/4 下能跑、能上图、0 回退**（控制模型、厂商路径）；
 - `doctor` 能在 TP 运行前指出宿主 HCCL rootinfo 的问题。
 

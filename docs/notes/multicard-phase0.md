@@ -87,10 +87,13 @@ Provider 级门禁之外，补上了**模型级**门禁，并把第一个 route-
 MuseGlimmer 的 TP=2 设备证据（125K 单流 18.4 s/30.6 ms、128K×4 74.2 s max TTFT）见
 [`muse-glimmer-v3-validation-20261117.md`](muse-glimmer-v3-validation-20261117.md) §4.2。
 
-**2026-11-18 设备补充**（卡 0-7，HCCL rootinfo 临时移走/恢复）：
+**2026-11-18/19 设备补充**（卡 0-7，HCCL rootinfo 临时移走/恢复）：
 
 - **Muse TP=2 C3**：6 图（PIECEWISE 3 + FULL 3）、`decode_calls=99`、99/99 命中、
   `fallbacks=0`、0 errors；补上之前缺的"TP 下图捕获"证据；
+- **Muse TP=2 C4 + 128K×图（11-19）**：TPOT **23.9–24.1 ms**、8,675-token TTFT **0.62 s**、
+  8 路 **279.4 tok/s**、fresh-cache 冷启动 **75.2 s**；125,891-token 请求 6 图、14/14 命中、
+  0 回退；125,325-token needle content 恰为 `7391`、150/150、0 回退；
 - **Qwen3.6 TP=4**：health 75 s、6 图、99/99 命中、0 回退；
 - **Qwen3.6 TP=8**：health 90 s、捕获 6 图，但**首个请求挂起**（`Running: 1 reqs`、
   `No available shared memory broadcast block found in 60 seconds`、`decode_calls=0`）；

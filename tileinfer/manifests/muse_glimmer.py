@@ -86,6 +86,26 @@ MUSE_GLIMMER = ModelManifest(
         },
         "reference": "tools/muse/c2_oracle.py",
         "measured": "2026-11-17, Ascend950PR bf16 vs float32 reference; top1 diff 3.7e-5, top5 max 0.059",
+        # Absolute C4 gate for this vendor-absent model (no independent vendor arm exists).
+        # Measured with tools/muse/perf_probe.py; see the validation note §4/§4.2.
+        "c4_gate": {
+            "single_stream_tpot_ms": 100,
+            "ttft_8k_s": 3.0,
+            "eight_way_tok_s": 100,
+            "cold_start_s": 120,
+            "measured_tp1": {
+                "tpot_ms": 40.4,
+                "ttft_8k_s": 1.26,
+                "eight_way_tok_s": 175.4,
+                "cold_start_s": 38,
+            },
+            "measured_tp2": {
+                "tpot_ms": 24.0,
+                "ttft_8k_s": 0.62,
+                "eight_way_tok_s": 279.4,
+                "cold_start_s": 75.2,
+            },
+        },
     },
     model_impl="tileinfer.bridge.models.muse_glimmer",
     parallel=("single", "tp"),
@@ -96,6 +116,8 @@ MUSE_GLIMMER = ModelManifest(
         "vision": "not_implemented",
         "mtp": "not_implemented",
         "quant": ["bf16"],
+        "tp": ["1", "2"],
+        "max_context_verified": 131072,
     },
     source="docs/notes/muse-glimmer-static.md",
 )
