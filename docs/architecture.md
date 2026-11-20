@@ -68,7 +68,7 @@
 | **L1 模型层** | 每个模型一份**声明**（结构、注意力变体序列、KV 分组、量化、依赖的能力、基准样例）；config/weight/state 的纯数学和兼容逻辑也在这里。**会 import vLLM 的模型类放在 L5 `bridge/models/`** | 谁来提供实现 | 🟢 Qwen3.6、MuseGlimmer、LFM3、Nemotron 声明已落盘；路线 O 模型实现在 `bridge/models/` |
 | **L2 决策层** | 把（声明 × 现场能力 × 策略）解成一张计划表 + 一份缺口清单 | 实现长什么样 | 🟡 有零散开关，无计划产物 |
 | **L3 契约层** | 9 类能力契约（注意力 full / 滑窗 sliding / 线性 / MoE / 归一化 / 旋转 / 采样 / 状态 / 量化），纯接口 | 引擎、NPU、模型名 | 🟡 注意力已有 plan/run 契约 |
-| **L4 提供者层** | **只收厂商缺口的实现**；所有表通过 `providers/registry.py` 统一查找（自研 / 引入 / 参考）；厂商原生的条目只进计划表、不进本层。每个声明覆盖范围、生命周期（default/candidate）、作用域（global/model）、安装方式、graph_safe、证据（有基线给比值，无基线给绝对数 + 参考一致性） | 决策、引擎 | 🟡 LFM3 `tileinfer.short_conv`（模型作用域，C1/C3 过）；Nemotron 两个候选（Mamba2 / 非门控 MoE），非默认，C2 未过 |
+| **L4 提供者层** | **只收厂商缺口的实现**；所有表通过 `providers/registry.py` 统一查找（自研 / 引入 / 参考）；厂商原生的条目只进计划表、不进本层。每个声明覆盖范围、生命周期（default/candidate）、作用域（global/model）、安装方式、graph_safe、证据（有基线给比值，无基线给绝对数 + 参考一致性） | 决策、引擎 | 🟡 LFM3 `tileinfer.short_conv`（模型作用域，C1/C2/C3/C4 过）；Nemotron 两个候选（Mamba2 / 非门控 MoE），非默认，C2 教师强制 rank 通过、MTP greedy 闭合，TP8 out-of-scope |
 | **L5 选择性拦截层** | 唯一允许 import 上游的层；把计划翻译成"换哪张表、包哪个方法"；路线 O 的 vLLM 模型实现、`ModelAdapters`（config/model/parser 顺序流水线）、provider `install_actions`、weight map、compat hooks、统一 `InstallResult` 和 runtime gate 也在这里。**不占平台槽位** | 模型、策略 | 🟢 `model_table` 已用于 MuseGlimmer/LFM3，`impl_table` 已用于 LFM3/Nemotron；v2 已归档到 `legacy/v2/` |
 | **L6 内核层** | 内核 + 预编译内核集 + 内容寻址缓存 | 引擎、契约 | ✅ 四族内核已建，预编译未做 |
 
