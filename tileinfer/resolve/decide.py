@@ -30,9 +30,13 @@ from ..contracts.plan import (
     VersionTriangle,
 )
 from .probe import Environment
-from .vendor import VENDOR_PROVIDERS
 from ..providers.global_ import GLOBAL_PROVIDERS
-from ..providers.registry import candidate_providers, global_provider, route_providers
+from ..providers.registry import (
+    candidate_providers,
+    global_provider,
+    route_providers,
+    vendor_provider,
+)
 
 #: Compatibility alias.  Tests and bring-up tools may add a temporary default to this dict.
 TILEINFER_PROVIDERS = GLOBAL_PROVIDERS
@@ -101,7 +105,7 @@ def _select(
     gaps: List[Gap] = []
     for cap_name in manifest.required_capabilities:
         capability = Capability(cap_name)
-        vendor = VENDOR_PROVIDERS.get(capability)
+        vendor = vendor_provider(capability)
         ours = global_provider(capability)
         # Model-scoped providers only exist for declarations that ship a model_impl.  A
         # capability may have more than one model-scoped declaration, so match by covers.

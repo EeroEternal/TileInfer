@@ -200,7 +200,7 @@ class ProviderSpec:
     mandatory either way; a provider without one is a candidate, never a default.
 
     ``source`` still accepts ``vendor`` because the same shape describes the vendor entries
-    in the plan table (``resolve/vendor.py``); those are *selections*, not providers in
+    in the plan table (``providers/vendor.py``); those are *selections*, not providers in
     ``providers/``.
     """
 

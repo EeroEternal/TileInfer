@@ -447,7 +447,7 @@ def test_a_mamba2_provider_with_the_right_covers_can_fill_state_linear(monkeypat
     provider = ProviderSpec(
         capability=Capability.STATE_LINEAR,
         name="tileinfer.mamba2_state",
-        impl="tileinfer.providers.mamba2:Mamba2State",
+        impl="tileinfer.providers.nemotron.mamba2",
         source="tileinfer",
         graphable=False,
         covers={"mixer": "mamba2"},

@@ -21,6 +21,7 @@ from .registry import (
     records,
     records_for,
     route_providers,
+    vendor_provider,
 )
 from .vendor import VENDOR_PROVIDERS
 
@@ -34,6 +35,7 @@ PROVIDER_SPECS = provider_specs()
 
 __all__ = [
     "VENDOR_PROVIDERS",
+    "ROUTE_O_PROVIDERS",
     "GLOBAL_PROVIDERS",
     "CANDIDATE_PROVIDERS",
     "MAMBA2_STATE",
@@ -46,6 +48,7 @@ __all__ = [
     "records",
     "records_for",
     "global_provider",
+    "vendor_provider",
     "route_providers",
     "candidate_providers",
 ]
