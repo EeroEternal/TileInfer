@@ -5,7 +5,7 @@ model's cost be computed on a CPU laptop before anyone books a device window.
 
 * :mod:`~tileinfer.resolve.probe` answers "what does this machine have?".
 * :mod:`~tileinfer.resolve.decide` is the pure function "manifest x environment x policy".
-* :mod:`~tileinfer.resolve.vendor` holds the vendor provider catalogue (data only).
+* the vendor provider catalogue now lives in :mod:`tileinfer.providers.vendor`.
 """
 
 from __future__ import annotations

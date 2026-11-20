@@ -115,7 +115,7 @@ candidate_providers(capability)
 四类来源仍然存在，但只由 registry 解释：
 
 ```text
-vendor    resolve/vendor.py（兼容重导出 providers/vendor.py）
+vendor    providers/vendor.py
 global    providers/global_.py
 route_o   providers/catalog.py
 candidate providers/nemotron/

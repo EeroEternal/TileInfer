@@ -63,7 +63,7 @@ registry 与审计脚本预期不一致），与本次改动无关。
 | `tileinfer/contracts/plan.py` | `Plan.parallel`（写入/读取/校验/plan_id/摘要） |
 | `tileinfer/resolve/probe.py` | `Environment` 并行字段 + `parallel_axes()`；`probe()` 读 CLI/环境变量 |
 | `tileinfer/resolve/decide.py` | 选择层按 `provider.parallel ⊇ env.parallel_axes()` 过滤；计划写入 `parallel` |
-| `tileinfer/resolve/vendor.py` | 厂商条目声明全轴 |
+| `tileinfer/providers/vendor.py` | 厂商条目声明全轴 |
 | `tileinfer/cli/plan.py` | `--tp/--ep/--dp/--pp` |
 | `tileinfer/cli/doctor.py` | `parallel` 门 |
 

@@ -9,7 +9,7 @@ of where it was declared, and ``origin`` makes the source explicit for audit and
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, List, Tuple
 
 from ..contracts.capabilities import Capability, ProviderSpec
 from .catalog import ROUTE_O_PROVIDERS
@@ -69,21 +69,33 @@ def find_provider(name: str) -> ProviderSpec | None:
     return None
 
 
+def _default(spec: ProviderSpec | None) -> ProviderSpec | None:
+    return spec if spec is not None and spec.status == "default" else None
+
+
 def global_provider(capability: Capability) -> ProviderSpec | None:
-    return GLOBAL_PROVIDERS.get(capability)
+    """The selectable global default; a candidate in the table is not a default."""
+    return _default(GLOBAL_PROVIDERS.get(capability))
+
+
+def vendor_provider(capability: Capability) -> ProviderSpec | None:
+    """The vendor baseline for a capability, if vllm-ascend advertises one."""
+    return _default(VENDOR_PROVIDERS.get(capability))
 
 
 def route_providers(capability: Capability) -> Tuple[ProviderSpec, ...]:
+    """Selectable route-O providers; candidate route entries stay out of normal planning."""
     return tuple(
         record.spec
         for record in records_for(capability)
-        if record.origin == "route_o"
+        if record.origin == "route_o" and record.selectable
     )
 
 
 def candidate_providers(capability: Capability) -> Tuple[ProviderSpec, ...]:
+    """Candidates are intentionally non-selectable; they feed gap/bring-up paths."""
     return tuple(
         record.spec
         for record in records_for(capability)
-        if record.origin == "candidate"
+        if record.origin == "candidate" and record.spec.status == "candidate"
     )
