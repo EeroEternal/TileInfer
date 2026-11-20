@@ -2,6 +2,7 @@
 
 > 回答一个问题：**要加东西的时候，改哪儿、按什么顺序、怎么算加完了。**
 > 不含代码骨架——骨架会随实现变，规则不会。
+> 规范性约束见 [`development-rules.md`](development-rules.md)；两者冲突时以后者为准。
 
 ---
 
@@ -106,14 +107,12 @@ route-O / candidate 四类来源；`decide`、`doctor`、`impl_table` 都通过
 |---|---|---|
 | `status` | `default` / `candidate` | `candidate` 只能经 `allow_candidates` 的 bring-up 进入计划，计划仍 `servable=false` |
 | `scope` | `global` / `model` | `model` 只在声明了 `model_impl` 的模型内生效，避免 short-conv 误选 Qwen 的 GDN |
-| `install` | `impl_table` / `model_impl` / `vendor_hook` | 装进算子表、由我们的模型直接调用，或通过 vendor 钩子生效 |
+| `install_actions` | `impl_bind` / `vendor_patch` / `model_call` | 声明实际安装动作；旧 `install` / `install_actor` 仅用于兼容，新 provider 必须用 actions |
 | `graph_safe` | `bool` | 已实测图捕获/replay/无 host 同步，而不仅是“形状上可图” |
 | `evidence_level` | `candidate` / `cpu` / `device-c1..c4` / `verified` | 机器可读的证据成熟度，和自由文本 `evidence` 分开 |
 
-`install_impl_table()` 不再硬编码 `tileinfer.short_conv`：它按 `ProviderSpec.install` 跳过
-模型内部消费的 provider，只把真正的算子表条目交给 binder。`impl_table` 的 binder 现在由
-`ProviderSpec.install_actor` 声明（`module:function`），不再维护第二张
-`PROVIDER_BINDERS` 表。
+`install_impl_table()` 不再硬编码 `tileinfer.short_conv`：它按 `install_actions` 执行
+`impl_bind` / `vendor_patch` / `model_call`，不再维护 `PROVIDER_BINDERS` 这种第二张表。
 
 **统一模型 actor 流水线与安装动作（P2）**：`bridge/model_adapters.py` 按固定顺序执行
 config adapter → `model.register_config` → `model.register_models` → parser，并在
