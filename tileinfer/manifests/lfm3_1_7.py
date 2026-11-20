@@ -110,6 +110,7 @@ LFM3_1_7 = ModelManifest(
         "mtp": "not_applicable",
         "quant": ["bf16"],
     },
+    hooks=("lfm3_rope_global_buffer",),
     source="docs/notes/lfm3-adaptation.md",
     model_impl="tileinfer.bridge.models.lfm3",
     # Validated single-card only.  LFM3's short convolution is depthwise over the full

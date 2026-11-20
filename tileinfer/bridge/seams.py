@@ -26,24 +26,32 @@ The six mechanisms and where each lives:
 
 from __future__ import annotations
 
-import importlib
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from . import metrics
+from .results import InstallResult
 
 
-class SeamResult:
-    """Outcome of one seam: installed or not, and why."""
+class SeamResult(InstallResult):
+    """Outcome of one seam, expressed with the common install-result type."""
 
-    __slots__ = ("name", "ok", "detail")
-
-    def __init__(self, name: str, ok: bool, detail: str = "") -> None:
-        self.name = name
-        self.ok = ok
-        self.detail = detail
-
-    def as_dict(self) -> Dict[str, Any]:
-        return {"name": self.name, "ok": self.ok, "detail": self.detail}
+    def __init__(
+        self,
+        name: str,
+        ok: bool,
+        detail: str = "",
+        installed: Optional[Iterable[str]] = None,
+        skipped: Optional[Iterable[str]] = None,
+        failed: Optional[Dict[str, str]] = None,
+    ) -> None:
+        super().__init__(
+            name=name,
+            ok=ok,
+            installed=list(installed or []),
+            skipped=list(skipped or []),
+            failed=dict(failed or {}),
+            detail=detail,
+        )
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return f"SeamResult({self.name!r}, ok={self.ok}, detail={self.detail!r})"
@@ -219,50 +227,20 @@ def install_impl_table(plan: Any) -> SeamResult:
 
 
 def install_model_table(plan: Any) -> SeamResult:
-    """Register the model (and its chat parser) when the declaration names one.
+    """Run the plan's ordered model adapter pipeline (config -> model -> parser)."""
+    if plan is None:
+        return SeamResult("model_table", False, "no plan")
+    from .model_adapters import install_model_adapters
 
-    A vendor-served model leaves both fields empty and this seam is a no-op.  A model the
-    vendor lacks (MuseGlimmer is the first) ships its implementation in this repository:
-    ``plan.model_impl`` names a module with the ``register_config`` / ``register_models``
-    actors, and ``plan.reasoning_parser`` / ``reasoning_parser_impl`` name the chat-format
-    parser to register under vLLM's parser manager.  Imports and registrations are reported,
-    never raised: a broken optional model must not stop a vendor-served boot.
-    """
-    spec = str(getattr(plan, "model_impl", "") or "").strip()
-    parser = str(getattr(plan, "reasoning_parser", "") or "").strip()
-    parser_impl = str(getattr(plan, "reasoning_parser_impl", "") or "").strip()
-    if not spec and not parser:
-        return SeamResult("model_table", True, "no model replacement requested")
-
-    details: List[str] = []
-    if spec:
-        try:
-            module = importlib.import_module(spec)
-        except Exception as exc:  # noqa: BLE001 - report, never raise from a seam
-            return SeamResult("model_table", False, f"cannot import {spec!r}: {exc!r}")
-        for actor in ("register_config", "register_models"):
-            fn = getattr(module, actor, None)
-            if fn is None:
-                continue
-            try:
-                result = fn()
-            except Exception as exc:  # noqa: BLE001
-                return SeamResult("model_table", False, f"{spec}.{actor} raised {exc!r}")
-            details.append(f"{actor}: {result}")
-    if parser and parser_impl:
-        try:
-            from vllm.reasoning import ReasoningParserManager
-
-            module_name, _, class_name = parser_impl.partition(":")
-            parser_cls = getattr(importlib.import_module(module_name), class_name)
-            # 0.23's register_module takes the class as a KEYWORD; positionally it lands in
-            # ``force`` and raises.
-            ReasoningParserManager.register_module(parser, module=parser_cls)
-            details.append(f"parser {parser!r} registered")
-        except Exception as exc:  # noqa: BLE001
-            return SeamResult("model_table", False, f"parser registration failed: {exc!r}")
-    return SeamResult("model_table", True, "; ".join(details) or "nothing to register")
-
+    result = install_model_adapters(plan)
+    return SeamResult(
+        "model_table",
+        result.ok,
+        result.detail or result.summary(),
+        installed=result.installed,
+        skipped=result.skipped,
+        failed=result.failed,
+    )
 
 def install_method_wrappers(plan: Any) -> SeamResult:
     """Ordinary-method seam.  Currently only the dispatcher, which is the graph hook."""

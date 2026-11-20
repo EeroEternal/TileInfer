@@ -95,3 +95,21 @@ def test_compat_hook_disable_switch_is_honoured(monkeypatch) -> None:
     result = install_compat_hook("lfm3_rope_global_buffer")
     assert result["ok"] is True
     assert result["disabled"] is True
+
+
+def test_weight_map_module_imports_without_vllm() -> None:
+    import subprocess
+    import sys
+
+    code = (
+        "import sys; sys.modules['vllm'] = None; "
+        "import tileinfer.bridge.weight_map; print('ok')"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "ok" in result.stdout

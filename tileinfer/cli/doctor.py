@@ -169,6 +169,7 @@ def _check_parallel(report: Report, plan: Optional[Any]) -> None:
         report.add("parallel", SKIP, "no plan")
         return
     try:
+        from ..bridge.runtime_gate import check_plan
         from ..contracts.capabilities import parallel_supports
         from ..resolve.probe import probe
     except Exception as exc:  # pragma: no cover - defensive
@@ -178,32 +179,12 @@ def _check_parallel(report: Report, plan: Optional[Any]) -> None:
     env = probe()
     live_axes = env.parallel_axes()
     plan_axes = tuple(getattr(plan, "parallel", ("single",)))
-    if set(plan_axes) != set(live_axes):
-        report.add(
-            "parallel",
-            FAIL,
-            f"plan was built for parallel={list(plan_axes)} but this run is {list(live_axes)}; "
-            "rebuild with `tileinfer plan build --tp/--ep/--dp/--pp` "
-            "or set TILEINFER_TP_SIZE/TILEINFER_EP_SIZE/...",
-        )
+    reason = check_plan(plan, {}, parallel_axes=live_axes, check_versions=False)
+    if reason:
+        report.add("parallel", FAIL, reason)
         return
 
-    try:
-        from ..providers import CANDIDATE_PROVIDERS
-        from ..providers.catalog import ROUTE_O_PROVIDERS
-
-        known = {provider.name: provider for provider in CANDIDATE_PROVIDERS}
-        known.update({provider.name: provider for provider in ROUTE_O_PROVIDERS.values()})
-    except Exception:  # pragma: no cover - optional in early bring-up
-        known = {}
-
     bad = []
-    for selection in plan.selections:
-        if selection.source == "vendor":
-            continue
-        provider = known.get(selection.provider)
-        if provider is not None and not parallel_supports(provider.parallel, live_axes):
-            bad.append(f"{selection.provider} supports {list(provider.parallel)}")
 
     # Route-O models ship their own class, so their declared axes matter even when every
     # capability row is vendor-served (MuseGlimmer is exactly this case).
@@ -320,6 +301,7 @@ def _check_metrics(report: Report, path: Optional[str] = None) -> None:
 def _collect(report: Report, metrics_path: str) -> None:
     _check_versions(report)
     plan = _check_plan(report)
+    _check_support(report, plan)
     _check_parallel(report, plan)
     _check_hccl_rootinfo(report)
     _check_imports(report)

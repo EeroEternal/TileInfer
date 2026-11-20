@@ -11,10 +11,10 @@ from __future__ import annotations
 
 from typing import Dict
 
-from ..contracts.capabilities import Capability, ProviderSpec
+from ..contracts.capabilities import Capability, InstallAction, ProviderSpec
 
-ROUTE_O_PROVIDERS: Dict[Capability, ProviderSpec] = {
-    Capability.STATE_LINEAR: ProviderSpec(
+ROUTE_O_PROVIDERS: Dict[str, ProviderSpec] = {
+    "tileinfer.short_conv": ProviderSpec(
         capability=Capability.STATE_LINEAR,
         name="tileinfer.short_conv",
         impl="tileinfer.providers.state.short_conv:ShortConvState",
@@ -35,6 +35,7 @@ ROUTE_O_PROVIDERS: Dict[Capability, ProviderSpec] = {
         status="default",
         scope="model",
         install="model_impl",
+        install_actions=(InstallAction("model_call"),),
         graph_safe=True,
         evidence_level="device-c3",
     ),

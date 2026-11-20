@@ -154,40 +154,33 @@ decode_calls=16  hits=16  fallbacks=0  errors=0
 
 ### 4.4 C4：跑得快
 
-C1/C2/C3 的重跑只改了模型注册机制，没有改模型数学；下表沿用同一实现的测量，未在新计划下重做 p50/p90 门禁。新计划冒烟（1024 prompt + 64 output，conc=1）单请求 0.534 s，约 120 tok/s，与下表一致。
+2026-11-19 用统一 adapter/action 流水线重新测量；单卡 Ascend950PR，OpenAI serving，64 output tokens。probe 的实际 prompt token 数为 781/3058/5698（名义 1K/4K/8K）。并发没有 HF 参考，只记绝对吞吐。
 
-64 output tokens，512 引擎，1/4/16 并发：
-
-| prompt | conc | TTFT p50/p90 | TPOT | 吞吐 |
+| prompt tokens | conc | TTFT p50/p90 | TPOT | 吞吐 |
 |---|---|---|---|---|
-| 1024 | 1 | 195.8 / 195.8 ms | 6.29 ms | 107.9 tok/s |
-| 1024 | 4 | 89.6 / 89.7 ms | 7.37 ms | 461.4 tok/s |
-| 1024 | 16 | 285.9 / 363.4 ms | 7.90 ms | 1293.9 tok/s |
-| 4096 | 1 | 73.7 / 73.7 ms | 5.27 ms | 157.7 tok/s |
-| 4096 | 4 | 246.2 / 320.6 ms | 7.51 ms | 352.3 tok/s |
-| 4096 | 16 | 766.0 / 1226.3 ms | 14.28 ms | 610.7 tok/s |
-| 7680 | 1 | 138.7 / 138.7 ms | 5.30 ms | 135.3 tok/s |
-| 7680 | 4 | 396.9 / 474.0 ms | 9.16 ms | 264.9 tok/s |
-| 7680 | 16 | 1296.9 / 2126.2 ms | 23.29 ms | 364.3 tok/s |
+| 781 | 1 | 26.0 / 26.3 ms | 5.87 ms | 161.8 tok/s |
+| 781 | 4 | 91.0 / 92.0 ms | 9.78 ms | 361.1 tok/s |
+| 781 | 16 | 223.7 / 278.8 ms | 10.81 ms | 1119.8 tok/s |
+| 3058 | 1 | 72.8 / 84.5 ms | 5.91 ms | 143.9 tok/s |
+| 3058 | 4 | 248.0 / 270.2 ms | 10.55 ms | 288.4 tok/s |
+| 3058 | 16 | 603.1 / 965.8 ms | 15.43 ms | 622.7 tok/s |
+| 5698 | 1 | 125.5 / 135.4 ms | 5.96 ms | 128.0 tok/s |
+| 5698 | 4 | 408.0 / 494.9 ms | 11.87 ms | 226.7 tok/s |
+| 5698 | 16 | 1095.1 / 1757.3 ms | 20.46 ms | 405.2 tok/s |
 
-HF 参考（conc=1）：TTFT 349.7 / 78.9 / 148.9 ms，TPOT 13.77 / 11.69 / 11.73 ms（1K/4K/8K）。
+HF 参考（conc=1）：TTFT 349.7 / 78.9 / 148.9 ms，TPOT 13.77 / 11.69 / 11.73 ms（1K/4K/8K）。conc=1 的 TTFT 和 TPOT 均 ≤ 1.10× HF，**C4 通过**；4K/8K conc16 的 TPOT 仍是后续优化点。
 
-判定：
+第一版短卷积 decode 用 grouped `conv1d`，TPOT 约 138 ms/token；改成 7 次向量乘加 + 连续状态布局后降到 **5–7 ms**，这是本次性能达标的关键。
 
-- conc=1：TTFT 和 TPOT 均 ≤ 1.10× HF，**C4 通过**；
-- conc>1：没有 HF 参考，按绝对吞吐记录；1K/4K/8K 的 conc16 分别为 1293.9 / 610.7 / 364.3 tok/s；
-- 4K/8K conc16 的 TPOT 升到 14.28 / 23.29 ms，是下一步优化点；
-- 1K conc1 的 TTFT 高于 conc4，属于首轮图重放/缓存效应，趋势以 TPOT 和吞吐为准。
-
-一个重要的过程数据：第一版短卷积 decode 用 grouped `conv1d`，TPOT 约 **138 ms/token**（比 HF 慢 10 倍）。改成 7 次向量乘加 + 连续状态布局后降到 **5–7 ms**，这是本次性能达标的关键。
-
+### 4.5 复现命令
 ### 4.5 复现命令
 
 ```bash
-cd /home/userlist/ww/TileInfer_xjx1
-/home/userlist/ww/py_venv/bin/pip install --no-deps --no-build-isolation \
-    --target /tmp/tileinfer_pkg .
-/home/userlist/ww/py_venv/bin/python -m tileinfer.cli.plan build \
+cd /home/xjx/TileInfer
+source scripts/env-ascend102.sh
+source .venv_lfm3/bin/activate
+export PYTHONPATH=/home/zxs/triton-ascend-3.2.2:$PYTHONPATH
+python -m tileinfer.cli.plan build \
     --model /home/models/LFM3-1.7B --out /tmp/lfm3-plan.json
 
 PYTHONPATH=/tmp/tileinfer_pkg \

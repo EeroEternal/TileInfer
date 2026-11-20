@@ -207,6 +207,50 @@ class MoESpec:
         return data
 
 
+SUPPORT_STATUSES = {"verified", "partial", "failed", "not_applicable", "not_implemented", "not_verified"}
+_SUPPORT_KEYS = {
+    "text",
+    "vision",
+    "audio",
+    "mtp",
+    "quant",
+    "tp",
+    "tp_note",
+    "max_context_verified",
+    "notes",
+}
+
+
+class SupportSpec(dict):
+    """Validated verification scope copied into plans and the doctor report."""
+
+    def __init__(self, value: Optional[Mapping[str, Any]] = None) -> None:
+        data = dict(value or {})
+        unknown = sorted(set(data) - _SUPPORT_KEYS)
+        if unknown:
+            raise ValueError(f"unknown support keys {unknown}; known: {sorted(_SUPPORT_KEYS)}")
+        for key in ("text", "vision", "audio", "mtp"):
+            if key in data:
+                status = str(data[key])
+                if status not in SUPPORT_STATUSES:
+                    raise ValueError(
+                        f"support[{key!r}]={status!r}; known: {sorted(SUPPORT_STATUSES)}"
+                    )
+                data[key] = status
+        for key in ("quant", "tp"):
+            if key in data:
+                data[key] = list(data[key])
+        if "max_context_verified" in data and data["max_context_verified"] is not None:
+            data["max_context_verified"] = int(data["max_context_verified"])
+        super().__init__(data)
+
+    def as_dict(self) -> Dict[str, Any]:
+        return dict(self)
+
+    def validate(self) -> None:
+        SupportSpec(self)
+
+
 @dataclass(frozen=True)
 class ModelManifest:
     """One model, one declaration (single source of truth)."""
@@ -247,9 +291,16 @@ class ModelManifest:
     reasoning_parser_impl: str = ""
     #: Machine-readable verification scope (text/vision/mtp/quant/tp/context), so a plan,
     #: doctor report, or evidence page cannot turn "C1 ran" into "fully supported".
-    support: Dict[str, Any] = field(default_factory=dict)
+    support: SupportSpec = field(default_factory=SupportSpec)
+    #: Compat-hook names this declaration needs.  Kept out of the content-addressed manifest
+    #: fingerprint (like ``support``) but copied into Plan.hooks for the deployment audit.
+    hooks: Tuple[str, ...] = ()
     source: str = "docs/notes/op-coverage-qwen36.md"
     schema_version: int = MANIFEST_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.support, SupportSpec):
+            object.__setattr__(self, "support", SupportSpec(self.support))
 
     def validate(self) -> None:
         if self.schema_version != MANIFEST_SCHEMA_VERSION:
@@ -325,6 +376,7 @@ class ModelManifest:
         # A declaration may ship before its C2 sample is captured; it then cannot be used for
         # numeric acceptance, but it can still drive deployment (this is how a brand-new model
         # is onboarded).  A partially filled sample is an error, never a silent pass.
+        self.support.validate()
         if self.benchmark:
             for key in ("prompt", "max_tokens", "top5"):
                 if key not in self.benchmark:
@@ -352,6 +404,7 @@ class ModelManifest:
         # Support is evidence metadata, not a deployment fact: recording that MTP failed
         # must not change a content-addressed plan id (and therefore the plan itself).
         data.pop("support", None)
+        data.pop("hooks", None)
         payload = json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
         import hashlib
 
@@ -379,7 +432,8 @@ class ModelManifest:
             "model_impl": self.model_impl,
             "reasoning_parser": self.reasoning_parser,
             "reasoning_parser_impl": self.reasoning_parser_impl,
-            "support": dict(self.support),
+            "support": self.support.as_dict(),
+            "hooks": list(self.hooks),
             "source": self.source,
         }
         if self.config_impl:

@@ -22,6 +22,21 @@ from .capabilities import normalize_parallel
 
 SCHEMA_VERSION = 1
 
+#: Actual injection actions a plan may record.  These are finer than ACCESS_POINTS:
+#: config adapters and vendor patches have no access-point name of their own.
+PLAN_MECHANISMS = {
+    "plugin_entry",
+    "config_adapter",
+    "model_register",
+    "parser_register",
+    "impl_bind",
+    "model_call",
+    "vendor_patch",
+    "attn_select",
+    "method_wrap",
+    "graph_hook",
+}
+
 #: The only mechanisms a plan may name.  This closed list is the real cap: a seventh name is
 #: rejected on read, so a config file cannot invent a mechanism.  Six are defined today;
 #: ``MAX_ACCESS_POINTS`` (8) is the *design* ceiling - reaching 7 or 8 means editing this
@@ -160,6 +175,12 @@ class Plan:
     #: compute on locally sharded tensors and produce wrong numbers instead of an error.  Older
     #: plan files that predate this field load as ``("single",)``.
     parallel: Tuple[str, ...] = ("single",)
+    #: Actual injection mechanisms, not only the coarse access-point budget.  Audit metadata:
+    #: config adapters and vendor patches have no access-point name of their own.  Excluded
+    #: from ``compute_id`` so adding an audit field does not invalidate a plan.
+    mechanisms: Tuple[str, ...] = ()
+    #: Compat-hook names requested by the declaration; audit metadata, like mechanisms.
+    hooks: Tuple[str, ...] = ()
     plan_id: str = ""
     created_at: str = ""
     schema_version: int = SCHEMA_VERSION
@@ -214,6 +235,12 @@ class Plan:
             )
         if len(set(self.access_points)) != len(self.access_points):
             raise ValueError("plan lists an access point twice")
+        unknown_mechanisms = sorted(set(self.mechanisms) - PLAN_MECHANISMS)
+        if unknown_mechanisms:
+            raise ValueError(
+                f"plan names unknown mechanisms {unknown_mechanisms}; "
+                f"allowed: {sorted(PLAN_MECHANISMS)}"
+            )
         if (
             any(s.source != "vendor" for s in self.selections)
             and "impl_table" not in self.access_points
@@ -248,6 +275,8 @@ class Plan:
             "servable": bool(self.servable),
             "support": dict(self.support),
             "parallel": list(self.parallel),
+            "mechanisms": list(self.mechanisms),
+            "hooks": list(self.hooks),
         }
 
     @classmethod
@@ -269,6 +298,8 @@ class Plan:
             "servable",
             "support",
             "parallel",
+            "mechanisms",
+            "hooks",
         }
         unknown = sorted(set(data) - known)
         if unknown:
@@ -287,6 +318,8 @@ class Plan:
             servable=bool(data.get("servable", True)),
             support=dict(data.get("support", {})),
             parallel=tuple(data.get("parallel", ("single",))),
+            mechanisms=tuple(data.get("mechanisms", ())),
+            hooks=tuple(data.get("hooks", ())),
             plan_id=str(data.get("plan_id", "")),
             created_at=str(data.get("created_at", "")),
             schema_version=int(data.get("schema_version", SCHEMA_VERSION)),

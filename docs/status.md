@@ -8,6 +8,10 @@
 > 多卡交付增量（模型级并行门、跨 TP C2 口径、Qwen TP=4、HCCL rootinfo 预检）；
 > 单卡/双卡 Ascend950PR，CANN 9.3.0。
 > 多卡交付边界见 [`notes/multicard-deliverable-20261118.md`](notes/multicard-deliverable-20261118.md)。
+>
+> **2026-11-19 适配层统一重构**：provider 统一 registry、安装结果统一 `InstallResult`、
+> plan 记录 mechanisms/hooks、install/doctor 共用 runtime gate、`support` 改为受校验的
+> `SupportSpec`；目标用例与 LFM3/Muse/Nemotron 真权重 C1 已重跑。
 
 ---
 
@@ -23,7 +27,7 @@ P2/P3、K1/K2、O2 对控制模型免测，见 `verification-matrix.md` §1.9；
 | 模型 | 状态 | 证据 |
 |---|---|---|
 | MuseGlimmer-30B | **在役（vendor-absent，绝对门）**：C1–C4 通过（单卡 + TP=2；C2 容差内，C4 TPOT 24 ms、8K TTFT 0.62 s、8 路 279 tok/s、冷启动 75 s）；128K×图/needle 通过；无独立厂商基线（N/A） | `notes/muse-glimmer-v3-validation-20261117.md` |
-| LFM3-1.7B | C1/C3 通过；short-conv provider；C2/C4 为历史证据，P1 后未重做完整门禁 | `notes/lfm3-adaptation.md` |
+| LFM3-1.7B | C1/C2/C3/C4 均通过：C2 top-5 集合一致且 logprob 在 0.1 内；C4 conc1 TTFT 26.7–122.1 ms、TPOT 5.88–6.06 ms，conc16 404–1136 tok/s；short-conv provider | `notes/lfm3-adaptation.md` |
 | Nemotron-3.5-30B-A3B | C1/C3 通过；candidate providers；`servable=false`；C2 教师强制 top-1/top-5 rank 通过；TP8 out-of-scope | `notes/m5-nemotron-validation-20261116.md` |
 
 M5 的 C2 已改用教师强制 top-1/top-5 rank：4 个 prompt 的 top-1 id 全同或有 near-tie，参考 top-1 全在服务 top-5；绝对 logprob 差仅诊断（capital step31 0.574，code 首 token 0.198）；MTP 已在 TP=1 图模式做到 greedy 逐 token 等价，TP=8 已列为 out-of-scope（共享 HCCL rootinfo/ACL 环境阻塞，不作为本轮交付阻塞）。
@@ -174,9 +178,10 @@ python3 scripts/ti_trace.py run --preset smoke
 **结论**：这是独立的一轮排查任务。在它被修掉之前：判断某次改动有没有破坏东西，
 用逐文件跑，不要用整套的红绿。设备侧测试是另一套入口。
 
-2026-11-17 P0/P1 目标用例（`test_p0_adaptation`、`test_p1_adaptation`、v3 contracts、LFM3、
-Nemotron、impl_table、plan、layer_deps 等）全部通过；真权重 C1 已重跑 Muse/LFM3/Nemotron，
-均出 token，Muse/Nemotron C3 为 8 图/8 命中/0 回退。
+2026-11-19 适配层统一重构后，目标用例全部通过：`test_p0_adaptation`、`test_p1_adaptation`、
+`test_p2_architecture`、v3 contracts、LFM3、Nemotron、impl_table、plan、parallel、layer_deps、
+manifest/checkpoint verifier 等。真权重 C1 重跑 LFM3/Muse/Nemotron，均正常出 token；
+Muse/Nemotron C3 为 8 图/8 命中/0 回退；Qwen/LFM3 doctor 均 PASS。
 
 ---
 

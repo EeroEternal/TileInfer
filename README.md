@@ -39,10 +39,13 @@ vllm-ascend 已经适配的模型走它；它没适配的模型，我们把缺�
 
 ## 现在是什么状态
 
-- **v3 接入层已建成（M1 + P0/P1）**：`tileinfer/bridge/`（6 个接入点 + 版本门 + 指标）、
+- **v3 接入层已建成（M1 + P0/P1/P2）**：`tileinfer/bridge/`（6 个接入点 + 版本门 + 指标）、
   `contracts/`、`resolve/`、`manifests/`、`cli/` 均已实现；P0 增加了 provider 生命周期字段、
   config adapter、manifest/plan `support`；P1 增加了 `WeightMapSpec`、`StateLayout`、
-  `CompatHook`。`pyproject.toml` 只注册
+  `CompatHook`；P2 把 provider 查找收敛到 `providers/registry.py`、安装结果收敛到
+  `InstallResult`、`ModelAdapters` 统一 config/model/parser 流水线、provider `install_actions` 声明化、
+  plan 记录实际 `mechanisms`/`hooks`，并在 install 中执行 runtime parallel gate。
+  `pyproject.toml` 只注册
   `vllm.general_plugins → tileinfer.bridge.install:install`，不注册平台插件。当前进度与每条断点见
   [`docs/status.md`](docs/status.md)。
 - **v2 运行时（`tileinfer/vllm/`）已归档到 `legacy/v2/`**，不在安装包内、不可 import。v3 的
@@ -76,13 +79,18 @@ manifest（说明书）
        └─ graph_hook       图捕获计数
 ```
 
-P0/P1 的新增内容包括 `ProviderSpec` 的 status/scope/install/graph_safe/evidence_level、
-manifest/plan 的 `config_impl` 和 `support`，以及四个工具：
+P0/P1/P2 的新增内容包括 `ProviderSpec` 的 status/scope/install/install_actor/graph_safe/
+evidence_level、manifest/plan 的 `config_impl`/`support`/`hooks`/`mechanisms`，以及：
 
+- `tileinfer/providers/registry.py`：所有 provider 的唯一查找入口；
+- `tileinfer/bridge/results.py`：所有安装动作的统一 `InstallResult`；
+- `tileinfer/bridge/model_adapters.py`：config adapter → register_config → register_models → parser 的顺序流水线；
 - `tileinfer/bridge/config_adapter.py`：`config_impl` 的标准入口；
 - `tileinfer/bridge/weight_map.py`：权重改名 / 融合 / skip / expert remap；
 - `tileinfer/models/state_layout.py`：state 逻辑形状、Ascend 页对齐、padded shape；
-- `tileinfer/bridge/compat_hooks.py`：vendor hook / platform guard / rope patch / model-side fix 的登记、禁用和删除条件。
+- `tileinfer/bridge/compat_hooks.py`：vendor hook / platform guard / rope patch / model-side fix 的登记、禁用和删除条件；
+- `tileinfer/bridge/runtime_gate.py`：install 和 doctor 共用的版本/并行/provider 适用性检查；
+- `tileinfer/manifests/verify.py`：manifest ↔ checkpoint config 的通用一致性校验。
 
 ## 文档地图
 

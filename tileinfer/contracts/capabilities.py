@@ -173,6 +173,18 @@ QuantContract = QuantConfigContract
 
 
 @dataclass(frozen=True)
+class InstallAction:
+    """One declared side effect of installing a provider."""
+
+    kind: str  # impl_bind | vendor_patch | model_call
+    actor: str = ""
+    hook: str = ""
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {"kind": self.kind, "actor": self.actor, "hook": self.hook}
+
+
+@dataclass(frozen=True)
 class ProviderSpec:
     """A provider's declaration (L4).  Five fields are mandatory by project rule.
 
@@ -214,6 +226,11 @@ class ProviderSpec:
     #: How the bridge installs it: an operator-table entry, a provider consumed by our model
     #: implementation, or a vendor hook (platform guard / monkeypatch).
     install: str = "impl_table"
+    #: Optional legacy single binder.  Prefer ``install_actions`` for new providers.
+    install_actor: str = ""
+    #: Declared side effects.  A provider may bind an operator, install one or more vendor
+    #: patches, and/or be consumed directly by the model implementation.
+    install_actions: Tuple[InstallAction, ...] = ()
     #: Measured under ACL graph capture (replay, no host sync, no fallback), not merely
     #: "this implementation is graph-shaped".
     graph_safe: bool = False
@@ -231,6 +248,9 @@ class ProviderSpec:
             raise ValueError(f"unknown provider scope {self.scope!r}")
         if self.install not in {"impl_table", "model_impl", "vendor_hook"}:
             raise ValueError(f"unknown provider install mode {self.install!r}")
+        for action in self.install_actions:
+            if action.kind not in {"impl_bind", "vendor_patch", "model_call"}:
+                raise ValueError(f"unknown install action {action.kind!r}")
         if self.evidence_level not in {
             "declared",
             "candidate",
@@ -270,6 +290,8 @@ class ProviderSpec:
             "status": self.status,
             "scope": self.scope,
             "install": self.install,
+            "install_actor": self.install_actor,
+            "install_actions": [action.as_dict() for action in self.install_actions],
             "graph_safe": self.graph_safe,
             "evidence_level": self.evidence_level,
         }

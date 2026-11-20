@@ -18,6 +18,8 @@ import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional
 
+from .results import InstallResult
+
 _TRUE = {"1", "true", "yes", "on"}
 
 
@@ -84,7 +86,7 @@ HOOKS: Dict[str, CompatHook] = {
     ),
 }
 
-_INSTALLED: Dict[str, Dict[str, Any]] = {}
+_INSTALLED: Dict[str, InstallResult] = {}
 
 
 def list_compat_hooks() -> List[Dict[str, Any]]:
@@ -104,52 +106,77 @@ def list_compat_hooks() -> List[Dict[str, Any]]:
     ]
 
 
-def install_compat_hook(name: str) -> Dict[str, Any]:
-    """Install one declared hook and return a machine-readable status."""
+def install_compat_hook(name: str) -> InstallResult:
+    """Install one declared hook and return the common install result."""
     hook = HOOKS.get(name)
-    info: Dict[str, Any] = {
-        "name": name,
-        "ok": False,
-        "disabled": False,
-        "installed": False,
-        "detail": "",
-    }
     if hook is None:
-        info["detail"] = f"unknown compat hook {name!r}"
-        return info
+        return InstallResult(name=name, ok=False, detail=f"unknown compat hook {name!r}")
     if hook.disable_env and os.environ.get(hook.disable_env, "").strip().lower() in _TRUE:
-        info.update(ok=True, disabled=True, detail=f"disabled by {hook.disable_env}")
-        return info
+        return InstallResult(
+            name=name,
+            ok=True,
+            detail=f"disabled by {hook.disable_env}",
+            extra={"disabled": True},
+        )
     if not hook.installer:
-        info.update(ok=True, detail="metadata-only hook (model-side numeric fix)")
-        return info
+        return InstallResult(
+            name=name,
+            ok=True,
+            detail="metadata-only hook (model-side numeric fix)",
+            extra={"disabled": False},
+        )
     if hook.idempotent and name in _INSTALLED:
-        return dict(_INSTALLED[name], detail="already installed")
+        cached = _INSTALLED[name]
+        return InstallResult(
+            name=name,
+            ok=cached.ok,
+            installed=cached.installed,
+            skipped=cached.skipped,
+            failed=cached.failed,
+            detail="already installed",
+            extra=dict(cached.extra),
+        )
 
     module_name, _, actor = hook.installer.partition(":")
     try:
         module = importlib.import_module(module_name)
     except Exception as exc:  # noqa: BLE001
-        info["detail"] = f"cannot import {module_name!r}: {type(exc).__name__}: {exc}"
-        return info
+        return InstallResult(
+            name=name,
+            ok=False,
+            detail=f"cannot import {module_name!r}: {type(exc).__name__}: {exc}",
+        )
     fn = getattr(module, actor, None)
     if not callable(fn):
-        info["detail"] = f"{module_name!r} has no callable {actor!r}"
-        return info
+        return InstallResult(
+            name=name,
+            ok=False,
+            detail=f"{module_name!r} has no callable {actor!r}",
+        )
     try:
-        result = fn()
+        value = fn()
     except Exception as exc:  # noqa: BLE001
-        info["detail"] = f"{hook.installer} raised {type(exc).__name__}: {exc}"
-        return info
-    if result is False:
-        info["detail"] = f"{hook.installer} returned False (target unavailable)"
-        return info
-    info.update(ok=True, installed=True, detail=f"installed {hook.installer}")
-    if isinstance(result, Mapping):
-        info["result"] = dict(result)
+        return InstallResult(
+            name=name,
+            ok=False,
+            detail=f"{hook.installer} raised {type(exc).__name__}: {exc}",
+        )
+    if value is False:
+        return InstallResult(
+            name=name,
+            ok=False,
+            detail=f"{hook.installer} returned False (target unavailable)",
+        )
+    result = InstallResult(
+        name=name,
+        ok=True,
+        installed=[hook.installer],
+        detail=f"installed {hook.installer}",
+        extra={"disabled": False, "result": value if isinstance(value, Mapping) else None},
+    )
     if hook.idempotent:
-        _INSTALLED[name] = dict(info)
-    return info
+        _INSTALLED[name] = result
+    return result
 
 
 def reset_compat_hooks() -> None:

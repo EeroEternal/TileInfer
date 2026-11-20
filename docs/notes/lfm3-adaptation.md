@@ -127,38 +127,33 @@ OK
 
 ## C4: performance
 
-The C1/C2/C3 rerun changed only the model-registration mechanism, not the model math, so
-the C4 numbers below are retained from the same implementation and were **not re-measured**
-under plan `d0ded082891fbb99`.  A post-merge smoke run (1024-token prompt, 64 output tokens,
-conc=1) finished in 0.534 s end to end (~120 tok/s), consistent with the table; it is not a
-p50/p90 gate measurement.
+Re-measured on 2026-11-19 with the unified adapter/action pipeline, using the LFM3 OpenAI
+server on one Ascend950PR, 64 output tokens per request.  Prompt sizes are the server's
+actual token counts (the probe repeats text; 1024/4096/7680 nominal produce 781/3058/5698
+tokens).  `perf_probe.py` streams and records TTFT/TPOT; concurrency has no HF reference and
+is reported as absolute throughput.
 
-After replacing the grouped `conv1d` decode and the non-contiguous state gather/scatter with
-seven fused multiply-adds over a contiguous state slice, TPOT dropped from ~138 ms to
-5-6 ms per token (a regression in the first implementation, not a model property).
-
-vLLM/TileInfer, 512-token engine, 64 output tokens, 1/4/16 concurrent requests:
-
-| prompt | conc | TTFT p50 / p90 | TPOT | throughput |
+| prompt tokens | conc | TTFT p50 / p90 | TPOT | throughput |
 |---|---|---|---|---|
-| 1024 | 1 | 195.8 / 195.8 ms | 6.29 ms | 107.9 tok/s |
-| 1024 | 4 | 89.6 / 89.7 ms | 7.37 ms | 461.4 tok/s |
-| 1024 | 16 | 285.9 / 363.4 ms | 7.90 ms | 1293.9 tok/s |
-| 4096 | 1 | 73.7 / 73.7 ms | 5.27 ms | 157.7 tok/s |
-| 4096 | 4 | 246.2 / 320.6 ms | 7.51 ms | 352.3 tok/s |
-| 4096 | 16 | 766.0 / 1226.3 ms | 14.28 ms | 610.7 tok/s |
-| 7680 | 1 | 138.7 / 138.7 ms | 5.30 ms | 135.3 tok/s |
-| 7680 | 4 | 396.9 / 474.0 ms | 9.16 ms | 264.9 tok/s |
-| 7680 | 16 | 1296.9 / 2126.2 ms | 23.29 ms | 364.3 tok/s |
+| 781 | 1 | 26.0 / 26.3 ms | 5.87 ms | 161.8 tok/s |
+| 781 | 4 | 91.0 / 92.0 ms | 9.78 ms | 361.1 tok/s |
+| 781 | 16 | 223.7 / 278.8 ms | 10.81 ms | 1119.8 tok/s |
+| 3058 | 1 | 72.8 / 84.5 ms | 5.91 ms | 143.9 tok/s |
+| 3058 | 4 | 248.0 / 270.2 ms | 10.55 ms | 288.4 tok/s |
+| 3058 | 16 | 603.1 / 965.8 ms | 15.43 ms | 622.7 tok/s |
+| 5698 | 1 | 125.5 / 135.4 ms | 5.96 ms | 128.0 tok/s |
+| 5698 | 4 | 408.0 / 494.9 ms | 11.87 ms | 226.7 tok/s |
+| 5698 | 16 | 1095.1 / 1757.3 ms | 20.46 ms | 405.2 tok/s |
 
-HF transformers reference, conc=1: TTFT 349.7 / 78.9 / 148.9 ms and TPOT 13.77 / 11.69 /
-11.73 ms for 1K / 4K / 8K. The conc=1 gate (TTFT and TPOT <= 1.10x HF) passes; concurrency
-has no HF reference and is recorded as absolute throughput. Full graph capture: 8 graphs,
-567/567 decode hits, 0 fallbacks, 0 errors.
+Conc=1 TTFT/TPOT remain within the declared 1.10x HF reference gate; concurrency is
+recorded as absolute throughput.  The older class-path numbers are superseded by this run.
+The short-conv decode path is still the seven fused multiply-adds over a contiguous state
+slice (grouped `conv1d` was ~138 ms TPOT).
 
 ## Limitations
 
-- C2 is tolerance-based, not bit-exact; C4 has not been measured.
+- C2 is tolerance-based, not bit-exact (top-5 set matches, every logprob inside 0.1).
+- C4 is measured on one card; concurrency has no HF reference and is absolute only.
 - Single card only: `Lfm3ShortConv` raises for TP > 1.
 - Requires transformers 5.16+ (tested 5.17) because of the checkpoint's remote config code.
 - The short-conv state is padded (2048 x 32 bf16) to satisfy vllm-ascend's page-size
